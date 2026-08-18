@@ -1,4 +1,4 @@
-// Metal Shading Language kernels for the Vassista Metal engine.
+// Metal Shading Language kernels for the Metal engine.
 //
 // Design rule: ONE kernel call == ONE command-buffer commit (the caller
 // batches a whole model step into a single command buffer when needed).

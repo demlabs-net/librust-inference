@@ -1,4 +1,4 @@
-//! Native NN layers on the Vassista Metal engine — the candle-replacement
+//! Native NN layers on the Metal engine — the candle-replacement
 //! layer API (macOS). Every layer holds its weights as [`GpuTensor`]s and
 //! dispatches its kernels through [`MetalCtx`]; each forward is one command
 //! buffer per kernel call (batch fusion lands together with the model ports).

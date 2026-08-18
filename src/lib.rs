@@ -1,4 +1,4 @@
-//! Shared inference infrastructure — the Vassista replacement for candle.
+//! Shared inference infrastructure — the replacement for candle.
 //!
 //! Extracted from `librust-speech-inference` so the general-purpose inference
 //! stack (NN primitives, the own Metal engine, device/backend management,
@@ -6,10 +6,10 @@
 //!
 //! ## Modules
 //!
-//! - [`nn`] — Native NN layers on the Vassista Metal engine (Linear, RMSNorm,
+//! - [`nn`] — Native NN layers on the Metal engine (Linear, RMSNorm,
 //!   RoPE, GQA Attention + KV cache, SwiGLU, CausalConv1d/ConvTranspose,
 //!   ConvNeXt, Snake, Embedding) — the candle-replacement layer API.
-//! - [`metal`] — The Vassista Metal engine: own MSL kernels + buffers
+//! - [`metal`] — The Metal engine: own MSL kernels + buffers
 //!   (macOS-only), the candle-replacement compute runtime.
 //! - [`inference`] — Sampling (top-p, repetition penalty, RAS), CUDA graph stub.
 //! - [`ops`] — Tensor ops missing a kernel in candle 0.11 (softmax_last_dim).
@@ -21,7 +21,7 @@
 //!
 //! The candle-based pieces (`nn_candle`, `ops`, `quant`, `backend`, `device`,
 //! `cuda_graph`, tensor sampling) are gated behind the `candle` feature
-//! (NOT enabled by default) — the Vassista Metal engine does not need candle
+//! (NOT enabled by default) — the Metal engine does not need candle
 //! at all; it is only pulled in by the CUDA/Linux path and the golden
 //! reference tests.
 

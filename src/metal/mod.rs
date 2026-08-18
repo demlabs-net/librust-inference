@@ -1,4 +1,4 @@
-//! **Vassista Metal engine** — our own Metal compute runtime.
+//! **Metal engine** — our own Metal compute runtime.
 //!
 //! Why this exists: candle-core's Metal backend commits a separate command
 //! buffer **per tensor op** (im2col + gemm + transpose for every conv1d) and

@@ -15,12 +15,15 @@
 //! - [`concurrency`] — Cross-engine inference guards (Metal command-buffer serialization).
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
 
+pub mod backend;
 pub mod nn;
 pub mod concurrency;
 pub mod inference;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod weights;
+
+pub use backend::{Backend, Tensor};
 
 /// GPU-only rule: a build without an integrated GPU backend must not silently
 /// fall back to CPU (there is no CPU path). The Metal engine covers macOS; a

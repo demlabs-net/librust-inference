@@ -376,6 +376,32 @@ impl MetalCtx {
         })
     }
 
+    /// Elementwise subtract: Y = A - B (same shape; may alias A or B).
+    pub fn sub_f32(&self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = a.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("sub_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_bytes(3, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Elementwise divide: Y = A / B (same shape; may alias A or B).
+    pub fn div_f32(&self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = a.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("div_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_bytes(3, 8, (&n as *const usize).cast());
+        })
+    }
+
     /// Elementwise sqrt (same shape, may alias).
     pub fn sqrt_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let n = x.numel();
@@ -1273,4 +1299,164 @@ pub fn batch(
         cmd.wait_until_completed();
         Ok(())
     })
+}
+
+/// The Metal backend — the [`crate::backend::Backend`] implementation over
+/// the own engine. Consumers use `&dyn Backend` and never touch this type.
+pub struct MetalBackend {
+    pub ctx: MetalCtx,
+}
+
+impl MetalBackend {
+    pub fn new() -> Result<Self, MetalError> {
+        Ok(Self { ctx: MetalCtx::new()? })
+    }
+}
+
+impl crate::backend::Backend for MetalBackend {
+    fn zeros(&self, shape: Vec<usize>) -> Result<crate::backend::Tensor, MetalError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::zeros(&self.ctx.device, shape)?))
+    }
+
+    fn from_cpu_f32(&self, data: &[f32], shape: Vec<usize>) -> Result<crate::backend::Tensor, MetalError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f32(&self.ctx.device, data, shape)?))
+    }
+
+    fn to_cpu_f32(&self, t: &crate::backend::Tensor) -> Result<Vec<f32>, MetalError> {
+        t.as_gpu().to_cpu_f32(&self.ctx)
+    }
+
+    fn gemm(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.gemm_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())
+    }
+
+    fn gemm_nt(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.gemm_nt_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())
+    }
+
+    fn mul(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.mul_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())
+    }
+
+    fn add(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.add_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())
+    }
+
+    fn sub(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.sub_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())
+    }
+
+    fn div(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.div_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())
+    }
+
+    fn add_scalar(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, c: f32) -> Result<(), MetalError> {
+        self.ctx.add_scalar_f32(x.as_gpu(), y.as_gpu(), c)
+    }
+
+    fn scale(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, c: f32) -> Result<(), MetalError> {
+        self.ctx.scale_f32(x.as_gpu(), y.as_gpu(), c)
+    }
+
+    fn add_bias(&self, x: &crate::backend::Tensor, bias: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.add_bias_f32(x.as_gpu(), bias.as_gpu(), y.as_gpu())
+    }
+
+    fn sqrt(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.sqrt_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn log(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.log_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn max_scalar(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, floor: f32) -> Result<(), MetalError> {
+        self.ctx.max_scalar_f32(x.as_gpu(), y.as_gpu(), floor)
+    }
+
+    fn relu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.relu_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn leaky_relu_clip(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.leaky_relu_clip_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn sigmoid(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.sigmoid_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn tanh(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.tanh_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn silu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.silu_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn gelu_tanh(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.gelu_tanh_f32(x.as_gpu(), y.as_gpu())
+    }
+
+    fn snake(&self, x: &crate::backend::Tensor, a: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), MetalError> {
+        self.ctx.snake_f32(x.as_gpu(), a.as_gpu(), y.as_gpu())
+    }
+
+    fn rmsnorm(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor, eps: f32) -> Result<(), MetalError> {
+        self.ctx.rmsnorm_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), eps)
+    }
+
+    fn layernorm(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, eps: f32) -> Result<(), MetalError> {
+        self.ctx.layernorm_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), eps)
+    }
+
+    fn conv1d(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        bias: Option<&crate::backend::Tensor>,
+        stride: usize,
+        pad_l: usize,
+        dil: usize,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), MetalError> {
+        let params = Conv1dParams { stride, pad: pad_l, dilation: dil };
+        let dense = w.as_gpu().shape[1] == x.as_gpu().shape[2];
+        self.ctx.conv1d_groups_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), params, 0, true, true, dense, y.as_gpu())
+    }
+
+    fn conv2d_nchw(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        bias: Option<&crate::backend::Tensor>,
+        pad_h: usize,
+        pad_w: usize,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), MetalError> {
+        self.ctx.conv2d_nchw_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), pad_h, pad_w, y.as_gpu())
+    }
+
+    fn maxpool2d(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, kh: usize, kw: usize) -> Result<(), MetalError> {
+        self.ctx.maxpool2d_f32(x.as_gpu(), y.as_gpu(), kh, kw)
+    }
+
+    fn conv_transpose1d(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        bias: Option<&crate::backend::Tensor>,
+        stride: usize,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), MetalError> {
+        self.ctx.conv_transpose1d_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), stride, y.as_gpu())
+    }
+
+    fn slice_last(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, off: usize) -> Result<(), MetalError> {
+        self.ctx.slice_last_f32(x.as_gpu(), y.as_gpu(), off)
+    }
+
+    fn slice_time(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, u: usize) -> Result<(), MetalError> {
+        self.ctx.slice_time_f32(x.as_gpu(), y.as_gpu(), u)
+    }
 }

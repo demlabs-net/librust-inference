@@ -152,6 +152,8 @@ impl MetalCtx {
             "sigmoid_f32",
             "add_f32",
             "add_scalar_f32",
+            "sub_f32",
+            "div_f32",
             "sqrt_f32",
             "log_f32",
             "max_scalar_f32",

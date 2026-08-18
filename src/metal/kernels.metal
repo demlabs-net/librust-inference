@@ -262,6 +262,30 @@ kernel void add_f32(
     Y[gid] = A[gid] + B[gid];
 }
 
+// ── Elementwise subtract: Y = A - B ──────────────────────────────────────────
+kernel void sub_f32(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    Y[gid] = A[gid] - B[gid];
+}
+
+// ── Elementwise divide: Y = A / B ────────────────────────────────────────────
+kernel void div_f32(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    Y[gid] = A[gid] / B[gid];
+}
+
 // ── Elementwise add scalar: Y = X + c ────────────────────────────────────────
 kernel void add_scalar_f32(
     device const float* X [[buffer(0)]],

@@ -438,7 +438,7 @@ impl MetalCtx {
         let (n, ci, hi, wi) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
         let (co, _, kh, kw) = (w.shape[0], w.shape[1], w.shape[2], w.shape[3]);
         let (oh, ow) = (y.shape[2], y.shape[3]);
-        let grid = MTLSize::new(n as u64, oh as u64, co as u64);
+        let grid = MTLSize::new((oh * ow) as u64, n as u64, co as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("conv2d_nchw_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), 0);
@@ -461,7 +461,7 @@ impl MetalCtx {
     ) -> Result<(), MetalError> {
         let (n, c, hi, wi) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
         let (oh, ow) = (y.shape[2], y.shape[3]);
-        let grid = MTLSize::new(n as u64, oh as u64, c as u64);
+        let grid = MTLSize::new((oh * ow) as u64, n as u64, c as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("maxpool2d_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), 0);

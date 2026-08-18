@@ -342,7 +342,8 @@ kernel void conv2d_nchw_f32(
     constant uint& pad_w [[buffer(14)]],
     uint3 gid [[thread_position_in_grid]])
 {
-    uint n = gid.x, oh = gid.y, co = gid.z;
+    uint t = gid.x, n = gid.y, co = gid.z;
+    uint oh = t / OW, ow = t % OW;
     if (oh >= OH || co >= Co) return;
     float acc = (bias != nullptr) ? bias[co] : 0.0f;
     for (uint ci = 0; ci < Ci; ++ci) {
@@ -374,7 +375,8 @@ kernel void maxpool2d_f32(
     constant uint& KW [[buffer(9)]],
     uint3 gid [[thread_position_in_grid]])
 {
-    uint n = gid.x, oh = gid.y, co = gid.z;
+    uint t = gid.x, n = gid.y, co = gid.z;
+    uint oh = t / OW, ow = t % OW;
     if (oh >= OH || co >= C) return;
     float m = -1e30f;
     for (uint kh = 0; kh < KH; ++kh) {

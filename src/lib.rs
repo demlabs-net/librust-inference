@@ -6,8 +6,9 @@
 //!
 //! ## Modules
 //!
-//! - [`nn`] — Neural network primitives: KvCache, GQA Attention, RMSNorm, RoPE,
-//!   SwiGLU, CausalConv1d, ConvNeXt, Snake activation, Residual/Encoder/Decoder blocks.
+//! - [`nn`] — Native NN layers on the Vassista Metal engine (Linear, RMSNorm,
+//!   RoPE, GQA Attention + KV cache, SwiGLU, CausalConv1d/ConvTranspose,
+//!   ConvNeXt, Snake, Embedding) — the candle-replacement layer API.
 //! - [`metal`] — The Vassista Metal engine: own MSL kernels + buffers
 //!   (macOS-only), the candle-replacement compute runtime.
 //! - [`inference`] — Sampling (top-p, repetition penalty, RAS), CUDA graph stub.
@@ -18,12 +19,15 @@
 //! - [`quant`] — Quantization levels (FP32/BF16/FP16/INT8/INT6/INT4/NF4).
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader + weight-norm helpers.
 //!
-//! The candle-based pieces (`nn`, `ops`, `quant`, `backend`, `device`,
+//! The candle-based pieces (`nn_candle`, `ops`, `quant`, `backend`, `device`,
 //! `cuda_graph`, tensor sampling) are gated behind the `candle` feature
 //! (NOT enabled by default) — the Vassista Metal engine does not need candle
 //! at all; it is only pulled in by the CUDA/Linux path and the golden
 //! reference tests.
 
+pub mod nn;
+#[cfg(feature = "candle")]
+pub mod nn_candle;
 #[cfg(feature = "candle")]
 pub mod backend;
 pub mod concurrency;
@@ -32,8 +36,6 @@ pub mod device;
 pub mod inference;
 #[cfg(target_os = "macos")]
 pub mod metal;
-#[cfg(feature = "candle")]
-pub mod nn;
 #[cfg(feature = "candle")]
 pub mod ops;
 #[cfg(feature = "candle")]

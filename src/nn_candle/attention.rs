@@ -6,9 +6,9 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
 
 
-use crate::nn::linear::QLinear;
-use crate::nn::rmsnorm::RmsNorm;
-use crate::nn::rope::RotaryEmbedding;
+use crate::nn_candle::linear::QLinear;
+use crate::nn_candle::rmsnorm::RmsNorm;
+use crate::nn_candle::rope::RotaryEmbedding;
 
 /// Initial capacity (positions) of a KV cache. Caches GROW on demand
 /// (doubling) during generation instead of pre-allocating the model's

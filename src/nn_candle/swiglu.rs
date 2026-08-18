@@ -7,7 +7,7 @@
 
 use candle_core::{Module, Result, Tensor};
 
-use crate::nn::linear::QLinear;
+use crate::nn_candle::linear::QLinear;
 
 /// SwiGLU FFN layer (quantizable — see [QLinear]).
 #[derive(Clone)]

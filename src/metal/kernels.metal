@@ -262,6 +262,18 @@ kernel void add_f32(
     Y[gid] = A[gid] + B[gid];
 }
 
+// ── Elementwise add scalar: Y = X + c ────────────────────────────────────────
+kernel void add_scalar_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant float& c [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    Y[gid] = X[gid] + c;
+}
+
 // ── Elementwise sqrt ─────────────────────────────────────────────────────────
 kernel void sqrt_f32(
     device const float* X [[buffer(0)]],
@@ -271,6 +283,109 @@ kernel void sqrt_f32(
 {
     if (gid >= n) return;
     Y[gid] = sqrt(X[gid]);
+}
+
+// ── Elementwise log ──────────────────────────────────────────────────────────
+kernel void log_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    Y[gid] = log(X[gid]);
+}
+
+// ── Elementwise max with a scalar floor: Y = max(X, floor) ───────────────────
+kernel void max_scalar_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant float& floor [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float x = X[gid];
+    Y[gid] = x > floor ? x : floor;
+}
+
+// ── Clipped leaky ReLU: Y = max(leaky(x, 0.2), -0.4) ─────────────────────────
+kernel void leaky_relu_clip_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float x = X[gid];
+    float y = x > 0.0f ? x : 0.2f * x;
+    Y[gid] = y > -0.4f ? y : -0.4f;
+}
+
+// ── 2D convolution (NCHW): y[n,co,oh,ow] = Σ x[n,ci,ih,iw]·w[co,ci,kh,kw] ────
+// X (N,Ci,H,W), W (Co,Ci,KH,KW), bias (Co) or None, Y (N,Co,OH,OW).
+kernel void conv2d_nchw_f32(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& Ci [[buffer(5)]],
+    constant uint& Hi [[buffer(6)]],
+    constant uint& Wi [[buffer(7)]],
+    constant uint& Co [[buffer(8)]],
+    constant uint& KH [[buffer(9)]],
+    constant uint& KW [[buffer(10)]],
+    constant uint& OH [[buffer(11)]],
+    constant uint& OW [[buffer(12)]],
+    constant uint& pad_h [[buffer(13)]],
+    constant uint& pad_w [[buffer(14)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint n = gid.x, oh = gid.y, co = gid.z;
+    if (oh >= OH || co >= Co) return;
+    float acc = (bias != nullptr) ? bias[co] : 0.0f;
+    for (uint ci = 0; ci < Ci; ++ci) {
+        for (uint kh = 0; kh < KH; ++kh) {
+            int ih = (int)(oh) - (int)pad_h + (int)kh;
+            if (ih < 0 || ih >= (int)Hi) continue;
+            for (uint kw = 0; kw < KW; ++kw) {
+                int iw = (int)(ow) - (int)pad_w + (int)kw;
+                if (iw < 0 || iw >= (int)Wi) continue;
+                acc += X[((n * Ci + ci) * Hi + (uint)ih) * Wi + (uint)iw]
+                     * W[((co * Ci + ci) * KH + kh) * KW + kw];
+            }
+        }
+    }
+    Y[((n * Co + co) * OH + oh) * OW + ow] = acc;
+}
+
+// ── MaxPool2d (kernel == stride): y[n,co,oh,ow] = max over (kh,kw) window ────
+kernel void maxpool2d_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& N [[buffer(2)]],
+    constant uint& C [[buffer(3)]],
+    constant uint& Hi [[buffer(4)]],
+    constant uint& Wi [[buffer(5)]],
+    constant uint& OH [[buffer(6)]],
+    constant uint& OW [[buffer(7)]],
+    constant uint& KH [[buffer(8)]],
+    constant uint& KW [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint n = gid.x, oh = gid.y, co = gid.z;
+    if (oh >= OH || co >= C) return;
+    float m = -1e30f;
+    for (uint kh = 0; kh < KH; ++kh) {
+        uint ih = oh * KH + kh;
+        for (uint kw = 0; kw < KW; ++kw) {
+            uint iw = ow * KW + kw;
+            float v = X[((n * C + co) * Hi + ih) * Wi + iw];
+            m = v > m ? v : m;
+        }
+    }
+    Y[((n * C + co) * OH + oh) * OW + ow] = m;
 }
 
 // ── GLU: gate * sigmoid(value), sigmoid via the tanh identity ───────────────

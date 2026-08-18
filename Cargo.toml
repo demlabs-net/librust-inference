@@ -1,13 +1,11 @@
 [package]
 name = "rust-inference"
-description = "Shared inference infrastructure: NN primitives, the Vassista Metal engine, device management, sampling, weights"
+description = "Shared inference infrastructure: NN primitives, the Metal engine, sampling, weights"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [dependencies]
-# candle-core/candle-nn are declared per-target below (metal on macOS, cuda on
-# Linux) — see the [target.'cfg(...)'.dependencies] sections.
 safetensors = "0.4"
 parking_lot = "0.12"
 tracing = "0.1"
@@ -16,70 +14,14 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 once_cell = "1"
-# Optional — pulled in only by the `nvml` feature (VRAM probes on CUDA/Linux).
-nvml-wrapper = { version = "0.10", optional = true }
 
-# Compute backend — selected by target platform at build time (no runtime
-# choice, no --features flag needed). macOS → Metal, Linux → CUDA. Windows is
-# feature-selected: `cuda` (NVIDIA) or the DirectML slot (policy default, not
-# integrated yet — the build fails with a clear compile_error! instead of a
-# broken CUDA build). The matching feature is forwarded into candle-nn too.
-# A future DirectML / Vulkan / OpenCL backend would slot in here and in
-# src/backend.rs.
-# The Vassista Metal engine (our own MSL kernels + buffers) also lives on macOS.
-#
-# candle is NOT a default dependency: the own Metal engine needs no candle.
-# It is pulled in by the `candle` feature (CUDA/Linux path, golden-reference
-# tests) — target-specific so macOS and Linux select their own backend feature.
+# The Metal engine (our own MSL kernels + buffers) lives on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11", features = ["metal"], optional = true }
-candle-nn = { version = "0.11", features = ["metal"], optional = true }
 metal = "0.31"
 objc = "0.2"
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-candle-core = { version = "0.11", features = ["cuda"], optional = true }
-candle-nn = { version = "0.11", features = ["cuda"], optional = true }
-# CUDA driver API (cuMemGetInfo, memory-pool management) for free-VRAM checks —
-# same version/features candle-core already pulls in, so feature unification is
-# free.
-cudarc = { version = "0.19", features = ["driver"], optional = true }
-
-# Windows: the CUDA backend is optional (NVIDIA only). Without it there is no
-# integrated GPU runtime yet (DirectML slot) — see the compile_error! in
-# src/lib.rs.
-[target.'cfg(target_os = "windows")'.dependencies]
-candle-core = { version = "0.11", features = ["cuda"], optional = true }
-candle-nn = { version = "0.11", features = ["cuda"], optional = true }
-
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 metal = "0.31"
-
-[features]
-# The candle-based inference stack (nn/ops/quant/backend/device/cuda_graph,
-# tensor sampling) — the CUDA/Linux path and the golden-reference tests.
-# NOT enabled by default: the own Metal engine does not need candle.
-candle = ["dep:candle-core", "dep:candle-nn", "dep:cudarc"]
-# CUDA on Windows (NVIDIA) — the policy default there is the DirectML slot.
-cuda = ["dep:candle-core", "dep:candle-nn"]
-# Placeholder for the Windows DirectML runtime — not integrated yet.
-# Building for Windows without `cuda` fails with a clear error (src/lib.rs).
-directml = []
-# Placeholder for a future OpenCL backend — not implemented (candle has no
-# OpenCL device). See src/backend.rs.
-opencl = []
-# NVML-based VRAM introspection: device::vram_free_bytes / vram_total_bytes /
-# log_pool_stats on non-macOS builds. Enable on CUDA/Linux targets where
-# libnvidia-ml is present. Without it the probes return None and callers
-# (engine pools) fall back to a permissive allocation policy.
-nvml = ["dep:nvml-wrapper"]
-# macOS-only examples (Vassista Metal engine) — hidden on other targets so
-# --all-targets / CI builds don't fail on the missing `metal` crate.
-metal-examples = []
-
-[[example]]
-name = "metal_bench"
-required-features = ["metal-examples", "candle"]
 
 [profile.release]
 lto = "thin"

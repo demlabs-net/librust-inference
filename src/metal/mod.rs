@@ -151,7 +151,13 @@ impl MetalCtx {
             "relu_f32",
             "sigmoid_f32",
             "add_f32",
+            "add_scalar_f32",
             "sqrt_f32",
+            "log_f32",
+            "max_scalar_f32",
+            "leaky_relu_clip_f32",
+            "conv2d_nchw_f32",
+            "maxpool2d_f32",
             "glu_f32",
             "add_bias_f32",
             "add_bias2d_f32",
@@ -355,6 +361,19 @@ impl MetalCtx {
         })
     }
 
+    /// Elementwise add scalar: Y = X + c (same shape, may alias).
+    pub fn add_scalar_f32(&self, x: &GpuTensor, y: &GpuTensor, c: f32) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("add_scalar_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+            enc.set_bytes(3, 4, (&c as *const f32).cast());
+        })
+    }
+
     /// Elementwise sqrt (same shape, may alias).
     pub fn sqrt_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let n = x.numel();
@@ -364,6 +383,92 @@ impl MetalCtx {
             enc.set_buffer(0, Some(&x.buffer), 0);
             enc.set_buffer(1, Some(&y.buffer), 0);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Elementwise log (same shape, may alias).
+    pub fn log_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("log_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Elementwise max with a scalar floor: Y = max(X, floor).
+    pub fn max_scalar_f32(&self, x: &GpuTensor, y: &GpuTensor, floor: f32) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("max_scalar_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+            enc.set_bytes(3, 4, (&floor as *const f32).cast());
+        })
+    }
+
+    /// Clipped leaky ReLU: Y = max(leaky(x, 0.2), -0.4).
+    pub fn leaky_relu_clip_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("leaky_relu_clip_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// 2D convolution (NCHW). X (N,Ci,Hi,Wi), W (Co,Ci,KH,KW), bias (Co),
+    /// Y (N,Co,OH,OW) with OH = (Hi + 2·pad_h - KH)/1 + 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_nchw_f32(
+        &self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        pad_h: usize,
+        pad_w: usize,
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let (n, ci, hi, wi) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        let (co, _, kh, kw) = (w.shape[0], w.shape[1], w.shape[2], w.shape[3]);
+        let (oh, ow) = (y.shape[2], y.shape[3]);
+        let grid = MTLSize::new(n as u64, oh as u64, co as u64);
+        let group = MTLSize::new(1, 1, 1);
+        self.run("conv2d_nchw_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&w.buffer), 0);
+            enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
+            enc.set_buffer(3, Some(&y.buffer), 0);
+            for (i, v) in [n, ci, hi, wi, co, kh, kw, oh, ow, pad_h, pad_w].iter().enumerate() {
+                enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })
+    }
+
+    /// MaxPool2d (kernel == stride, no padding). X/Y (N,C,H,W).
+    pub fn maxpool2d_f32(
+        &self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        kh: usize,
+        kw: usize,
+    ) -> Result<(), MetalError> {
+        let (n, c, hi, wi) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        let (oh, ow) = (y.shape[2], y.shape[3]);
+        let grid = MTLSize::new(n as u64, oh as u64, c as u64);
+        let group = MTLSize::new(1, 1, 1);
+        self.run("maxpool2d_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            for (i, v) in [n, c, hi, wi, oh, ow, kh, kw].iter().enumerate() {
+                enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
+            }
         })
     }
 

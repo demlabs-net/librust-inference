@@ -1,11 +1,10 @@
 //! Metal GPU concurrency guard.
 //!
-//! candle-core's Metal backend can panic when multiple command buffers are
-//! committed concurrently from different threads (a known limitation of the
-//! shared Metal device). The engine pools (`GLOBAL_TTS`, `GLOBAL_STT`) keep N
-//! warm engines to serve parallel calls; without gating, several concurrent
-//! Metal forward passes risk the "committing a command buffer while an encoder
-//! is still active" panic.
+//! The Metal device can panic when multiple command buffers are committed
+//! concurrently from different threads (a known limitation of the shared
+//! Metal device). The engine pools keep N warm engines to serve parallel
+//! calls; without gating, several concurrent Metal forward passes risk the
+//! "committing a command buffer while an encoder is still active" panic.
 //!
 //! [`metal_inference_guard()`] returns an RAII guard holding a permit from a
 //! process-wide counting semaphore. Wrap the top-level GPU call of each engine

@@ -1,8 +1,8 @@
 //! **Metal engine** — our own Metal compute runtime.
 //!
-//! Why this exists: candle-core's Metal backend commits a separate command
+//! Why this exists: existing per-op GPU runtimes commit a separate command
 //! buffer **per tensor op** (im2col + gemm + transpose for every conv1d) and
-//! synchronises the CPU after each; its tensor buffers are private and its
+//! synchronise the CPU after each; their tensor buffers are private and
 //! kernels are recompiled at runtime per process. For conv-heavy streaming
 //! models (t-one conformer, S2-Pro DualAR, DAC codec) that makes real-time
 //! inference on Metal impossible.
@@ -107,7 +107,7 @@ impl GpuTensor {
     }
 }
 
-/// 1D convolution parameters (same semantics as candle's `ParamsConv1D`).
+/// 1D convolution parameters (stride/pad/dilation).
 #[derive(Debug, Clone, Copy)]
 pub struct Conv1dParams {
     pub stride: usize,
@@ -885,7 +885,7 @@ impl MetalCtx {
 
     // ── DAC codec ops (fp32) ──
 
-    /// Transposed 1D convolution. W is (Cin, Cout, K) — the candle
+    /// Transposed 1D convolution. W is (Cin, Cout, K) — the
     /// conv_transpose1d layout (in_channels, out_channels, k). X (B,T,Cin),
     /// bias (Cout) or None, Y (B,Tout,Cout) with Tout = (T-1)*stride + K.
     pub fn conv_transpose1d_f32(

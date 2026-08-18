@@ -148,6 +148,10 @@ impl MetalCtx {
             "rmsnorm_f32",
             "layernorm_f32",
             "silu_f32",
+            "relu_f32",
+            "sigmoid_f32",
+            "add_f32",
+            "sqrt_f32",
             "glu_f32",
             "add_bias_f32",
             "add_bias2d_f32",
@@ -308,6 +312,55 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("silu_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// ReLU: y[i] = max(x[i], 0) (same shape, may alias).
+    pub fn relu_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("relu_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Sigmoid: y[i] = 1/(1+exp(-x[i])) (same shape, may alias).
+    pub fn sigmoid_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("sigmoid_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Elementwise add: Y = A + B (same shape; may alias A or B).
+    pub fn add_f32(&self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = a.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("add_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_bytes(3, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Elementwise sqrt (same shape, may alias).
+    pub fn sqrt_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("sqrt_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), 0);
             enc.set_buffer(1, Some(&y.buffer), 0);
             enc.set_bytes(2, 8, (&n as *const usize).cast());

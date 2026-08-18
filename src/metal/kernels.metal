@@ -226,6 +226,53 @@ kernel void silu_f32(
     Y[gid] = x / (1.0f + exp(-x));
 }
 
+// ── ReLU ─────────────────────────────────────────────────────────────────────
+kernel void relu_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float x = X[gid];
+    Y[gid] = x > 0.0f ? x : 0.0f;
+}
+
+// ── Sigmoid: 1/(1+exp(-x)) — safe for large |x| ──────────────────────────────
+kernel void sigmoid_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float x = X[gid];
+    Y[gid] = 1.0f / (1.0f + exp(-x));
+}
+
+// ── Elementwise add: Y = A + B ───────────────────────────────────────────────
+kernel void add_f32(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    Y[gid] = A[gid] + B[gid];
+}
+
+// ── Elementwise sqrt ─────────────────────────────────────────────────────────
+kernel void sqrt_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    Y[gid] = sqrt(X[gid]);
+}
+
 // ── GLU: gate * sigmoid(value), sigmoid via the tanh identity ───────────────
 // X [rows, 2D] → Y [rows, D]
 kernel void glu_f32(

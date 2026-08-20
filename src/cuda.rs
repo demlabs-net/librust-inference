@@ -468,72 +468,89 @@ impl Backend for CudaBackend {
             let n32 = n as i32;
             let m32 = m as i32;
             let c = c.as_cuda_mut();
-            if m == 1 {
-                let nblk = k / 32;
-                let grid_x = (n + 255) / 256;
-                // Split-k: largest power-of-2 slice count that keeps the
-                // grid near the GPU's block capacity (m=1 alone leaves most
-                // SMs idle — e.g. 8 blocks for n=2048). Requires 16-byte
-                // aligned columns and a k-slice fitting the shared A buffer.
-                let s = [32usize, 16, 8, 4, 2, 1]
+            let nblk = k / 32;
+            let grid_x = (n + 255) / 256;
+            // Split-k: largest power-of-2 slice count that keeps the grid
+            // near the GPU's block capacity (m=1 leaves most SMs idle
+            // otherwise — e.g. 8 blocks for n=2048; m≤64 already has m× the
+            // row blocks, so the grid cap applies to m=1 only). Requires
+            // 16-byte aligned columns and a k-slice fitting the shared A.
+            let s = if m == 1 {
+                [32usize, 16, 8, 4, 2, 1]
                     .iter()
                     .copied()
                     .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * s <= 512)
-                    .unwrap_or(1);
-                if s > 1 && n % 16 == 0 && (k / s) <= 2048 {
-                    let cpart = self.take_pooled(s * n)?;
-                    let f = self.function("gemm_i8_m1_splitk")?;
-                    let cfg = LaunchConfig {
-                        grid_dim: (((n + 255) / 256) as u32, s as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let mut la = self.stream.launch_builder(&f);
-                    la.arg(&q);
-                    la.arg(&ascale);
-                    la.arg(b8);
-                    la.arg(wscale);
-                    la.arg(&cpart);
-                    la.arg(&k32);
-                    la.arg(&n32);
-                    let s32 = s as i32;
-                    la.arg(&s32);
-                    unsafe { la.launch(cfg) }.map_err(map_err)?;
-                    // Combine the S partials (stream-ordered after splitk).
-                    let f = self.function("gemm_i8_reduce")?;
-                    let cfg = LaunchConfig {
-                        grid_dim: (((n + 255) / 256) as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let mut la = self.stream.launch_builder(&f);
-                    la.arg(&cpart);
-                    la.arg(c);
-                    la.arg(&n32);
-                    la.arg(&s32);
-                    unsafe { la.launch(cfg) }.map_err(map_err)?;
-                    self.pool.lock().unwrap().entry(s * n).or_default().push(cpart);
-                } else {
-                    let f = self.function("gemm_i8_m1")?;
-                    let cfg = LaunchConfig {
-                        grid_dim: (((n + 255) / 256) as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let mut la = self.stream.launch_builder(&f);
-                    la.arg(&q);
-                    la.arg(&ascale);
-                    la.arg(b8);
-                    la.arg(wscale);
-                    la.arg(c);
-                    la.arg(&k32);
-                    la.arg(&n32);
-                    unsafe { la.launch(cfg) }.map_err(map_err)?;
-                }
+                    .unwrap_or(1)
+            } else {
+                [32usize, 16, 8, 4, 2, 1]
+                    .iter()
+                    .copied()
+                    .find(|&s| nblk % s == 0 && (k / s) <= 2048)
+                    .unwrap_or(1)
+            };
+            let use_splitk = s > 1 && n % 16 == 0 && (k / s) <= 2048;
+            if m <= 64 && use_splitk {
+                // m≤64 (TTS fill/decode, m = tokens): one block per
+                // (row, 256 columns), split over k. The split-k kernel
+                // re-reads B from L2 once per output row — cheaper than the
+                // tiled kernel's latency-bound small-m occupancy (166 us vs
+                // 238 us at 32x6144x2048). m>64 (STT frames) uses tiled,
+                // which reads B exactly once.
+                let cpart = self.take_pooled(s * m * n)?;
+                let f = self.function("gemm_i8_mn_splitk")?;
+                let cfg = LaunchConfig {
+                    grid_dim: ((grid_x * m) as u32, s as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&q);
+                la.arg(&ascale);
+                la.arg(b8);
+                la.arg(wscale);
+                la.arg(&cpart);
+                la.arg(&k32);
+                la.arg(&n32);
+                let s32 = s as i32;
+                la.arg(&s32);
+                let m32i = m as i32;
+                la.arg(&m32i);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                // Combine the S partials (stream-ordered after splitk).
+                let f = self.function("gemm_i8_reduce")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&cpart);
+                la.arg(c);
+                la.arg(&n32);
+                la.arg(&s32);
+                la.arg(&m32i);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+            } else if m == 1 && !use_splitk {
+                let f = self.function("gemm_i8_m1")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&q);
+                la.arg(&ascale);
+                la.arg(b8);
+                la.arg(wscale);
+                la.arg(c);
+                la.arg(&k32);
+                la.arg(&n32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
             } else {
                 let f = self.function("gemm_i8_tiled")?;
                 let cfg = LaunchConfig {
-                    grid_dim: (((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1),
+                    grid_dim: (((n + 31) / 32) as u32, ((m + 31) / 32) as u32, 1),
                     block_dim: (16, 16, 1),
                     shared_mem_bytes: 0,
                 };

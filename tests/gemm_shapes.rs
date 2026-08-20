@@ -142,8 +142,13 @@ fn check_i8(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
     let g = gpu.to_cpu_f32(&y).unwrap();
     let c = cpu.to_cpu_f32(&yc).unwrap();
     let tol = 2e-2 + 1e-2 * c.iter().fold(0f32, |mm, &v| mm.max(v.abs()));
+    let mut bad = 0;
     for i in 0..g.len() {
         let ok = (g[i] - c[i]).abs() <= tol;
+        if !ok && bad < 8 {
+            eprintln!("int8 [{m}x{k}x{n}] row {} col {}: gpu {} cpu {}", i / n, i % n, g[i], c[i]);
+            bad += 1;
+        }
         assert!(ok, "int8 gemm_nt [{m}x{k}x{n}] [{i}]: gpu {} cpu {}", g[i], c[i]);
     }
     println!("gemm_nt int8 {m:>4}x{k:>4}x{n:>4} ok");

@@ -1007,40 +1007,44 @@ extern "C" __global__ void quant_f32_i8_blk(
     }
 }
 
-/// int8 GEMM, m == 1 (TTS decode hot path), split-k variant.
-/// Grid (ceil(n/256), S); each block computes the partial dot over its
-/// k-slice (k/S, a multiple of 32) for 256 columns. m=1 alone cannot fill
-/// the GPU (24 blocks for n=6144 — latency-bound 1-byte loads measured
-/// ~130 us); split-k gives 8x the blocks and LDG.128 gives 512 consecutive
-/// bytes per warp instruction. `gemm_i8_reduce` combines the partials.
+/// int8 GEMM, small m (1..=64 — TTS fill/decode), split-k variant.
+/// Grid (ceil(n/256)·m, S); each block computes the partial dot over its
+/// k-slice (k/S, a multiple of 32) for ONE output row × 256 columns. Small-m
+/// GEMMs cannot fill the GPU with the 64-row tiled kernel (the old m1 kernel
+/// measured ~130-800 us vs 10 us fp16); split-k gives S× the blocks and
+/// LDG.128 gives 512 consecutive bytes per warp instruction.
+/// `gemm_i8_reduce` combines the partials (S·m rows).
 ///
 /// Shared: the A-slice (k/S bytes) + double-buffered 32×256 weight tiles
-/// (padded to 272 → conflict-free column reads; 2-way on the 16-byte
-/// writes). Weights are stored transposed (k, n) row-major; scales
-/// transposed (k/32, n) — both read coalesced across columns.
-extern "C" __global__ void gemm_i8_m1_splitk(
-    const signed char* __restrict__ A,   // (k)
-    const float* __restrict__ asc,       // (k/32)
+/// (padded to 272 → conflict-free column reads). Weights stored transposed
+/// (k, n); scales transposed (k/32, n) — both read coalesced.
+extern "C" __global__ void gemm_i8_mn_splitk(
+    const signed char* __restrict__ A,   // (m, k)
+    const float* __restrict__ asc,       // (m, k/32)
     const signed char* __restrict__ B,   // (k, n) row-major
     const float* __restrict__ wsc,       // (k/32, n)
-    float* __restrict__ Cpart,           // (S, n) partial sums
+    float* __restrict__ Cpart,           // (S·m, n) partial sums
     int k,
     int n,
-    int S)
+    int S,
+    int m)
 {
     const int BN = 256;
     __shared__ signed char As[2048];       // k-slice activations (≤ 2048)
     __shared__ signed char Bs[2][32][272]; // double-buffered weight tiles
 
     int tid = threadIdx.x;
-    int col = blockIdx.x * BN + tid;
+    int bx = blockIdx.x;
+    int row = bx % m;
+    int nb = bx / m;
+    int col = nb * BN + tid;
     int ks = k / S;
     int nblk_s = ks >> 5;
     int kb0 = blockIdx.y * nblk_s;
 
     // A-slice → shared (every thread dots the same segment).
     for (int i = tid; i < ks; i += BN) {
-        As[i] = A[kb0 * 32 + i];
+        As[i] = A[row * k + kb0 * 32 + i];
     }
 
     // Stage one 32×256 weight tile: 16 bytes per thread (LDG.128); round r
@@ -1048,10 +1052,10 @@ extern "C" __global__ void gemm_i8_m1_splitk(
     auto load_tile = [&](int t, int buf) {
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            int row = r * 16 + (tid >> 4);
+            int rr = r * 16 + (tid >> 4);
             int seg = (tid & 15) * 16;
-            int gcol = blockIdx.x * BN + seg;
-            int kk = (kb0 + t) * 32 + row;
+            int gcol = nb * BN + seg;
+            int kk = (kb0 + t) * 32 + rr;
             int4 v = make_int4(0, 0, 0, 0);
             if (gcol + 16 <= n) {
                 v = *(const int4*)&B[kk * n + gcol];
@@ -1062,7 +1066,7 @@ extern "C" __global__ void gemm_i8_m1_splitk(
                     ((signed char*)&v)[i] = (gc < n) ? B[kk * n + gc] : 0;
                 }
             }
-            *(int4*)&Bs[buf][row][seg] = v;
+            *(int4*)&Bs[buf][rr][seg] = v;
         }
     };
 
@@ -1080,172 +1084,140 @@ extern "C" __global__ void gemm_i8_m1_splitk(
         for (int j = 0; j < 32; ++j) {
             s += (int)a[j] * (int)Bs[cur][j][tid];
         }
-        if (col < n) acc += (float)s * (asc[kb0 + t] * wsc[(kb0 + t) * n + col]);
+        if (col < n) acc += (float)s * (asc[row * (k / 32) + kb0 + t] * wsc[(kb0 + t) * n + col]);
         cur = 1 - cur;
     }
-    if (col < n) Cpart[blockIdx.y * n + col] = acc;
+    if (col < n) Cpart[(blockIdx.y * m + row) * n + col] = acc;
 }
 
-/// int8 GEMM, m == 1 — single-kernel fallback (used when split-k is not
-/// applicable: odd tile counts / unaligned columns). Same shared-tile dot as
-/// the split-k variant; scales transposed (k/32, n).
-extern "C" __global__ void gemm_i8_m1(
-    const signed char* __restrict__ A,   // (k)
-    const float* __restrict__ asc,       // (k/32)
-    const signed char* __restrict__ B,   // (k, n) row-major
-    const float* __restrict__ wsc,       // (k/32, n)
-    float* __restrict__ C,               // (n)
-    int k,
-    int n)
-{
-    __shared__ signed char Bs[32][272];
-    int tid = threadIdx.x;
-    int col = blockIdx.x * 256 + tid;
-    int nblk = k >> 5;
-
-    float acc = 0.0f;
-    for (int kb = 0; kb < nblk; ++kb) {
-        // Stage the k-tile: 16 bytes per thread (LDG.128), 2 rounds.
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            int row = r * 16 + (tid >> 4);
-            int seg = (tid & 15) * 16;
-            int gcol = blockIdx.x * 256 + seg;
-            int kk = kb * 32 + row;
-            int4 v = make_int4(0, 0, 0, 0);
-            if (gcol + 16 <= n) {
-                v = *(const int4*)&B[kk * n + gcol];
-            } else if (gcol < n) {
-                for (int i = 0; i < 16; ++i) {
-                    int gc = gcol + i;
-                    ((signed char*)&v)[i] = (gc < n) ? B[kk * n + gc] : 0;
-                }
-            }
-            *(int4*)&Bs[row][seg] = v;
-        }
-        __syncthreads();
-        const signed char* a = A + kb * 32;
-        int s = 0;
-#pragma unroll
-        for (int j = 0; j < 32; ++j) {
-            s += (int)a[j] * (int)Bs[j][tid];
-        }
-        if (col < n) acc += (float)s * (asc[kb] * wsc[kb * n + col]);
-        __syncthreads();
-    }
-    if (col < n) C[col] = acc;
-}
-
+/// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
 /// Combine the split-k partials: C[col] = Σ_s Cpart[s·n + col].
 
-/// Combine the split-k partials: C[col] = Σ_s Cpart[s·n + col].
+/// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
 extern "C" __global__ void gemm_i8_reduce(
-    const float* __restrict__ Cpart,   // (S, n)
-    float* __restrict__ C,             // (n)
+    const float* __restrict__ Cpart,   // (S·m, n)
+    float* __restrict__ C,             // (m, n)
     int n,
-    int S)
+    int S,
+    int m)
 {
-    int col = blockIdx.x * 256 + threadIdx.x;
-    if (col >= n) return;
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= m * n) return;
+    int r = idx / n;
+    int c = idx % n;
     float acc = 0.0f;
-    for (int s = 0; s < S; ++s) acc += Cpart[s * n + col];
-    C[col] = acc;
+    for (int s = 0; s < S; ++s) acc += Cpart[(s * m + r) * n + c];
+    C[r * n + c] = acc;
 }
 
-/// int8 GEMM, m > 1 — classic tiled kernel. BM=64, BN=64, BK=32; block
-/// (16,16) = 256 threads, each thread owns a 4x4 output micro-tile;
-/// per-32-block i32 accumulation with one fp32 dequant FMA per k-tile.
-/// B is stored transposed (k, n) row-major — warps load consecutive columns.
+/// int8 GEMM, m > 1 — tiled kernel. BM=32, BN=64, BK=32; block (16,8) =
+/// 128 threads, each thread owns a 4x4 output micro-tile (8 rows × 4 = 32 =
+/// BM — the 64-row variant only covered half its tile with (32,8) and had
+/// too few blocks: 96 for m=32 on 128 SMs). BM=32 doubles the m-block count
+/// (192 for m=32). Shared tiles are PADDED (33/65 bytes per row) — unpadded
+/// 32-byte rows put every lane on the same bank (32-way conflicts); A reads
+/// are broadcasts (conflict-free), B reads hit 4-way worst case.
+/// Double-buffered: one sync per k-tile, the next tile prefetches while the
+/// current one computes. B stored transposed (k, n); scales (k/32, n).
 extern "C" __global__ void gemm_i8_tiled(
     const signed char* __restrict__ A,   // (m, k)
     const float* __restrict__ asc,       // (m, k/32)
     const signed char* __restrict__ B,   // (k, n) row-major
-    const float* __restrict__ wsc,       // (k/32, n) transposed scales
+    const float* __restrict__ wsc,       // (k/32, n)
     float* __restrict__ C,               // (m, n)
     int m,
     int k,
     int n)
 {
-    const int BM = 64, BN = 64, BK = 32;
-    __shared__ signed char As[64 * 32];
-    __shared__ signed char Bs[32 * 64];
-    __shared__ float ascs[64];
-    __shared__ float wscs[64];
+    // BM=32, BN=32 with a 2x2 micro-tile: warp count = m*n/128 (384 warps
+    // for 32x6144 with 4x4 — 3 warps/SM, latency-bound; 2x2 gives 1536,
+    // 12/SM). Per-32-block i32 accumulation + one fp32 dequant FMA per
+    // k-tile. Padded shared tiles (33 bytes/row) — unpadded rows put every
+    // lane on the same bank; A reads are broadcasts, B reads 2-way.
+    const int BM = 32, BN = 32, BK = 32;
+    __shared__ signed char As[2][32][33];
+    __shared__ signed char Bs[2][32][33];
+    __shared__ float ascs[2][32];
+    __shared__ float wscs[2][32];
 
     int m0 = blockIdx.y * BM;
     int n0 = blockIdx.x * BN;
     int nblk = k >> 5;
     int tx = threadIdx.x, ty = threadIdx.y;
 
-    int acc_i[4][4] = {};
-    float acc_f[4][4] = {};
+    int acc_i[2][2] = {};
+    float acc_f[2][2] = {};
 
-    for (int kb = 0; kb < nblk; ++kb) {
-        // Load A tile (64 x 32) + row scales; B tile (32 x 64) + col scales.
-        // A tile: 64 rows × 32 k = 2048 elements, 8 per thread (the (16,16)
-        // block covers it via the linear index — tx alone spans only 16 of
-        // 32 k elements).
+    // Stage one k-tile into buffer `buf`.
+    auto load_tile = [&](int kb, int buf) {
+        // A tile: 32 rows x 32 k = 1024 elements, 4 per thread.
         for (int idx = ty * 16 + tx; idx < BM * BK; idx += 256) {
             int i = idx / BK;
             int j = idx % BK;
             int row = m0 + i;
-            As[i * BK + j] = (row < m) ? A[row * k + kb * BK + j] : 0;
+            As[buf][i][j] = (row < m) ? A[row * k + kb * BK + j] : 0;
         }
         for (int i = ty; i < BM; i += 16) {
             int row = m0 + i;
-            ascs[i] = (row < m) ? asc[row * nblk + kb] : 0.0f;
+            ascs[buf][i] = (row < m) ? asc[row * nblk + kb] : 0.0f;
         }
-        for (int j = tx; j < BN; j += 16) {
-            int col = n0 + j;
-            wscs[j] = (col < n) ? wsc[kb * n + col] : 0.0f;
-        }
-        // B tile: 32 k-rows × 64 cols; B is (k, n) row-major — consecutive
-        // idx = consecutive columns within a row (coalesced warp loads).
+        // B tile: 32 k-rows x 32 cols = 1024 elements, 4 per thread.
         for (int idx = ty * 16 + tx; idx < BK * BN; idx += 256) {
             int i = idx / BN;
             int j = idx % BN;
             int kk = kb * BK + i;
             int col = n0 + j;
-            Bs[i * BN + j] = (col < n) ? B[kk * n + col] : 0;
+            Bs[buf][i][j] = (col < n) ? B[kk * n + col] : 0;
         }
+        for (int j = tx; j < BN; j += 16) {
+            int col = n0 + j;
+            wscs[buf][j] = (col < n) ? wsc[kb * n + col] : 0.0f;
+        }
+    };
+
+    load_tile(0, 0);
+    int cur = 0;
+    for (int kb = 0; kb < nblk; ++kb) {
         __syncthreads();
+        if (kb + 1 < nblk) load_tile(kb + 1, 1 - cur);
 #pragma unroll
         for (int i = 0; i < BK; ++i) {
-            signed char av[4];
-            signed char bv[4];
+            signed char av[2];
+            signed char bv[2];
 #pragma unroll
-            for (int rr = 0; rr < 4; ++rr) av[rr] = As[(ty * 4 + rr) * BK + i];
+            for (int rr = 0; rr < 2; ++rr) av[rr] = As[cur][ty * 2 + rr][i];
 #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) bv[cc] = Bs[i * BN + tx * 4 + cc];
+            for (int cc = 0; cc < 2; ++cc) bv[cc] = Bs[cur][i][tx * 2 + cc];
 #pragma unroll
-            for (int rr = 0; rr < 4; ++rr) {
+            for (int rr = 0; rr < 2; ++rr) {
 #pragma unroll
-                for (int cc = 0; cc < 4; ++cc) {
+                for (int cc = 0; cc < 2; ++cc) {
                     acc_i[rr][cc] += (int)av[rr] * (int)bv[cc];
                 }
             }
         }
         // Dequant this k-tile: one fp32 FMA per output element.
 #pragma unroll
-        for (int rr = 0; rr < 4; ++rr) {
+        for (int rr = 0; rr < 2; ++rr) {
 #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) {
-                acc_f[rr][cc] += (float)acc_i[rr][cc] * (ascs[ty * 4 + rr] * wscs[tx * 4 + cc]);
+            for (int cc = 0; cc < 2; ++cc) {
+                acc_f[rr][cc] += (float)acc_i[rr][cc]
+                    * (ascs[cur][ty * 2 + rr] * wscs[cur][tx * 2 + cc]);
             }
         }
 #pragma unroll
-        for (int rr = 0; rr < 4; ++rr) {
+        for (int rr = 0; rr < 2; ++rr) {
 #pragma unroll
-            for (int cc = 0; cc < 4; ++cc) acc_i[rr][cc] = 0;
+            for (int cc = 0; cc < 2; ++cc) acc_i[rr][cc] = 0;
         }
-        __syncthreads();
+        cur = 1 - cur;
     }
     // Write out (with edge masks).
-    for (int rr = 0; rr < 4; ++rr) {
-        int row = m0 + ty * 4 + rr;
+    for (int rr = 0; rr < 2; ++rr) {
+        int row = m0 + ty * 2 + rr;
         if (row >= m) continue;
-        for (int cc = 0; cc < 4; ++cc) {
-            int col = n0 + tx * 4 + cc;
+        for (int cc = 0; cc < 2; ++cc) {
+            int col = n0 + tx * 2 + cc;
             if (col < n) C[row * n + col] = acc_f[rr][cc];
         }
     }

@@ -1140,3 +1140,55 @@ kernel void mul_rows_f32(
     if (r >= rows || d >= D) return;
     Y[r * D + d] = X[r * D + d] * W[r];
 }
+
+// ── im2col (conv → GEMM; the DAC codec runs its convs through GEMMs) ──
+// Dense 1D conv (groups=1): Xc[t, ci*K + kk] = X[t*stride + kk*dil - pad_l, ci]
+// (zero outside). X: (B, T, Cin); Xc: (B, Tout, Cin*K).
+kernel void im2col1d_f32(
+    device const float* X [[buffer(0)]],
+    device float* Xc [[buffer(1)]],
+    constant uint& T [[buffer(2)]],
+    constant uint& Cin [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant int& stride [[buffer(5)]],
+    constant int& pad_l [[buffer(6)]],
+    constant int& dil [[buffer(7)]],
+    constant uint& Tout [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x, t = gid.y, ck = gid.z;
+    uint ci = ck / K;
+    uint kk = ck % K;
+    int src = (int)(t * (uint)stride) - pad_l + (int)kk * dil;
+    float v = 0.0f;
+    if (src >= 0 && src < (int)T) {
+        v = X[(b * T + (uint)src) * Cin + ci];
+    }
+    Xc[(b * Tout + t) * (Cin * K) + ck] = v;
+}
+
+// Transposed 1D conv (upsample): Xc[t, ci*K+kk] = X[(t-kk)/stride, ci] when
+// (t-kk) % stride == 0 and (t-kk)/stride < Tin, else 0.
+// X: (B, Tin, Cin); Xc: (B, Tout, Cin*K).
+kernel void im2col_t1d_f32(
+    device const float* X [[buffer(0)]],
+    device float* Xc [[buffer(1)]],
+    constant uint& Tin [[buffer(2)]],
+    constant uint& Cin [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& stride [[buffer(5)]],
+    constant uint& Tout [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x, t = gid.y, ck = gid.z;
+    uint ci = ck / K;
+    uint kk = ck % K;
+    float v = 0.0f;
+    if (t >= kk && (t - kk) % stride == 0) {
+        uint src = (t - kk) / stride;
+        if (src < Tin) {
+            v = X[(b * Tin + src) * Cin + ci];
+        }
+    }
+    Xc[(b * Tout + t) * (Cin * K) + ck] = v;
+}

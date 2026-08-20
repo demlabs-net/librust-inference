@@ -368,6 +368,76 @@ impl MetalCtx {
         })
     }
 
+    /// im2col for a dense 1D conv (groups=1): X (B,T,Cin) → Xc (B,Tout,Cin·K),
+    /// Xc[t, ci·K+kk] = X[t·stride + kk·dil − pad_l, ci] (zero outside).
+    pub fn im2col1d_f32(
+        &self,
+        x: &GpuTensor,
+        xc: &GpuTensor,
+        k: usize,
+        stride: usize,
+        pad_l: usize,
+        dil: usize,
+        tout: usize,
+    ) -> Result<(), MetalError> {
+        let b = x.shape[0];
+        let t = x.shape[1];
+        let cin = x.shape[2];
+        if xc.shape != [b, tout, cin * k] {
+            return Err(MetalError::Shape(format!(
+                "im2col1d out {:?} != [{b},{tout},{}]",
+                xc.shape,
+                cin * k
+            )));
+        }
+        let grid = MTLSize::new(b as u64, tout as u64, (cin * k) as u64);
+        let group = MTLSize::new(1, 1, 1);
+        self.run("im2col1d_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&xc.buffer), 0);
+            for (i, v) in [t, cin, k].iter().enumerate() {
+                enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
+            }
+            for (i, v) in [stride, pad_l, dil, tout].iter().enumerate() {
+                enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })
+    }
+
+    /// im2col for a transposed 1D conv: X (B,Tin,Cin) → Xc (B,Tout,Cin·K),
+    /// Xc[t, ci·K+kk] = X[(t−kk)/stride, ci] when divisible, else 0.
+    pub fn im2col_t1d_f32(
+        &self,
+        x: &GpuTensor,
+        xc: &GpuTensor,
+        k: usize,
+        stride: usize,
+        tout: usize,
+    ) -> Result<(), MetalError> {
+        let b = x.shape[0];
+        let tin = x.shape[1];
+        let cin = x.shape[2];
+        if xc.shape != [b, tout, cin * k] {
+            return Err(MetalError::Shape(format!(
+                "im2col_t1d out {:?} != [{b},{tout},{}]",
+                xc.shape,
+                cin * k
+            )));
+        }
+        let grid = MTLSize::new(b as u64, tout as u64, (cin * k) as u64);
+        let group = MTLSize::new(1, 1, 1);
+        self.run("im2col_t1d_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), 0);
+            enc.set_buffer(1, Some(&xc.buffer), 0);
+            for (i, v) in [tin, cin, k].iter().enumerate() {
+                enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
+            }
+            for (i, v) in [stride, tout].iter().enumerate() {
+                enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })
+    }
+
     /// Softmax over the last dimension. X/Y same shape (rows, cols).
     pub fn softmax_last_dim_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let rows = x.shape[0];
@@ -1598,30 +1668,30 @@ impl crate::backend::Backend for MetalBackend {
         Ok(())
     }
 
-    // im2col is the CUDA-side conv→GEMM path (the DAC codec on Metal keeps
-    // its native conv kernels).
     fn im2col1d(
         &self,
-        _x: &crate::backend::Tensor,
-        _xc: &crate::backend::Tensor,
-        _k: usize,
-        _stride: usize,
-        _pad_l: usize,
-        _dil: usize,
-        _tout: usize,
+        x: &crate::backend::Tensor,
+        xc: &crate::backend::Tensor,
+        k: usize,
+        stride: usize,
+        pad_l: usize,
+        dil: usize,
+        tout: usize,
     ) -> Result<(), crate::error::BackendError> {
-        unimplemented!("im2col1d is not supported on the Metal backend")
+        self.ctx.im2col1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, pad_l, dil, tout)?;
+        Ok(())
     }
 
     fn im2col_t1d(
         &self,
-        _x: &crate::backend::Tensor,
-        _xc: &crate::backend::Tensor,
-        _k: usize,
-        _stride: usize,
-        _tout: usize,
+        x: &crate::backend::Tensor,
+        xc: &crate::backend::Tensor,
+        k: usize,
+        stride: usize,
+        tout: usize,
     ) -> Result<(), crate::error::BackendError> {
-        unimplemented!("im2col_t1d is not supported on the Metal backend")
+        self.ctx.im2col_t1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, tout)?;
+        Ok(())
     }
 
     fn slice_last(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, off: usize) -> Result<(), crate::error::BackendError> {

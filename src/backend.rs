@@ -227,9 +227,13 @@ impl Tensor {
 
     /// A zero-copy view with a new shape (same buffer). The caller must keep
     /// the total element count (row-major reinterpretation).
+    ///
+    /// Metal note: the inner `GpuTensor` carries its own shape which the
+    /// Metal wrappers read — the view REBUILDS it so both stay in sync
+    /// (a stale inner shape made every view-using gemm fail shape checks).
     pub fn view(&self, shape: Vec<usize>) -> Tensor {
         debug_assert_eq!(shape.iter().product::<usize>(), self.numel());
-        Tensor { inner: self.inner.clone(), shape, dtype: self.dtype }
+        self.view_inner(shape)
     }
 
     /// Restricted zero-copy view: a window over a LARGER buffer (e.g. the
@@ -237,7 +241,27 @@ impl Tensor {
     /// caller guarantees `product(shape) ≤ numel()`.
     pub fn view_restricted(&self, shape: Vec<usize>) -> Tensor {
         debug_assert!(shape.iter().product::<usize>() <= self.numel());
-        Tensor { inner: self.inner.clone(), shape, dtype: self.dtype }
+        self.view_inner(shape)
+    }
+
+    fn view_inner(&self, shape: Vec<usize>) -> Tensor {
+        let dtype = self.dtype;
+        #[cfg(feature = "metal")]
+        {
+            if let TensorInner::Metal(g) = &self.inner {
+                return Tensor {
+                    inner: TensorInner::Metal(GpuTensor {
+                        buffer: g.buffer.clone(),
+                        shape: shape.clone(),
+                        dtype: g.dtype,
+                    }),
+                    shape,
+                    dtype,
+                };
+            }
+        }
+        #[allow(unreachable_code)]
+        Tensor { inner: self.inner.clone(), shape, dtype }
     }
 }
 

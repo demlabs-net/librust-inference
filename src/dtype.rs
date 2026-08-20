@@ -11,6 +11,10 @@
 //!
 //! [`validate`] rejects incompatible combinations at load time (fail fast —
 //! the candle-era lesson "matmul lhs F16 rhs BF16"), never as a kernel crash.
+//!
+//! The block-quantized weight/KV layouts (Q8_0, Q6_K, q4_0) follow the
+//! canonical llama.cpp formats (MIT License, https://github.com/ggml-org/llama.cpp)
+//! — reimplemented here, not vendored.
 
 use crate::error::BackendError;
 

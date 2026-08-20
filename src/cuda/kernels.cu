@@ -484,6 +484,65 @@ extern "C" __global__ void kv_update_f32(
     dst[(bi * cap + pos + ti) * d + dj] = src[i];
 }
 
+/// kv_update with f16 storage (KV quantization): src f32 (b, tq, d) →
+/// dst half (b, cap, d) at pos. Attention dequantizes inline on read.
+extern "C" __global__ void kv_update_f16(
+    const float* __restrict__ src,
+    __half* __restrict__ dst,
+    int b,
+    int tq,
+    int pos,
+    int d,
+    int cap)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= b * tq * d) return;
+    int bi = i / (tq * d);
+    int rem = i % (tq * d);
+    int ti = rem / d;
+    int dj = rem % d;
+    dst[(bi * cap + pos + ti) * d + dj] = __float2half_rn(src[i]);
+}
+
+/// kv_update copying f16 → f16 (KV grow: the old half cache rows are
+/// copied into the grown buffer without precision loss).
+extern "C" __global__ void kv_update_f16_f16(
+    const __half* __restrict__ src,
+    __half* __restrict__ dst,
+    int b,
+    int tq,
+    int pos,
+    int d,
+    int cap)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= b * tq * d) return;
+    int bi = i / (tq * d);
+    int rem = i % (tq * d);
+    int ti = rem / d;
+    int dj = rem % d;
+    dst[(bi * cap + pos + ti) * d + dj] = src[i];
+}
+
+/// kv_update copying f16 → f32 (mixed storage during a grow).
+extern "C" __global__ void kv_update_f16_f32(
+    const __half* __restrict__ src,
+    float* __restrict__ dst,
+    int b,
+    int tq,
+    int pos,
+    int d,
+    int cap)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= b * tq * d) return;
+    int bi = i / (tq * d);
+    int rem = i % (tq * d);
+    int ti = rem / d;
+    int dj = rem % d;
+    dst[(bi * cap + pos + ti) * d + dj] = __half2float(src[i]);
+}
+
 /// y (len(idx), d) = table (v, d)[idx[i]]
 extern "C" __global__ void embedding_f32(
     const unsigned int* __restrict__ idx,
@@ -846,6 +905,84 @@ extern "C" __global__ void attn_ar_v2_f32(
         out[j] = acc;
     }
 }
+
+extern "C" __global__ void attn_ar_v2_f16(
+    const float* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    const float* __restrict__ mask,
+    float* __restrict__ y,
+    int b,
+    int tq,
+    int tkv,
+    int n_heads,
+    int kv_heads,
+    int hd,
+    int n_rep,
+    int has_mask)
+{
+    int bi = blockIdx.z;
+    int hh = blockIdx.y;
+    int t = blockIdx.x;
+    if (bi >= b || hh >= n_heads || t >= tq) return;
+    int kvh = hh / n_rep;
+    const float* qrow = q + (bi * tq + t) * (n_heads * hd) + hh * hd;
+    __shared__ float scores[4096];
+    __shared__ float exps[4096];
+    __shared__ float red[256];
+    __shared__ float smx;
+    float scale = rsqrtf((float)hd);
+    if (tkv > 4096) return;
+    if (threadIdx.x == 0) smx = -INFINITY;
+    __syncthreads();
+
+    // Phase 1: scores[tk] = q·k[tk] * scale (+mask), block-reduced over hd.
+    for (int tk = 0; tk < tkv; ++tk) {
+        const __half* krow = k + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd;
+        float acc = 0.0f;
+        for (int j = threadIdx.x; j < hd; j += blockDim.x) acc += qrow[j] * __half2float(krow[j]);
+        red[threadIdx.x] = acc;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float sc = red[0] * scale;
+            if (has_mask) sc += mask[t * tkv + tk];
+            scores[tk] = sc;
+            smx = fmaxf(smx, sc);
+        }
+        __syncthreads();
+    }
+
+    // Phase 2: exp/sum (softmax denominator).
+    float sum = 0.0f;
+    for (int tk = threadIdx.x; tk < tkv; tk += blockDim.x) {
+        float e = __expf(scores[tk] - smx);
+        exps[tk] = e;
+        sum += e;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+
+    // Phase 3: out[j] = Σ_tk exps[tk]·inv·v[tk][j], j = threadIdx.x.
+    float* out = y + (bi * tq + t) * (n_heads * hd) + hh * hd;
+    for (int j = threadIdx.x; j < hd; j += blockDim.x) {
+        float acc = 0.0f;
+        for (int tk = 0; tk < tkv; ++tk) {
+            const __half* vrow = v + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd;
+            acc += exps[tk] * inv * __half2float(vrow[j]);
+        }
+        out[j] = acc;
+    }
+}
+
 
 /// Autoregressive GQA attention (TTS): q (b, tq, n_heads·hd),
 /// k/v (b, tkv, kv_heads·hd), mask (tq, tkv) bias (0 / -inf) or null.

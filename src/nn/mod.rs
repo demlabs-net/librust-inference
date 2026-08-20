@@ -315,25 +315,52 @@ impl Attention {
 }
 
 /// Growing KV cache (K/V rows (1, cap, D)); `pos` advances on update.
+/// Storage format: `KvFormat::F32` (default) or `KvFormat::F16` — f16 is
+/// quantized on write (kv_update) and dequantized inline in the fused
+/// attention kernels (CUDA); the CPU reference and Metal keep fp32.
 pub struct KvCache {
     k: Tensor,
     v: Tensor,
     pub pos: usize,
     cap: usize,
+    format: crate::dtype::KvFormat,
 }
 
 const KV_CACHE_INIT_CAPACITY: usize = 256;
 
 impl KvCache {
     /// Create with the initial capacity; grows geometrically on demand.
-    pub fn new(backend: &dyn Backend, n_kv_heads: usize, head_dim: usize) -> Result<Self, BackendError> {
+    pub fn new(
+        backend: &dyn Backend,
+        n_kv_heads: usize,
+        head_dim: usize,
+        format: crate::dtype::KvFormat,
+    ) -> Result<Self, BackendError> {
         let cap = KV_CACHE_INIT_CAPACITY;
         let d = n_kv_heads * head_dim;
+        let (k, v) = match format {
+            crate::dtype::KvFormat::F32 => {
+                (backend.zeros(vec![1, cap, d])?, backend.zeros(vec![1, cap, d])?)
+            }
+            crate::dtype::KvFormat::F16 => {
+                let zeros = vec![half::f16::from_f32(0.0); cap * d];
+                (
+                    backend.from_cpu_f16(&zeros, vec![1, cap, d])?,
+                    backend.from_cpu_f16(&zeros, vec![1, cap, d])?,
+                )
+            }
+            crate::dtype::KvFormat::Q8_0 | crate::dtype::KvFormat::Q4_0 => {
+                return Err(BackendError::Shape(
+                    "KV q8_0/q4_0 not implemented yet — use fp16".into(),
+                ));
+            }
+        };
         Ok(Self {
-            k: backend.zeros(vec![1, cap, d])?,
-            v: backend.zeros(vec![1, cap, d])?,
+            k,
+            v,
             pos: 0,
             cap,
+            format,
         })
     }
 
@@ -346,8 +373,29 @@ impl KvCache {
             new_cap = new_cap.saturating_mul(2);
         }
         let d = self.k.shape()[2];
-        let old_k = std::mem::replace(&mut self.k, backend.zeros(vec![1, new_cap, d])?);
-        let old_v = std::mem::replace(&mut self.v, backend.zeros(vec![1, new_cap, d])?);
+        // Grow in the SAME storage format — zeros() is f32-only, so f16
+        // caches are reallocated as f16 and the copy below is dtype-
+        // dispatched on both tensors (kv_update_f16_f16 / f16_f32).
+        let fresh = match self.format {
+            crate::dtype::KvFormat::F32 => (
+                backend.zeros(vec![1, new_cap, d])?,
+                backend.zeros(vec![1, new_cap, d])?,
+            ),
+            crate::dtype::KvFormat::F16 => {
+                let zeros = vec![half::f16::from_f32(0.0); new_cap * d];
+                (
+                    backend.from_cpu_f16(&zeros, vec![1, new_cap, d])?,
+                    backend.from_cpu_f16(&zeros, vec![1, new_cap, d])?,
+                )
+            }
+            crate::dtype::KvFormat::Q8_0 | crate::dtype::KvFormat::Q4_0 => {
+                return Err(BackendError::Shape(
+                    "KV q8_0/q4_0 not implemented yet — use fp16".into(),
+                ));
+            }
+        };
+        let old_k = std::mem::replace(&mut self.k, fresh.0);
+        let old_v = std::mem::replace(&mut self.v, fresh.1);
         if self.pos > 0 {
             backend.kv_update(&self.k, &old_k, 0)?;
             backend.kv_update(&self.v, &old_v, 0)?;
@@ -387,8 +435,26 @@ impl KvCache {
     pub fn shrink_to_init(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
         if self.cap > KV_CACHE_INIT_CAPACITY {
             let d = self.k.shape()[2];
-            self.k = backend.zeros(vec![1, KV_CACHE_INIT_CAPACITY, d])?;
-            self.v = backend.zeros(vec![1, KV_CACHE_INIT_CAPACITY, d])?;
+            let fresh = match self.format {
+                crate::dtype::KvFormat::F32 => (
+                    backend.zeros(vec![1, KV_CACHE_INIT_CAPACITY, d])?,
+                    backend.zeros(vec![1, KV_CACHE_INIT_CAPACITY, d])?,
+                ),
+                crate::dtype::KvFormat::F16 => {
+                    let zeros = vec![half::f16::from_f32(0.0); KV_CACHE_INIT_CAPACITY * d];
+                    (
+                        backend.from_cpu_f16(&zeros, vec![1, KV_CACHE_INIT_CAPACITY, d])?,
+                        backend.from_cpu_f16(&zeros, vec![1, KV_CACHE_INIT_CAPACITY, d])?,
+                    )
+                }
+                crate::dtype::KvFormat::Q8_0 | crate::dtype::KvFormat::Q4_0 => {
+                    return Err(BackendError::Shape(
+                        "KV q8_0/q4_0 not implemented yet — use fp16".into(),
+                    ));
+                }
+            };
+            self.k = fresh.0;
+            self.v = fresh.1;
             self.cap = KV_CACHE_INIT_CAPACITY;
         }
         self.pos = 0;
@@ -406,6 +472,7 @@ impl KvCache {
             v: Tensor::from_gpu(GpuTensor::zeros(&ctx.device, vec![1, cap, d])?),
             pos: 0,
             cap,
+            format: crate::dtype::KvFormat::F32,
         })
     }
 
@@ -597,7 +664,7 @@ mod tests {
             b.from_cpu_f32(&[1.0, 1.0, 1.0, 1.0], vec![4, 1]).unwrap(), // cos = 1 (max_seq, hd/2)
             b.from_cpu_f32(&[0.0, 0.0, 0.0, 0.0], vec![4, 1]).unwrap(), // sin = 0
         );
-        let mut cache = KvCache::new(&b, 1, 2).unwrap();
+        let mut cache = KvCache::new(&b, 1, 2, crate::dtype::KvFormat::F32).unwrap();
         // step 1: x=[1,0] → attention over itself → y = x
         let x1 = b.from_cpu_f32(&[1.0, 0.0], vec![1, 1, 2]).unwrap();
         let y1 = attn.forward(&b, &x1, &mut cache, 0, 1, &rope).unwrap();
@@ -623,7 +690,7 @@ mod tests {
     #[test]
     fn kv_cache_growth() {
         let b = backend();
-        let mut cache = KvCache::new(&b, 1, 2).unwrap();
+        let mut cache = KvCache::new(&b, 1, 2, crate::dtype::KvFormat::F32).unwrap();
         for i in 0..300u32 {
             let v = i as f32;
             let k = b.from_cpu_f32(&[v, 0.0], vec![1, 1, 2]).unwrap();

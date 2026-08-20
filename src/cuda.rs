@@ -423,7 +423,19 @@ impl Backend for CudaBackend {
     }
 
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
-        self.stream.clone_dtoh(t.as_cuda()).map_err(map_err)
+        // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
+        // raw bits and widens on the CPU — same result as a device-side cast.
+        match &t.inner {
+            crate::backend::TensorInner::CudaF16(b) => {
+                let raw: Vec<half::f16> = self.stream.clone_dtoh(b).map_err(map_err)?;
+                Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+            }
+            crate::backend::TensorInner::CudaBF16(b) => {
+                let raw: Vec<half::bf16> = self.stream.clone_dtoh(b).map_err(map_err)?;
+                Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+            }
+            _ => self.stream.clone_dtoh(t.as_cuda()).map_err(map_err),
+        }
     }
 
     fn gemm(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError> {
@@ -1366,7 +1378,12 @@ impl Backend for CudaBackend {
         let tkv = k.shape()[1];
         let n_rep = n_heads / kv_heads;
         // Parallel kernel: one 256-thread block per (batch, head, query).
-        let f = self.function("attn_ar_v2_f32")?;
+        // f16 KV storage: attn_ar_v2_f16 dequantizes k/v inline on read.
+        let f16 = matches!(
+            &k.inner,
+            crate::backend::TensorInner::CudaF16(_) | crate::backend::TensorInner::CudaBF16(_)
+        );
+        let f = if f16 { self.function("attn_ar_v2_f16")? } else { self.function("attn_ar_v2_f32")? };
         let cfg = LaunchConfig {
             grid_dim: (tq as u32, n_heads as u32, b as u32),
             block_dim: (256, 1, 1),
@@ -1374,8 +1391,21 @@ impl Backend for CudaBackend {
         };
         let mut la = self.stream.launch_builder(&f);
         la.arg(q.as_cuda());
-        la.arg(k.as_cuda());
-        la.arg(v.as_cuda());
+        if f16 {
+            match &k.inner {
+                crate::backend::TensorInner::CudaF16(b) => { la.arg(b); }
+                crate::backend::TensorInner::CudaBF16(b) => { la.arg(b); }
+                _ => unreachable!(),
+            }
+            match &v.inner {
+                crate::backend::TensorInner::CudaF16(b) => { la.arg(b); }
+                crate::backend::TensorInner::CudaBF16(b) => { la.arg(b); }
+                _ => unreachable!(),
+            }
+        } else {
+            la.arg(k.as_cuda());
+            la.arg(v.as_cuda());
+        }
         if let Some(m) = mask {
             la.arg(m.as_cuda());
         } else {
@@ -1470,11 +1500,43 @@ impl Backend for CudaBackend {
         let (b, tq, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
         let cap = dst.shape()[1];
         let n = b * tq * d;
-        let f = self.function("kv_update_f32")?;
+        // KV storage dtype dispatch on BOTH tensors: writes quantize to f16
+        // (kv_update_f16), and the grow path copies an existing f16 cache
+        // into the grown buffer (f16→f16) or an f32 one (f16→f32).
+        let src16 = matches!(
+            &src.inner,
+            crate::backend::TensorInner::CudaF16(_) | crate::backend::TensorInner::CudaBF16(_)
+        );
+        let dst16 = matches!(
+            &dst.inner,
+            crate::backend::TensorInner::CudaF16(_) | crate::backend::TensorInner::CudaBF16(_)
+        );
+        let f = match (src16, dst16) {
+            (false, false) => self.function("kv_update_f32")?,
+            (false, true) => self.function("kv_update_f16")?,
+            (true, true) => self.function("kv_update_f16_f16")?,
+            (true, false) => self.function("kv_update_f16_f32")?,
+        };
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);
-        la.arg(src.as_cuda());
-        la.arg(dst.as_cuda());
+        if src16 {
+            match &src.inner {
+                crate::backend::TensorInner::CudaF16(b) => { la.arg(b); }
+                crate::backend::TensorInner::CudaBF16(b) => { la.arg(b); }
+                _ => unreachable!(),
+            }
+        } else {
+            la.arg(src.as_cuda());
+        }
+        if dst16 {
+            match &dst.inner {
+                crate::backend::TensorInner::CudaF16(b) => { la.arg(b); }
+                crate::backend::TensorInner::CudaBF16(b) => { la.arg(b); }
+                _ => unreachable!(),
+            }
+        } else {
+            la.arg(dst.as_cuda());
+        }
         let __a99 = b as i32;
         la.arg(&__a99);
         let __a100 = tq as i32;

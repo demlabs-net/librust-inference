@@ -4,6 +4,7 @@
 //! Run with `REGEN_GOLDEN=1` to (re)generate `tests/golden/*.json` from the
 //! CPU oracle; the normal run compares. Once GPU backends land, they reuse
 //! the same committed inputs/outputs (tolerance-based comparison).
+#![cfg(feature = "cpu")]
 
 use rust_inference::harness::{check_deterministic, check_op, upload};
 use rust_inference::Backend;

@@ -71,7 +71,12 @@ impl Tensor {
     #[cfg(feature = "metal")]
     pub(crate) fn from_gpu(t: GpuTensor) -> Self {
         let shape = t.shape.clone();
-        Self { inner: TensorInner::Metal(t), shape, dtype: Dtype::F32 }
+        let dtype = match t.dtype {
+            crate::metal::GpuDtype::F32 => Dtype::F32,
+            crate::metal::GpuDtype::F16 => Dtype::F16,
+            crate::metal::GpuDtype::BF16 => Dtype::BF16,
+        };
+        Self { inner: TensorInner::Metal(t), shape, dtype }
     }
 
     #[cfg(feature = "metal")]

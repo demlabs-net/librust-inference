@@ -54,6 +54,90 @@ kernel void gemm_nt_f32(
     C[m * N + n] = acc;
 }
 
+// ── Quantized GEMM: fp32 activations × fp16/bf16 weights, fp32 accumulate ───
+// Same layouts as the f32 kernels; only the B (weight) storage narrows to
+// 2 bytes/element. bf16 has no native MSL type on older stacks — the bits
+// are passed through and widened with a shift (exact, no rounding).
+
+// C[m,n] = Σ A[m*K+k] · B[n*K+k], B in fp16.
+kernel void gemm_nt_f16(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += A[m * K + k] * (float)B[n * K + k];
+    }
+    C[m * N + n] = acc;
+}
+
+// C[m,n] = Σ A[m*K+k] · B[n*K+k], B in bf16 (ushort bits).
+static inline float bf16_to_f32(device const ushort* p, uint i) {
+    return as_type<float>((uint)p[i] << 16);
+}
+kernel void gemm_nt_bf16(
+    device const float* A [[buffer(0)]],
+    device const ushort* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += A[m * K + k] * bf16_to_f32(B, n * K + k);
+    }
+    C[m * N + n] = acc;
+}
+
+// C[m,n] = Σ A[m*K+k] · B[k*N+n], B in fp16.
+kernel void gemm_f16(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += A[m * K + k] * (float)B[k * N + n];
+    }
+    C[m * N + n] = acc;
+}
+
+// C[m,n] = Σ A[m*K+k] · B[k*N+n], B in bf16 (ushort bits).
+kernel void gemm_bf16(
+    device const float* A [[buffer(0)]],
+    device const ushort* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += A[m * K + k] * bf16_to_f32(B, k * N + n);
+    }
+    C[m * N + n] = acc;
+}
+
 // ── 1D convolution with groups (dense groups=1, depthwise groups=D) ─────────
 // X: [B, Cin, T]; W: [Cout, Cin/groups, K]; bias: [Cout] or null
 // Y: [B, Cout, T_out], t_out = (T + padL + padR - dil*(K-1) - 1)/stride + 1
@@ -364,6 +448,9 @@ kernel void conv2d_nchw_f32(
     constant uint& OW [[buffer(12)]],
     constant uint& pad_h [[buffer(13)]],
     constant uint& pad_w [[buffer(14)]],
+    constant uint& stride_t [[buffer(15)]],
+    constant uint& stride_f [[buffer(16)]],
+    constant uint& time_major_out [[buffer(17)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint t = gid.x, n = gid.y, co = gid.z;
@@ -372,17 +459,23 @@ kernel void conv2d_nchw_f32(
     float acc = (bias != nullptr) ? bias[co] : 0.0f;
     for (uint ci = 0; ci < Ci; ++ci) {
         for (uint kh = 0; kh < KH; ++kh) {
-            int ih = (int)(oh) - (int)pad_h + (int)kh;
+            int ih = (int)(oh * stride_t) - (int)pad_h + (int)kh;
             if (ih < 0 || ih >= (int)Hi) continue;
             for (uint kw = 0; kw < KW; ++kw) {
-                int iw = (int)(ow) - (int)pad_w + (int)kw;
+                int iw = (int)(ow * stride_f) - (int)pad_w + (int)kw;
                 if (iw < 0 || iw >= (int)Wi) continue;
                 acc += X[((n * Ci + ci) * Hi + (uint)ih) * Wi + (uint)iw]
                      * W[((co * Ci + ci) * KH + kh) * KW + kw];
             }
         }
     }
-    Y[((n * Co + co) * OH + oh) * OW + ow] = acc;
+    if (time_major_out != 0u) {
+        // (n, oh, co, ow) — same linear layout as (n, oh, co*ow), the t-one
+        // subsampling layout.
+        Y[((n * OH + oh) * Co + co) * OW + ow] = acc;
+    } else {
+        Y[((n * Co + co) * OH + oh) * OW + ow] = acc;
+    }
 }
 
 // ── MaxPool2d (kernel == stride): y[n,co,oh,ow] = max over (kh,kw) window ────

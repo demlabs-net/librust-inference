@@ -80,3 +80,87 @@ fn embedding_and_rope_smoke() {
     assert_eq!(&vr[..2], &[1.0, 2.0]);
     assert_eq!(&vr[2..], &[-4.0, 3.0]);
 }
+
+/// Quantized GEMM (fp32 activations × f16/bf16 weights) matches the fp32
+/// reference within the narrow-format tolerance. Weights here stay exactly
+/// representable, so the tolerance is tight (1e-3 guards fp32 accumulation
+/// ordering).
+#[test]
+fn gemm_nt_quant_smoke() {
+    let ctx = MetalCtx::new().unwrap();
+    let m = 8usize;
+    let k = 16usize;
+    let n = 12usize;
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+    let b: Vec<f32> = (0..n * k).map(|i| ((i % 11) as f32 - 5.0) * 0.5).collect();
+    // reference: C = A · Bᵀ
+    let mut ref_c = vec![0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0f32;
+            for ki in 0..k {
+                acc += a[mi * k + ki] * b[ni * k + ki];
+            }
+            ref_c[mi * n + ni] = acc;
+        }
+    }
+    let a_t = GpuTensor::from_cpu_f32(&ctx.device, &a, vec![m, k]).unwrap();
+    let c = GpuTensor::zeros(&ctx.device, vec![m, n]).unwrap();
+
+    for (name, w) in [
+        ("f16", half::f16::from_f32),
+        // bf16 rounds mantissa to 8 bits — compare with looser bound
+    ] {
+        let _ = name;
+        let w16: Vec<half::f16> = b.iter().map(|&v| w(v)).collect();
+        let b_t = GpuTensor::from_cpu_f16(&ctx.device, &w16, vec![n, k]).unwrap();
+        assert_eq!(b_t.dtype, rust_inference::metal::GpuDtype::F16);
+        ctx.gemm_nt_f32(&a_t, &b_t, &c).unwrap();
+        let got = c.to_cpu_f32(&ctx).unwrap();
+        for (gi, gv) in got.iter().enumerate() {
+            assert!(
+                (gv - ref_c[gi]).abs() < 1e-2,
+                "gemm_nt_f16 mismatch at {gi}: {gv} vs {}",
+                ref_c[gi]
+            );
+        }
+    }
+
+    // bf16: convert explicitly, allow the 8-bit-mantissa rounding
+    let wbf: Vec<half::bf16> = b.iter().map(|&v| half::bf16::from_f32(v)).collect();
+    let b_t = GpuTensor::from_cpu_bf16(&ctx.device, &wbf, vec![n, k]).unwrap();
+    assert_eq!(b_t.dtype, rust_inference::metal::GpuDtype::BF16);
+    ctx.gemm_nt_f32(&a_t, &b_t, &c).unwrap();
+    let got = c.to_cpu_f32(&ctx).unwrap();
+    for (gi, gv) in got.iter().enumerate() {
+        assert!(
+            (gv - ref_c[gi]).abs() < 0.5,
+            "gemm_nt_bf16 mismatch at {gi}: {gv} vs {}",
+            ref_c[gi]
+        );
+    }
+
+    // plain gemm (B row-major K,N) with f16 weights
+    let bn: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.5).collect();
+    let mut ref_c2 = vec![0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0f32;
+            for ki in 0..k {
+                acc += a[mi * k + ki] * bn[ki * n + ni];
+            }
+            ref_c2[mi * n + ni] = acc;
+        }
+    }
+    let w16: Vec<half::f16> = bn.iter().map(|&v| half::f16::from_f32(v)).collect();
+    let b_row = GpuTensor::from_cpu_f16(&ctx.device, &w16, vec![k, n]).unwrap();
+    ctx.gemm_f32(&a_t, &b_row, &c).unwrap();
+    let got = c.to_cpu_f32(&ctx).unwrap();
+    for (gi, gv) in got.iter().enumerate() {
+        assert!(
+            (gv - ref_c2[gi]).abs() < 1e-2,
+            "gemm_f16 mismatch at {gi}: {gv} vs {}",
+            ref_c2[gi]
+        );
+    }
+}

@@ -38,11 +38,23 @@ pub enum MetalError {
     Shape(String),
 }
 
-/// A contiguous fp32 tensor living in Metal memory.
+/// Storage dtype of a [`GpuTensor`]. Activations stay fp32; fp16/bf16 are
+/// GEMM weight formats (halved VRAM + weight-read traffic, fp32 accumulate
+/// in the kernels — the backend dtype contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDtype {
+    F32,
+    F16,
+    BF16,
+}
+
+/// A contiguous tensor living in Metal memory (fp32 activations, or
+/// fp16/bf16 GEMM weights — see [`GpuDtype`]).
 #[derive(Debug, Clone)]
 pub struct GpuTensor {
     pub buffer: Buffer,
     pub shape: Vec<usize>,
+    pub dtype: GpuDtype,
 }
 
 impl GpuTensor {
@@ -68,10 +80,10 @@ impl GpuTensor {
             // would be UB, fail loudly instead.
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape })
+        Ok(Self { buffer, shape, dtype: GpuDtype::F32 })
     }
 
-    /// Zero-filled buffer of the given shape.
+    /// Zero-filled buffer of the given shape (fp32).
     pub fn zeros(device: &Device, shape: Vec<usize>) -> Result<Self, MetalError> {
         let bytes = shape.iter().product::<usize>() * 4;
         let zeroed = vec![0u8; bytes];
@@ -83,7 +95,46 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape })
+        Ok(Self { buffer, shape, dtype: GpuDtype::F32 })
+    }
+
+    /// Upload fp16 GEMM weights (2 bytes/element; the gemm kernels decode
+    /// and accumulate in fp32).
+    pub fn from_cpu_f16(
+        device: &Device,
+        data: &[half::f16],
+        shape: Vec<usize>,
+    ) -> Result<Self, MetalError> {
+        let expected: usize = shape.iter().product();
+        assert_eq!(expected, data.len(), "GpuTensor f16 data/shape mismatch");
+        let buffer = device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            (data.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        if buffer.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        Ok(Self { buffer, shape, dtype: GpuDtype::F16 })
+    }
+
+    /// Upload bf16 GEMM weights (2 bytes/element, bit-pattern passthrough).
+    pub fn from_cpu_bf16(
+        device: &Device,
+        data: &[half::bf16],
+        shape: Vec<usize>,
+    ) -> Result<Self, MetalError> {
+        let expected: usize = shape.iter().product();
+        assert_eq!(expected, data.len(), "GpuTensor bf16 data/shape mismatch");
+        let buffer = device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            (data.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        if buffer.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        Ok(Self { buffer, shape, dtype: GpuDtype::BF16 })
     }
 
     /// Download to CPU (shared memory). First commits an EMPTY command
@@ -92,6 +143,11 @@ impl GpuTensor {
     /// contract relied silently on callers having committed+waited; a
     /// missing wait returned stale/partial data.
     pub fn to_cpu_f32(&self, ctx: &MetalCtx) -> Result<Vec<f32>, MetalError> {
+        if self.dtype != GpuDtype::F32 {
+            return Err(MetalError::Shape(
+                "to_cpu_f32 on a quantized (f16/bf16) tensor".into(),
+            ));
+        }
         let barrier = ctx.queue.new_command_buffer();
         barrier.commit();
         barrier.wait_until_completed();
@@ -136,6 +192,11 @@ impl MetalCtx {
         for name in [
             "gemm_f32",
             "gemm_nt_f32",
+            // quantized GEMM (fp32 activations × f16/bf16 weights, f32 acc)
+            "gemm_f16",
+            "gemm_bf16",
+            "gemm_nt_f16",
+            "gemm_nt_bf16",
             "conv1d_groups_f32",
             "conv2d_f32",
             "conv1d_direct_f32",
@@ -237,6 +298,8 @@ impl MetalCtx {
     // ── ops ──
 
     /// C = A·B (all row-major). Shapes: A (M,K), B (K,N), C (M,N).
+    /// B may carry fp16/bf16 GEMM weights — the kernel narrows the weight
+    /// reads to 2 bytes/element and accumulates in fp32 (A/C stay fp32).
     pub fn gemm_f32(&self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> Result<(), MetalError> {
         let m = a.shape[0];
         let k = a.shape[1];
@@ -247,9 +310,14 @@ impl MetalCtx {
                 a.shape, b.shape, c.shape
             )));
         }
+        let name = match b.dtype {
+            GpuDtype::F32 => "gemm_f32",
+            GpuDtype::F16 => "gemm_f16",
+            GpuDtype::BF16 => "gemm_bf16",
+        };
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
-        self.run("gemm_f32", grid, group, |enc| {
+        self.run(name, grid, group, |enc| {
             enc.set_buffer(0, Some(&a.buffer), 0);
             enc.set_buffer(1, Some(&b.buffer), 0);
             enc.set_buffer(2, Some(&c.buffer), 0);
@@ -452,7 +520,9 @@ impl MetalCtx {
     }
 
     /// 2D convolution (NCHW). X (N,Ci,Hi,Wi), W (Co,Ci,KH,KW), bias (Co),
-    /// Y (N,Co,OH,OW) with OH = (Hi + 2·pad_h - KH)/1 + 1.
+    /// 2D conv (NCHW) with strides; `time_major_out` produces Y (N,OH,Co·OW)
+    /// — the t-one subsampling layout. LEFT padding (CUDA/conv1d convention):
+    /// OH = (Hi + pad_h − KH)/stride_t + 1.
     #[allow(clippy::too_many_arguments)]
     pub fn conv2d_nchw_f32(
         &self,
@@ -461,11 +531,15 @@ impl MetalCtx {
         bias: Option<&GpuTensor>,
         pad_h: usize,
         pad_w: usize,
+        stride_t: usize,
+        stride_f: usize,
+        time_major_out: bool,
         y: &GpuTensor,
     ) -> Result<(), MetalError> {
         let (n, ci, hi, wi) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
         let (co, _, kh, kw) = (w.shape[0], w.shape[1], w.shape[2], w.shape[3]);
-        let (oh, ow) = (y.shape[2], y.shape[3]);
+        let oh = (hi + pad_h - kh) / stride_t + 1;
+        let ow = (wi + pad_w - kw) / stride_f + 1;
         let grid = MTLSize::new((oh * ow) as u64, n as u64, co as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("conv2d_nchw_f32", grid, group, |enc| {
@@ -473,7 +547,11 @@ impl MetalCtx {
             enc.set_buffer(1, Some(&w.buffer), 0);
             enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
             enc.set_buffer(3, Some(&y.buffer), 0);
-            for (i, v) in [n, ci, hi, wi, co, kh, kw, oh, ow, pad_h, pad_w].iter().enumerate() {
+            let consts = [
+                n, ci, hi, wi, co, kh, kw, oh, ow, pad_h, pad_w, stride_t,
+                stride_f, time_major_out as usize,
+            ];
+            for (i, v) in consts.iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
         })
@@ -556,9 +634,16 @@ impl MetalCtx {
                 a.shape, b.shape, c.shape
             )));
         }
+        // B (the weight) may be stored fp16/bf16 — narrowed reads, fp32
+        // accumulate; A/C stay fp32.
+        let name = match b.dtype {
+            GpuDtype::F32 => "gemm_nt_f32",
+            GpuDtype::F16 => "gemm_nt_f16",
+            GpuDtype::BF16 => "gemm_nt_bf16",
+        };
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
-        self.run("gemm_nt_f32", grid, group, |enc| {
+        self.run(name, grid, group, |enc| {
             enc.set_buffer(0, Some(&a.buffer), 0);
             enc.set_buffer(1, Some(&b.buffer), 0);
             enc.set_buffer(2, Some(&c.buffer), 0);
@@ -1127,7 +1212,7 @@ impl MetalCtx {
         kv_heads: usize,
         hd: usize,
     ) -> Result<(), MetalError> {
-        let (b, tq, d) = (q.shape[0], q.shape[1], q.shape[2]);
+        let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
         let tkv = k.shape[1];
         let n_rep = n_heads / kv_heads;
         let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
@@ -1322,6 +1407,17 @@ impl crate::backend::Backend for MetalBackend {
         Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f32(&self.ctx.device, data, shape)?))
     }
 
+    /// fp16 GEMM weights: stored as true fp16 (2 bytes/element) — the gemm
+    /// kernels read them narrowed and accumulate in fp32.
+    fn from_cpu_f16(&self, data: &[half::f16], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f16(&self.ctx.device, data, shape)?))
+    }
+
+    /// bf16 GEMM weights: stored as true bf16 (bit-pattern passthrough).
+    fn from_cpu_bf16(&self, data: &[half::bf16], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_bf16(&self.ctx.device, data, shape)?))
+    }
+
     fn to_cpu_f32(&self, t: &crate::backend::Tensor) -> Result<Vec<f32>, crate::error::BackendError> {
         Ok(t.as_gpu().to_cpu_f32(&self.ctx)?)
     }
@@ -1462,6 +1558,7 @@ impl crate::backend::Backend for MetalBackend {
     ) -> Result<(), crate::error::BackendError> {
         // The Metal kernel derives Cin_g from W (Cout, Cin_g, K); dense is
         // true when every out channel reads all Cin input channels.
+        let _ = groups; // implied by W's Cin_g dim (see the kernel)
         let params = Conv1dParams { stride, pad: pad_l, dilation: dil };
         let dense = w.as_gpu().shape[1] == x.as_gpu().shape[2];
         self.ctx.conv1d_groups_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), params, pad_r, true, true, dense, y.as_gpu())?;

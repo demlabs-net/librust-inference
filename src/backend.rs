@@ -135,16 +135,19 @@ impl Tensor {
     }
 
     /// fp16 tensor from a CUDA buffer (weights for fp16 GEMMs).
+    #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda_f16(b: cudarc::driver::CudaSlice<half::f16>, shape: Vec<usize>) -> Self {
         Self { inner: TensorInner::CudaF16(b), shape, dtype: Dtype::F16 }
     }
 
     /// bf16 tensor from a CUDA buffer (weights for bf16 GEMMs).
+    #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda_bf16(b: cudarc::driver::CudaSlice<half::bf16>, shape: Vec<usize>) -> Self {
         Self { inner: TensorInner::CudaBF16(b), shape, dtype: Dtype::BF16 }
     }
 
     /// int8 tensor with a per-channel fp32 scale (weights for int8 GEMMs).
+    #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda_i8(
         data: cudarc::driver::CudaSlice<i8>,
         scale: cudarc::driver::CudaSlice<f32>,
@@ -173,6 +176,7 @@ impl Tensor {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda_bf16(&self) -> &cudarc::driver::CudaSlice<half::bf16> {
         match &self.inner {
             TensorInner::CudaBF16(b) => b,
@@ -180,6 +184,7 @@ impl Tensor {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda_i8(&self) -> (&cudarc::driver::CudaSlice<i8>, &cudarc::driver::CudaSlice<f32>) {
         match &self.inner {
             TensorInner::CudaI8 { data, scale } => (data, scale),
@@ -187,6 +192,7 @@ impl Tensor {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda_mut(&self) -> &mut cudarc::driver::CudaSlice<f32> {
         // &mut through &self: the caller is the only holder of the backend
         // during an op (no concurrent mutation of this tensor's storage).

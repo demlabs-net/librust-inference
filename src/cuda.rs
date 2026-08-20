@@ -167,13 +167,20 @@ impl CudaBackend {
         s
     }
 
-    /// Raw cuBLAS handle bound to this backend's stream (gemm_ex fp16 path —
-    /// CudaBlas hides its handle and its safe Gemm<f16> forces fp16 output).
-    fn cublas_handle_raw(&self) -> Result<cudarc::cublas::sys::cublasHandle_t, BackendError> {
+    /// Raw cuBLAS handle bound to this backend's stream (gemm_ex fp16/bf16
+    /// path — CudaBlas hides its handle and its safe Gemm<f16> forces fp16
+    /// output). The returned guard MUST be held for the whole gemm_ex call:
+    /// cuBLAS handles are NOT thread-safe, and the TTS pool drives GEMMs from
+    /// several threads at once (generation + codec decoder) — a concurrent
+    /// gemm_ex on one handle returned CUDA_ERROR_INVALID_VALUE mid-decode
+    /// (seen live: "DAC decode failed" on bf16 codec weights).
+    fn cublas_raw_guard(
+        &self,
+    ) -> Result<(cudarc::cublas::sys::cublasHandle_t, std::sync::MutexGuard<'_, Option<RawCublas>>), BackendError> {
         use cudarc::cublas::sys;
         let mut guard = self.cublas_raw.lock().unwrap();
         if let Some(h) = *guard {
-            return Ok(h.0);
+            return Ok((h.0, guard));
         }
         let mut h = std::ptr::null_mut();
         let st = unsafe { sys::cublasCreate_v2(&mut h) };
@@ -183,7 +190,7 @@ impl CudaBackend {
         // No cublasSetStream: the backend uses the legacy (null) stream, which
         // is cuBLAS's default — same ordering as every other kernel launch.
         *guard = Some(RawCublas(h));
-        Ok(h)
+        Ok((h, guard))
     }
 
     /// Cast x (f32) into a bf16 scratch buffer of the same size.
@@ -487,7 +494,7 @@ impl Backend for CudaBackend {
         }
         if let crate::backend::TensorInner::CudaBF16(b16) = &b.inner {
             let a16 = self.cast_bf16(a)?;
-            let handle = self.cublas_handle_raw()?;
+            let (handle, _raw_guard) = self.cublas_raw_guard()?;
             let alpha = 1.0f32;
             let beta = 0.0f32;
             let res = {
@@ -518,11 +525,11 @@ impl Backend for CudaBackend {
                     )
                 }
             };
-            return res.map_err(|e| map_err(format!("cublasGemmEx(bf16): {e}")));
+            return res.map_err(|e| map_err(format!("cublasGemmEx(bf16) [{m}x{k}x{n}]: {e}")));
         }
         if let crate::backend::TensorInner::CudaF16(b16) = &b.inner {
             let a16 = self.cast_f16(a)?;
-            let handle = self.cublas_handle_raw()?;
+            let (handle, _raw_guard) = self.cublas_raw_guard()?;
             let alpha = 1.0f32;
             let beta = 0.0f32;
             let res = {

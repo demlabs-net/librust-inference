@@ -92,7 +92,19 @@ impl CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if let (Some(s), Some(pool)) = (self.slice.take(), &self.pool) {
-            pool.lock().unwrap().entry(s.len()).or_default().push(s);
+            let mut pool = pool.lock().unwrap();
+            let bucket = pool.entry(s.len()).or_default();
+            // Cap the pool per bucket AND by byte size: without the byte
+            // cap, grown KV buffers (~16 MB+ per cache row) returned by
+            // KvCache::shrink_to_init pile up in unique-size buckets and
+            // never free (18 GB of dead KV after a few calls — the live
+            // VRAM creep). Small hot buffers (activations, cpart) stay.
+            const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
+            const MAX_PER_BUCKET: usize = 8;
+            if bucket.len() < MAX_PER_BUCKET && s.len() * 4 <= MAX_POOL_BYTES {
+                bucket.push(s);
+            }
+            // else: drop — the cudaMalloc'd memory is released.
         }
     }
 }

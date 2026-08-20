@@ -509,6 +509,74 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn im2col1d(
+        &self,
+        x: &Tensor,
+        xc: &Tensor,
+        k: usize,
+        stride: usize,
+        pad_l: usize,
+        dil: usize,
+        tout: usize,
+    ) -> Result<(), BackendError> {
+        let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        if xc.shape() != &[b, tout, cin * k] {
+            return Err(BackendError::Shape("im2col1d: output shape mismatch".into()));
+        }
+        let xd = data(x);
+        let mut xcd = data_mut(xc);
+        let per = cin * k;
+        for bi in 0..b {
+            for to in 0..tout {
+                for ci in 0..cin {
+                    for kk in 0..k {
+                        let src = to * stride + kk * dil - pad_l;
+                        let v = if src >= 0 && src < t {
+                            xd[(bi * t + src) * cin + ci]
+                        } else {
+                            0.0
+                        };
+                        xcd[(bi * tout + to) * per + ci * k + kk] = v;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn im2col_t1d(
+        &self,
+        x: &Tensor,
+        xc: &Tensor,
+        k: usize,
+        stride: usize,
+        tout: usize,
+    ) -> Result<(), BackendError> {
+        let (b, tin, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        if xc.shape() != &[b, tout, cin * k] {
+            return Err(BackendError::Shape("im2col_t1d: output shape mismatch".into()));
+        }
+        let xd = data(x);
+        let mut xcd = data_mut(xc);
+        let per = cin * k;
+        for bi in 0..b {
+            for to in 0..tout {
+                for ci in 0..cin {
+                    for kk in 0..k {
+                        let num = to as isize - kk as isize;
+                        let v = if num >= 0 && num % stride as isize == 0 && (num / stride as isize) < tin as isize {
+                            xd[(bi * tin + (num / stride as isize) as usize) * cin + ci]
+                        } else {
+                            0.0
+                        };
+                        xcd[(bi * tout + to) * per + ci * k + kk] = v;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn slice_last(&self, x: &Tensor, y: &Tensor, off: usize) -> Result<(), BackendError> {
         // X (rows, D) → Y (rows, d0): columns [off, off+d0); d0 comes from Y.
         let (rows, d) = (x.shape()[0], x.shape()[1]);

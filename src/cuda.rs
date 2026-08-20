@@ -998,6 +998,72 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn im2col1d(
+        &self,
+        x: &Tensor,
+        xc: &Tensor,
+        k: usize,
+        stride: usize,
+        pad_l: usize,
+        dil: usize,
+        tout: usize,
+    ) -> Result<(), BackendError> {
+        let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let n = b * tout * cin * k;
+        let f = self.function("im2col1d_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(xc.as_cuda());
+        let __a = b as i32;
+        la.arg(&__a);
+        let __b = t as i32;
+        la.arg(&__b);
+        let __c = cin as i32;
+        la.arg(&__c);
+        let __d = k as i32;
+        la.arg(&__d);
+        let __e = stride as i32;
+        la.arg(&__e);
+        let __f = pad_l as i32;
+        la.arg(&__f);
+        let __g = dil as i32;
+        la.arg(&__g);
+        let __h = tout as i32;
+        la.arg(&__h);
+        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+    }
+
+    fn im2col_t1d(
+        &self,
+        x: &Tensor,
+        xc: &Tensor,
+        k: usize,
+        stride: usize,
+        tout: usize,
+    ) -> Result<(), BackendError> {
+        let (b, tin, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let n = b * tout * cin * k;
+        let f = self.function("im2col_t1d_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(xc.as_cuda());
+        let __a = b as i32;
+        la.arg(&__a);
+        let __b = tin as i32;
+        la.arg(&__b);
+        let __c = cin as i32;
+        la.arg(&__c);
+        let __d = k as i32;
+        la.arg(&__d);
+        let __e = stride as i32;
+        la.arg(&__e);
+        let __f = tout as i32;
+        la.arg(&__f);
+        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+    }
+
     fn slice_last(&self, x: &Tensor, y: &Tensor, off: usize) -> Result<(), BackendError> {
         // Contract: X (rows, D) → Y (rows, d0) — 2D, like Metal/CPU (callers
         // flatten (B,T) into rows via view).

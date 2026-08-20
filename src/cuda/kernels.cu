@@ -1222,3 +1222,68 @@ extern "C" __global__ void gemm_i8_tiled(
         }
     }
 }
+
+// ─────────────────────── im2col (conv → GEMM) ───────────────────────
+//
+// The DAC codec decoder runs ~10 conv1d + 4 conv-transpose1d per piece
+// (~22 GFLOP); the naive per-element conv kernel did that at ~25 GFLOP/s
+// (≈0.9 s per 64-token piece — the decode bottleneck). im2col turns every
+// conv into a plain GEMM (cuBLAS fp16/bf16), which also lets the conv
+// WEIGHTS take DAC_QUANTIZATION like the linear layers do.
+
+/// im2col for a 1D conv (groups=1): X'[t, ci·k + kk] =
+/// x[t·stride + kk·dil − pad_l, ci], zero outside. Layout (b, tout, cin·k).
+extern "C" __global__ void im2col1d_f32(
+    const float* __restrict__ x,   // (b, t, cin)
+    float* __restrict__ xc,        // (b, tout, cin·k)
+    int b,
+    int t,
+    int cin,
+    int k,
+    int stride,
+    int pad_l,
+    int dil,
+    int tout)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int per = cin * k;
+    if (i >= b * tout * per) return;
+    int bi = i / (tout * per);
+    int rem = i % (tout * per);
+    int to = rem / per;
+    int ck = rem % per;
+    int ci = ck / k;
+    int kk = ck % k;
+    int src = to * stride + kk * dil - pad_l;
+    xc[i] = (src >= 0 && src < t) ? x[(bi * t + src) * cin + ci] : 0.0f;
+}
+
+/// im2col for a transposed 1D conv (upsample): the output frame to gets
+/// contributions from input ti = (to − kk)/stride when divisible — gather:
+/// X'[t, ci·k + kk] = x[(t − kk)/stride, ci] or 0.
+extern "C" __global__ void im2col_t1d_f32(
+    const float* __restrict__ x,   // (b, tin, cin)
+    float* __restrict__ xc,        // (b, tout, cin·k)
+    int b,
+    int tin,
+    int cin,
+    int k,
+    int stride,
+    int tout)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int per = cin * k;
+    if (i >= b * tout * per) return;
+    int bi = i / (tout * per);
+    int rem = i % (tout * per);
+    int to = rem / per;
+    int ck = rem % per;
+    int ci = ck / k;
+    int kk = ck % k;
+    int num = to - kk;
+    float v = 0.0f;
+    if (num >= 0 && num % stride == 0 && num / stride < tin) {
+        v = x[(bi * tin + (num / stride)) * cin + ci];
+    }
+    xc[i] = v;
+}

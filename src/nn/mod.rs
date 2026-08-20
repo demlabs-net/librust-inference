@@ -381,6 +381,20 @@ impl KvCache {
         self.pos = 0;
     }
 
+    /// Drop the grown capacity — called when an engine returns to the pool:
+    /// a long utterance's KV buffers stay at their peak size otherwise
+    /// (~1.2 GB per engine at cap 4096) and accumulate across calls/engines.
+    pub fn shrink_to_init(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
+        if self.cap > KV_CACHE_INIT_CAPACITY {
+            let d = self.k.shape()[2];
+            self.k = backend.zeros(vec![1, KV_CACHE_INIT_CAPACITY, d])?;
+            self.v = backend.zeros(vec![1, KV_CACHE_INIT_CAPACITY, d])?;
+            self.cap = KV_CACHE_INIT_CAPACITY;
+        }
+        self.pos = 0;
+        Ok(())
+    }
+
     // ── Metal migration bridge (speech crate; remove after 1.6) ──
 
     #[cfg(feature = "metal")]

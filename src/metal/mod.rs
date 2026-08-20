@@ -1598,6 +1598,32 @@ impl crate::backend::Backend for MetalBackend {
         Ok(())
     }
 
+    // im2col is the CUDA-side conv→GEMM path (the DAC codec on Metal keeps
+    // its native conv kernels).
+    fn im2col1d(
+        &self,
+        _x: &crate::backend::Tensor,
+        _xc: &crate::backend::Tensor,
+        _k: usize,
+        _stride: usize,
+        _pad_l: usize,
+        _dil: usize,
+        _tout: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        unimplemented!("im2col1d is not supported on the Metal backend")
+    }
+
+    fn im2col_t1d(
+        &self,
+        _x: &crate::backend::Tensor,
+        _xc: &crate::backend::Tensor,
+        _k: usize,
+        _stride: usize,
+        _tout: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        unimplemented!("im2col_t1d is not supported on the Metal backend")
+    }
+
     fn slice_last(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, off: usize) -> Result<(), crate::error::BackendError> {
         self.ctx.slice_last_f32(x.as_gpu(), y.as_gpu(), off)?;
         Ok(())

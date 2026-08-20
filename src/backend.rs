@@ -416,6 +416,32 @@ pub trait Backend: Send + Sync {
         y: &Tensor,
     ) -> Result<(), BackendError>;
 
+    /// im2col for a dense 1D conv (groups=1): X (B,T,Cin) → Xc
+    /// (B,Tout,Cin·K): Xc[t, ci·K+kk] = X[t·stride + kk·dil − pad_l, ci]
+    /// (zero outside). Turns convs into GEMMs (cuBLAS fp16/bf16), which
+    /// also lets conv WEIGHTS take the model quantization.
+    #[allow(clippy::too_many_arguments)]
+    fn im2col1d(
+        &self,
+        x: &Tensor,
+        xc: &Tensor,
+        k: usize,
+        stride: usize,
+        pad_l: usize,
+        dil: usize,
+        tout: usize,
+    ) -> Result<(), BackendError>;
+    /// im2col for a transposed 1D conv: X (B,Tin,Cin) → Xc (B,Tout,Cin·K)
+    /// with Xc[t, ci·K+kk] = X[(t−kk)/stride, ci] when divisible, else 0.
+    fn im2col_t1d(
+        &self,
+        x: &Tensor,
+        xc: &Tensor,
+        k: usize,
+        stride: usize,
+        tout: usize,
+    ) -> Result<(), BackendError>;
+
     // ── slices ──
     /// Last-dim slice: X (rows, D) → Y (rows, d0), starting at `off`.
     fn slice_last(&self, x: &Tensor, y: &Tensor, off: usize) -> Result<(), BackendError>;

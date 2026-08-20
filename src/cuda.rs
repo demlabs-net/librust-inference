@@ -115,6 +115,9 @@ pub struct CudaBackend {
     cublas: Mutex<Option<Arc<CudaBlas>>>,
     /// fp16 scratch pool (activations cast for fp16-weight GEMMs).
     pool_f16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::f16>>>>>,
+    /// int8 scratch pool (activations quantized for int8-weight GEMMs) —
+    /// raw cudaMalloc per quant call added ~10-20 us to every decode GEMM.
+    pool_i8: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<i8>>>>>,
     /// Raw cuBLAS handle (fp16 gemm_ex path); destroyed on Drop.
     cublas_raw: Mutex<Option<RawCublas>>,
 }
@@ -145,6 +148,7 @@ impl CudaBackend {
             pool: Arc::new(Mutex::new(HashMap::new())),
             cublas: Mutex::new(None),
             pool_f16: Arc::new(Mutex::new(HashMap::new())),
+            pool_i8: Arc::new(Mutex::new(HashMap::new())),
             cublas_raw: Mutex::new(None),
         })
     }
@@ -219,8 +223,19 @@ impl CudaBackend {
             )));
         }
         let nblk = k / 32;
-        let q = unsafe { self.stream.alloc::<i8>(m * k) }.map_err(map_err)?;
-        let sc = unsafe { self.stream.alloc::<f32>(m * nblk) }.map_err(map_err)?;
+        let q = {
+            let mut pool = self.pool_i8.lock().unwrap();
+            if let Some(bucket) = pool.get_mut(&(m * k)) {
+                if let Some(s) = bucket.pop() {
+                    s
+                } else {
+                    unsafe { self.stream.alloc::<i8>(m * k) }.map_err(map_err)?
+                }
+            } else {
+                unsafe { self.stream.alloc::<i8>(m * k) }.map_err(map_err)?
+            }
+        };
+        let sc = self.take_pooled(m * nblk)?;
         let f = self.function("quant_f32_i8_blk")?;
         let cfg = LaunchConfig::for_num_elems((m * nblk) as u32);
         let mut la = self.stream.launch_builder(&f);
@@ -445,33 +460,76 @@ impl Backend for CudaBackend {
             // Q8_0-style int8 GEMM: per-32-block weight + activation scales,
             // our own kernels (cuBLAS IGEMM was 10-50x slower than fp16 on
             // decode shapes and cannot express block scales anyway). m==1
-            // (decode hot path) gets the shared-tile column kernel, m>1 the
-            // tiled one.
-            // EXPERIMENTAL: correct (Q8_0 precision), but ~10x slower than
-            // the fp16 path — 1-byte loads underutilize the memory system.
-            // A vectorized (16-byte loads + double-buffered shared) kernel
-            // is the Phase 7.3 follow-up; int8 stays opt-in until then.
+            // (decode hot path) uses the split-k kernel (S slices over k —
+            // m=1 alone cannot fill the GPU: the old 1-byte-load kernel
+            // measured ~130 us vs 10.5 us fp16); m>1 uses the tiled one.
             let (q, ascale) = self.quant_i8_blk(a)?;
             let k32 = k as i32;
             let n32 = n as i32;
             let m32 = m as i32;
             let c = c.as_cuda_mut();
             if m == 1 {
-                let f = self.function("gemm_i8_m1")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&q);
-                la.arg(&ascale);
-                la.arg(b8);
-                la.arg(wscale);
-                la.arg(c);
-                la.arg(&k32);
-                la.arg(&n32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                let nblk = k / 32;
+                let grid_x = (n + 255) / 256;
+                // Split-k: largest power-of-2 slice count that keeps the
+                // grid near the GPU's block capacity (m=1 alone leaves most
+                // SMs idle — e.g. 8 blocks for n=2048). Requires 16-byte
+                // aligned columns and a k-slice fitting the shared A buffer.
+                let s = [32usize, 16, 8, 4, 2, 1]
+                    .iter()
+                    .copied()
+                    .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * s <= 512)
+                    .unwrap_or(1);
+                if s > 1 && n % 16 == 0 && (k / s) <= 2048 {
+                    let cpart = self.take_pooled(s * n)?;
+                    let f = self.function("gemm_i8_m1_splitk")?;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n + 255) / 256) as u32, s as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut la = self.stream.launch_builder(&f);
+                    la.arg(&q);
+                    la.arg(&ascale);
+                    la.arg(b8);
+                    la.arg(wscale);
+                    la.arg(&cpart);
+                    la.arg(&k32);
+                    la.arg(&n32);
+                    let s32 = s as i32;
+                    la.arg(&s32);
+                    unsafe { la.launch(cfg) }.map_err(map_err)?;
+                    // Combine the S partials (stream-ordered after splitk).
+                    let f = self.function("gemm_i8_reduce")?;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut la = self.stream.launch_builder(&f);
+                    la.arg(&cpart);
+                    la.arg(c);
+                    la.arg(&n32);
+                    la.arg(&s32);
+                    unsafe { la.launch(cfg) }.map_err(map_err)?;
+                    self.pool.lock().unwrap().entry(s * n).or_default().push(cpart);
+                } else {
+                    let f = self.function("gemm_i8_m1")?;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut la = self.stream.launch_builder(&f);
+                    la.arg(&q);
+                    la.arg(&ascale);
+                    la.arg(b8);
+                    la.arg(wscale);
+                    la.arg(c);
+                    la.arg(&k32);
+                    la.arg(&n32);
+                    unsafe { la.launch(cfg) }.map_err(map_err)?;
+                }
             } else {
                 let f = self.function("gemm_i8_tiled")?;
                 let cfg = LaunchConfig {
@@ -490,6 +548,11 @@ impl Backend for CudaBackend {
                 la.arg(&n32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
+            // Return the quant scratch to the pools — stream-ordered: the
+            // next quant/GEMM is queued after these kernels, so reuse is
+            // safe without a sync.
+            self.pool_i8.lock().unwrap().entry(q.len()).or_default().push(q);
+            self.pool.lock().unwrap().entry(ascale.len()).or_default().push(ascale);
             return Ok(());
         }
         if let crate::backend::TensorInner::CudaBF16(b16) = &b.inner {

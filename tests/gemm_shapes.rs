@@ -107,14 +107,21 @@ fn check_i8(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
             }
         }
     }
-    // Upload TRANSPOSED (k, n) — matches upload_quant / the CUDA kernels.
+    // Upload TRANSPOSED (k, n) + transposed scales (nblk, n) — matches
+    // upload_quant / the CUDA kernels.
     let mut qt = vec![0i8; n * k];
     for r in 0..n {
         for kk in 0..k {
             qt[kk * n + r] = q[r * k + kk];
         }
     }
-    let bw = gpu.from_cpu_i8(&qt, &sc, vec![n, k]).unwrap();
+    let mut sct = vec![0f32; n * nblk];
+    for r in 0..n {
+        for b in 0..nblk {
+            sct[b * n + r] = sc[r * nblk + b];
+        }
+    }
+    let bw = gpu.from_cpu_i8(&qt, &sct, vec![n, k]).unwrap();
     // CPU reference: dequantized weight matrix → plain fp32 GEMM.
     let mut bd = vec![0.0f32; n * k];
     for r in 0..n {

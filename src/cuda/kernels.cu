@@ -1007,46 +1007,121 @@ extern "C" __global__ void quant_f32_i8_blk(
     }
 }
 
-/// int8 GEMM, m == 1 (TTS decode hot path — one activation row against the
-/// weight matrix). B is stored TRANSPOSED (k, n) row-major (weights arrive
-/// as (n, k); upload_quant transposes them so warp reads are coalesced).
+/// int8 GEMM, m == 1 (TTS decode hot path), split-k variant.
+/// Grid (ceil(n/256), S); each block computes the partial dot over its
+/// k-slice (k/S, a multiple of 32) for 256 columns. m=1 alone cannot fill
+/// the GPU (24 blocks for n=6144 — latency-bound 1-byte loads measured
+/// ~130 us); split-k gives 8x the blocks and LDG.128 gives 512 consecutive
+/// bytes per warp instruction. `gemm_i8_reduce` combines the partials.
 ///
-/// Block = 256 threads → 256 columns. Each k-tile (32×256) is staged into
-/// shared (padded to 260 → no bank conflicts on read or write): warp w loads
-/// k-row kb·32+w — 32 consecutive bytes per warp, one per lane. Every thread
-/// then dots the shared tile with its A segment and dequantizes with one
-/// fp32 FMA per tile.
+/// Shared: the A-slice (k/S bytes) + double-buffered 32×256 weight tiles
+/// (padded to 272 → conflict-free column reads; 2-way on the 16-byte
+/// writes). Weights are stored transposed (k, n) row-major; scales
+/// transposed (k/32, n) — both read coalesced across columns.
+extern "C" __global__ void gemm_i8_m1_splitk(
+    const signed char* __restrict__ A,   // (k)
+    const float* __restrict__ asc,       // (k/32)
+    const signed char* __restrict__ B,   // (k, n) row-major
+    const float* __restrict__ wsc,       // (k/32, n)
+    float* __restrict__ Cpart,           // (S, n) partial sums
+    int k,
+    int n,
+    int S)
+{
+    const int BN = 256;
+    __shared__ signed char As[2048];       // k-slice activations (≤ 2048)
+    __shared__ signed char Bs[2][32][272]; // double-buffered weight tiles
+
+    int tid = threadIdx.x;
+    int col = blockIdx.x * BN + tid;
+    int ks = k / S;
+    int nblk_s = ks >> 5;
+    int kb0 = blockIdx.y * nblk_s;
+
+    // A-slice → shared (every thread dots the same segment).
+    for (int i = tid; i < ks; i += BN) {
+        As[i] = A[kb0 * 32 + i];
+    }
+
+    // Stage one 32×256 weight tile: 16 bytes per thread (LDG.128); round r
+    // covers k-rows r*16..r*16+15, lanes spread over the 256 columns.
+    auto load_tile = [&](int t, int buf) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            int row = r * 16 + (tid >> 4);
+            int seg = (tid & 15) * 16;
+            int gcol = blockIdx.x * BN + seg;
+            int kk = (kb0 + t) * 32 + row;
+            int4 v = make_int4(0, 0, 0, 0);
+            if (gcol + 16 <= n) {
+                v = *(const int4*)&B[kk * n + gcol];
+            } else if (gcol < n) {
+                // Column tail: byte-wise, zero-padded.
+                for (int i = 0; i < 16; ++i) {
+                    int gc = gcol + i;
+                    ((signed char*)&v)[i] = (gc < n) ? B[kk * n + gc] : 0;
+                }
+            }
+            *(int4*)&Bs[buf][row][seg] = v;
+        }
+    };
+
+    load_tile(0, 0);
+    float acc = 0.0f;
+    int cur = 0;
+    for (int t = 0; t < nblk_s; ++t) {
+        __syncthreads();
+        // Prefetch the next tile while computing this one (loads stay in
+        // flight during the 32-IMAD dot).
+        if (t + 1 < nblk_s) load_tile(t + 1, 1 - cur);
+        const signed char* a = As + t * 32;
+        int s = 0;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            s += (int)a[j] * (int)Bs[cur][j][tid];
+        }
+        if (col < n) acc += (float)s * (asc[kb0 + t] * wsc[(kb0 + t) * n + col]);
+        cur = 1 - cur;
+    }
+    if (col < n) Cpart[blockIdx.y * n + col] = acc;
+}
+
+/// int8 GEMM, m == 1 — single-kernel fallback (used when split-k is not
+/// applicable: odd tile counts / unaligned columns). Same shared-tile dot as
+/// the split-k variant; scales transposed (k/32, n).
 extern "C" __global__ void gemm_i8_m1(
     const signed char* __restrict__ A,   // (k)
     const float* __restrict__ asc,       // (k/32)
     const signed char* __restrict__ B,   // (k, n) row-major
-    const float* __restrict__ wsc,       // (n, k/32)
+    const float* __restrict__ wsc,       // (k/32, n)
     float* __restrict__ C,               // (n)
     int k,
     int n)
 {
-    __shared__ signed char Bs[32][260];
+    __shared__ signed char Bs[32][272];
     int tid = threadIdx.x;
     int col = blockIdx.x * 256 + tid;
     int nblk = k >> 5;
-    int w = tid >> 5;
-    int lane = tid & 31;
-    int col_base = blockIdx.x * 256;
 
     float acc = 0.0f;
     for (int kb = 0; kb < nblk; ++kb) {
-        // Stage the k-tile (32 rows × 256 cols): each warp loads 4 k-rows
-        // (w, w+8, w+16, w+24), 8 column segments of 32 bytes each — every
-        // load is one full 32-byte coalesced row segment.
+        // Stage the k-tile: 16 bytes per thread (LDG.128), 2 rounds.
 #pragma unroll
-        for (int r4 = 0; r4 < 4; ++r4) {
-            int row = w + r4 * 8;
-#pragma unroll
-            for (int s = 0; s < 8; ++s) {
-                int gcol = col_base + s * 32 + lane;
-                signed char v = (gcol < n) ? B[(kb * 32 + row) * n + gcol] : 0;
-                Bs[row][s * 32 + lane] = v;
+        for (int r = 0; r < 2; ++r) {
+            int row = r * 16 + (tid >> 4);
+            int seg = (tid & 15) * 16;
+            int gcol = blockIdx.x * 256 + seg;
+            int kk = kb * 32 + row;
+            int4 v = make_int4(0, 0, 0, 0);
+            if (gcol + 16 <= n) {
+                v = *(const int4*)&B[kk * n + gcol];
+            } else if (gcol < n) {
+                for (int i = 0; i < 16; ++i) {
+                    int gc = gcol + i;
+                    ((signed char*)&v)[i] = (gc < n) ? B[kk * n + gc] : 0;
+                }
             }
+            *(int4*)&Bs[row][seg] = v;
         }
         __syncthreads();
         const signed char* a = A + kb * 32;
@@ -1055,10 +1130,26 @@ extern "C" __global__ void gemm_i8_m1(
         for (int j = 0; j < 32; ++j) {
             s += (int)a[j] * (int)Bs[j][tid];
         }
-        if (col < n) acc += (float)s * (asc[kb] * wsc[col * nblk + kb]);
+        if (col < n) acc += (float)s * (asc[kb] * wsc[kb * n + col]);
         __syncthreads();
     }
     if (col < n) C[col] = acc;
+}
+
+/// Combine the split-k partials: C[col] = Σ_s Cpart[s·n + col].
+
+/// Combine the split-k partials: C[col] = Σ_s Cpart[s·n + col].
+extern "C" __global__ void gemm_i8_reduce(
+    const float* __restrict__ Cpart,   // (S, n)
+    float* __restrict__ C,             // (n)
+    int n,
+    int S)
+{
+    int col = blockIdx.x * 256 + threadIdx.x;
+    if (col >= n) return;
+    float acc = 0.0f;
+    for (int s = 0; s < S; ++s) acc += Cpart[s * n + col];
+    C[col] = acc;
 }
 
 /// int8 GEMM, m > 1 — classic tiled kernel. BM=64, BN=64, BK=32; block
@@ -1069,7 +1160,7 @@ extern "C" __global__ void gemm_i8_tiled(
     const signed char* __restrict__ A,   // (m, k)
     const float* __restrict__ asc,       // (m, k/32)
     const signed char* __restrict__ B,   // (k, n) row-major
-    const float* __restrict__ wsc,       // (n, k/32)
+    const float* __restrict__ wsc,       // (k/32, n) transposed scales
     float* __restrict__ C,               // (m, n)
     int m,
     int k,
@@ -1106,7 +1197,7 @@ extern "C" __global__ void gemm_i8_tiled(
         }
         for (int j = tx; j < BN; j += 16) {
             int col = n0 + j;
-            wscs[j] = (col < n) ? wsc[col * nblk + kb] : 0.0f;
+            wscs[j] = (col < n) ? wsc[kb * n + col] : 0.0f;
         }
         // B tile: 32 k-rows × 64 cols; B is (k, n) row-major — consecutive
         // idx = consecutive columns within a row (coalesced warp loads).

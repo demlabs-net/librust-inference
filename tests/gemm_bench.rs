@@ -82,14 +82,20 @@ fn bench_nt_i8(gpu: &CudaBackend, m: usize, k: usize, n: usize, reps: usize) {
             }
         }
     }
-    // Upload transposed (k, n) — matches upload_quant / the CUDA kernels.
+    // Upload transposed (k, n) + transposed scales — matches upload_quant.
     let mut qt = vec![0i8; n * k];
     for r in 0..n {
         for kk in 0..k {
             qt[kk * n + r] = q[r * k + kk];
         }
     }
-    let bw = gpu.from_cpu_i8(&qt, &sc, vec![n, k]).unwrap();
+    let mut sct = vec![0f32; n * nblk];
+    for r in 0..n {
+        for b in 0..nblk {
+            sct[b * n + r] = sc[r * nblk + b];
+        }
+    }
+    let bw = gpu.from_cpu_i8(&qt, &sct, vec![n, k]).unwrap();
     let a = gpu.from_cpu_f32(&vec![0.5f32; m * k], vec![m, k]).unwrap();
     let c = gpu.zeros(vec![m, n]).unwrap();
 

@@ -201,13 +201,21 @@ impl CudaBackend {
         Ok(y)
     }
 
-    /// Quantize activations to int8 with a per-row scale (for int8 GEMMs).
-    fn quant_i8(&self, x: &Tensor) -> Result<(cudarc::driver::CudaSlice<i8>, cudarc::driver::CudaSlice<f32>), BackendError> {
+    /// Quantize activations f32 (m, k) → int8 + per-32-block scales (m, k/32).
+    /// Q8_0 layout — matches `quant_f32_i8_blk` in kernels.cu. k must be a
+    /// multiple of 32 (all TTS/STT GEMM dims are; callers pad otherwise).
+    fn quant_i8_blk(&self, x: &Tensor) -> Result<(cudarc::driver::CudaSlice<i8>, cudarc::driver::CudaSlice<f32>), BackendError> {
         let (m, k) = (x.shape()[0], x.shape()[1]);
+        if k % 32 != 0 {
+            return Err(BackendError::Shape(format!(
+                "quant_i8_blk: k={k} not a multiple of 32"
+            )));
+        }
+        let nblk = k / 32;
         let q = unsafe { self.stream.alloc::<i8>(m * k) }.map_err(map_err)?;
-        let sc = unsafe { self.stream.alloc::<f32>(m) }.map_err(map_err)?;
-        let f = self.function("cast_f32_i8")?;
-        let cfg = LaunchConfig::for_num_elems(m as u32);
+        let sc = unsafe { self.stream.alloc::<f32>(m * nblk) }.map_err(map_err)?;
+        let f = self.function("quant_f32_i8_blk")?;
+        let cfg = LaunchConfig::for_num_elems((m * nblk) as u32);
         let mut la = self.stream.launch_builder(&f);
         la.arg(x.as_cuda());
         la.arg(&q);
@@ -422,61 +430,59 @@ impl Backend for CudaBackend {
     fn gemm_nt(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError> {
         let (m, k) = (a.shape()[0], a.shape()[1]);
         let n = b.shape()[0];
-        // fp16 weights: cast the activation row(s) to fp16 and run cuBLAS
+        // Weight formats: fp16/bf16 cast the activation row(s) and run cuBLAS
         // gemm_ex (16F×16F → 32F out, fp32 accumulate) — halves the weight
-        // read traffic (the decode bottleneck) and the weight VRAM.
+        // read traffic (the decode bottleneck) and the weight VRAM; int8 uses
+        // our Q8_0-style kernels below.
         if let crate::backend::TensorInner::CudaI8 { data: b8, scale: wscale } = &b.inner {
-            // Quantize activations (per-row scale), IGEMM, dequantize.
-            let (q, ascale) = self.quant_i8(a)?;
-            let c32 = unsafe { self.stream.alloc::<i32>(m * n) }.map_err(map_err)?;
-            let handle = self.cublas_handle_raw()?;
-            let alpha = 1i32;
-            let beta = 0i32;
-            let res = {
-                let (bptr, _br) = b8.device_ptr(&self.stream);
-                let (aptr, _ar) = q.device_ptr(&self.stream);
-                let (cptr, _cr) = c32.device_ptr(&self.stream);
-                unsafe {
-                    result::gemm_ex(
-                        handle,
-                        cublasOperation_t::CUBLAS_OP_T,
-                        cublasOperation_t::CUBLAS_OP_N,
-                        n as i32,
-                        m as i32,
-                        k as i32,
-                        (&alpha as *const i32) as *const _,
-                        bptr as *const _,
-                        cudaDataType::CUDA_R_8I,
-                        k as i32,
-                        aptr as *const _,
-                        cudaDataType::CUDA_R_8I,
-                        k as i32,
-                        (&beta as *const i32) as *const _,
-                        cptr as *mut _,
-                        cudaDataType::CUDA_R_32I,
-                        n as i32,
-                        cublasComputeType_t::CUBLAS_COMPUTE_32I,
-                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    )
-                }
-            };
-            if let Err(e) = res {
-                return Err(map_err(format!("cublasGemmEx(int8): {e}")));
-            }
-            // c32[m,n] * ascale[m] * wscale[n] -> c fp32
-            let c = c.as_cuda_mut();
-            let f = self.function("dequant_i32_f32")?;
-            let cfg = LaunchConfig::for_num_elems((m * n) as u32);
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&c32);
-            la.arg(&ascale);
-            la.arg(wscale);
-            la.arg(c);
-            let m32 = m as i32;
+            // Q8_0-style int8 GEMM: per-32-block weight + activation scales,
+            // our own kernels (cuBLAS IGEMM was 10-50x slower than fp16 on
+            // decode shapes and cannot express block scales anyway). m==1
+            // (decode hot path) gets the shared-tile column kernel, m>1 the
+            // tiled one.
+            // EXPERIMENTAL: correct (Q8_0 precision), but ~10x slower than
+            // the fp16 path — 1-byte loads underutilize the memory system.
+            // A vectorized (16-byte loads + double-buffered shared) kernel
+            // is the Phase 7.3 follow-up; int8 stays opt-in until then.
+            let (q, ascale) = self.quant_i8_blk(a)?;
+            let k32 = k as i32;
             let n32 = n as i32;
-            la.arg(&m32);
-            la.arg(&n32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            let m32 = m as i32;
+            let c = c.as_cuda_mut();
+            if m == 1 {
+                let f = self.function("gemm_i8_m1")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&q);
+                la.arg(&ascale);
+                la.arg(b8);
+                la.arg(wscale);
+                la.arg(c);
+                la.arg(&k32);
+                la.arg(&n32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            } else {
+                let f = self.function("gemm_i8_tiled")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1),
+                    block_dim: (16, 16, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&q);
+                la.arg(&ascale);
+                la.arg(b8);
+                la.arg(wscale);
+                la.arg(c);
+                la.arg(&m32);
+                la.arg(&k32);
+                la.arg(&n32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            }
             return Ok(());
         }
         if let crate::backend::TensorInner::CudaBF16(b16) = &b.inner {

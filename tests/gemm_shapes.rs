@@ -72,3 +72,91 @@ fn gemm_nt_shapes() {
     check(&gpu, &cpu, 470, 384, 384);
     check(&gpu, &cpu, 470, 1536, 384);
 }
+
+/// int8 (Q8_0-style) GEMM correctness vs the fp32 CPU reference. Weights are
+/// quantized per 32-element blocks; the reference compares against the
+/// dequantized approximation, so the tolerance is the int8 quantization
+/// error (Lcg values in [-0.5, 0.5), ~127 levels → <1e-2 absolute).
+fn check_i8(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
+    assert_eq!(k % 32, 0, "k must be a multiple of 32");
+    let seed = (m * 7919 + k * 104729 + n) as u64;
+    let a = {
+        let mut d = vec![0.0f32; m * k];
+        Lcg::new(seed).fill(&mut d);
+        gpu.from_cpu_f32(&d, vec![m, k]).unwrap()
+    };
+    let ac = {
+        let mut d = vec![0.0f32; m * k];
+        Lcg::new(seed).fill(&mut d);
+        cpu.from_cpu_f32(&d, vec![m, k]).unwrap()
+    };
+    // Quantize weights per 32-block on the CPU (same as upload_quant).
+    let nblk = k / 32;
+    let mut b = vec![0.0f32; n * k];
+    Lcg::new(seed + 1).fill(&mut b);
+    let mut q = vec![0i8; n * k];
+    let mut sc = vec![0f32; n * nblk];
+    for r in 0..n {
+        for blk in 0..nblk {
+            let base = r * k + blk * 32;
+            let mx = b[base..base + 32].iter().fold(0f32, |mm, &v| mm.max(v.abs()));
+            let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+            sc[r * nblk + blk] = s;
+            for j in 0..32 {
+                q[base + j] = (b[base + j] / s).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+    }
+    // Upload TRANSPOSED (k, n) — matches upload_quant / the CUDA kernels.
+    let mut qt = vec![0i8; n * k];
+    for r in 0..n {
+        for kk in 0..k {
+            qt[kk * n + r] = q[r * k + kk];
+        }
+    }
+    let bw = gpu.from_cpu_i8(&qt, &sc, vec![n, k]).unwrap();
+    // CPU reference: dequantized weight matrix → plain fp32 GEMM.
+    let mut bd = vec![0.0f32; n * k];
+    for r in 0..n {
+        for blk in 0..nblk {
+            let base = r * k + blk * 32;
+            for j in 0..32 {
+                bd[base + j] = q[base + j] as f32 * sc[r * nblk + blk];
+            }
+        }
+    }
+    let bdc = cpu.from_cpu_f32(&bd, vec![n, k]).unwrap();
+
+    let y = gpu.zeros(vec![m, n]).unwrap();
+    let yc = cpu.zeros(vec![m, n]).unwrap();
+    gpu.gemm_nt(&a, &bw, &y).unwrap();
+    gpu.synchronize().unwrap();
+    cpu.gemm_nt(&ac, &bdc, &yc).unwrap();
+    let g = gpu.to_cpu_f32(&y).unwrap();
+    let c = cpu.to_cpu_f32(&yc).unwrap();
+    let tol = 2e-2 + 1e-2 * c.iter().fold(0f32, |mm, &v| mm.max(v.abs()));
+    for i in 0..g.len() {
+        let ok = (g[i] - c[i]).abs() <= tol;
+        assert!(ok, "int8 gemm_nt [{m}x{k}x{n}] [{i}]: gpu {} cpu {}", g[i], c[i]);
+    }
+    println!("gemm_nt int8 {m:>4}x{k:>4}x{n:>4} ok");
+}
+
+#[test]
+fn gemm_nt_i8_shapes() {
+    let gpu = CudaBackend::new(0).unwrap();
+    let cpu = CpuBackend;
+    // TTS decode (m=1) + fill (m>1) shapes, incl. non-square FFN.
+    check_i8(&gpu, &cpu, 1, 2048, 6144);
+    check_i8(&gpu, &cpu, 1, 2048, 8192);
+    check_i8(&gpu, &cpu, 1, 8192, 2048);
+    check_i8(&gpu, &cpu, 1, 2048, 1024);
+    check_i8(&gpu, &cpu, 1, 2048, 400);
+    check_i8(&gpu, &cpu, 8, 2048, 6144);
+    check_i8(&gpu, &cpu, 8, 2048, 8192);
+    check_i8(&gpu, &cpu, 8, 8192, 2048);
+    check_i8(&gpu, &cpu, 33, 2048, 2048);
+    // Edge: m not a multiple of 64 / n not a multiple of 64 (tiled masks).
+    check_i8(&gpu, &cpu, 65, 2048, 65);
+    check_i8(&gpu, &cpu, 129, 1024, 400);
+}

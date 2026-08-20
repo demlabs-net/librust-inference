@@ -723,49 +723,6 @@ extern "C" __global__ void cast_f32_bf16(
     y[i] = __float2bfloat16(x[i]);
 }
 
-/// f32 → int8 with a per-row scale (activations for int8 GEMMs):
-/// scale[i] = max|x[i,:]| / 127; xq = round(x / scale), clamped.
-/// x (rows, cols), y (rows, cols) i8, scale (rows) f32 out.
-extern "C" __global__ void cast_f32_i8(
-    const float* __restrict__ x,
-    signed char* __restrict__ y,
-    float* __restrict__ scale,
-    int rows,
-    int cols)
-{
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const float* row = x + r * cols;
-    float mx = 0.0f;
-    for (int j = 0; j < cols; ++j) mx = fmaxf(mx, fabsf(row[j]));
-    float s = mx / 127.0f;
-    if (s < 1e-12f) s = 1.0f;
-    scale[r] = s;
-    signed char* out = y + r * cols;
-    for (int j = 0; j < cols; ++j) {
-        float v = row[j] / s;
-        v = fminf(127.0f, fmaxf(-128.0f, v));
-        out[j] = (signed char)__float2int_rn(v);
-    }
-}
-
-/// Dequantize int32 GEMM output: y = c * sa[i] * sw[j].
-/// c (rows, cols) int32; sa (rows), sw (cols) f32 scales; y (rows, cols) f32.
-extern "C" __global__ void dequant_i32_f32(
-    const int* __restrict__ c,
-    const float* __restrict__ sa,
-    const float* __restrict__ sw,
-    float* __restrict__ y,
-    int rows,
-    int cols)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    int r = i / cols;
-    int j = i % cols;
-    y[i] = (float)c[i] * sa[r] * sw[j];
-}
-
 /// f32 → fp16 cast (weights/activations for fp16 GEMMs).
 extern "C" __global__ void cast_f32_f16(
     const float* __restrict__ x,
@@ -1001,3 +958,204 @@ extern "C" __global__ void mhsa_f32(
 /// Autoregressive GQA attention (TTS): q (b, tq, n_heads·hd),
 /// k/v (b, tkv, kv_heads·hd), mask (tq, tkv) bias (0 / -inf) or null.
 /// One thread per (b, head, tq) — softmax over tkv in f32.
+
+// ───────────────────────── int8 (Q8_0-style) ─────────────────────────
+//
+// Symmetric int8 GEMM with per-32-element block scales (llama.cpp Q8_0
+// layout), for both weights and activations. 32 elements per scale is ~64x
+// finer than per-channel — the precision loss that truncated int8 TTS
+// utterances with the old per-channel scheme.
+//
+// Layouts (all row-major):
+//   weights:  W (k, n) i8,  wsc (n, k/32) f32 — wsc[n][kb] = max|W[kb·32.., n]|/127
+//   act:      A (m, k) i8,  asc (m, k/32) f32
+//   out:      C (m, n) f32
+// C[i,j] = Σ_kb asc[i][kb]·wsc[j][kb] · Σ_{k∈kb} A[i,k]·W[k,j]   (i32 per
+// 32-block, one fp32 FMA per block — 32 IMADs per dequant).
+// k must be a multiple of 32 (all TTS/STT GEMM dims are).
+
+/// Quantize activations f32 (m, k) → i8 + per-32-block scales (m, k/32).
+/// One thread per 32-element block; k%32==0 required (callers pad).
+extern "C" __global__ void quant_f32_i8_blk(
+    const float* __restrict__ x,
+    signed char* __restrict__ y,
+    float* __restrict__ sc,
+    int m,
+    int k)
+{
+    int nblk = k >> 5;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // over m*nblk blocks
+    if (i >= m * nblk) return;
+    int r = i / nblk;
+    int kb = i % nblk;
+    const float* src = x + r * k + kb * 32;
+    float mx = 0.0f;
+    float v[32];
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        v[j] = src[j];
+        mx = fmaxf(mx, fabsf(src[j]));
+    }
+    float s = mx / 127.0f;
+    if (s < 1e-12f) s = 1.0f;
+    sc[i] = s;
+    signed char* dst = y + r * k + kb * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        float q = fminf(127.0f, fmaxf(-128.0f, v[j] / s));
+        dst[j] = (signed char)__float2int_rn(q);
+    }
+}
+
+/// int8 GEMM, m == 1 (TTS decode hot path — one activation row against the
+/// weight matrix). B is stored TRANSPOSED (k, n) row-major (weights arrive
+/// as (n, k); upload_quant transposes them so warp reads are coalesced).
+///
+/// Block = 256 threads → 256 columns. Each k-tile (32×256) is staged into
+/// shared (padded to 260 → no bank conflicts on read or write): warp w loads
+/// k-row kb·32+w — 32 consecutive bytes per warp, one per lane. Every thread
+/// then dots the shared tile with its A segment and dequantizes with one
+/// fp32 FMA per tile.
+extern "C" __global__ void gemm_i8_m1(
+    const signed char* __restrict__ A,   // (k)
+    const float* __restrict__ asc,       // (k/32)
+    const signed char* __restrict__ B,   // (k, n) row-major
+    const float* __restrict__ wsc,       // (n, k/32)
+    float* __restrict__ C,               // (n)
+    int k,
+    int n)
+{
+    __shared__ signed char Bs[32][260];
+    int tid = threadIdx.x;
+    int col = blockIdx.x * 256 + tid;
+    int nblk = k >> 5;
+    int w = tid >> 5;
+    int lane = tid & 31;
+    int col_base = blockIdx.x * 256;
+
+    float acc = 0.0f;
+    for (int kb = 0; kb < nblk; ++kb) {
+        // Stage the k-tile (32 rows × 256 cols): each warp loads 4 k-rows
+        // (w, w+8, w+16, w+24), 8 column segments of 32 bytes each — every
+        // load is one full 32-byte coalesced row segment.
+#pragma unroll
+        for (int r4 = 0; r4 < 4; ++r4) {
+            int row = w + r4 * 8;
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                int gcol = col_base + s * 32 + lane;
+                signed char v = (gcol < n) ? B[(kb * 32 + row) * n + gcol] : 0;
+                Bs[row][s * 32 + lane] = v;
+            }
+        }
+        __syncthreads();
+        const signed char* a = A + kb * 32;
+        int s = 0;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            s += (int)a[j] * (int)Bs[j][tid];
+        }
+        if (col < n) acc += (float)s * (asc[kb] * wsc[col * nblk + kb]);
+        __syncthreads();
+    }
+    if (col < n) C[col] = acc;
+}
+
+/// int8 GEMM, m > 1 — classic tiled kernel. BM=64, BN=64, BK=32; block
+/// (16,16) = 256 threads, each thread owns a 4x4 output micro-tile;
+/// per-32-block i32 accumulation with one fp32 dequant FMA per k-tile.
+/// B is stored transposed (k, n) row-major — warps load consecutive columns.
+extern "C" __global__ void gemm_i8_tiled(
+    const signed char* __restrict__ A,   // (m, k)
+    const float* __restrict__ asc,       // (m, k/32)
+    const signed char* __restrict__ B,   // (k, n) row-major
+    const float* __restrict__ wsc,       // (n, k/32)
+    float* __restrict__ C,               // (m, n)
+    int m,
+    int k,
+    int n)
+{
+    const int BM = 64, BN = 64, BK = 32;
+    __shared__ signed char As[64 * 32];
+    __shared__ signed char Bs[32 * 64];
+    __shared__ float ascs[64];
+    __shared__ float wscs[64];
+
+    int m0 = blockIdx.y * BM;
+    int n0 = blockIdx.x * BN;
+    int nblk = k >> 5;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    int acc_i[4][4] = {};
+    float acc_f[4][4] = {};
+
+    for (int kb = 0; kb < nblk; ++kb) {
+        // Load A tile (64 x 32) + row scales; B tile (32 x 64) + col scales.
+        // A tile: 64 rows × 32 k = 2048 elements, 8 per thread (the (16,16)
+        // block covers it via the linear index — tx alone spans only 16 of
+        // 32 k elements).
+        for (int idx = ty * 16 + tx; idx < BM * BK; idx += 256) {
+            int i = idx / BK;
+            int j = idx % BK;
+            int row = m0 + i;
+            As[i * BK + j] = (row < m) ? A[row * k + kb * BK + j] : 0;
+        }
+        for (int i = ty; i < BM; i += 16) {
+            int row = m0 + i;
+            ascs[i] = (row < m) ? asc[row * nblk + kb] : 0.0f;
+        }
+        for (int j = tx; j < BN; j += 16) {
+            int col = n0 + j;
+            wscs[j] = (col < n) ? wsc[col * nblk + kb] : 0.0f;
+        }
+        // B tile: 32 k-rows × 64 cols; B is (k, n) row-major — consecutive
+        // idx = consecutive columns within a row (coalesced warp loads).
+        for (int idx = ty * 16 + tx; idx < BK * BN; idx += 256) {
+            int i = idx / BN;
+            int j = idx % BN;
+            int kk = kb * BK + i;
+            int col = n0 + j;
+            Bs[i * BN + j] = (col < n) ? B[kk * n + col] : 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < BK; ++i) {
+            signed char av[4];
+            signed char bv[4];
+#pragma unroll
+            for (int rr = 0; rr < 4; ++rr) av[rr] = As[(ty * 4 + rr) * BK + i];
+#pragma unroll
+            for (int cc = 0; cc < 4; ++cc) bv[cc] = Bs[i * BN + tx * 4 + cc];
+#pragma unroll
+            for (int rr = 0; rr < 4; ++rr) {
+#pragma unroll
+                for (int cc = 0; cc < 4; ++cc) {
+                    acc_i[rr][cc] += (int)av[rr] * (int)bv[cc];
+                }
+            }
+        }
+        // Dequant this k-tile: one fp32 FMA per output element.
+#pragma unroll
+        for (int rr = 0; rr < 4; ++rr) {
+#pragma unroll
+            for (int cc = 0; cc < 4; ++cc) {
+                acc_f[rr][cc] += (float)acc_i[rr][cc] * (ascs[ty * 4 + rr] * wscs[tx * 4 + cc]);
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < 4; ++rr) {
+#pragma unroll
+            for (int cc = 0; cc < 4; ++cc) acc_i[rr][cc] = 0;
+        }
+        __syncthreads();
+    }
+    // Write out (with edge masks).
+    for (int rr = 0; rr < 4; ++rr) {
+        int row = m0 + ty * 4 + rr;
+        if (row >= m) continue;
+        for (int cc = 0; cc < 4; ++cc) {
+            int col = n0 + tx * 4 + cc;
+            if (col < n) C[row * n + col] = acc_f[rr][cc];
+        }
+    }
+}

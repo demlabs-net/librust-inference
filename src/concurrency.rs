@@ -17,17 +17,18 @@
 
 /// Simple counting semaphore (sync) over std Mutex + Condvar. macOS-only —
 /// the CUDA/Linux guard is a no-op and never touches it.
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 use once_cell::sync::Lazy;
+#[cfg(feature = "metal")]
 use std::sync::{Condvar, Mutex};
 
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 struct Semaphore {
     count: Mutex<usize>,
     cv: Condvar,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 impl Semaphore {
     fn new(count: usize) -> Self {
         Self { count: Mutex::new(count), cv: Condvar::new() }
@@ -50,7 +51,7 @@ impl Semaphore {
 
 /// Default permits (parallel, below the observed Metal panic threshold).
 /// Override with the `METAL_CONCURRENCY` env var (must be > 0).
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 fn configured_permits() -> usize {
     std::env::var("METAL_CONCURRENCY")
         .ok()
@@ -59,19 +60,19 @@ fn configured_permits() -> usize {
         .unwrap_or(2)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 static METAL_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(configured_permits()));
 
 /// RAII inference guard. On Metal it holds a semaphore permit for its lifetime;
 /// on other backends it is a zero-sized no-op.
 pub struct InferenceGuard {
-    #[cfg(target_os = "macos")]
+    #[cfg(feature = "metal")]
     _permit: Permit,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 struct Permit;
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 impl Drop for Permit {
     fn drop(&mut self) {
         METAL_SEM.release();
@@ -84,7 +85,7 @@ impl Drop for Permit {
 /// ```ignore
 /// let _g = rust_inference::concurrency::metal_inference_guard();
 /// ```
-#[cfg(target_os = "macos")]
+#[cfg(feature = "metal")]
 pub fn metal_inference_guard() -> InferenceGuard {
     METAL_SEM.acquire();
     tracing::trace!("metal inference permit acquired");
@@ -92,7 +93,7 @@ pub fn metal_inference_guard() -> InferenceGuard {
 }
 
 /// No-op guard on non-Metal builds (CUDA / CPU): no command-buffer contention.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(feature = "metal"))]
 pub fn metal_inference_guard() -> InferenceGuard {
     InferenceGuard {}
 }

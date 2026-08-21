@@ -588,7 +588,7 @@ impl Backend for CudaBackend {
         // no-shared kernel (the slow-AR w2 has k=9728), m>64 (STT one-shot)
         // uses the row-chunk kernel — the same policy as the int8 path.
         if let crate::backend::TensorInner::CudaQ6K(bpack) = &b.inner {
-            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 210, 128, "gemm_q6k");
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 210, 32, "gemm_q6k");
         }
         if let crate::backend::TensorInner::CudaQ4K(bpack) = &b.inner {
             return self.gemm_packed_nt(a, bpack, c, m, k, n, 5, 18, 256, "gemm_q4k");
@@ -1844,7 +1844,8 @@ impl Backend for CudaBackend {
 impl CudaBackend {
     /// Fused-dequant GEMM for packed weights (Q6_K / Q4_0). `nsup_shift`:
     /// weights per packed block (8 → 256, 5 → 32); `blk_bytes`: 210 / 18;
-    /// `bn`: column tile (128 Q6_K — 48 KB static-shared limit, 256 Q4_0).
+    /// `bn`: column tile (32 Q6_K v2 — dequant-amortized f32 tile fits the
+    /// 48 KB static-shared budget; 256 Q4_0).
     /// Kernel family `name` ∈ {gemm_q6k, gemm_q4k}.
     fn gemm_packed_nt(
         &self,
@@ -1860,7 +1861,7 @@ impl CudaBackend {
         name: &str,
     ) -> Result<(), BackendError> {
         let (splitk, tiled) = match name {
-            "gemm_q6k" => ("gemm_q6k_splitk", "gemm_q6k_tiled"),
+            "gemm_q6k" => ("gemm_q6k_splitk_v2", "gemm_q6k_tiled_v3"),
             "gemm_q4k" => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
             _ => unreachable!("gemm_packed_nt: unknown family {name}"),
         };
@@ -1870,11 +1871,12 @@ impl CudaBackend {
         let c = c.as_cuda_mut();
         let nblk = k >> nsup_shift;
         let grid_x = (n + bn - 1) / bn;
-        // Split-k for m ≤ 64 (decode + TTS prefill chunks): B is re-read per
-        // row but from L2, and the grid stays full. The tiled kernel wins
-        // only for m > 64 (STT one-shot frames) where B is read once per
-        // 32-row chunk. S=1 writes straight into C — no reduce pass.
-        let s = if m <= 64 {
+        // Split-k for m == 1 (decode): the dequant-amortized f32-tile kernel.
+        // For m > 1 the tiled kernel stages B once per 32-row chunk and the
+        // activation tile in shared (the split-k re-reads B per row AND
+        // re-dequants — measured 3-7× slower for prefill). S=1 writes
+        // straight into C — no reduce pass.
+        let s = if m == 1 {
             [32usize, 16, 8, 4, 2]
                 .iter()
                 .copied()
@@ -1883,7 +1885,7 @@ impl CudaBackend {
         } else {
             1
         };
-        if m <= 64 {
+        if m == 1 {
             if s > 1 {
                 let cpart = self.take_pooled(s * m * n)?;
                 let f = self.function(splitk)?;

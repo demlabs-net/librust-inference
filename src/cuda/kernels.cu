@@ -1622,8 +1622,167 @@ extern "C" __global__ void SUF##_tiled(                                     \
     }                                                                       \
 }
 
-DEFINE_Q_GEMMS(gemm_q6k, q6k_weight, 8, 256, 210, 128)
 DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18, 256)
+
+// ─────────────────── Q6_K GEMM v2 (dequant-amortized) ───────────────────
+// The v1 splitk dequantized inline per FMA: 3 shared byte loads + ~12 ALU
+// per weight, strided 210 B (gcd(210,32)=2 — 2-way bank conflicts) — 49 us
+// for the qkv shape vs 10 us fp16. v2 amortizes: per k-block, 256 threads
+// cooperatively dequantize the 32-column tile ONCE into a TRANSPOSED f32
+// tile (TILE[j][col] — consecutive threads read consecutive columns, bank
+// conflict-free), then the compute is pure FMA. BN=32: Bs 6.7 KB + f32
+// tile 32 KB fits the 48 KB static-shared budget.
+extern "C" __global__ void gemm_q6k_splitk_v2(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ Cpart,          // (S·m, n)
+    int k,
+    int n,
+    int S,
+    int m)
+{
+    const int BN = 32;
+    __shared__ unsigned char Bs[BN * 210];
+    __shared__ float T[256][BN];
+    __shared__ float As[256];
+    int tid = threadIdx.x;
+    int bx = blockIdx.x;
+    int row = bx % m;
+    int nb = bx / m;
+    int col0 = nb * BN;
+    int nsup = k >> 8;
+    int nblk_s = (k / S) >> 8;
+    int kb0 = blockIdx.y * nblk_s;
+    const float* arow = A + (size_t)row * k;
+    float acc = 0.0f;
+    for (int t = 0; t < nblk_s; ++t) {
+        int kb = kb0 + t;
+        // Activation k-block (shared — the compute's 32 threads would not
+        // hide 256 global loads per thread otherwise).
+        As[tid] = arow[kb * 256 + tid];
+        const unsigned char* src = B + (size_t)(kb * n + col0) * 210;
+        // Flat coalesced tile load (interior: 6720 B contiguous; edge:
+        // per-column byte copy, garbage columns zeroed — masked later).
+        if (col0 + BN <= n && (n & 7) == 0) {
+            for (int i = tid; i < (BN * 210) / 16; i += 256) {
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);
+            }
+        } else if (tid < BN) {
+            int c = col0 + tid;
+            if (c < n) {
+                const unsigned char* s = src + (size_t)tid * 210;
+                unsigned char* d = Bs + tid * 210;
+                for (int i = 0; i < 210; ++i) d[i] = s[i];
+            } else {
+                for (int i = 0; i < 210; ++i) Bs[tid * 210 + i] = 0;
+            }
+        }
+        __syncthreads();
+        // Dequant pass: thread (col, jg) → TILE[j][col] (transposed —
+        // conflict-free writes and reads).
+        int col = tid & 31;
+        int jg = tid >> 5;
+        {
+            const unsigned char* blk = Bs + col * 210;
+            float d = __half2float(*(const __half*)(blk + 208));
+            for (int r = 0; r < 32; ++r) {
+                int j = jg * 32 + r;
+                // For j = jg·32+r: lane = r, q = jg&3 (r < 32 → lane = r).
+                int nchunk = j >> 7;
+                int lane = r;
+                int q = jg & 3;
+                int qlb = nchunk * 64 + lane + ((q & 1) << 5);
+                int qhb = nchunk * 32 + lane;
+                int scb = nchunk * 8 + (lane >> 4) + (q << 1);
+                int low = ((q >> 1) & 1) ? (blk[qlb] >> 4) : (blk[qlb] & 0xF);
+                int high = (blk[128 + qhb] >> (q << 1)) & 3;
+                int qv = (low | (high << 4)) - 32;
+                T[j][col] = d * (float)(signed char)blk[192 + scb] * (float)qv;
+            }
+        }
+        __syncthreads();
+        // Compute: 32 threads (one per column), pure FMA over the f32 tile.
+        if (tid < BN && col0 + tid < n) {
+            for (int j = 0; j < 256; ++j) {
+                acc += As[j] * T[j][tid];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < BN && col0 + tid < n) {
+        Cpart[(blockIdx.y * m + row) * n + col0 + tid] = acc;
+    }
+}
+
+/// Q6_K GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
+/// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The
+/// 32×256 activation tile is staged in shared (the v1 read A from global
+/// per (j, row): 8192 loads/thread/k-block — the m=16 variant measured
+/// 1.7 ms); the packed B tile is staged too and the dequant is broadcast
+/// per column (the 4 row-threads of a column read the same bytes).
+extern "C" __global__ void gemm_q6k_tiled_v3(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ C,              // (m, n)
+    int m,
+    int k,
+    int n)
+{
+    const int BM = 32, BN = 64;
+    __shared__ unsigned char Bs[BN * 210];
+    __shared__ float As[BM * 256];
+    int tid = threadIdx.x;
+    int col0 = blockIdx.x * BN;
+    int r0 = blockIdx.y * BM;
+    int nsup = k >> 8;
+    int col = tid & 63;
+    int rq = tid >> 6;      // 0..3 — eight rows per thread
+    float acc[8];
+    for (int q = 0; q < 8; ++q) acc[q] = 0.0f;
+    for (int kb = 0; kb < nsup; ++kb) {
+        const unsigned char* src = B + (size_t)(kb * n + col0) * 210;
+        if (col0 + BN <= n && (n & 7) == 0) {
+            for (int i = tid; i < (BN * 210) / 16; i += 256) {
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);
+            }
+        } else if (tid < BN) {
+            int c = col0 + tid;
+            if (c < n) {
+                const unsigned char* s = src + (size_t)tid * 210;
+                unsigned char* d = Bs + tid * 210;
+                for (int i = 0; i < 210; ++i) d[i] = s[i];
+            } else {
+                for (int i = 0; i < 210; ++i) Bs[tid * 210 + i] = 0;
+            }
+        }
+        // Activation tile: 32 rows × 256 j — 4 rows per thread (i = r·256+j,
+        // j = i&255, r = i>>8 → thread rq covers rows rq, rq+8, rq+16, rq+24).
+        for (int i = tid; i < BM * 256; i += 256) {
+            int j = i & 255;
+            int rr = i >> 8;
+            int r = r0 + rr;
+            As[rr * 256 + j] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : 0.0f;
+        }
+        __syncthreads();
+        if (col0 + col < n) {
+            const unsigned char* blk = Bs + col * 210;
+            for (int j = 0; j < 256; ++j) {
+                float w = q6k_weight(blk, j);
+                for (int q = 0; q < 8; ++q) {
+                    int rr = rq + 4 * (q & 3) + 16 * (q >> 2);
+                    if (r0 + rr < m) acc[q] += As[rr * 256 + j] * w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (col0 + col >= n) return;
+    float* c0 = C + (size_t)r0 * n + col0 + col;
+    for (int q = 0; q < 8; ++q) {
+        int rr = rq + 4 * (q & 3) + 16 * (q >> 2);
+        if (r0 + rr < m) c0[rr * n] = acc[q];
+    }
+}
 
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //

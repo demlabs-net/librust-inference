@@ -268,6 +268,58 @@ fn kv_update_q8_grow_copy() {
     println!("kv_update q8→q8 grow: ok");
 }
 
+/// Long-window attention across chunk boundaries (the v2 kernels capped at
+/// 4096 shared scores; v4 chunks — this also validates the cross-chunk
+/// online-softmax combine).
+#[test]
+fn attn_ar_long_window() {
+    let gpu = CudaBackend::new(0).unwrap();
+    let cpu = CpuBackend;
+    let b = 1usize;
+    let tq = 2usize;
+    let tkv = 5000usize; // 79 chunks of 64
+    let heads = 2usize;
+    let kv_heads = 1usize;
+    let hd = 64usize;
+
+    let mut q = vec![0f32; b * tq * heads * hd];
+    Lcg::new(9).fill(&mut q);
+    let mut kv = vec![0f32; b * tkv * kv_heads * hd];
+    Lcg::new(10).fill(&mut kv);
+    let mask: Vec<f32> = (0..tq * tkv)
+        .map(|i| if i % tkv <= i / tkv { 0.0 } else { -10000.0 })
+        .collect();
+
+    let q_g = gpu.from_cpu_f32(&q, vec![b, tq, heads * hd]).unwrap();
+    let k_g = gpu.from_cpu_f32(&kv, vec![b, tkv, kv_heads * hd]).unwrap();
+    let m_g = gpu.from_cpu_f32(&mask, vec![tq, tkv]).unwrap();
+    let y_g = gpu.zeros(vec![b, tq, heads * hd]).unwrap();
+    gpu.attn_ar(&q_g, &k_g, &k_g, Some(&m_g), &y_g, heads, kv_heads, hd).unwrap();
+    gpu.synchronize().unwrap();
+    let g = gpu.to_cpu_f32(&y_g).unwrap();
+
+    let q_c = cpu.from_cpu_f32(&q, vec![b, tq, heads * hd]).unwrap();
+    let k_c = cpu.from_cpu_f32(&kv, vec![b, tkv, kv_heads * hd]).unwrap();
+    let m_c = cpu.from_cpu_f32(&mask, vec![tq, tkv]).unwrap();
+    let y_c = cpu.zeros(vec![b, tq, heads * hd]).unwrap();
+    cpu.attn_ar(&q_c, &k_c, &k_c, Some(&m_c), &y_c, heads, kv_heads, hd).unwrap();
+    let c = cpu.to_cpu_f32(&y_c).unwrap();
+
+    let tol = 2e-3 + 2e-3 * c.iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let mut bad = 0;
+    for i in 0..g.len() {
+        let ok = g[i].is_finite() && c[i].is_finite() && (g[i] - c[i]).abs() <= tol;
+        if !ok {
+            bad += 1;
+            if bad < 5 {
+                eprintln!("attn_long [{i}] gpu {} cpu {}", g[i], c[i]);
+            }
+        }
+    }
+    assert_eq!(bad, 0, "attn_ar long window mismatch: {bad}/{}, tol {tol}", g.len());
+    println!("attn_ar long window (tkv={tkv}): ok ({} elems, tol {tol:.4})", g.len());
+}
+
 #[test]
 fn kv_update_f16_roundtrip() {
     let gpu = CudaBackend::new(0).unwrap();

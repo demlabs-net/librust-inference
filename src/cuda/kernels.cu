@@ -909,87 +909,142 @@ __device__ inline float kv_read_q8(const signed char* p, const float* sc, int j)
      (FMT) == 1 ? kv_read_f16((const __half*)(ptr), (sc), (j)) :            \
                  kv_read_q8((const signed char*)(ptr), (sc), (j)))
 
-// attn_ar_v2 for all K/V storage pairs: F=0 f32, F=1 f16, F=2 q8_0.
+// attn_ar_v4 for all K/V storage pairs: F=0 f32, F=1 f16, F=2 q8_0.
 // q/activations/mask stay f32; k/v are read through KV_READ (f16
-// dequant inline, q8_0 block-dequant: k/v value * block scale).
-#define ATTN_AR_V2(NAME, KT, VT, KS, VS)                                   \
+// dequant inline, q8_0 block-dequant).
+//
+// Two-kernel warp-chunked attention. The v3 kernel still paid 2
+// syncthreads per tk (~300 us at pos 1000 — 36 layers × that reaches the
+// 46 ms/token real-time budget at pos ~2000). v4 splits the window into
+// CHUNK-sized pieces: one block per (batch, head, query, chunk), each warp
+// independently runs the ONLINE softmax over its chunk with warp shuffles
+// ONLY — zero block-level syncs in the hot loop — and writes one partial
+// (max, sum-exp, weighted-V[32 columns]) per warp. `attn_ar_v4_combine`
+// merges the partials. No full-window score array: any tkv ≤ max_seq 32768.
+#define ATTN_AR_V4_PARTIAL(NAME, KT, VT, KS, VS)                            \
 extern "C" __global__ void NAME(                                           \
     const float* __restrict__ q,                                           \
     const KT* __restrict__ k,                                              \
     const VT* __restrict__ v,                                              \
     const float* __restrict__ mask,                                        \
-    float* __restrict__ y,                                                 \
+    float* __restrict__ part,      /* (chunk, warp) slots of 34 f32 */     \
     int b, int tq, int tkv, int n_heads, int kv_heads, int hd, int n_rep,  \
-    int has_mask, const float* __restrict__ ksc, const float* __restrict__ vsc) \
+    int has_mask, int nwarps, int nchunks,                                 \
+    const float* __restrict__ ksc, const float* __restrict__ vsc)          \
+{                                                                          \
+    const int CHUNK = 64;                                                  \
+    int bi = blockIdx.z / nchunks;                                         \
+    int chunk = blockIdx.z % nchunks;                                      \
+    int hh = blockIdx.y;                                                   \
+    int t = blockIdx.x;                                                    \
+    if (bi >= b || hh >= n_heads || t >= tq) return;                       \
+    int kvh = hh / n_rep;                                                  \
+    int tid = threadIdx.x;                                                 \
+    int warp = tid >> 5;                                                   \
+    int lane = tid & 31;                                                   \
+    if (warp >= nwarps) return;                                            \
+    int c0 = chunk * CHUNK;                                                \
+    int cnt = tkv - c0;                                                    \
+    if (cnt > CHUNK) cnt = CHUNK;                                          \
+    const float* qrow = q + (bi * tq + t) * (n_heads * hd) + hh * hd;      \
+    int col = warp * 32 + lane;                                            \
+    float scale = rsqrtf((float)hd);                                       \
+    /* Pass 1: warp-local partial dots for every tk of the chunk — a       \
+       warp's shuffle only sums ITS 32 columns, so the full score needs    \
+       all nwarps' partials. Store them to shared, one sync per chunk. */  \
+    __shared__ float sh_p[8][64];                                          \
+    for (int tk = 0; tk < cnt; ++tk) {                                     \
+        float s = 0.0f;                                                    \
+        if (col < hd) {                                                    \
+            const KT* krow = k + (bi * tkv + c0 + tk) * (kv_heads * hd) + kvh * hd; \
+            const float* kscrow = ksc + ((bi * tkv + c0 + tk) * kv_heads + kvh) * (hd >> 5); \
+            s = qrow[col] * KV_READ(KS, krow, kscrow, col);                \
+        }                                                                  \
+        for (int off = 16; off > 0; off >>= 1) {                           \
+            s += __shfl_xor_sync(0xffffffffu, s, off);                     \
+        }                                                                  \
+        if (lane == 0) sh_p[warp][tk] = s;                                 \
+    }                                                                      \
+    __syncthreads();                                                       \
+    /* Pass 2: full score = Σ warp partials, online softmax, warp-local    \
+       (all lanes agree on m/sum; each lane owns its column's V sum). */   \
+    float m = -INFINITY;                                                   \
+    float sum = 0.0f;                                                      \
+    float acc = 0.0f;                                                      \
+    for (int tk = 0; tk < cnt; ++tk) {                                     \
+        float sc = 0.0f;                                                   \
+        for (int w = 0; w < nwarps; ++w) sc += sh_p[w][tk];                \
+        float score = sc * scale;                                          \
+        if (has_mask) score += mask[t * tkv + c0 + tk];                    \
+        float m_new = fmaxf(m, score);                                     \
+        float rescale = __expf(m - m_new);                                 \
+        sum *= rescale;                                                    \
+        acc *= rescale;                                                    \
+        float e = __expf(score - m_new);                                   \
+        sum += e;                                                          \
+        if (col < hd) {                                                    \
+            const VT* vrow = v + (bi * tkv + c0 + tk) * (kv_heads * hd) + kvh * hd; \
+            const float* vscrow = vsc + ((bi * tkv + c0 + tk) * kv_heads + kvh) * (hd >> 5); \
+            acc += e * KV_READ(VS, vrow, vscrow, col);                     \
+        }                                                                  \
+        m = m_new;                                                         \
+    }                                                                      \
+    float* slot = part + ((((bi * tq + t) * n_heads + hh) * nchunks + chunk) * nwarps + warp) * 34; \
+    slot[0] = m;                                                           \
+    slot[1] = sum;                                                         \
+    slot[2 + lane] = acc;                                                  \
+}
+
+#define ATTN_AR_V4_COMBINE(NAME)                                           \
+extern "C" __global__ void NAME(                                           \
+    const float* __restrict__ part,      /* (chunk, warp) slots of 34 */   \
+    float* __restrict__ y,               /* (b, tq, n_heads·hd) */         \
+    int b, int tq, int n_heads, int hd, int nwarps, int nchunks)           \
 {                                                                          \
     int bi = blockIdx.z;                                                   \
     int hh = blockIdx.y;                                                   \
     int t = blockIdx.x;                                                    \
     if (bi >= b || hh >= n_heads || t >= tq) return;                       \
-    int kvh = hh / n_rep;                                                  \
-    const float* qrow = q + (bi * tq + t) * (n_heads * hd) + hh * hd;      \
-    __shared__ float scores[4096];                                         \
-    __shared__ float exps[4096];                                           \
+    int tid = threadIdx.x;                                                 \
+    int base = ((bi * tq + t) * n_heads + hh) * nchunks * nwarps * 34;     \
+    int nslot = nchunks * nwarps;                                          \
+    /* global max over the partials */                                     \
+    float M = -INFINITY;                                                   \
+    for (int i = tid; i < nslot; i += 256) M = fmaxf(M, part[base + i * 34]); \
     __shared__ float red[256];                                             \
-    __shared__ float smx;                                                  \
-    float scale = rsqrtf((float)hd);                                       \
-    if (tkv > 4096) return;                                                \
-    if (threadIdx.x == 0) smx = -INFINITY;                                 \
+    red[tid] = M;                                                          \
     __syncthreads();                                                       \
-    for (int tk = 0; tk < tkv; ++tk) {                                     \
-        const KT* krow = k + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd; \
-        const float* kscrow = ksc + ((bi * tkv + tk) * kv_heads + kvh) * (hd >> 5); \
+    for (int s = 256 / 2; s > 0; s >>= 1) {                                \
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);             \
+        __syncthreads();                                                   \
+    }                                                                      \
+    M = red[0];                                                            \
+    if (tid < hd) {                                                        \
+        int col = tid;                                                     \
+        int mywarp = col / 32;                                             \
+        float l = 0.0f;                                                    \
         float acc = 0.0f;                                                  \
-        for (int j = threadIdx.x; j < hd; j += blockDim.x) {               \
-            float kvv = KV_READ(KS, krow, kscrow, j);                      \
-            acc += qrow[j] * kvv;                                          \
+        /* All warps of a chunk see the SAME scores, so their (m, sum)     \
+           are equal — count each chunk's sum ONCE (warp 0's slot).        \
+           The V-sums live per warp: a column takes its acc only from      \
+           its own warp's slot. */                                         \
+        for (int c = 0; c < nchunks; ++c) {                                \
+            const float* s0 = part + base + c * nwarps * 34;               \
+            float e = __expf(s0[0] - M);                                   \
+            l += s0[1] * e;                                                \
+            const float* sw = part + base + (c * nwarps + mywarp) * 34;    \
+            acc += sw[2 + (col & 31)] * e;                                 \
         }                                                                  \
-        red[threadIdx.x] = acc;                                            \
-        __syncthreads();                                                   \
-        for (int ss = blockDim.x / 2; ss > 0; ss >>= 1) {                  \
-            if (threadIdx.x < ss) red[threadIdx.x] += red[threadIdx.x + ss]; \
-            __syncthreads();                                               \
-        }                                                                  \
-        if (threadIdx.x == 0) {                                            \
-            float sc = red[0] * scale;                                     \
-            if (has_mask) sc += mask[t * tkv + tk];                        \
-            scores[tk] = sc;                                               \
-            smx = fmaxf(smx, sc);                                          \
-        }                                                                  \
-        __syncthreads();                                                   \
-    }                                                                      \
-    float sum = 0.0f;                                                      \
-    for (int tk = threadIdx.x; tk < tkv; tk += blockDim.x) {               \
-        float e = __expf(scores[tk] - smx);                                \
-        exps[tk] = e;                                                      \
-        sum += e;                                                          \
-    }                                                                      \
-    red[threadIdx.x] = sum;                                                \
-    __syncthreads();                                                       \
-    for (int ss = blockDim.x / 2; ss > 0; ss >>= 1) {                      \
-        if (threadIdx.x < ss) red[threadIdx.x] += red[threadIdx.x + ss];   \
-        __syncthreads();                                                   \
-    }                                                                      \
-    float inv = 1.0f / red[0];                                             \
-    float* out = y + (bi * tq + t) * (n_heads * hd) + hh * hd;             \
-    for (int j = threadIdx.x; j < hd; j += blockDim.x) {                   \
-        float acc = 0.0f;                                                  \
-        for (int tk = 0; tk < tkv; ++tk) {                                 \
-            const VT* vrow = v + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd; \
-            const float* vscrow = vsc + ((bi * tkv + tk) * kv_heads + kvh) * (hd >> 5); \
-            float vv = KV_READ(VS, vrow, vscrow, j);                      \
-            acc += exps[tk] * inv * vv;                                    \
-        }                                                                  \
-        out[j] = acc;                                                      \
+        y[(bi * tq + t) * (n_heads * hd) + hh * hd + col] = acc / l;       \
     }                                                                      \
 }
 
 // Name order is {K}{V} — matches the cuda.rs dispatch table
 // ((kfmt, vfmt) → kernel name). SUF is the K storage, the suffix is V.
 #define ATTN_K(SUF, KT, KS)                                                \
-    ATTN_AR_V2(ATTN_M(attn_ar_v2_, SUF, f32), KT, float, KS, 0)            \
-    ATTN_AR_V2(ATTN_M(attn_ar_v2_, SUF, f16), KT, __half, KS, 1)           \
-    ATTN_AR_V2(ATTN_M(attn_ar_v2_, SUF, q8), KT, signed char, KS, 2)
+    ATTN_AR_V4_PARTIAL(ATTN_M(attn_ar_v4_, SUF, f32), KT, float, KS, 0)    \
+    ATTN_AR_V4_PARTIAL(ATTN_M(attn_ar_v4_, SUF, f16), KT, __half, KS, 1)   \
+    ATTN_AR_V4_PARTIAL(ATTN_M(attn_ar_v4_, SUF, q8), KT, signed char, KS, 2)
 
 #define ATTN_M(A, B, C) ATTN_M_I(A, B, C)
 #define ATTN_M_I(A, B, C) A##B##C
@@ -997,6 +1052,8 @@ extern "C" __global__ void NAME(                                           \
 ATTN_K(f32, float, 0)
 ATTN_K(f16, __half, 1)
 ATTN_K(q8, signed char, 2)
+
+ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
 
 /// Autoregressive GQA attention (TTS): q (b, tq, n_heads·hd),
 /// k/v (b, tkv, kv_heads·hd), mask (tq, tkv) bias (0 / -inf) or null.
@@ -1244,6 +1301,34 @@ extern "C" __global__ void gemm_i8_mn_splitk(
 /// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
 /// Combine the split-k partials: C[col] = Σ_s Cpart[s·n + col].
 
+/// int8 GEMM, m = 1 without split-k (n % 16 != 0 — the split-k path needs
+/// 16-byte aligned columns): one thread per column, serial dot over k.
+extern "C" __global__ void gemm_i8_m1(
+    const signed char* __restrict__ A,   // (1, k)
+    const float* __restrict__ asc,       // (1, k/32)
+    const signed char* __restrict__ B,   // (k, n) row-major
+    const float* __restrict__ wsc,       // (k/32, n)
+    float* __restrict__ C,               // (1, n)
+    int k,
+    int n)
+{
+    int col = blockIdx.x * 256 + threadIdx.x;
+    if (col >= n) return;
+    int nblk = k >> 5;
+    int acc = 0;
+    for (int b = 0; b < nblk; ++b) {
+        int s = 0;
+        const signed char* a = A + b * 32;
+        const signed char* w = B + b * 32 * n + col;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            s += (int)a[j] * (int)w[j * n];
+        }
+        acc += (int)(s * (asc[b] * wsc[b * n + col]));
+    }
+    C[col] = (float)acc;
+}
+
 /// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
 extern "C" __global__ void gemm_i8_reduce(
     const float* __restrict__ Cpart,   // (S·m, n)
@@ -1408,87 +1493,118 @@ __device__ inline float q4k_weight(const unsigned char* blk, int j) {
     return (float)(q - 8) * d;
 }
 
-// Q6_K / Q4_0 packed-weight GEMMs — identical structure, the format differs
-// only in the inline dequant (WREAD), the block granularity (NSUP_SHIFT)
-// and the packed block size (BLK_BYTES).
-#define DEFINE_Q_GEMMS(SUF, WREAD, NSUP_SHIFT, WPB, BLK_BYTES)               \
-/* Small m (1..=64 — TTS fill/decode): split-k over k-slices; activations   \
-   shared (f32, k/S ≤ 2048); gemm_i8_reduce combines the partials.          \
-   Grid (ceil(n/256)·m, S), one block per (row, 256 cols). */               \
+// Q6_K / Q4_0 packed-weight GEMMs. Weights are stored kb-major — block
+// (kb, col) at (kb·rows + col)·BLK_BYTES — so one k-block's BN columns are
+// ONE contiguous segment; the kernels stage it into shared with vectorized
+// (uchar4) cooperative loads (the old per-column scattered byte loads ran
+// 70-100x slower than fp16 cuBLAS) and dequantize from shared.
+// BN: 128 for Q6_K (26.9 KB tile — 48 KB static-shared limit), 256 for
+// Q4_0 (4.6 KB). No activation staging: A is re-read per k-block and
+// broadcasts across the block's threads (L2-resident).
+#define DEFINE_Q_GEMMS(SUF, WREAD, NSUP_SHIFT, WPB, BLK_BYTES, BN)          \
+/* m ≤ 64 (TTS fill/decode): split-k over k-slices. Grid                  \
+   (ceil(n/BN)·m, S); each block: one output row × BN columns, per         \
+   k-block a cooperative tile load + full WPB-weight dot from shared.      \
+   S=1 needs no shared A window (activations read from global) — one       \
+   kernel covers every k. `gemm_i8_reduce` combines the partials. */       \
 extern "C" __global__ void SUF##_splitk(                                    \
     const float* __restrict__ A,        /* (m, k) */                        \
-    const unsigned char* __restrict__ B,/* packed blocks, (col·nsuper+kb)·BLK_BYTES */ \
+    const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
     float* __restrict__ Cpart,          /* (S·m, n) */                      \
     int k, int n, int S, int m)                                             \
 {                                                                           \
-    const int BN = 256;                                                     \
-    __shared__ float As[2048];                                              \
+    __shared__ unsigned char Bs[BN * BLK_BYTES];                            \
     int tid = threadIdx.x;                                                  \
     int bx = blockIdx.x;                                                    \
     int row = bx % m;                                                       \
     int nb = bx / m;                                                        \
-    int col = nb * BN + tid;                                                \
+    int col0 = nb * BN;                                                     \
     int ks = k / S;                                                         \
     int nblk_s = ks >> NSUP_SHIFT;                                          \
     int nsup = k >> NSUP_SHIFT;                                             \
     int kb0 = blockIdx.y * nblk_s;                                          \
     const float* arow = A + (size_t)row * k;                                \
-    for (int i = tid; i < ks; i += BN) As[i] = arow[kb0 * WPB + i];         \
-    __syncthreads();                                                        \
     float acc = 0.0f;                                                       \
+    const int tile_bytes = BN * BLK_BYTES;                                  \
+    const int tile_v4 = tile_bytes >> 4;                                    \
     for (int t = 0; t < nblk_s; ++t) {                                      \
-        const unsigned char* blk = B + (size_t)(col * nsup + kb0 + t) * BLK_BYTES; \
-        if (col < n) {                                                      \
-            for (int j = 0; j < WPB; ++j) {                                 \
-                acc += As[t * WPB + j] * WREAD(blk, j);                     \
+        int kb = kb0 + t;                                                   \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK_BYTES; \
+        /* Fast path: (kb·n + col0)·BLK_BYTES is 16-aligned when n % 8 == 0 \
+           (all real TTS/STT n) — uint4 vector loads, fully coalesced.     \
+           Otherwise per-column byte loads (never OOB; garbage columns     \
+           zeroed — their outputs are masked). */                           \
+        if (col0 + BN <= n && (n & 7) == 0) {                               \
+            for (int i = tid; i < tile_v4; i += 256) {                      \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);     \
+            }                                                               \
+        } else if (tid < BN) {                                              \
+            int c = col0 + tid;                                             \
+            if (c < n) {                                                    \
+                const unsigned char* s = src + (size_t)tid * BLK_BYTES;     \
+                unsigned char* d = Bs + tid * BLK_BYTES;                    \
+                /* Byte copy: BLK_BYTES is not 16-aligned, the per-column   \
+                   source is misaligned — vector loads are not allowed. */  \
+                for (int i = 0; i < BLK_BYTES; ++i) d[i] = s[i];            \
+            } else {                                                        \
+                for (int i = 0; i < BLK_BYTES; ++i) Bs[tid * BLK_BYTES + i] = 0; \
             }                                                               \
         }                                                                   \
-    }                                                                       \
-    if (col < n) Cpart[(blockIdx.y * m + row) * n + col] = acc;             \
-}                                                                           \
-/* Fallback for k-slices that cannot fit the shared A window                \
-   (k/S > 2048 — e.g. the slow-AR w2 with k=9728): no shared staging,       \
-   each thread dots its column over ALL of k reading A directly. */         \
-extern "C" __global__ void SUF##_simple(                                    \
-    const float* __restrict__ A,        /* (m, k) */                        \
-    const unsigned char* __restrict__ B,/* packed blocks */                 \
-    float* __restrict__ C,              /* (m, n) */                        \
-    int m, int k, int n)                                                    \
-{                                                                           \
-    int bx = blockIdx.x;                                                    \
-    int row = bx % m;                                                       \
-    int nb = bx / m;                                                        \
-    int col = nb * 256 + threadIdx.x;                                       \
-    if (col >= n) return;                                                   \
-    int nsup = k >> NSUP_SHIFT;                                             \
-    const float* arow = A + (size_t)row * k;                                \
-    float acc = 0.0f;                                                       \
-    for (int kb = 0; kb < nsup; ++kb) {                                     \
-        const unsigned char* blk = B + (size_t)(col * nsup + kb) * BLK_BYTES; \
-        for (int j = 0; j < WPB; ++j) {                                     \
-            acc += arow[kb * WPB + j] * WREAD(blk, j);                      \
+        __syncthreads();                                                    \
+        if (col0 + tid < n && tid < BN) {                                   \
+            const unsigned char* blk = Bs + tid * BLK_BYTES;                \
+            /* Modest unroll: full 256-way unrolling of the dequant+FMA     \
+               chain spills registers; 8-way keeps the dequant latency      \
+               hidden without pressure. */                                  \
+            _Pragma("unroll 8")                                             \
+            for (int j = 0; j < WPB; ++j) {                                 \
+                acc += arow[kb * WPB + j] * WREAD(blk, j);                  \
+            }                                                               \
         }                                                                   \
+        __syncthreads();                                                    \
     }                                                                       \
-    C[(size_t)row * n + col] = acc;                                         \
+    if (col0 + tid < n && tid < BN) {                                       \
+        Cpart[(blockIdx.y * m + row) * n + col0 + tid] = acc;               \
+    }                                                                       \
 }                                                                           \
-/* m > 64 (STT one-shot frames): block per (32 rows × 256 cols), thread =   \
-   one column, 32 row accumulators; B read once per row-chunk. */           \
+/* m > 64 (STT one-shot frames): block per (32 rows × BN cols), 32 row     \
+   accumulators in registers; B staged once per k-block, reused by all     \
+   32 rows — B read once per row-chunk, not per row. */                    \
 extern "C" __global__ void SUF##_tiled(                                     \
     const float* __restrict__ A,        /* (m, k) */                        \
-    const unsigned char* __restrict__ B,/* packed blocks */                 \
+    const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
     float* __restrict__ C,              /* (m, n) */                        \
     int m, int k, int n)                                                    \
 {                                                                           \
-    const int BM = 32, BN = 256;                                            \
+    const int BM = 32;                                                      \
+    __shared__ unsigned char Bs[BN * BLK_BYTES];                            \
     int tid = threadIdx.x;                                                  \
-    int col = blockIdx.x * BN + tid;                                        \
+    int col0 = blockIdx.x * BN;                                             \
     int r0 = blockIdx.y * BM;                                               \
-    int nblk = k >> NSUP_SHIFT;                                             \
+    int nsup = k >> NSUP_SHIFT;                                             \
     float acc[BM];                                                          \
     for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                         \
-    for (int kb = 0; kb < nblk; ++kb) {                                     \
-        const unsigned char* blk = B + (size_t)(col * nblk + kb) * BLK_BYTES; \
-        if (col < n) {                                                      \
+    const int tile_bytes = BN * BLK_BYTES;                                  \
+    const int tile_v4 = tile_bytes >> 4;                                    \
+    for (int kb = 0; kb < nsup; ++kb) {                                     \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK_BYTES; \
+        if (col0 + BN <= n && (n & 7) == 0) {                               \
+            for (int i = tid; i < tile_v4; i += 256) {                      \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);     \
+            }                                                               \
+        } else if (tid < BN) {                                              \
+            int c = col0 + tid;                                             \
+            if (c < n) {                                                    \
+                const unsigned char* s = src + (size_t)tid * BLK_BYTES;     \
+                unsigned char* d = Bs + tid * BLK_BYTES;                    \
+                for (int i = 0; i < BLK_BYTES; ++i) d[i] = s[i];            \
+            } else {                                                        \
+                for (int i = 0; i < BLK_BYTES; ++i) Bs[tid * BLK_BYTES + i] = 0; \
+            }                                                               \
+        }                                                                   \
+        __syncthreads();                                                    \
+        if (col0 + tid < n && tid < BN) {                                   \
+            const unsigned char* blk = Bs + tid * BLK_BYTES;                \
             for (int j = 0; j < WPB; ++j) {                                 \
                 float w = WREAD(blk, j);                                    \
                 const float* a0 = A + (size_t)r0 * k + kb * WPB + j;        \
@@ -1497,16 +1613,17 @@ extern "C" __global__ void SUF##_tiled(                                     \
                 }                                                           \
             }                                                               \
         }                                                                   \
+        __syncthreads();                                                    \
     }                                                                       \
-    if (col >= n) return;                                                   \
-    float* c0 = C + (size_t)r0 * n + col;                                   \
+    if (col0 + tid >= n || tid >= BN) return;                               \
+    float* c0 = C + (size_t)r0 * n + col0 + tid;                            \
     for (int rr = 0; rr < BM; ++rr) {                                       \
         if (r0 + rr < m) c0[rr * n] = acc[rr];                              \
     }                                                                       \
 }
 
-DEFINE_Q_GEMMS(gemm_q6k, q6k_weight, 8, 256, 210)
-DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18)
+DEFINE_Q_GEMMS(gemm_q6k, q6k_weight, 8, 256, 210, 128)
+DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18, 256)
 
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //

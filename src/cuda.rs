@@ -492,7 +492,8 @@ impl Backend for CudaBackend {
                 let mut out = vec![0f32; rows * per];
                 for r in 0..rows {
                     for sb in 0..nsuper {
-                        let blk = &raw[(r * nsuper + sb) * 210..(r * nsuper + sb + 1) * 210];
+                        // kb-major: block (sb, r) at (sb·rows + r)·210.
+                        let blk = &raw[(sb * rows + r) * 210..(sb * rows + r + 1) * 210];
                         let d = f32::from(half::f16::from_bits(
                             u16::from_le_bytes([blk[208], blk[209]]),
                         ));
@@ -528,7 +529,8 @@ impl Backend for CudaBackend {
                 let mut out = vec![0f32; rows * per];
                 for r in 0..rows {
                     for sb in 0..nsup {
-                        let blk = &raw[(r * nsup + sb) * 18..(r * nsup + sb + 1) * 18];
+                        // kb-major: block (sb, r) at (sb·rows + r)·18.
+                        let blk = &raw[(sb * rows + r) * 18..(sb * rows + r + 1) * 18];
                         let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
                         for j in 0..32 {
                             let nib = blk[2 + (j >> 1)];
@@ -586,10 +588,10 @@ impl Backend for CudaBackend {
         // no-shared kernel (the slow-AR w2 has k=9728), m>64 (STT one-shot)
         // uses the row-chunk kernel — the same policy as the int8 path.
         if let crate::backend::TensorInner::CudaQ6K(bpack) = &b.inner {
-            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 210, "gemm_q6k");
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 210, 128, "gemm_q6k");
         }
         if let crate::backend::TensorInner::CudaQ4K(bpack) = &b.inner {
-            return self.gemm_packed_nt(a, bpack, c, m, k, n, 5, 18, "gemm_q4k");
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 5, 18, 256, "gemm_q4k");
         }
         // Plain fp16/bf16 weights: cast the activation row(s) and run cuBLAS
         // gemm_ex (16F×16F → 32F out, fp32 accumulate) — halves the weight
@@ -1492,8 +1494,16 @@ impl Backend for CudaBackend {
         let (b, tq, _) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let tkv = k.shape()[1];
         let n_rep = n_heads / kv_heads;
-        // One 256-thread block per (batch, head, query). K/V storage dtype
-        // dispatch: 0=f32, 1=f16/bf16, 2=q8_0 — the attn_ar_v2_{k}{v} kernels
+        if tkv == 0 {
+            return Ok(());
+        }
+        // Two-kernel warp-chunked attention (attn_ar_v4): each (chunk, warp)
+        // writes a 34-f32 partial (max, sum-exp, weighted-V[32]) with ZERO
+        // block-level syncs in the hot loop; attn_ar_v4_combine merges them.
+        let nwarps = (hd + 31) / 32;
+        let nchunks = tkv.div_ceil(64).max(1);
+        let scratch = self.take_pooled(b * tq * n_heads * nchunks * nwarps * 34)?;
+        // K/V storage dtype: 0=f32, 1=f16/bf16, 2=q8_0 — the v4 kernels
         // dequantize inline on read (f16 → float, q8_0 block-scale).
         let kfmt = match &k.inner {
             crate::backend::TensorInner::Cuda(_) => 0,
@@ -1508,20 +1518,20 @@ impl Backend for CudaBackend {
             _ => unreachable!(),
         };
         let fname: &'static str = match (kfmt, vfmt) {
-            (0, 0) => "attn_ar_v2_f32f32",
-            (0, 1) => "attn_ar_v2_f32f16",
-            (0, 2) => "attn_ar_v2_f32q8",
-            (1, 0) => "attn_ar_v2_f16f32",
-            (1, 1) => "attn_ar_v2_f16f16",
-            (1, 2) => "attn_ar_v2_f16q8",
-            (2, 0) => "attn_ar_v2_q8f32",
-            (2, 1) => "attn_ar_v2_q8f16",
-            (2, 2) => "attn_ar_v2_q8q8",
+            (0, 0) => "attn_ar_v4_f32f32",
+            (0, 1) => "attn_ar_v4_f32f16",
+            (0, 2) => "attn_ar_v4_f32q8",
+            (1, 0) => "attn_ar_v4_f16f32",
+            (1, 1) => "attn_ar_v4_f16f16",
+            (1, 2) => "attn_ar_v4_f16q8",
+            (2, 0) => "attn_ar_v4_q8f32",
+            (2, 1) => "attn_ar_v4_q8f16",
+            (2, 2) => "attn_ar_v4_q8q8",
             _ => unreachable!(),
         };
         let f = self.function(fname)?;
         let cfg = LaunchConfig {
-            grid_dim: (tq as u32, n_heads as u32, b as u32),
+            grid_dim: (tq as u32, n_heads as u32, (b * nchunks) as u32),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -1546,7 +1556,7 @@ impl Backend for CudaBackend {
         } else {
             la.arg(q.as_cuda()); // dummy — kernel guards via has_mask
         }
-        la.arg(y.as_cuda());
+        la.arg(&scratch);
         let __a84 = b as i32;
         la.arg(&__a84);
         let __a85 = tq as i32;
@@ -1563,6 +1573,10 @@ impl Backend for CudaBackend {
         la.arg(&__a90);
         let has_mask = if mask.is_some() { 1i32 } else { 0i32 };
         la.arg(&has_mask);
+        let nw32 = nwarps as i32;
+        la.arg(&nw32);
+        let nc32 = nchunks as i32;
+        la.arg(&nc32);
         // Block scales for q8_0 K/V (dummy f32 slice for non-q8 — unused;
         // a per-call alloc of 4 bytes is cheaper than a borrow juggle).
         let dummy = self.take_pooled(1)?;
@@ -1575,7 +1589,33 @@ impl Backend for CudaBackend {
             crate::backend::TensorInner::CudaI8 { scale, .. } => { la.arg(scale); }
             _ => { la.arg(&dummy2); }
         }
-        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // Merge the partials into the output.
+        let f = self.function("attn_ar_v4_combine")?;
+        let cfg = LaunchConfig {
+            grid_dim: (tq as u32, n_heads as u32, b as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(&scratch);
+        la.arg(y.as_cuda_mut());
+        la.arg(&__a84);
+        la.arg(&__a85);
+        let nh32 = n_heads as i32;
+        la.arg(&nh32);
+        let hd32 = hd as i32;
+        la.arg(&hd32);
+        la.arg(&nw32);
+        la.arg(&nc32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        self.pool
+            .lock()
+            .unwrap()
+            .entry(scratch.len())
+            .or_default()
+            .push(scratch);
+        Ok(())
     }
 
     fn mhsa(
@@ -1803,8 +1843,9 @@ impl Backend for CudaBackend {
 
 impl CudaBackend {
     /// Fused-dequant GEMM for packed weights (Q6_K / Q4_0). `nsup_shift`:
-    /// weights per packed block (8 → 256, 5 → 32); `blk_bytes`: 210 / 18.
-    /// Kernel family `name` ∈ {gemm_q6k, gemm_q4k} — the same three shapes.
+    /// weights per packed block (8 → 256, 5 → 32); `blk_bytes`: 210 / 18;
+    /// `bn`: column tile (128 Q6_K — 48 KB static-shared limit, 256 Q4_0).
+    /// Kernel family `name` ∈ {gemm_q6k, gemm_q4k}.
     fn gemm_packed_nt(
         &self,
         a: &Tensor,
@@ -1815,11 +1856,12 @@ impl CudaBackend {
         n: usize,
         nsup_shift: u32,
         blk_bytes: usize,
+        bn: usize,
         name: &str,
     ) -> Result<(), BackendError> {
-        let (splitk, simple, tiled) = match name {
-            "gemm_q6k" => ("gemm_q6k_splitk", "gemm_q6k_simple", "gemm_q6k_tiled"),
-            "gemm_q4k" => ("gemm_q4k_splitk", "gemm_q4k_simple", "gemm_q4k_tiled"),
+        let (splitk, tiled) = match name {
+            "gemm_q6k" => ("gemm_q6k_splitk", "gemm_q6k_tiled"),
+            "gemm_q4k" => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
             _ => unreachable!("gemm_packed_nt: unknown family {name}"),
         };
         let k32 = k as i32;
@@ -1827,67 +1869,71 @@ impl CudaBackend {
         let m32 = m as i32;
         let c = c.as_cuda_mut();
         let nblk = k >> nsup_shift;
-        let grid_x = (n + 255) / 256;
-        // Split-k only when a k-slice fits the shared A window (≤ 2048)
-        // and the grid stays sane; otherwise the no-shared fallback
-        // (the slow-AR w2 has k=9728 — k/S > 2048 for every S).
+        let grid_x = (n + bn - 1) / bn;
+        // Split-k for m ≤ 64 (decode + TTS prefill chunks): B is re-read per
+        // row but from L2, and the grid stays full. The tiled kernel wins
+        // only for m > 64 (STT one-shot frames) where B is read once per
+        // 32-row chunk. S=1 writes straight into C — no reduce pass.
         let s = if m <= 64 {
             [32usize, 16, 8, 4, 2]
                 .iter()
                 .copied()
-                .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * m * s <= 512)
+                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
                 .unwrap_or(1)
         } else {
             1
         };
-        if m <= 64 && s > 1 {
-            let cpart = self.take_pooled(s * m * n)?;
-            let f = self.function(splitk)?;
-            let cfg = LaunchConfig {
-                grid_dim: ((grid_x * m) as u32, s as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(a.as_cuda());
-            la.arg(bpack);
-            la.arg(&cpart);
-            la.arg(&k32);
-            la.arg(&n32);
-            let s32 = s as i32;
-            la.arg(&s32);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            let f = self.function("gemm_i8_reduce")?;
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&cpart);
-            la.arg(c);
-            la.arg(&n32);
-            la.arg(&s32);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
-        } else if m <= 64 {
-            // k/S > 2048 for every S: no shared staging, direct A reads.
-            let f = self.function(simple)?;
-            let cfg = LaunchConfig {
-                grid_dim: ((grid_x * m) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(a.as_cuda());
-            la.arg(bpack);
-            la.arg(c);
-            la.arg(&m32);
-            la.arg(&k32);
-            la.arg(&n32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        if m <= 64 {
+            if s > 1 {
+                let cpart = self.take_pooled(s * m * n)?;
+                let f = self.function(splitk)?;
+                let cfg = LaunchConfig {
+                    grid_dim: ((grid_x * m) as u32, s as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(a.as_cuda());
+                la.arg(bpack);
+                la.arg(&cpart);
+                la.arg(&k32);
+                la.arg(&n32);
+                let s32 = s as i32;
+                la.arg(&s32);
+                la.arg(&m32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                let f = self.function("gemm_i8_reduce")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&cpart);
+                la.arg(c);
+                la.arg(&n32);
+                la.arg(&s32);
+                la.arg(&m32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+            } else {
+                let f = self.function(splitk)?;
+                let cfg = LaunchConfig {
+                    grid_dim: ((grid_x * m) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(a.as_cuda());
+                la.arg(bpack);
+                la.arg(c);
+                la.arg(&k32);
+                la.arg(&n32);
+                let s32 = 1i32;
+                la.arg(&s32);
+                la.arg(&m32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            }
         } else {
             let f = self.function(tiled)?;
             let cfg = LaunchConfig {

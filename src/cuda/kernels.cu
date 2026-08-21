@@ -1374,6 +1374,146 @@ extern "C" __global__ void gemm_i8_tiled(
     }
 }
 
+// ─────────────────────── Q6_K GEMM (packed weights) ───────────────────────
+// Canonical llama.cpp Q6_K layout, 210 bytes per 256-weight super-block:
+//   ql[128]  — low 4 bits (2 weights per byte)
+//   qh[64]   — high 2 bits (4 weights per byte)
+//   scales[16] — int8 sub-scales (16-elem sub-blocks)
+//   d[2]     — f16 super-block scale (bytes 208..210)
+// Dequant of weight j (0..255): q = ((ql|qh) & 0x3F) - 32, w = d·sc[j]·q.
+// Weights uploaded col-major: block (col, kb) at (col·nsuper + kb)·210 —
+// same layout as the quantizer/to_cpu_f32.
+__device__ inline float q6k_weight(const unsigned char* blk, int j) {
+    int nchunk = j >> 7;          // 0..1 (128-weight halves)
+    int lane = j & 31;
+    int q = (j >> 5) & 3;         // 0..3 (4 weights share one qh byte)
+    int qlb = nchunk * 64 + lane + ((q & 1) << 5);
+    int qhb = nchunk * 32 + lane;
+    int scb = nchunk * 8 + (lane >> 4) + (q << 1);
+    // q1/q2 read the low nibble of their ql byte, q3/q4 the high nibble.
+    int low = ((q >> 1) & 1) ? (blk[qlb] >> 4) : (blk[qlb] & 0xF);
+    int high = (blk[128 + qhb] >> (q << 1)) & 3;
+    int qv = (low | (high << 4)) - 32;
+    float d = __half2float(*(const __half*)(blk + 208));
+    return d * (float)(signed char)blk[192 + scb] * (float)qv;
+}
+
+/// Q6_K GEMM, small m (1..=64 — TTS fill/decode): split-k, mirror of
+/// gemm_i8_mn_splitk with fp32 activations (no activation quant — the packed
+/// weight dequant dominates). Grid (ceil(n/256)·m, S); each block computes a
+/// k-slice partial for one output row × 256 columns; `gemm_i8_reduce`
+/// combines the partials. Activations shared (f32, k/S ≤ 2048).
+extern "C" __global__ void gemm_q6k_splitk(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ Cpart,          // (S·m, n)
+    int k,
+    int n,
+    int S,
+    int m)
+{
+    const int BN = 256;
+    __shared__ float As[2048];
+    int tid = threadIdx.x;
+    int bx = blockIdx.x;
+    int row = bx % m;
+    int nb = bx / m;
+    int col = nb * BN + tid;
+    int ks = k / S;
+    int nblk_s = ks >> 8;
+    int nsup = k >> 8;
+    int kb0 = blockIdx.y * nblk_s;
+    const float* arow = A + (size_t)row * k;
+    // This block's k-slice of the row (slice = kb0·256 .. kb0·256 + ks).
+    for (int i = tid; i < ks; i += BN) As[i] = arow[kb0 * 256 + i];
+    __syncthreads();
+    float acc = 0.0f;
+    for (int t = 0; t < nblk_s; ++t) {
+        // Blocks are col-major: (col·nsuper + kb)·210 (matches the uploader).
+        const unsigned char* blk = B + (size_t)(col * nsup + kb0 + t) * 210;
+        if (col < n) {
+            // Full 256-weight dot of this k-slice for the thread's column.
+#pragma unroll
+            for (int j = 0; j < 256; ++j) {
+                acc += As[t * 256 + j] * q6k_weight(blk, j);
+            }
+        }
+    }
+    if (col < n) Cpart[(blockIdx.y * m + row) * n + col] = acc;
+}
+
+/// Q6_K GEMM fallback for k-slices that cannot fit the shared A window
+/// (k/S > 2048 — e.g. the slow-AR w2 with k=9728): no shared staging, each
+/// thread dots its column over ALL of k reading A directly (A broadcasts
+/// across the block — every thread reads the same element).
+extern "C" __global__ void gemm_q6k_simple(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ C,              // (m, n)
+    int m,
+    int k,
+    int n)
+{
+    int bx = blockIdx.x;
+    int row = bx % m;
+    int nb = bx / m;
+    int col = nb * 256 + threadIdx.x;
+    if (col >= n) return;
+    int nsup = k >> 8;
+    const float* arow = A + (size_t)row * k;
+    float acc = 0.0f;
+    for (int kb = 0; kb < nsup; ++kb) {
+        const unsigned char* blk = B + (size_t)(col * nsup + kb) * 210;
+#pragma unroll
+        for (int j = 0; j < 256; ++j) {
+            acc += arow[kb * 256 + j] * q6k_weight(blk, j);
+        }
+    }
+    C[(size_t)row * n + col] = acc;
+}
+
+/// Q6_K GEMM, m > 64 (STT one-shot frames): block per (32 rows × 256 cols).
+/// Each thread owns one column and serially dots all 256 weights of each
+/// k-block for its 32 rows (A reads broadcast across the 256 threads) —
+/// B is read once per row-chunk, not once per row.
+extern "C" __global__ void gemm_q6k_tiled(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ C,              // (m, n)
+    int m,
+    int k,
+    int n)
+{
+    const int BM = 32, BN = 256;
+    int tid = threadIdx.x;
+    int col = blockIdx.x * BN + tid;
+    int r0 = blockIdx.y * BM;
+    int nblk = k >> 8;
+    float acc[BM];
+#pragma unroll
+    for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;
+    for (int kb = 0; kb < nblk; ++kb) {
+        // Blocks are col-major: (col·nsuper + kb)·210 (matches the uploader).
+        const unsigned char* blk = B + (size_t)(col * nblk + kb) * 210;
+        if (col < n) {
+            for (int j = 0; j < 256; ++j) {
+                float w = q6k_weight(blk, j);
+                const float* a0 = A + (size_t)r0 * k + kb * 256 + j;
+#pragma unroll
+                for (int rr = 0; rr < BM; ++rr) {
+                    if (r0 + rr < m) acc[rr] += a0[rr * k] * w;
+                }
+            }
+        }
+    }
+    if (col >= n) return;
+    float* c0 = C + (size_t)r0 * n + col;
+#pragma unroll
+    for (int rr = 0; rr < BM; ++rr) {
+        if (r0 + rr < m) c0[rr * n] = acc[rr];
+    }
+}
+
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //
 // The DAC codec decoder runs ~10 conv1d + 4 conv-transpose1d per piece

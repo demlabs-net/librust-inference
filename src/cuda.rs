@@ -422,6 +422,25 @@ impl Backend for CudaBackend {
         Ok(Tensor::from_cuda_i8(s, sc, shape))
     }
 
+    fn from_cpu_q6k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        let per: usize = shape[1..].iter().product();
+        if per % 256 != 0 {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q6k: per-dim {per} not a multiple of 256 (Q6_K super-blocks)"
+            )));
+        }
+        let expect = shape[0] * (per / 256) * 210;
+        if data.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q6k: {} packed bytes for shape {shape:?} (expected {expect})",
+                data.len()
+            )));
+        }
+        let mut s = unsafe { self.stream.alloc::<u8>(data.len()) }.map_err(map_err)?;
+        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        Ok(Tensor::from_cuda_q6k(s, shape))
+    }
+
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
         // raw bits and widens on the CPU — same result as a device-side cast.
@@ -445,6 +464,42 @@ impl Backend for CudaBackend {
                     .enumerate()
                     .map(|(i, v)| f32::from(v) * sc[i / per.max(1)])
                     .collect())
+            }
+            crate::backend::TensorInner::CudaQ6K(data) => {
+                let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
+                let per: usize = t.shape()[1..].iter().product();
+                let rows = t.shape()[0];
+                let nsuper = per / 256;
+                let mut out = vec![0f32; rows * per];
+                for r in 0..rows {
+                    for sb in 0..nsuper {
+                        let blk = &raw[(r * nsuper + sb) * 210..(r * nsuper + sb + 1) * 210];
+                        let d = f32::from(half::f16::from_bits(
+                            u16::from_le_bytes([blk[208], blk[209]]),
+                        ));
+                        for nchunk in 0..2 {
+                            for lane in 0..32 {
+                                let ql0 = blk[nchunk * 64 + lane];
+                                let ql1 = blk[nchunk * 64 + lane + 32];
+                                let qh = blk[128 + nchunk * 32 + lane];
+                                let base = r * per + sb * 256 + nchunk * 128 + lane;
+                                let sc0 = blk[192 + nchunk * 8 + (lane >> 4)] as i8 as f32;
+                                let sc1 = blk[192 + nchunk * 8 + (lane >> 4) + 2] as i8 as f32;
+                                let sc2 = blk[192 + nchunk * 8 + (lane >> 4) + 4] as i8 as f32;
+                                let sc3 = blk[192 + nchunk * 8 + (lane >> 4) + 6] as i8 as f32;
+                                let q1 = (((ql0 & 0xF) | (((qh >> 0) & 3) << 4)) as i32 - 32) as f32;
+                                let q2 = (((ql1 & 0xF) | (((qh >> 2) & 3) << 4)) as i32 - 32) as f32;
+                                let q3 = ((((ql0 >> 4) & 0xF) | (((qh >> 4) & 3) << 4)) as i32 - 32) as f32;
+                                let q4 = ((((ql1 >> 4) & 0xF) | (((qh >> 6) & 3) << 4)) as i32 - 32) as f32;
+                                out[base + 0] = d * sc0 * q1;
+                                out[base + 32] = d * sc1 * q2;
+                                out[base + 64] = d * sc2 * q3;
+                                out[base + 96] = d * sc3 * q4;
+                            }
+                        }
+                    }
+                }
+                Ok(out)
             }
             _ => self.stream.clone_dtoh(t.as_cuda()).map_err(map_err),
         }
@@ -488,7 +543,95 @@ impl Backend for CudaBackend {
     fn gemm_nt(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError> {
         let (m, k) = (a.shape()[0], a.shape()[1]);
         let n = b.shape()[0];
-        // Weight formats: fp16/bf16 cast the activation row(s) and run cuBLAS
+        // Q6_K packed weights: fused-dequant GEMM (fp32 activations). m≤64
+        // (TTS decode/fill) uses split-k, m>64 (STT one-shot) the row-chunk
+        // kernel — the same policy as the int8 path.
+        if let crate::backend::TensorInner::CudaQ6K(bpack) = &b.inner {
+            let k32 = k as i32;
+            let n32 = n as i32;
+            let m32 = m as i32;
+            let c = c.as_cuda_mut();
+            let nblk = k / 256;
+            let grid_x = (n + 255) / 256;
+            // Split-k only when a k-slice fits the shared A window (≤ 2048)
+            // and the grid stays sane; otherwise the no-shared fallback
+            // (the slow-AR w2 has k=9728 — k/S > 2048 for every S).
+            let s = if m <= 64 {
+                [32usize, 16, 8, 4, 2]
+                    .iter()
+                    .copied()
+                    .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * m * s <= 512)
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+            if m <= 64 && s > 1 {
+                let cpart = self.take_pooled(s * m * n)?;
+                let f = self.function("gemm_q6k_splitk")?;
+                let cfg = LaunchConfig {
+                    grid_dim: ((grid_x * m) as u32, s as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(a.as_cuda());
+                la.arg(bpack);
+                la.arg(&cpart);
+                la.arg(&k32);
+                la.arg(&n32);
+                let s32 = s as i32;
+                la.arg(&s32);
+                la.arg(&m32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                let f = self.function("gemm_i8_reduce")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&cpart);
+                la.arg(c);
+                la.arg(&n32);
+                la.arg(&s32);
+                la.arg(&m32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+            } else if m <= 64 {
+                // k/S > 2048 for every S: no shared staging, direct A reads.
+                let f = self.function("gemm_q6k_simple")?;
+                let cfg = LaunchConfig {
+                    grid_dim: ((grid_x * m) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(a.as_cuda());
+                la.arg(bpack);
+                la.arg(c);
+                la.arg(&m32);
+                la.arg(&k32);
+                la.arg(&n32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            } else {
+                let f = self.function("gemm_q6k_tiled")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(a.as_cuda());
+                la.arg(bpack);
+                la.arg(c);
+                la.arg(&m32);
+                la.arg(&k32);
+                la.arg(&n32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            }
+            return Ok(());
+        }
+        // Plain fp16/bf16 weights: cast the activation row(s) and run cuBLAS
         // gemm_ex (16F×16F → 32F out, fp32 accumulate) — halves the weight
         // read traffic (the decode bottleneck) and the weight VRAM; int8 uses
         // our Q8_0-style kernels below.

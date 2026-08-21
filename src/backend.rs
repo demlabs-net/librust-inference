@@ -51,6 +51,11 @@ pub(crate) enum TensorInner {
         data: cudarc::driver::CudaSlice<i8>,
         scale: cudarc::driver::CudaSlice<f32>,
     },
+    /// Q6_K packed weights (GEMM operands only): canonical llama.cpp layout,
+    /// 210 bytes per 256-weight super-block (ql[128] + qh[64] + scales[16] +
+    /// f16 d) — dequantized inline in the fused GEMM kernel.
+    #[cfg(feature = "cuda")]
+    CudaQ6K(cudarc::driver::CudaSlice<u8>),
     /// Backend-less builds: no storage exists (contract skeleton only). Keeps
     /// the enum non-empty so `Tensor` methods compile without warnings.
     #[cfg(not(any(feature = "metal", feature = "cpu", feature = "cuda")))]
@@ -103,7 +108,7 @@ impl Tensor {
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("cpu_read() on a non-CPU tensor"),
             #[cfg(feature = "cuda")]
-            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("cpu_read() on a non-CPU tensor"),
+            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) => panic!("cpu_read() on a non-CPU tensor"),
         }
     }
 
@@ -115,7 +120,7 @@ impl Tensor {
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("cpu_write() on a non-CPU tensor"),
             #[cfg(feature = "cuda")]
-            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("cpu_write() on a non-CPU tensor"),
+            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) => panic!("cpu_write() on a non-CPU tensor"),
         }
     }
 
@@ -161,11 +166,25 @@ impl Tensor {
         Self { inner: TensorInner::CudaI8 { data, scale }, shape, dtype: Dtype::I8 }
     }
 
+    /// Q6_K packed-weight tensor (canonical 210 B / 256-weight blocks).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn from_cuda_q6k(data: cudarc::driver::CudaSlice<u8>, shape: Vec<usize>) -> Self {
+        Self { inner: TensorInner::CudaQ6K(data), shape, dtype: Dtype::I8 }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn as_cuda_q6k(&self) -> &cudarc::driver::CudaSlice<u8> {
+        match &self.inner {
+            TensorInner::CudaQ6K(b) => b,
+            _ => panic!("as_cuda_q6k() on a non-CudaQ6K tensor"),
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda(&self) -> &cudarc::driver::CudaSlice<f32> {
         match &self.inner {
             TensorInner::Cuda(b) => b.as_slice(),
-            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("as_cuda() on a half/int8 tensor"),
+            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) => panic!("as_cuda() on a half/int8/Q6K tensor"),
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda() on a non-CUDA tensor"),
             #[cfg(feature = "cpu")]
@@ -205,7 +224,7 @@ impl Tensor {
             TensorInner::Cuda(b) => unsafe {
                 &mut *Arc::as_ptr(b).cast_mut().as_mut().unwrap().as_slice_mut()
             },
-            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("as_cuda_mut() on a half/int8 tensor"),
+            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) => panic!("as_cuda_mut() on a half/int8/Q6K tensor"),
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda_mut() on a non-CUDA tensor"),
             #[cfg(feature = "cpu")]
@@ -321,6 +340,15 @@ pub trait Backend: Send + Sync {
         }
         let _ = rows;
         self.from_cpu_f32(&f32s, shape)
+    }
+
+    /// Upload Q6_K packed weights (canonical llama.cpp layout — 210 bytes per
+    /// 256-weight super-block; see `WeightFormat::Q6_K`). Only the CUDA
+    /// backend stores the packed form; default: unsupported.
+    fn from_cpu_q6k(&self, _data: &[u8], _shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "from_cpu_q6k: only the CUDA backend stores packed Q6_K weights".into(),
+        ))
     }
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;

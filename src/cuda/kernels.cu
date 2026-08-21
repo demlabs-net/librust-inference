@@ -1398,121 +1398,115 @@ __device__ inline float q6k_weight(const unsigned char* blk, int j) {
     return d * (float)(signed char)blk[192 + scb] * (float)qv;
 }
 
-/// Q6_K GEMM, small m (1..=64 — TTS fill/decode): split-k, mirror of
-/// gemm_i8_mn_splitk with fp32 activations (no activation quant — the packed
-/// weight dequant dominates). Grid (ceil(n/256)·m, S); each block computes a
-/// k-slice partial for one output row × 256 columns; `gemm_i8_reduce`
-/// combines the partials. Activations shared (f32, k/S ≤ 2048).
-extern "C" __global__ void gemm_q6k_splitk(
-    const float* __restrict__ A,        // (m, k)
-    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
-    float* __restrict__ Cpart,          // (S·m, n)
-    int k,
-    int n,
-    int S,
-    int m)
-{
-    const int BN = 256;
-    __shared__ float As[2048];
-    int tid = threadIdx.x;
-    int bx = blockIdx.x;
-    int row = bx % m;
-    int nb = bx / m;
-    int col = nb * BN + tid;
-    int ks = k / S;
-    int nblk_s = ks >> 8;
-    int nsup = k >> 8;
-    int kb0 = blockIdx.y * nblk_s;
-    const float* arow = A + (size_t)row * k;
-    // This block's k-slice of the row (slice = kb0·256 .. kb0·256 + ks).
-    for (int i = tid; i < ks; i += BN) As[i] = arow[kb0 * 256 + i];
-    __syncthreads();
-    float acc = 0.0f;
-    for (int t = 0; t < nblk_s; ++t) {
-        // Blocks are col-major: (col·nsuper + kb)·210 (matches the uploader).
-        const unsigned char* blk = B + (size_t)(col * nsup + kb0 + t) * 210;
-        if (col < n) {
-            // Full 256-weight dot of this k-slice for the thread's column.
-#pragma unroll
-            for (int j = 0; j < 256; ++j) {
-                acc += As[t * 256 + j] * q6k_weight(blk, j);
-            }
-        }
-    }
-    if (col < n) Cpart[(blockIdx.y * m + row) * n + col] = acc;
+/// Q4_0 canonical layout, 18 bytes per 32-weight block: f16 d (bytes 0..2)
+/// + 16 bytes of 4-bit nibbles. Dequant: w = ((nib & 0xF) - 8)·d (the -8
+/// offset is baked into the dequant — no stored zero-point).
+__device__ inline float q4k_weight(const unsigned char* blk, int j) {
+    float d = __half2float(*(const __half*)(blk));
+    int nib = blk[2 + (j >> 1)];
+    int q = (j & 1) ? (nib >> 4) : (nib & 0xF);
+    return (float)(q - 8) * d;
 }
 
-/// Q6_K GEMM fallback for k-slices that cannot fit the shared A window
-/// (k/S > 2048 — e.g. the slow-AR w2 with k=9728): no shared staging, each
-/// thread dots its column over ALL of k reading A directly (A broadcasts
-/// across the block — every thread reads the same element).
-extern "C" __global__ void gemm_q6k_simple(
-    const float* __restrict__ A,        // (m, k)
-    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
-    float* __restrict__ C,              // (m, n)
-    int m,
-    int k,
-    int n)
-{
-    int bx = blockIdx.x;
-    int row = bx % m;
-    int nb = bx / m;
-    int col = nb * 256 + threadIdx.x;
-    if (col >= n) return;
-    int nsup = k >> 8;
-    const float* arow = A + (size_t)row * k;
-    float acc = 0.0f;
-    for (int kb = 0; kb < nsup; ++kb) {
-        const unsigned char* blk = B + (size_t)(col * nsup + kb) * 210;
-#pragma unroll
-        for (int j = 0; j < 256; ++j) {
-            acc += arow[kb * 256 + j] * q6k_weight(blk, j);
-        }
-    }
-    C[(size_t)row * n + col] = acc;
+// Q6_K / Q4_0 packed-weight GEMMs — identical structure, the format differs
+// only in the inline dequant (WREAD), the block granularity (NSUP_SHIFT)
+// and the packed block size (BLK_BYTES).
+#define DEFINE_Q_GEMMS(SUF, WREAD, NSUP_SHIFT, WPB, BLK_BYTES)               \
+/* Small m (1..=64 — TTS fill/decode): split-k over k-slices; activations   \
+   shared (f32, k/S ≤ 2048); gemm_i8_reduce combines the partials.          \
+   Grid (ceil(n/256)·m, S), one block per (row, 256 cols). */               \
+extern "C" __global__ void SUF##_splitk(                                    \
+    const float* __restrict__ A,        /* (m, k) */                        \
+    const unsigned char* __restrict__ B,/* packed blocks, (col·nsuper+kb)·BLK_BYTES */ \
+    float* __restrict__ Cpart,          /* (S·m, n) */                      \
+    int k, int n, int S, int m)                                             \
+{                                                                           \
+    const int BN = 256;                                                     \
+    __shared__ float As[2048];                                              \
+    int tid = threadIdx.x;                                                  \
+    int bx = blockIdx.x;                                                    \
+    int row = bx % m;                                                       \
+    int nb = bx / m;                                                        \
+    int col = nb * BN + tid;                                                \
+    int ks = k / S;                                                         \
+    int nblk_s = ks >> NSUP_SHIFT;                                          \
+    int nsup = k >> NSUP_SHIFT;                                             \
+    int kb0 = blockIdx.y * nblk_s;                                          \
+    const float* arow = A + (size_t)row * k;                                \
+    for (int i = tid; i < ks; i += BN) As[i] = arow[kb0 * WPB + i];         \
+    __syncthreads();                                                        \
+    float acc = 0.0f;                                                       \
+    for (int t = 0; t < nblk_s; ++t) {                                      \
+        const unsigned char* blk = B + (size_t)(col * nsup + kb0 + t) * BLK_BYTES; \
+        if (col < n) {                                                      \
+            for (int j = 0; j < WPB; ++j) {                                 \
+                acc += As[t * WPB + j] * WREAD(blk, j);                     \
+            }                                                               \
+        }                                                                   \
+    }                                                                       \
+    if (col < n) Cpart[(blockIdx.y * m + row) * n + col] = acc;             \
+}                                                                           \
+/* Fallback for k-slices that cannot fit the shared A window                \
+   (k/S > 2048 — e.g. the slow-AR w2 with k=9728): no shared staging,       \
+   each thread dots its column over ALL of k reading A directly. */         \
+extern "C" __global__ void SUF##_simple(                                    \
+    const float* __restrict__ A,        /* (m, k) */                        \
+    const unsigned char* __restrict__ B,/* packed blocks */                 \
+    float* __restrict__ C,              /* (m, n) */                        \
+    int m, int k, int n)                                                    \
+{                                                                           \
+    int bx = blockIdx.x;                                                    \
+    int row = bx % m;                                                       \
+    int nb = bx / m;                                                        \
+    int col = nb * 256 + threadIdx.x;                                       \
+    if (col >= n) return;                                                   \
+    int nsup = k >> NSUP_SHIFT;                                             \
+    const float* arow = A + (size_t)row * k;                                \
+    float acc = 0.0f;                                                       \
+    for (int kb = 0; kb < nsup; ++kb) {                                     \
+        const unsigned char* blk = B + (size_t)(col * nsup + kb) * BLK_BYTES; \
+        for (int j = 0; j < WPB; ++j) {                                     \
+            acc += arow[kb * WPB + j] * WREAD(blk, j);                      \
+        }                                                                   \
+    }                                                                       \
+    C[(size_t)row * n + col] = acc;                                         \
+}                                                                           \
+/* m > 64 (STT one-shot frames): block per (32 rows × 256 cols), thread =   \
+   one column, 32 row accumulators; B read once per row-chunk. */           \
+extern "C" __global__ void SUF##_tiled(                                     \
+    const float* __restrict__ A,        /* (m, k) */                        \
+    const unsigned char* __restrict__ B,/* packed blocks */                 \
+    float* __restrict__ C,              /* (m, n) */                        \
+    int m, int k, int n)                                                    \
+{                                                                           \
+    const int BM = 32, BN = 256;                                            \
+    int tid = threadIdx.x;                                                  \
+    int col = blockIdx.x * BN + tid;                                        \
+    int r0 = blockIdx.y * BM;                                               \
+    int nblk = k >> NSUP_SHIFT;                                             \
+    float acc[BM];                                                          \
+    for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                         \
+    for (int kb = 0; kb < nblk; ++kb) {                                     \
+        const unsigned char* blk = B + (size_t)(col * nblk + kb) * BLK_BYTES; \
+        if (col < n) {                                                      \
+            for (int j = 0; j < WPB; ++j) {                                 \
+                float w = WREAD(blk, j);                                    \
+                const float* a0 = A + (size_t)r0 * k + kb * WPB + j;        \
+                for (int rr = 0; rr < BM; ++rr) {                           \
+                    if (r0 + rr < m) acc[rr] += a0[rr * k] * w;             \
+                }                                                           \
+            }                                                               \
+        }                                                                   \
+    }                                                                       \
+    if (col >= n) return;                                                   \
+    float* c0 = C + (size_t)r0 * n + col;                                   \
+    for (int rr = 0; rr < BM; ++rr) {                                       \
+        if (r0 + rr < m) c0[rr * n] = acc[rr];                              \
+    }                                                                       \
 }
 
-/// Q6_K GEMM, m > 64 (STT one-shot frames): block per (32 rows × 256 cols).
-/// Each thread owns one column and serially dots all 256 weights of each
-/// k-block for its 32 rows (A reads broadcast across the 256 threads) —
-/// B is read once per row-chunk, not once per row.
-extern "C" __global__ void gemm_q6k_tiled(
-    const float* __restrict__ A,        // (m, k)
-    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
-    float* __restrict__ C,              // (m, n)
-    int m,
-    int k,
-    int n)
-{
-    const int BM = 32, BN = 256;
-    int tid = threadIdx.x;
-    int col = blockIdx.x * BN + tid;
-    int r0 = blockIdx.y * BM;
-    int nblk = k >> 8;
-    float acc[BM];
-#pragma unroll
-    for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;
-    for (int kb = 0; kb < nblk; ++kb) {
-        // Blocks are col-major: (col·nsuper + kb)·210 (matches the uploader).
-        const unsigned char* blk = B + (size_t)(col * nblk + kb) * 210;
-        if (col < n) {
-            for (int j = 0; j < 256; ++j) {
-                float w = q6k_weight(blk, j);
-                const float* a0 = A + (size_t)r0 * k + kb * 256 + j;
-#pragma unroll
-                for (int rr = 0; rr < BM; ++rr) {
-                    if (r0 + rr < m) acc[rr] += a0[rr * k] * w;
-                }
-            }
-        }
-    }
-    if (col >= n) return;
-    float* c0 = C + (size_t)r0 * n + col;
-#pragma unroll
-    for (int rr = 0; rr < BM; ++rr) {
-        if (r0 + rr < m) c0[rr * n] = acc[rr];
-    }
-}
+DEFINE_Q_GEMMS(gemm_q6k, q6k_weight, 8, 256, 210)
+DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18)
 
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //

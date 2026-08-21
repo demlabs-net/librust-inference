@@ -441,6 +441,25 @@ impl Backend for CudaBackend {
         Ok(Tensor::from_cuda_q6k(s, shape))
     }
 
+    fn from_cpu_q4k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        let per: usize = shape[1..].iter().product();
+        if per % 32 != 0 {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q4k: per-dim {per} not a multiple of 32 (Q4_0 blocks)"
+            )));
+        }
+        let expect = shape[0] * (per / 32) * 18;
+        if data.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q4k: {} packed bytes for shape {shape:?} (expected {expect})",
+                data.len()
+            )));
+        }
+        let mut s = unsafe { self.stream.alloc::<u8>(data.len()) }.map_err(map_err)?;
+        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        Ok(Tensor::from_cuda_q4k(s, shape))
+    }
+
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
         // raw bits and widens on the CPU — same result as a device-side cast.
@@ -501,6 +520,25 @@ impl Backend for CudaBackend {
                 }
                 Ok(out)
             }
+            crate::backend::TensorInner::CudaQ4K(data) => {
+                let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
+                let per: usize = t.shape()[1..].iter().product();
+                let rows = t.shape()[0];
+                let nsup = per / 32;
+                let mut out = vec![0f32; rows * per];
+                for r in 0..rows {
+                    for sb in 0..nsup {
+                        let blk = &raw[(r * nsup + sb) * 18..(r * nsup + sb + 1) * 18];
+                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+                        for j in 0..32 {
+                            let nib = blk[2 + (j >> 1)];
+                            let q = if j & 1 == 1 { nib >> 4 } else { nib & 0xF };
+                            out[r * per + sb * 32 + j] = (q as i32 - 8) as f32 * d;
+                        }
+                    }
+                }
+                Ok(out)
+            }
             _ => self.stream.clone_dtoh(t.as_cuda()).map_err(map_err),
         }
     }
@@ -543,93 +581,15 @@ impl Backend for CudaBackend {
     fn gemm_nt(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError> {
         let (m, k) = (a.shape()[0], a.shape()[1]);
         let n = b.shape()[0];
-        // Q6_K packed weights: fused-dequant GEMM (fp32 activations). m≤64
-        // (TTS decode/fill) uses split-k, m>64 (STT one-shot) the row-chunk
-        // kernel — the same policy as the int8 path.
+        // Q6_K / Q4_0 packed weights: fused-dequant GEMM (fp32 activations).
+        // m≤64 (TTS decode/fill) uses split-k, k/S > 2048 falls back to the
+        // no-shared kernel (the slow-AR w2 has k=9728), m>64 (STT one-shot)
+        // uses the row-chunk kernel — the same policy as the int8 path.
         if let crate::backend::TensorInner::CudaQ6K(bpack) = &b.inner {
-            let k32 = k as i32;
-            let n32 = n as i32;
-            let m32 = m as i32;
-            let c = c.as_cuda_mut();
-            let nblk = k / 256;
-            let grid_x = (n + 255) / 256;
-            // Split-k only when a k-slice fits the shared A window (≤ 2048)
-            // and the grid stays sane; otherwise the no-shared fallback
-            // (the slow-AR w2 has k=9728 — k/S > 2048 for every S).
-            let s = if m <= 64 {
-                [32usize, 16, 8, 4, 2]
-                    .iter()
-                    .copied()
-                    .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * m * s <= 512)
-                    .unwrap_or(1)
-            } else {
-                1
-            };
-            if m <= 64 && s > 1 {
-                let cpart = self.take_pooled(s * m * n)?;
-                let f = self.function("gemm_q6k_splitk")?;
-                let cfg = LaunchConfig {
-                    grid_dim: ((grid_x * m) as u32, s as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
-                la.arg(bpack);
-                la.arg(&cpart);
-                la.arg(&k32);
-                la.arg(&n32);
-                let s32 = s as i32;
-                la.arg(&s32);
-                la.arg(&m32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                let f = self.function("gemm_i8_reduce")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&cpart);
-                la.arg(c);
-                la.arg(&n32);
-                la.arg(&s32);
-                la.arg(&m32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
-            } else if m <= 64 {
-                // k/S > 2048 for every S: no shared staging, direct A reads.
-                let f = self.function("gemm_q6k_simple")?;
-                let cfg = LaunchConfig {
-                    grid_dim: ((grid_x * m) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
-                la.arg(bpack);
-                la.arg(c);
-                la.arg(&m32);
-                la.arg(&k32);
-                la.arg(&n32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-            } else {
-                let f = self.function("gemm_q6k_tiled")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
-                la.arg(bpack);
-                la.arg(c);
-                la.arg(&m32);
-                la.arg(&k32);
-                la.arg(&n32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-            }
-            return Ok(());
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 210, "gemm_q6k");
+        }
+        if let crate::backend::TensorInner::CudaQ4K(bpack) = &b.inner {
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 5, 18, "gemm_q4k");
         }
         // Plain fp16/bf16 weights: cast the activation row(s) and run cuBLAS
         // gemm_ex (16F×16F → 32F out, fp32 accumulate) — halves the weight
@@ -1839,4 +1799,113 @@ impl Backend for CudaBackend {
         idx.copy_from_slice(&got);
         Ok(())
     }
+}
+
+impl CudaBackend {
+    /// Fused-dequant GEMM for packed weights (Q6_K / Q4_0). `nsup_shift`:
+    /// weights per packed block (8 → 256, 5 → 32); `blk_bytes`: 210 / 18.
+    /// Kernel family `name` ∈ {gemm_q6k, gemm_q4k} — the same three shapes.
+    fn gemm_packed_nt(
+        &self,
+        a: &Tensor,
+        bpack: &cudarc::driver::CudaSlice<u8>,
+        c: &Tensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        nsup_shift: u32,
+        blk_bytes: usize,
+        name: &str,
+    ) -> Result<(), BackendError> {
+        let (splitk, simple, tiled) = match name {
+            "gemm_q6k" => ("gemm_q6k_splitk", "gemm_q6k_simple", "gemm_q6k_tiled"),
+            "gemm_q4k" => ("gemm_q4k_splitk", "gemm_q4k_simple", "gemm_q4k_tiled"),
+            _ => unreachable!("gemm_packed_nt: unknown family {name}"),
+        };
+        let k32 = k as i32;
+        let n32 = n as i32;
+        let m32 = m as i32;
+        let c = c.as_cuda_mut();
+        let nblk = k >> nsup_shift;
+        let grid_x = (n + 255) / 256;
+        // Split-k only when a k-slice fits the shared A window (≤ 2048)
+        // and the grid stays sane; otherwise the no-shared fallback
+        // (the slow-AR w2 has k=9728 — k/S > 2048 for every S).
+        let s = if m <= 64 {
+            [32usize, 16, 8, 4, 2]
+                .iter()
+                .copied()
+                .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * m * s <= 512)
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        if m <= 64 && s > 1 {
+            let cpart = self.take_pooled(s * m * n)?;
+            let f = self.function(splitk)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((grid_x * m) as u32, s as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(bpack);
+            la.arg(&cpart);
+            la.arg(&k32);
+            la.arg(&n32);
+            let s32 = s as i32;
+            la.arg(&s32);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            let f = self.function("gemm_i8_reduce")?;
+            let cfg = LaunchConfig {
+                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(&cpart);
+            la.arg(c);
+            la.arg(&n32);
+            la.arg(&s32);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        } else if m <= 64 {
+            // k/S > 2048 for every S: no shared staging, direct A reads.
+            let f = self.function(simple)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((grid_x * m) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(bpack);
+            la.arg(c);
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        } else {
+            let f = self.function(tiled)?;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(bpack);
+            la.arg(c);
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        }
+        let _ = blk_bytes; // layout constant — kept for the kernel contract
+        Ok(())
+    }
+
 }

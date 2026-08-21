@@ -1678,6 +1678,84 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 
+    fn mhsa_rel_pos(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        qp: &Tensor,
+        p: &Tensor,
+        u: &Tensor,
+        vb: &Tensor,
+        y: &Tensor,
+        wfull: Option<&Tensor>,
+        dk: usize,
+        dp: usize,
+        mode: u32,
+    ) -> Result<(), BackendError> {
+        let (t, d) = (q.shape()[0], q.shape()[1]);
+        let h = d / dk;
+        let f = self.function("mhsa_rel_pos_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (((t + 3) / 4) as u32, h as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(q.as_cuda());
+        la.arg(k.as_cuda());
+        la.arg(v.as_cuda());
+        la.arg(qp.as_cuda());
+        la.arg(p.as_cuda());
+        la.arg(u.as_cuda());
+        la.arg(vb.as_cuda());
+        la.arg(y.as_cuda_mut());
+        if let Some(w) = wfull {
+            la.arg(w.as_cuda_mut());
+        } else {
+            la.arg(y.as_cuda()); // dummy — kernel guards via wfull != NULL
+        }
+        let t32 = t as i32;
+        la.arg(&t32);
+        let dk32 = dk as i32;
+        la.arg(&dk32);
+        let dp32 = dp as i32;
+        la.arg(&dp32);
+        let h32 = h as i32;
+        la.arg(&h32);
+        let m32 = mode as i32;
+        la.arg(&m32);
+        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+    }
+
+    fn mhsa_apply_weights(
+        &self,
+        w: &Tensor,
+        x: &Tensor,
+        y: &Tensor,
+        vh: usize,
+    ) -> Result<(), BackendError> {
+        let (t, d) = (x.shape()[0], x.shape()[1]);
+        let h = d / vh;
+        let f = self.function("mhsa_apply_weights_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, h as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(w.as_cuda());
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda_mut());
+        let t32 = t as i32;
+        la.arg(&t32);
+        let vh32 = vh as i32;
+        la.arg(&vh32);
+        let h32 = h as i32;
+        la.arg(&h32);
+        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+    }
+
     fn uniform_attn(&self, v: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         let (b, t, c) = (v.shape()[0], v.shape()[1], v.shape()[2]);
         let n = b * c;

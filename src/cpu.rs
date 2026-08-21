@@ -994,6 +994,122 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    /// Relative-position MHSA (NeMo rel_pos / zipformer) — the CPU oracle:
+    /// per-head scores ((q+u)·kᵀ + shift((q+v)·pᵀ))/√dk, softmax, ·v.
+    fn mhsa_rel_pos(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        qp: &Tensor,
+        p: &Tensor,
+        u: &Tensor,
+        vb: &Tensor,
+        y: &Tensor,
+        wfull: Option<&Tensor>,
+        dk: usize,
+        dp: usize,
+        mode: u32,
+    ) -> Result<(), BackendError> {
+        let (t, d) = (q.shape()[0], q.shape()[1]);
+        let h = d / dk;
+        if y.shape() != &[t, d] || p.shape()[0] != 2 * t - 1 {
+            return Err(BackendError::Shape("mhsa_rel_pos: shape mismatch".into()));
+        }
+        let (qd, kd, vd, qpd, pd) = (
+            data(q).to_vec(), data(k).to_vec(), data(v).to_vec(),
+            data(qp).to_vec(), data(p).to_vec(),
+        );
+        let (ud, vbd) = (data(u).to_vec(), data(vb).to_vec());
+        let mut yd = data_mut(y);
+        yd.fill(0.0);
+        let mut wfd: Option<Vec<f32>> = wfull.map(|_| vec![0.0f32; h * t * t]);
+        let scale = 1.0 / (dk as f32).sqrt();
+        for hh in 0..h {
+            let (qo, ko, vo, po) = (hh * dk, hh * dk, hh * dk, hh * dp);
+            let (uo, vo_b) = (hh * dk, hh * dk);
+            for qt in 0..t {
+                let mut scores = vec![0.0f32; t];
+                for tk in 0..t {
+                    let mut ac = 0.0f32;
+                    for j in 0..dk {
+                        ac += (qd[qt * d + qo + j] + ud[uo + j]) * kd[tk * d + ko + j];
+                    }
+                    let mut bd = 0.0f32;
+                    if mode == 0 {
+                        // XL shift: position term reads query row
+                        // ((tk+1)·T + qt)/(2T) and p offset ((tk+1)·T + qt) % (2T) − 1.
+                        let flat = (tk + 1) * t + qt;
+                        let qrow = flat / (2 * t);
+                        let poff = flat % (2 * t);
+                        if poff > 0 {
+                            for j in 0..dp {
+                                bd += (qd[qrow * d + qo + j] + vbd[vo_b + j]) * pd[(poff - 1) * (h * dp) + po + j];
+                            }
+                        }
+                    } else {
+                        let poff = t - 1 + tk - qt;
+                        for j in 0..dp {
+                            bd += (qpd[qt * (h * dp) + hh * dp + j] + vbd[hh * dp + j]) * pd[poff * (h * dp) + po + j];
+                        }
+                    }
+                    scores[tk] = (ac + bd) * scale;
+                }
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    let e = (*s - mx).exp();
+                    *s = e;
+                    sum += e;
+                }
+                if let Some(w) = wfd.as_mut() {
+                    for (tk, &e) in scores.iter().enumerate() {
+                        w[hh * t * t + qt * t + tk] = e / sum;
+                    }
+                }
+                for (tk, &e) in scores.iter().enumerate() {
+                    for j in 0..dk {
+                        yd[qt * d + qo + j] += e * vd[tk * d + vo + j];
+                    }
+                }
+                for j in 0..dk {
+                    yd[qt * d + qo + j] /= sum;
+                }
+            }
+        }
+        if let (Some(wt), Some(w)) = (wfull, wfd) {
+            let mut wd = data_mut(wt);
+            wd.copy_from_slice(&w);
+        }
+        Ok(())
+    }
+
+    /// Per-head attention application over time (zipformer SelfAttention).
+    fn mhsa_apply_weights(
+        &self,
+        w: &Tensor,
+        x: &Tensor,
+        y: &Tensor,
+        vh: usize,
+    ) -> Result<(), BackendError> {
+        let (t, d) = (x.shape()[0], x.shape()[1]);
+        let h = d / vh;
+        let (wd, xd) = (data(w).to_vec(), data(x).to_vec());
+        let mut yd = data_mut(y);
+        for hh in 0..h {
+            for qt in 0..t {
+                for j in 0..vh {
+                    let mut acc = 0.0f32;
+                    for tk in 0..t {
+                        acc += wd[hh * t * t + qt * t + tk] * xd[tk * d + hh * vh + j];
+                    }
+                    yd[qt * d + hh * vh + j] = acc;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn uniform_attn(&self, v: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // Y (B,C) = mean over time of V (B,T,C).
         let (b, t, c) = (v.shape()[0], v.shape()[1], v.shape()[2]);

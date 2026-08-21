@@ -592,6 +592,48 @@ pub trait Backend: Send + Sync {
     /// Uniform attention (STT): Y = mean over the time axis of V (B,T,C) → (B,C).
     fn uniform_attn(&self, v: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// Bidirectional MHSA with relative positions (NeMo conformer rel_pos /
+    /// icefall zipformer): q/k/v (T, H·dk), p (2T−1, H·dp), u/vb (H·dk, the
+    /// per-head pos biases flattened), y (T, H·dk).
+    /// scores = ((q+u)·kᵀ + shift((q+v)·pᵀ)) / √dk; softmax over keys;
+    /// y = softmax·v. `mode` 0 = NeMo Transformer-XL shift, 1 = zipformer
+    /// direct shift. When `w0` is Some the head-0 post-softmax weights
+    /// (T, T) are written there (zipformer nonlin attention). f32-compute.
+    #[allow(clippy::too_many_arguments)]
+    fn mhsa_rel_pos(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        qp: &Tensor,
+        p: &Tensor,
+        u: &Tensor,
+        vb: &Tensor,
+        y: &Tensor,
+        wfull: Option<&Tensor>,
+        dk: usize,
+        dp: usize,
+        mode: u32,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "mhsa_rel_pos: backend does not implement relative-position attention".into(),
+        ))
+    }
+
+    /// Per-head attention application over time (zipformer SelfAttention):
+    /// y (T, H·vh) = w (H, T, T) · x (T, H·vh). f32-compute.
+    fn mhsa_apply_weights(
+        &self,
+        w: &Tensor,
+        x: &Tensor,
+        y: &Tensor,
+        vh: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "mhsa_apply_weights: backend does not implement attention-weight application".into(),
+        ))
+    }
+
     // ── KV cache ──
     /// Write SRC (B, Tq, D) into DST (B, cap, D) starting at position `pos`.
     /// Quantized KV formats quantize on write here; fused attention

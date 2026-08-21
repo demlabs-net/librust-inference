@@ -1055,6 +1055,159 @@ ATTN_K(q8, signed char, 2)
 
 ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
 
+// ─────────────────── relative-position attention (NeMo/Zipformer) ───────
+// Bidirectional MHSA with relative position scores:
+//   ac = (q + u) · kᵀ                          content–content (over dk)
+//   bd = (q + v) · pᵀ                          content–position (over dp)
+//   mode 0 (NeMo Transformer-XL): bd [T, 2T−1] shifted with the XL pad:
+//     shifted[t][t'] = bd_pad[((t'+1)·T + t) / (2T)][((t'+1)·T + t) % (2T)]
+//     with bd_pad[r][0] = 0;  u/v = pos_bias_u/v (per-head, flattened).
+//   mode 1 (icefall zipformer): shifted[t][t'] = bd[t][T−1 + t' − t]
+//     (no padding, no u/v biases — pass zeros).
+// scores = (ac + bd)/√dk; softmax over keys; y = softmax·v (over dk cols).
+// When `w0` is non-null the head-0 post-softmax weights [T, T] are written
+// there (zipformer nonlin attention).
+// One block per (head, query-chunk of Q); scores staged in shared
+// (Q·T ≤ 32 KB → Q=4 at T ≤ 2048 — the STT frame cap).
+extern "C" __global__ void mhsa_rel_pos_f32(
+    const float* __restrict__ q,    // (T, H·dk) content queries
+    const float* __restrict__ k,    // (T, H·dk)
+    const float* __restrict__ v,    // (T, H·dk)
+    const float* __restrict__ qp,   // (T, H·dp) position queries (zipformer p-slice; NeMo: = q)
+    const float* __restrict__ p,    // (2T−1, H·dp)
+    const float* __restrict__ u,    // (H·dk) pos_bias_u (flattened per head)
+    const float* __restrict__ vb,   // (H·dp) pos_bias_v (flattened per head)
+    float* __restrict__ y,          // (T, H·dk)
+    float* __restrict__ wfull,      // (H, T, T) post-softmax weights or null
+    int T,
+    int dk,
+    int dp,
+    int H,
+    int mode)
+{
+    const int Q = 4;
+    __shared__ float scs[Q][2048];
+    __shared__ float red[256];
+    int hh = blockIdx.y;
+    int t0 = blockIdx.x * Q;
+    int tid = threadIdx.x;
+    const float* qh = q + hh * dk;
+    const float* kh = k + hh * dk;
+    const float* vh = v + hh * dk;
+    const float* qph = qp + hh * dp;
+    const float* ph = p + hh * dp;
+    const float* uh = u + hh * dk;
+    const float* vbh = vb + hh * dp;
+    float scale = rsqrtf((float)dk);
+    // ── scores for the chunk's Q query rows ──
+    int pairs = Q * T;
+    for (int i = tid; i < pairs; i += 256) {
+        int ql = i / T;
+        int t1 = i % T;
+        int qt = t0 + ql;
+        if (qt >= T) { scs[ql][t1] = 0.0f; continue; }
+        const float* qrow = qh + qt * (H * dk);
+        const float* krow = kh + t1 * (H * dk);
+        float ac = 0.0f;
+        for (int j = 0; j < dk; ++j) {
+            ac += (qrow[j] + uh[j]) * krow[j];
+        }
+        float bd = 0.0f;
+        if (mode == 0) {
+            int flat = (t1 + 1) * T + qt;
+            int qrow_i = flat / (2 * T);
+            int poff = flat % (2 * T);
+            if (poff > 0) {
+                const float* qr = qh + qrow_i * (H * dk);
+                const float* pr = ph + (poff - 1) * (H * dp);
+                for (int j = 0; j < dp; ++j) {
+                    bd += (qr[j] + vbh[j]) * pr[j];
+                }
+            }
+        } else {
+            int poff = T - 1 + t1 - qt;
+            const float* qpr = qph + qt * (H * dp);
+            const float* pr = ph + poff * (H * dp);
+            for (int j = 0; j < dp; ++j) {
+                bd += (qpr[j] + vbh[j]) * pr[j];
+            }
+        }
+        scs[ql][t1] = (ac + bd) * scale;
+    }
+    __syncthreads();
+    // ── per-row softmax + weighted V ──
+    for (int ql = 0; ql < Q; ++ql) {
+        int qt = t0 + ql;
+        if (qt >= T) continue;
+        // row max
+        float mx = -INFINITY;
+        for (int i = tid; i < T; i += 256) mx = fmaxf(mx, scs[ql][i]);
+        red[tid] = mx;
+        __syncthreads();
+        for (int s = 256 / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+            __syncthreads();
+        }
+        float row_max = red[0];
+        // exp → sum
+        float sum = 0.0f;
+        for (int i = tid; i < T; i += 256) {
+            float e = __expf(scs[ql][i] - row_max);
+            scs[ql][i] = e;
+            sum += e;
+        }
+        red[tid] = sum;
+        __syncthreads();
+        for (int s = 256 / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float inv = 1.0f / red[0];
+        // post-softmax weights out (zipformer SelfAttention / NonlinAttention)
+        if (wfull != NULL) {
+            for (int i = tid; i < T; i += 256) {
+                wfull[hh * T * T + qt * T + i] = scs[ql][i] * inv;
+            }
+        }
+        // weighted V: thread j owns output column j of this row
+        if (tid < dk) {
+            float acc = 0.0f;
+            const float* vcol = vh + tid;
+            const float* srow = scs[ql];
+            for (int t1 = 0; t1 < T; ++t1) {
+                acc += srow[t1] * vcol[t1 * (H * dk)];
+            }
+            y[(qt) * (H * dk) + hh * dk + tid] = acc * inv;
+        }
+        __syncthreads();
+    }
+}
+
+/// Per-head attention application (zipformer SelfAttention / NonlinAttention):
+/// y (T, H·vh) = w (H, T, T) · x (T, H·vh), the post-softmax weights applied
+/// over time. One block per head.
+extern "C" __global__ void mhsa_apply_weights_f32(
+    const float* __restrict__ w,    // (H, T, T) post-softmax weights
+    const float* __restrict__ x,    // (T, H·vh)
+    float* __restrict__ y,          // (T, H·vh)
+    int T,
+    int vh,
+    int H)
+{
+    int hh = blockIdx.y;
+    int n = T * vh;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        int t = i / vh;
+        int j = i % vh;
+        const float* wrow = w + hh * T * T + t * T;
+        const float* xcol = x + hh * vh + j;
+        float acc = 0.0f;
+        for (int t1 = 0; t1 < T; ++t1) {
+            acc += wrow[t1] * xcol[t1 * (H * vh)];
+        }
+        y[t * (H * vh) + hh * vh + j] = acc;
+    }
+}
 /// Autoregressive GQA attention (TTS): q (b, tq, n_heads·hd),
 /// k/v (b, tkv, kv_heads·hd), mask (tq, tkv) bias (0 / -inf) or null.
 /// One thread per (b, head, tq) — softmax over tkv in f32.

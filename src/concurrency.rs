@@ -31,7 +31,10 @@ struct Semaphore {
 #[cfg(feature = "metal")]
 impl Semaphore {
     fn new(count: usize) -> Self {
-        Self { count: Mutex::new(count), cv: Condvar::new() }
+        Self {
+            count: Mutex::new(count),
+            cv: Condvar::new(),
+        }
     }
 
     fn acquire(&self) {

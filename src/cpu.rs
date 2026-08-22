@@ -60,7 +60,12 @@ fn elemwise<F: Fn(f32) -> f32>(x: &Tensor, y: &Tensor, f: F) -> Result<(), Backe
     Ok(())
 }
 
-fn elemwise2<F: Fn(f32, f32) -> f32>(a: &Tensor, b: &Tensor, y: &Tensor, f: F) -> Result<(), BackendError> {
+fn elemwise2<F: Fn(f32, f32) -> f32>(
+    a: &Tensor,
+    b: &Tensor,
+    y: &Tensor,
+    f: F,
+) -> Result<(), BackendError> {
     check_len(a, y.numel())?;
     check_len(b, y.numel())?;
     if y.cpu_same_storage(a) || y.cpu_same_storage(b) {
@@ -248,26 +253,41 @@ impl Backend for CpuBackend {
         let xd: Vec<f32> = data(x).to_vec();
         check_len(x, y.numel())?;
         if cols == 0 || x.numel() % cols != 0 {
-            return Err(BackendError::Shape("rmsnorm: weight size does not divide x".into()));
+            return Err(BackendError::Shape(
+                "rmsnorm: weight size does not divide x".into(),
+            ));
         }
         let wd = data(w);
         let mut yd = data_mut(y);
         for (r, row) in xd.chunks_exact(cols).enumerate() {
             let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
             let inv = 1.0 / (mean_sq + eps).sqrt();
-            for (j, (&xv, yv)) in row.iter().zip(yd[r * cols..(r + 1) * cols].iter_mut()).enumerate() {
+            for (j, (&xv, yv)) in row
+                .iter()
+                .zip(yd[r * cols..(r + 1) * cols].iter_mut())
+                .enumerate()
+            {
                 *yv = xv * inv * wd[j];
             }
         }
         Ok(())
     }
 
-    fn layernorm(&self, x: &Tensor, w: &Tensor, b: &Tensor, y: &Tensor, eps: f32) -> Result<(), BackendError> {
+    fn layernorm(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        b: &Tensor,
+        y: &Tensor,
+        eps: f32,
+    ) -> Result<(), BackendError> {
         let cols = w.numel();
         let xd: Vec<f32> = data(x).to_vec();
         check_len(x, y.numel())?;
         if cols == 0 || x.numel() % cols != 0 {
-            return Err(BackendError::Shape("layernorm: weight size does not divide x".into()));
+            return Err(BackendError::Shape(
+                "layernorm: weight size does not divide x".into(),
+            ));
         }
         let wd = data(w);
         let bd = data(b);
@@ -276,7 +296,11 @@ impl Backend for CpuBackend {
             let mean = row.iter().sum::<f32>() / cols as f32;
             let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
             let inv = 1.0 / (var + eps).sqrt();
-            for (j, (&xv, yv)) in row.iter().zip(yd[r * cols..(r + 1) * cols].iter_mut()).enumerate() {
+            for (j, (&xv, yv)) in row
+                .iter()
+                .zip(yd[r * cols..(r + 1) * cols].iter_mut())
+                .enumerate()
+            {
                 *yv = (xv - mean) * inv * wd[j] + bd[j];
             }
         }
@@ -384,12 +408,17 @@ impl Backend for CpuBackend {
         // LEFT padding on both axes (Metal conv2d_f32 semantics — the tone
         // pre-encode convs left-pad time by pad_t; symmetric padding would
         // shift the output by pad_h).
-        let (oh, ow) = ((h + pad_h - kh) / stride_t + 1, (wdim + pad_w - kw) / stride_f + 1);
+        let (oh, ow) = (
+            (h + pad_h - kh) / stride_t + 1,
+            (wdim + pad_w - kw) / stride_f + 1,
+        );
         if !time_major_out && y.shape() != &[n, co, oh, ow] {
             return Err(BackendError::Shape("conv2d: output shape mismatch".into()));
         }
         if time_major_out && y.shape() != &[n, oh, co * ow] {
-            return Err(BackendError::Shape("conv2d: time-major output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "conv2d: time-major output shape mismatch".into(),
+            ));
         }
         let (xd, wd) = (data(x).to_vec(), data(w).to_vec());
         let bd: Vec<f32> = match bias {
@@ -406,9 +435,10 @@ impl Backend for CpuBackend {
                         for ci3 in 0..ci {
                             for khh in 0..kh {
                                 for kww in 0..kw {
-                                    // usize underflow on negative pad → huge value → caught below
-                                    let hi = oci * stride_t + khh - pad_h;
-                                    let wi = owi * stride_f + kww - pad_w;
+                                    // Left-pad semantics: negative positions
+                                    // wrap to huge values and are skipped.
+                                    let hi = (oci * stride_t + khh).wrapping_sub(pad_h);
+                                    let wi = (owi * stride_f + kww).wrapping_sub(pad_w);
                                     if hi >= h || wi >= wdim {
                                         continue;
                                     }
@@ -434,7 +464,9 @@ impl Backend for CpuBackend {
         let (n, c, h, w) = (x.shape()[0], x.shape()[1], x.shape()[2], x.shape()[3]);
         let (oh, ow) = (h / kh, w / kw);
         if y.shape() != &[n, c, oh, ow] {
-            return Err(BackendError::Shape("maxpool2d: output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "maxpool2d: output shape mismatch".into(),
+            ));
         }
         let xd: Vec<f32> = data(x).to_vec();
         let mut yd = data_mut(y);
@@ -469,11 +501,15 @@ impl Backend for CpuBackend {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (cin2, cout, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
         if cin != cin2 {
-            return Err(BackendError::Shape("conv_transpose1d: channel mismatch".into()));
+            return Err(BackendError::Shape(
+                "conv_transpose1d: channel mismatch".into(),
+            ));
         }
         let tout = (t - 1) * stride + k;
         if y.shape() != &[b, tout, cout] {
-            return Err(BackendError::Shape("conv_transpose1d: output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "conv_transpose1d: output shape mismatch".into(),
+            ));
         }
         let (xd, wd) = (data(x).to_vec(), data(w).to_vec());
         let bd: Vec<f32> = match bias {
@@ -521,7 +557,9 @@ impl Backend for CpuBackend {
     ) -> Result<(), BackendError> {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         if xc.shape() != &[b, tout, cin * k] {
-            return Err(BackendError::Shape("im2col1d: output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "im2col1d: output shape mismatch".into(),
+            ));
         }
         let xd = data(x);
         let mut xcd = data_mut(xc);
@@ -554,7 +592,9 @@ impl Backend for CpuBackend {
     ) -> Result<(), BackendError> {
         let (b, tin, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         if xc.shape() != &[b, tout, cin * k] {
-            return Err(BackendError::Shape("im2col_t1d: output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "im2col_t1d: output shape mismatch".into(),
+            ));
         }
         let xd = data(x);
         let mut xcd = data_mut(xc);
@@ -564,7 +604,10 @@ impl Backend for CpuBackend {
                 for ci in 0..cin {
                     for kk in 0..k {
                         let num = to as isize - kk as isize;
-                        let v = if num >= 0 && num % stride as isize == 0 && (num / stride as isize) < tin as isize {
+                        let v = if num >= 0
+                            && num % stride as isize == 0
+                            && (num / stride as isize) < tin as isize
+                        {
                             xd[(bi * tin + (num / stride as isize) as usize) * cin + ci]
                         } else {
                             0.0
@@ -600,13 +643,16 @@ impl Backend for CpuBackend {
         // X (B,T,C) → Y (B,T-u,C): drop the last u frames.
         let (b, t, c) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         if y.shape() != &[b, t - u, c] {
-            return Err(BackendError::Shape("slice_time: output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "slice_time: output shape mismatch".into(),
+            ));
         }
         let xd: Vec<f32> = data(x).to_vec();
         let mut yd = data_mut(y);
         let keep = t - u;
         for bi in 0..b {
-            yd[bi * keep * c..(bi + 1) * keep * c].copy_from_slice(&xd[bi * t * c..bi * t * c + keep * c]);
+            yd[bi * keep * c..(bi + 1) * keep * c]
+                .copy_from_slice(&xd[bi * t * c..bi * t * c + keep * c]);
         }
         Ok(())
     }
@@ -620,7 +666,11 @@ impl Backend for CpuBackend {
             let row = &xd[r * d..(r + 1) * d];
             let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = row.iter().map(|v| (v - max).exp()).sum();
-            for (j, (&xv, yv)) in row.iter().zip(yd[r * d..(r + 1) * d].iter_mut()).enumerate() {
+            for (j, (&xv, yv)) in row
+                .iter()
+                .zip(yd[r * d..(r + 1) * d].iter_mut())
+                .enumerate()
+            {
                 let _ = j;
                 *yv = (xv - max).exp() / sum;
             }
@@ -645,14 +695,23 @@ impl Backend for CpuBackend {
         let mut yd = data_mut(y);
         for (i, &ix) in idx.iter().enumerate() {
             if ix as usize >= v {
-                return Err(BackendError::Shape(format!("embedding: index {ix} >= vocab {v}")));
+                return Err(BackendError::Shape(format!(
+                    "embedding: index {ix} >= vocab {v}"
+                )));
             }
             yd[i * d..(i + 1) * d].copy_from_slice(&td[ix as usize * d..(ix as usize + 1) * d]);
         }
         Ok(())
     }
 
-    fn rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, y: &Tensor, rope_dim: usize) -> Result<(), BackendError> {
+    fn rope(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        y: &Tensor,
+        rope_dim: usize,
+    ) -> Result<(), BackendError> {
         // Halved RoPE: X (T, head_dim), pairs (i, i + rope_dim/2).
         let (t, hd) = (x.shape()[0], x.shape()[1]);
         check_len(x, y.numel())?;
@@ -671,7 +730,15 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn rope_interleaved(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, y: &Tensor, rope_dim: usize, start: usize) -> Result<(), BackendError> {
+    fn rope_interleaved(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        y: &Tensor,
+        rope_dim: usize,
+        start: usize,
+    ) -> Result<(), BackendError> {
         // Interleaved (fishaudio), per-head (Metal semantics): x (B, T, H·hd)
         // with rope_dim = hd; pairs (2i, 2i+1) inside each head; cos/sin at
         // absolute position (t + start), shared across heads.
@@ -700,7 +767,15 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn rope_head(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, y: &Tensor, h: usize, rope_dim: usize) -> Result<(), BackendError> {
+    fn rope_head(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        y: &Tensor,
+        h: usize,
+        rope_dim: usize,
+    ) -> Result<(), BackendError> {
         // X (B, T, h·hd): halved RoPE inside the first rope_dim cols of each head.
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         check_len(x, y.numel())?;
@@ -725,7 +800,14 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn rmsnorm_head(&self, x: &Tensor, w: &Tensor, y: &Tensor, h: usize, eps: f32) -> Result<(), BackendError> {
+    fn rmsnorm_head(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        y: &Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
         // X (rows, h·hd), w (hd) shared across heads.
         let rows = x.shape()[0];
         let hd = x.shape()[1] / h;
@@ -745,7 +827,15 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn layernorm_head(&self, x: &Tensor, w: &Tensor, b: &Tensor, y: &Tensor, h: usize, eps: f32) -> Result<(), BackendError> {
+    fn layernorm_head(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        b: &Tensor,
+        y: &Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
         let rows = x.shape()[0];
         let hd = x.shape()[1] / h;
         check_len(x, y.numel())?;
@@ -755,7 +845,10 @@ impl Backend for CpuBackend {
             for hh in 0..h {
                 let base = r * (h * hd) + hh * hd;
                 let mean = (0..hd).map(|j| xd[base + j]).sum::<f32>() / hd as f32;
-                let var = (0..hd).map(|j| (xd[base + j] - mean) * (xd[base + j] - mean)).sum::<f32>() / hd as f32;
+                let var = (0..hd)
+                    .map(|j| (xd[base + j] - mean) * (xd[base + j] - mean))
+                    .sum::<f32>()
+                    / hd as f32;
                 let inv = 1.0 / (var + eps).sqrt();
                 for j in 0..hd {
                     yd[base + j] = (xd[base + j] - mean) * inv * wd[j] + bd[j];
@@ -827,13 +920,20 @@ impl Backend for CpuBackend {
             for ti in 0..t {
                 let src = &xd[(bi * t + ti) * d..(bi * t + ti + 1) * d];
                 yd[(bi * 2 * t + 2 * ti) * d..(bi * 2 * t + 2 * ti + 1) * d].copy_from_slice(src);
-                yd[(bi * 2 * t + 2 * ti + 1) * d..(bi * 2 * t + 2 * ti + 2) * d].copy_from_slice(src);
+                yd[(bi * 2 * t + 2 * ti + 1) * d..(bi * 2 * t + 2 * ti + 2) * d]
+                    .copy_from_slice(src);
             }
         }
         Ok(())
     }
 
-    fn add_scaled(&self, a: &Tensor, b: &Tensor, y: &Tensor, scale: f32) -> Result<(), BackendError> {
+    fn add_scaled(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        y: &Tensor,
+        scale: f32,
+    ) -> Result<(), BackendError> {
         elemwise2(a, b, y, |x, z| x + scale * z)
     }
 
@@ -1114,7 +1214,9 @@ impl Backend for CpuBackend {
         // Y (B,C) = mean over time of V (B,T,C).
         let (b, t, c) = (v.shape()[0], v.shape()[1], v.shape()[2]);
         if y.shape() != &[b, c] {
-            return Err(BackendError::Shape("uniform_attn: output shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "uniform_attn: output shape mismatch".into(),
+            ));
         }
         let vd: Vec<f32> = data(v).to_vec();
         let mut yd = data_mut(y);
@@ -1145,13 +1247,20 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn codebook_search(&self, x: &Tensor, table: &Tensor, idx: &mut [u32]) -> Result<(), BackendError> {
+    fn codebook_search(
+        &self,
+        x: &Tensor,
+        table: &Tensor,
+        idx: &mut [u32],
+    ) -> Result<(), BackendError> {
         // Nearest L2 row of table (V, D) for each row of X (rows, D).
         let rows = x.shape()[0] * x.shape()[1];
         let d = x.shape()[2];
         let (v, td) = (table.shape()[0], table.shape()[1]);
         if td != d || idx.len() != rows {
-            return Err(BackendError::Shape("codebook_search: shape mismatch".into()));
+            return Err(BackendError::Shape(
+                "codebook_search: shape mismatch".into(),
+            ));
         }
         let xd: Vec<f32> = data(x).to_vec();
         let tbl = data(table);
@@ -1226,7 +1335,9 @@ mod tests {
         let b = CpuBackend;
         // X (1,4,1) = [1,2,3,4]; W (1,1,3) = [1,1,1]; stride 1, LEFT pad 1, dil 1
         // → causal: Tout = (4 + 1 - 2 - 1)/1 + 1 = 3
-        let x = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 4, 1]).unwrap();
+        let x = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 4, 1])
+            .unwrap();
         let w = b.from_cpu_f32(&[1.0, 1.0, 1.0], vec![1, 1, 3]).unwrap();
         let y = b.zeros(vec![1, 3, 1]).unwrap();
         b.conv1d(&x, &w, None, 1, 1, 0, 1, &y).unwrap();
@@ -1239,14 +1350,18 @@ mod tests {
     #[test]
     fn slice_time_last() {
         let b = CpuBackend;
-        let x = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2]).unwrap();
+        let x = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2])
+            .unwrap();
         let y = b.zeros(vec![1, 2, 2]).unwrap();
         b.slice_time(&x, &y, 1).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
         assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0]);
 
         // slice_last: X (3,2) → Y (3,1), off=1: second column of each row.
-        let x2 = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]).unwrap();
+        let x2 = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2])
+            .unwrap();
         let y2 = b.zeros(vec![3, 1]).unwrap();
         b.slice_last(&x2, &y2, 1).unwrap();
         let got2 = b.to_cpu_f32(&y2).unwrap();
@@ -1280,7 +1395,12 @@ mod tests {
         assert!(approx(got[1], 1.0 + (1.0f32).sin().powi(2), 1e-6));
 
         // maxpool2d (2,2,4,4) → (2,2,2,2)
-        let m = b.from_cpu_f32(&(0..64).map(|v| v as f32).collect::<Vec<_>>(), vec![2, 2, 4, 4]).unwrap();
+        let m = b
+            .from_cpu_f32(
+                &(0..64).map(|v| v as f32).collect::<Vec<_>>(),
+                vec![2, 2, 4, 4],
+            )
+            .unwrap();
         let p = b.zeros(vec![2, 2, 2, 2]).unwrap();
         b.maxpool2d(&m, &p, 2, 2).unwrap();
         let got = b.to_cpu_f32(&p).unwrap();
@@ -1319,7 +1439,9 @@ mod tests {
         b.rope(&x, &cos, &sin, &y, 4).unwrap();
         assert_eq!(b.to_cpu_f32(&y).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
         // interleaved is 3D (B, T, H·hd) — single row (1, 1, 4)
-        let x3 = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 4]).unwrap();
+        let x3 = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 4])
+            .unwrap();
         let y3 = b.zeros(vec![1, 1, 4]).unwrap();
         b.rope_interleaved(&x3, &cos, &sin, &y3, 4, 0).unwrap();
         assert_eq!(b.to_cpu_f32(&y3).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
@@ -1337,7 +1459,9 @@ mod tests {
         // rope_head: (1,1,4), h=2, hd=2, rope_dim=2; cos/sin indexed globally
         // by t only (same rotation for every head) → with cos=[1,0.5]/sin=[0,0.5]
         // at t=0 both heads use (c=1, s=0) → identity.
-        let xh = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 4]).unwrap();
+        let xh = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 1, 4])
+            .unwrap();
         let yh = b.zeros(vec![1, 1, 4]).unwrap();
         b.rope_head(&xh, &cos2, &sin2, &yh, 2, 2).unwrap();
         let got = b.to_cpu_f32(&yh).unwrap();
@@ -1348,7 +1472,9 @@ mod tests {
     #[test]
     fn embedding_glu_repeat_kv() {
         let b = CpuBackend;
-        let table = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]).unwrap();
+        let table = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2])
+            .unwrap();
         let y = b.zeros(vec![2, 2]).unwrap();
         b.embedding(&[2, 0], &table, &y).unwrap();
         assert_eq!(b.to_cpu_f32(&y).unwrap(), vec![5.0, 6.0, 1.0, 2.0]);
@@ -1389,8 +1515,12 @@ mod tests {
         assert!(approx(got[2], 3.0 * inv1, 1e-5) && approx(got[3], 4.0 * inv1, 1e-5));
 
         // add_bias2d: elementwise (same shapes)
-        let x2 = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]).unwrap();
-        let bd = b.from_cpu_f32(&[10.0, 20.0, 10.0, 20.0], vec![1, 2, 2]).unwrap();
+        let x2 = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2])
+            .unwrap();
+        let bd = b
+            .from_cpu_f32(&[10.0, 20.0, 10.0, 20.0], vec![1, 2, 2])
+            .unwrap();
         let y2 = b.zeros(vec![1, 2, 2]).unwrap();
         b.add_bias2d(&x2, &bd, &y2).unwrap();
         assert_eq!(b.to_cpu_f32(&y2).unwrap(), vec![11.0, 22.0, 13.0, 24.0]);
@@ -1399,7 +1529,9 @@ mod tests {
     #[test]
     fn uniform_codebook_attn() {
         let b = CpuBackend;
-        let v = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]).unwrap();
+        let v = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2])
+            .unwrap();
         let y = b.zeros(vec![1, 2]).unwrap();
         b.uniform_attn(&v, &y).unwrap();
         assert_eq!(b.to_cpu_f32(&y).unwrap(), vec![2.0, 3.0]);
@@ -1421,9 +1553,15 @@ mod tests {
         assert!(approx(got[0], 5.0, 1e-5) && approx(got[1], 6.0, 1e-5));
 
         // mhsa mode 2 (uniform): y = mean over time of v, broadcast per frame
-        let qm = b.from_cpu_f32(&[1.0, 0.0, 0.0, 1.0], vec![1, 2, 2]).unwrap();
-        let km = b.from_cpu_f32(&[1.0, 0.0, 0.0, 1.0], vec![1, 2, 2]).unwrap();
-        let vm = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]).unwrap();
+        let qm = b
+            .from_cpu_f32(&[1.0, 0.0, 0.0, 1.0], vec![1, 2, 2])
+            .unwrap();
+        let km = b
+            .from_cpu_f32(&[1.0, 0.0, 0.0, 1.0], vec![1, 2, 2])
+            .unwrap();
+        let vm = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2])
+            .unwrap();
         let sc = b.zeros(vec![1, 1, 2, 2]).unwrap();
         let ym = b.zeros(vec![1, 2, 2]).unwrap();
         b.mhsa(&qm, &km, &vm, &sc, None, 2, &ym).unwrap();

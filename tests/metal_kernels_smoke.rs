@@ -44,7 +44,12 @@ fn conv_transpose_smoke() {
     let ctx = MetalCtx::new().unwrap();
     // x (1, 2, 2): [ [1,2], [3,4] ]; w (2, 2, 2) identity-ish; stride 2
     let x = GpuTensor::from_cpu_f32(&ctx.device, &[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]).unwrap();
-    let w = GpuTensor::from_cpu_f32(&ctx.device, &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], vec![2, 2, 2]).unwrap();
+    let w = GpuTensor::from_cpu_f32(
+        &ctx.device,
+        &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+        vec![2, 2, 2],
+    )
+    .unwrap();
     let y = GpuTensor::zeros(&ctx.device, vec![1, 4, 2]).unwrap();
     ctx.conv_transpose1d_f32(&x, &w, None, 2, &y).unwrap();
     let v = y.to_cpu_f32(&ctx).unwrap();

@@ -25,7 +25,11 @@ impl Default for SamplingParams {
 }
 
 /// Top-p sample over a CPU logits vector (temperature applied inside).
-pub fn top_p_sample_vec(logits: &[f32], params: &SamplingParams, rng_state: &mut Option<u64>) -> u32 {
+pub fn top_p_sample_vec(
+    logits: &[f32],
+    params: &SamplingParams,
+    rng_state: &mut Option<u64>,
+) -> u32 {
     let logits_vec: Vec<f32> = if params.temperature != 1.0 {
         logits.iter().map(|&l| l / params.temperature).collect()
     } else {
@@ -41,7 +45,8 @@ pub fn top_p_sample_vec(logits: &[f32], params: &SamplingParams, rng_state: &mut
         vec![1.0 / n; logits_vec.len()]
     };
 
-    let mut indexed: Vec<(usize, f32)> = probs_vec.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+    let mut indexed: Vec<(usize, f32)> =
+        probs_vec.iter().enumerate().map(|(i, &p)| (i, p)).collect();
     indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     let k = if params.top_k > 0 {
@@ -64,7 +69,9 @@ pub fn top_p_sample_vec(logits: &[f32], params: &SamplingParams, rng_state: &mut
 
     let r = match rng_state {
         Some(state) => {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (*state >> 33) as f32 / (1u64 << 33) as f32
         }
         None => {
@@ -73,7 +80,9 @@ pub fn top_p_sample_vec(logits: &[f32], params: &SamplingParams, rng_state: &mut
                 .unwrap_or_default()
                 .subsec_nanos();
             let mut state = nanos as u64;
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *rng_state = Some(state);
             (state >> 33) as f32 / (1u64 << 33) as f32
         }

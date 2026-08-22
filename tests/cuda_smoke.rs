@@ -6,10 +6,10 @@
 
 #![cfg(all(feature = "cuda", feature = "cpu"))]
 
+use rust_inference::Backend;
 use rust_inference::cpu::CpuBackend;
 use rust_inference::cuda::CudaBackend;
 use rust_inference::harness::Lcg;
-use rust_inference::Backend;
 
 fn make_gpu() -> Option<CudaBackend> {
     match CudaBackend::new(0) {
@@ -60,19 +60,31 @@ fn cuda_elementwise_vs_cpu() {
 
     gpu.add(&x, &y, &go).unwrap();
     cpu.add(&xc, &yc, &co).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
 
     gpu.scale(&x, &go, 0.75).unwrap();
     cpu.scale(&xc, &co, 0.75).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
 
     gpu.silu(&x, &go).unwrap();
     cpu.silu(&xc, &co).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
 
     gpu.gelu_tanh(&x, &go).unwrap();
     cpu.gelu_tanh(&xc, &co).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
 }
 
 #[test]
@@ -90,13 +102,22 @@ fn cuda_norms_softmax_vs_cpu() {
     let co = cpu.zeros(vec![4, 8]).unwrap();
     gpu.rmsnorm(&x, &w, &go, 1e-5).unwrap();
     cpu.rmsnorm(&xc, &wc, &co, 1e-5).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
     gpu.layernorm(&x, &w, &b, &go, 1e-5).unwrap();
     cpu.layernorm(&xc, &wc, &bc, &co, 1e-5).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
     gpu.softmax_last_dim(&x, &go).unwrap();
     cpu.softmax_last_dim(&xc, &co).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
 
     // head norms: (rows, h·hd) with h=2, hd=4
     let xh = lcg_tensor(&gpu, vec![4, 8], 6);
@@ -107,10 +128,16 @@ fn cuda_norms_softmax_vs_cpu() {
     let bhc = lcg_tensor(&cpu, vec![4], 8);
     gpu.rmsnorm_head(&xh, &wh, &go, 2, 1e-5).unwrap();
     cpu.rmsnorm_head(&xhc, &whc, &co, 2, 1e-5).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
     gpu.layernorm_head(&xh, &wh, &bh, &go, 2, 1e-5).unwrap();
     cpu.layernorm_head(&xhc, &whc, &bhc, &co, 2, 1e-5).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()));
+    assert!(close(
+        &gpu.to_cpu_f32(&go).unwrap(),
+        &cpu.to_cpu_f32(&co).unwrap()
+    ));
 }
 
 #[test]
@@ -126,7 +153,10 @@ fn cuda_convs_slices_vs_cpu() {
     let co = cpu.zeros(vec![1, 5, 5]).unwrap();
     gpu.conv1d(&x, &w, None, 1, 1, 0, 1, &go).unwrap();
     cpu.conv1d(&xc, &wc, None, 1, 1, 0, 1, &co).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()), "conv1d");
+    assert!(
+        close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()),
+        "conv1d"
+    );
 
     // conv_transpose1d: x (1,4,2), w (2,3,3), stride 2 → tout = (4-1)*2+3 = 9
     let xt = lcg_tensor(&gpu, vec![1, 4, 2], 11);
@@ -137,7 +167,13 @@ fn cuda_convs_slices_vs_cpu() {
     let cct = cpu.zeros(vec![1, 9, 3]).unwrap();
     gpu.conv_transpose1d(&xt, &wt, None, 2, &gct).unwrap();
     cpu.conv_transpose1d(&xtc, &wtc, None, 2, &cct).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gct).unwrap(), &cpu.to_cpu_f32(&cct).unwrap()), "conv_transpose1d");
+    assert!(
+        close(
+            &gpu.to_cpu_f32(&gct).unwrap(),
+            &cpu.to_cpu_f32(&cct).unwrap()
+        ),
+        "conv_transpose1d"
+    );
 
     // slices — contract is 2D (rows, D) → (rows, d0); 3D callers flatten
     let xs = lcg_tensor(&gpu, vec![6, 4], 13);
@@ -146,14 +182,23 @@ fn cuda_convs_slices_vs_cpu() {
     let cs = cpu.zeros(vec![6, 2]).unwrap();
     gpu.slice_last(&xs, &gs, 2).unwrap();
     cpu.slice_last(&xsc, &cs, 2).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gs).unwrap(), &cpu.to_cpu_f32(&cs).unwrap()), "slice_last");
+    assert!(
+        close(&gpu.to_cpu_f32(&gs).unwrap(), &cpu.to_cpu_f32(&cs).unwrap()),
+        "slice_last"
+    );
     let xs3 = lcg_tensor(&gpu, vec![2, 3, 4], 13);
     let xs3c = lcg_tensor(&cpu, vec![2, 3, 4], 13);
     let gs2 = gpu.zeros(vec![2, 2, 4]).unwrap();
     let cs2 = cpu.zeros(vec![2, 2, 4]).unwrap();
     gpu.slice_time(&xs3, &gs2, 1).unwrap();
     cpu.slice_time(&xs3c, &cs2, 1).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gs2).unwrap(), &cpu.to_cpu_f32(&cs2).unwrap()), "slice_time");
+    assert!(
+        close(
+            &gpu.to_cpu_f32(&gs2).unwrap(),
+            &cpu.to_cpu_f32(&cs2).unwrap()
+        ),
+        "slice_time"
+    );
 }
 
 #[test]
@@ -171,7 +216,10 @@ fn cuda_rope_glu_repeat_kv_vs_cpu() {
     let co = cpu.zeros(vec![1, 4, 8]).unwrap();
     gpu.rope_interleaved(&x, &cos, &sin, &go, 8, 3).unwrap();
     cpu.rope_interleaved(&xc, &cosc, &sinc, &co, 8, 3).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()), "rope_interleaved");
+    assert!(
+        close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()),
+        "rope_interleaved"
+    );
 
     // glu
     let gx = lcg_tensor(&gpu, vec![2, 8], 17);
@@ -180,7 +228,10 @@ fn cuda_rope_glu_repeat_kv_vs_cpu() {
     let cg = cpu.zeros(vec![2, 4]).unwrap();
     gpu.glu(&gx, &gg).unwrap();
     cpu.glu(&gxc, &cg).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gg).unwrap(), &cpu.to_cpu_f32(&cg).unwrap()), "glu");
+    assert!(
+        close(&gpu.to_cpu_f32(&gg).unwrap(), &cpu.to_cpu_f32(&cg).unwrap()),
+        "glu"
+    );
 
     // repeat ×2
     let rx = lcg_tensor(&gpu, vec![1, 3, 4], 18);
@@ -189,7 +240,10 @@ fn cuda_rope_glu_repeat_kv_vs_cpu() {
     let cr = cpu.zeros(vec![1, 6, 4]).unwrap();
     gpu.repeat(&rx, &gr).unwrap();
     cpu.repeat(&rxc, &cr).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()), "repeat");
+    assert!(
+        close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()),
+        "repeat"
+    );
 
     // kv_update
     let dst = gpu.zeros(vec![1, 8, 4]).unwrap();
@@ -198,7 +252,13 @@ fn cuda_rope_glu_repeat_kv_vs_cpu() {
     let srcc = lcg_tensor(&cpu, vec![1, 3, 4], 19);
     gpu.kv_update(&dst, &src, 2).unwrap();
     cpu.kv_update(&dstc, &srcc, 2).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&dst).unwrap(), &cpu.to_cpu_f32(&dstc).unwrap()), "kv_update");
+    assert!(
+        close(
+            &gpu.to_cpu_f32(&dst).unwrap(),
+            &cpu.to_cpu_f32(&dstc).unwrap()
+        ),
+        "kv_update"
+    );
 
     // embedding
     let table = lcg_tensor(&gpu, vec![16, 4], 20);
@@ -208,7 +268,10 @@ fn cuda_rope_glu_repeat_kv_vs_cpu() {
     let ce = cpu.zeros(vec![1, 5, 4]).unwrap();
     gpu.embedding(&idx, &table, &ge).unwrap();
     cpu.embedding(&idx, &tablec, &ce).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&ge).unwrap(), &cpu.to_cpu_f32(&ce).unwrap()), "embedding");
+    assert!(
+        close(&gpu.to_cpu_f32(&ge).unwrap(), &cpu.to_cpu_f32(&ce).unwrap()),
+        "embedding"
+    );
 
     // uniform_attn
     let v = lcg_tensor(&gpu, vec![1, 4, 6], 21);
@@ -217,7 +280,10 @@ fn cuda_rope_glu_repeat_kv_vs_cpu() {
     let cu = cpu.zeros(vec![1, 6]).unwrap();
     gpu.uniform_attn(&v, &gu).unwrap();
     cpu.uniform_attn(&vc, &cu).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gu).unwrap(), &cpu.to_cpu_f32(&cu).unwrap()), "uniform_attn");
+    assert!(
+        close(&gpu.to_cpu_f32(&gu).unwrap(), &cpu.to_cpu_f32(&cu).unwrap()),
+        "uniform_attn"
+    );
 }
 
 #[test]
@@ -245,12 +311,20 @@ fn cuda_attn_ar_vs_cpu() {
     let go = gpu.zeros(vec![1, 3, 8]).unwrap();
     let co = cpu.zeros(vec![1, 3, 8]).unwrap();
     gpu.attn_ar(&q, &k, &v, Some(&mask), &go, 4, 2, 2).unwrap();
-    cpu.attn_ar(&qc, &kc, &vc, Some(&maskc), &co, 4, 2, 2).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()), "attn_ar");
+    cpu.attn_ar(&qc, &kc, &vc, Some(&maskc), &co, 4, 2, 2)
+        .unwrap();
+    assert!(
+        close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()),
+        "attn_ar"
+    );
 
     // codebook_search
-    let x = gpu.from_cpu_f32(&[0.1, 0.2, 0.9, 0.8], vec![1, 2, 2]).unwrap();
-    let xc = cpu.from_cpu_f32(&[0.1, 0.2, 0.9, 0.8], vec![1, 2, 2]).unwrap();
+    let x = gpu
+        .from_cpu_f32(&[0.1, 0.2, 0.9, 0.8], vec![1, 2, 2])
+        .unwrap();
+    let xc = cpu
+        .from_cpu_f32(&[0.1, 0.2, 0.9, 0.8], vec![1, 2, 2])
+        .unwrap();
     let table = gpu.from_cpu_f32(&[0.0, 0.0, 1.0, 1.0], vec![2, 2]).unwrap();
     let tablec = cpu.from_cpu_f32(&[0.0, 0.0, 1.0, 1.0], vec![2, 2]).unwrap();
     let mut gi = [0u32; 2];
@@ -277,7 +351,10 @@ fn cuda_misc_vs_cpu() {
     let co = cpu.zeros(vec![1, 3, 4]).unwrap();
     gpu.mhsa(&q, &k, &v, &sc, None, 0, &go).unwrap();
     cpu.mhsa(&qc, &kc, &vc, &scc, None, 0, &co).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()), "mhsa");
+    assert!(
+        close(&gpu.to_cpu_f32(&go).unwrap(), &cpu.to_cpu_f32(&co).unwrap()),
+        "mhsa"
+    );
 
     // conv2d_nchw: x (1,2,5,5), w (3,2,3,3), pad 0 → (1,3,3,3)
     let x = lcg_tensor(&gpu, vec![1, 2, 5, 5], 33);
@@ -286,9 +363,14 @@ fn cuda_misc_vs_cpu() {
     let wc = lcg_tensor(&cpu, vec![3, 2, 3, 3], 34);
     let g2 = gpu.zeros(vec![1, 3, 3, 3]).unwrap();
     let c2 = cpu.zeros(vec![1, 3, 3, 3]).unwrap();
-    gpu.conv2d_nchw(&x, &w, None, 0, 0, 1, 1, false, &g2).unwrap();
-    cpu.conv2d_nchw(&xc, &wc, None, 0, 0, 1, 1, false, &c2).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&g2).unwrap(), &cpu.to_cpu_f32(&c2).unwrap()), "conv2d_nchw");
+    gpu.conv2d_nchw(&x, &w, None, 0, 0, 1, 1, false, &g2)
+        .unwrap();
+    cpu.conv2d_nchw(&xc, &wc, None, 0, 0, 1, 1, false, &c2)
+        .unwrap();
+    assert!(
+        close(&gpu.to_cpu_f32(&g2).unwrap(), &cpu.to_cpu_f32(&c2).unwrap()),
+        "conv2d_nchw"
+    );
 
     // maxpool2d: (1,1,4,4) k2 → (1,1,2,2)
     let m = lcg_tensor(&gpu, vec![1, 1, 4, 4], 35);
@@ -297,7 +379,10 @@ fn cuda_misc_vs_cpu() {
     let cm = cpu.zeros(vec![1, 1, 2, 2]).unwrap();
     gpu.maxpool2d(&m, &gm, 2, 2).unwrap();
     cpu.maxpool2d(&mc, &cm, 2, 2).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gm).unwrap(), &cpu.to_cpu_f32(&cm).unwrap()), "maxpool2d");
+    assert!(
+        close(&gpu.to_cpu_f32(&gm).unwrap(), &cpu.to_cpu_f32(&cm).unwrap()),
+        "maxpool2d"
+    );
 
     // add_bias2d: x (1,3,4) + b (1,4)
     let xb = lcg_tensor(&gpu, vec![1, 3, 4], 36);
@@ -308,7 +393,10 @@ fn cuda_misc_vs_cpu() {
     let cb = cpu.zeros(vec![1, 3, 4]).unwrap();
     gpu.add_bias2d(&xb, &bb, &gb).unwrap();
     cpu.add_bias2d(&xbc, &bbc, &cb).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gb).unwrap(), &cpu.to_cpu_f32(&cb).unwrap()), "add_bias2d");
+    assert!(
+        close(&gpu.to_cpu_f32(&gb).unwrap(), &cpu.to_cpu_f32(&cb).unwrap()),
+        "add_bias2d"
+    );
 
     // mul_rows / mul_vec / snake / rope_head
     let xr = lcg_tensor(&gpu, vec![3, 4], 38);
@@ -319,19 +407,28 @@ fn cuda_misc_vs_cpu() {
     let cr = cpu.zeros(vec![3, 4]).unwrap();
     gpu.mul_rows(&xr, &wr, &gr).unwrap();
     cpu.mul_rows(&xrc, &wrc, &cr).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()), "mul_rows");
+    assert!(
+        close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()),
+        "mul_rows"
+    );
 
     let wv = lcg_tensor(&gpu, vec![4], 40);
     let wvc = lcg_tensor(&cpu, vec![4], 40);
     gpu.mul_vec(&xr, &wv, &gr).unwrap();
     cpu.mul_vec(&xrc, &wvc, &cr).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()), "mul_vec");
+    assert!(
+        close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()),
+        "mul_vec"
+    );
 
     let sa = lcg_tensor(&gpu, vec![4], 41);
     let sac = lcg_tensor(&cpu, vec![4], 41);
     gpu.snake(&xr, &sa, &gr).unwrap();
     cpu.snake(&xrc, &sac, &cr).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()), "snake");
+    assert!(
+        close(&gpu.to_cpu_f32(&gr).unwrap(), &cpu.to_cpu_f32(&cr).unwrap()),
+        "snake"
+    );
 
     let rh = lcg_tensor(&gpu, vec![1, 3, 8], 42);
     let rhc = lcg_tensor(&cpu, vec![1, 3, 8], 42);
@@ -343,7 +440,13 @@ fn cuda_misc_vs_cpu() {
     let crh = cpu.zeros(vec![1, 3, 8]).unwrap();
     gpu.rope_head(&rh, &rcos, &rsin, &grh, 2, 4).unwrap();
     cpu.rope_head(&rhc, &rcosc, &rsinc, &crh, 2, 4).unwrap();
-    assert!(close(&gpu.to_cpu_f32(&grh).unwrap(), &cpu.to_cpu_f32(&crh).unwrap()), "rope_head");
+    assert!(
+        close(
+            &gpu.to_cpu_f32(&grh).unwrap(),
+            &cpu.to_cpu_f32(&crh).unwrap()
+        ),
+        "rope_head"
+    );
 }
 
 fn close(a: &[f32], b: &[f32]) -> bool {

@@ -70,9 +70,16 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
-    pub fn from_weights(backend: &dyn Backend, w: Vec<f32>, eps: f32) -> Result<Self, BackendError> {
+    pub fn from_weights(
+        backend: &dyn Backend,
+        w: Vec<f32>,
+        eps: f32,
+    ) -> Result<Self, BackendError> {
         let d = w.len();
-        Ok(Self { w: backend.from_cpu_f32(&w, vec![d])?, eps })
+        Ok(Self {
+            w: backend.from_cpu_f32(&w, vec![d])?,
+            eps,
+        })
     }
 
     pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
@@ -129,7 +136,9 @@ pub struct Snake {
 impl Snake {
     pub fn from_weights(backend: &dyn Backend, a: Vec<f32>) -> Result<Self, BackendError> {
         let d = a.len();
-        Ok(Self { a: backend.from_cpu_f32(&a, vec![d])? })
+        Ok(Self {
+            a: backend.from_cpu_f32(&a, vec![d])?,
+        })
     }
 
     pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
@@ -145,11 +154,22 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    pub fn from_weights(backend: &dyn Backend, table: Vec<f32>, shape: Vec<usize>) -> Result<Self, BackendError> {
-        Ok(Self { table: backend.from_cpu_f32(&table, shape)? })
+    pub fn from_weights(
+        backend: &dyn Backend,
+        table: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> Result<Self, BackendError> {
+        Ok(Self {
+            table: backend.from_cpu_f32(&table, shape)?,
+        })
     }
 
-    pub fn forward(&self, backend: &dyn Backend, idx: &[u32], t: usize) -> Result<Tensor, BackendError> {
+    pub fn forward(
+        &self,
+        backend: &dyn Backend,
+        idx: &[u32],
+        t: usize,
+    ) -> Result<Tensor, BackendError> {
         let d = self.table.shape()[1];
         let y = backend.zeros(vec![1, t, d])?;
         backend.embedding(idx, &self.table, &y)?;
@@ -288,12 +308,19 @@ impl Attention {
         let (b, tq, _) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let q_size = self.n_heads * self.head_dim;
         let kv_size = self.n_kv_heads * self.head_dim;
-        let qkv = Linear { w: self.wqkv.clone(), b: None }.forward(backend, x)?;
+        let qkv = Linear {
+            w: self.wqkv.clone(),
+            b: None,
+        }
+        .forward(backend, x)?;
         let q = slice_last(backend, &qkv, q_size, 0)?;
         let k = slice_last(backend, &qkv, kv_size, q_size)?;
         let v = slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
         let (q, k) = if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
-            (rmsnorm_head(backend, &q, qn, self.n_heads)?, rmsnorm_head(backend, &k, kn, self.n_kv_heads)?)
+            (
+                rmsnorm_head(backend, &q, qn, self.n_heads)?,
+                rmsnorm_head(backend, &k, kn, self.n_kv_heads)?,
+            )
         } else {
             (q, k)
         };
@@ -308,8 +335,21 @@ impl Attention {
             None
         };
         let attn = backend.zeros(vec![b, tq, q_size])?;
-        backend.attn_ar(&q, &ck, &cv, mask.as_ref(), &attn, self.n_heads, self.n_kv_heads, self.head_dim)?;
-        let out = Linear { w: self.wo.clone(), b: None }.forward(backend, &attn)?;
+        backend.attn_ar(
+            &q,
+            &ck,
+            &cv,
+            mask.as_ref(),
+            &attn,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+        )?;
+        let out = Linear {
+            w: self.wo.clone(),
+            b: None,
+        }
+        .forward(backend, &attn)?;
         Ok(out)
     }
 }
@@ -406,7 +446,12 @@ impl KvCache {
 
     /// Insert k/v (1, Tq, D) at the current position; advances `pos`.
     /// Quantized KV formats quantize on write inside the backend op.
-    pub fn update(&mut self, backend: &dyn Backend, k: &Tensor, v: &Tensor) -> Result<(), BackendError> {
+    pub fn update(
+        &mut self,
+        backend: &dyn Backend,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<(), BackendError> {
         let tq = k.shape()[1];
         self.ensure(backend, self.pos + tq)?;
         backend.kv_update(&self.k, k, self.pos)?;
@@ -446,7 +491,11 @@ impl KvCache {
     // ── Metal migration bridge (speech crate; remove after 1.6) ──
 
     #[cfg(feature = "metal")]
-    pub fn new_metal(ctx: &MetalCtx, n_kv_heads: usize, head_dim: usize) -> Result<Self, MetalError> {
+    pub fn new_metal(
+        ctx: &MetalCtx,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, MetalError> {
         let cap = KV_CACHE_INIT_CAPACITY;
         let d = n_kv_heads * head_dim;
         Ok(Self {
@@ -469,8 +518,14 @@ impl KvCache {
             new_cap = new_cap.saturating_mul(2);
         }
         let d = self.k.shape()[2];
-        let old_k = std::mem::replace(&mut self.k, Tensor::from_gpu(GpuTensor::zeros(&ctx.device, vec![1, new_cap, d])?));
-        let old_v = std::mem::replace(&mut self.v, Tensor::from_gpu(GpuTensor::zeros(&ctx.device, vec![1, new_cap, d])?));
+        let old_k = std::mem::replace(
+            &mut self.k,
+            Tensor::from_gpu(GpuTensor::zeros(&ctx.device, vec![1, new_cap, d])?),
+        );
+        let old_v = std::mem::replace(
+            &mut self.v,
+            Tensor::from_gpu(GpuTensor::zeros(&ctx.device, vec![1, new_cap, d])?),
+        );
         if self.pos > 0 {
             ctx.kv_update_f32(self.k.as_gpu(), old_k.as_gpu(), 0)?;
             ctx.kv_update_f32(self.v.as_gpu(), old_v.as_gpu(), 0)?;
@@ -480,7 +535,12 @@ impl KvCache {
     }
 
     #[cfg(feature = "metal")]
-    pub fn update_metal(&mut self, ctx: &MetalCtx, k: &GpuTensor, v: &GpuTensor) -> Result<(), MetalError> {
+    pub fn update_metal(
+        &mut self,
+        ctx: &MetalCtx,
+        k: &GpuTensor,
+        v: &GpuTensor,
+    ) -> Result<(), MetalError> {
         let tq = k.shape[1];
         self.ensure_metal(ctx, self.pos + tq)?;
         ctx.kv_update_f32(self.k.as_gpu(), k, self.pos)?;
@@ -491,19 +551,32 @@ impl KvCache {
 
     #[cfg(feature = "metal")]
     pub fn view_metal(&self) -> GpuTensor {
-        GpuTensor { buffer: self.k.as_gpu().buffer.clone(), shape: vec![1, self.pos, self.k.shape()[2]], dtype: crate::metal::GpuDtype::F32 }
+        GpuTensor {
+            buffer: self.k.as_gpu().buffer.clone(),
+            shape: vec![1, self.pos, self.k.shape()[2]],
+            dtype: crate::metal::GpuDtype::F32,
+        }
     }
 
     #[cfg(feature = "metal")]
     pub fn view_v_metal(&self) -> GpuTensor {
-        GpuTensor { buffer: self.v.as_gpu().buffer.clone(), shape: vec![1, self.pos, self.v.shape()[2]], dtype: crate::metal::GpuDtype::F32 }
+        GpuTensor {
+            buffer: self.v.as_gpu().buffer.clone(),
+            shape: vec![1, self.pos, self.v.shape()[2]],
+            dtype: crate::metal::GpuDtype::F32,
+        }
     }
 }
 
 // ─────────────────────── operator helpers ───────────────────────
 
 /// Slice the last dim: X (rows, D) → Y (rows, d0), starting at `off`.
-pub fn slice_last(backend: &dyn Backend, x: &Tensor, d0: usize, off: usize) -> Result<Tensor, BackendError> {
+pub fn slice_last(
+    backend: &dyn Backend,
+    x: &Tensor,
+    d0: usize,
+    off: usize,
+) -> Result<Tensor, BackendError> {
     let (b, t, _d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let rows = b * t;
     let y = backend.zeros(vec![rows, d0])?;
@@ -512,7 +585,12 @@ pub fn slice_last(backend: &dyn Backend, x: &Tensor, d0: usize, off: usize) -> R
 }
 
 /// RMSNorm per head: X (B,T,H*HD), W (H*HD) → Y (B,T,H*HD).
-fn rmsnorm_head(backend: &dyn Backend, x: &Tensor, w: &Tensor, n_heads: usize) -> Result<Tensor, BackendError> {
+fn rmsnorm_head(
+    backend: &dyn Backend,
+    x: &Tensor,
+    w: &Tensor,
+    n_heads: usize,
+) -> Result<Tensor, BackendError> {
     let y = backend.zeros(x.shape().to_vec())?;
     backend.rmsnorm_head(x, w, &y, n_heads, 1e-6)?;
     Ok(y)
@@ -562,14 +640,28 @@ mod tests {
     fn linear_forward() {
         let b = backend();
         // W = identity (2x2), x = [[1,2],[3,4]] (B=1,T=2,D=2) → y = x
-        let lin = Linear::from_weights(&b, vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], Some(vec![0.0, 0.0])).unwrap();
-        let x = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]).unwrap();
+        let lin = Linear::from_weights(
+            &b,
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![2, 2],
+            Some(vec![0.0, 0.0]),
+        )
+        .unwrap();
+        let x = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2])
+            .unwrap();
         let y = lin.forward(&b, &x).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
         assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0]);
 
         // bias shifts
-        let lin = Linear::from_weights(&b, vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], Some(vec![10.0, 20.0])).unwrap();
+        let lin = Linear::from_weights(
+            &b,
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![2, 2],
+            Some(vec![10.0, 20.0]),
+        )
+        .unwrap();
         let y = lin.forward(&b, &x).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
         assert_eq!(got, vec![11.0, 22.0, 13.0, 24.0]);
@@ -579,7 +671,9 @@ mod tests {
     fn rmsnorm_layer() {
         let b = backend();
         let rn = RmsNorm::from_weights(&b, vec![1.0, 1.0], 1e-5).unwrap();
-        let x = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]).unwrap();
+        let x = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 2, 2])
+            .unwrap();
         let y = rn.forward(&b, &x).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
         let inv = 1.0 / (2.5f32).sqrt();
@@ -589,7 +683,14 @@ mod tests {
     #[test]
     fn swiglu_snake_embedding() {
         let b = backend();
-        let sg = SwiGLU::from_weights(&b, vec![1.0, 0.0, 0.0, 1.0], vec![1.0, 0.0, 0.0, 1.0], vec![1.0, 0.0, 0.0, 1.0], 2).unwrap();
+        let sg = SwiGLU::from_weights(
+            &b,
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0, 1.0],
+            2,
+        )
+        .unwrap();
         let x = b.from_cpu_f32(&[1.0, 2.0], vec![1, 1, 2]).unwrap();
         let y = sg.forward(&b, &x).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
@@ -603,7 +704,8 @@ mod tests {
         let got = b.to_cpu_f32(&y).unwrap();
         assert!((got[0] - (1.0 + (1.0f32).sin().powi(2))).abs() < 1e-5);
 
-        let emb = Embedding::from_weights(&b, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]).unwrap();
+        let emb =
+            Embedding::from_weights(&b, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]).unwrap();
         let y = emb.forward(&b, &[2, 0], 2).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
         assert_eq!(got, vec![5.0, 6.0, 1.0, 2.0]);
@@ -613,8 +715,11 @@ mod tests {
     fn conv_layers() {
         let b = backend();
         // causal conv: k=3, dil=1 → pad=2, T_out = T
-        let cc = CausalConv1d::from_weights(&b, vec![1.0, 1.0, 1.0], vec![1, 1, 3], None, 1).unwrap();
-        let x = b.from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 4, 1]).unwrap();
+        let cc =
+            CausalConv1d::from_weights(&b, vec![1.0, 1.0, 1.0], vec![1, 1, 3], None, 1).unwrap();
+        let x = b
+            .from_cpu_f32(&[1.0, 2.0, 3.0, 4.0], vec![1, 4, 1])
+            .unwrap();
         let y = cc.forward(&b, &x).unwrap();
         let got = b.to_cpu_f32(&y).unwrap();
         // causal: y[t] = x[t] + x[t-1] + x[t-2] (left-padded)
@@ -634,7 +739,7 @@ mod tests {
         let attn = Attention::from_weights(
             &b,
             vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], // wqkv (6,2): Q=K=V=identity
-            vec![1.0, 0.0, 0.0, 1.0], // wo identity
+            vec![1.0, 0.0, 0.0, 1.0],                                         // wo identity
             None,
             None,
             2,

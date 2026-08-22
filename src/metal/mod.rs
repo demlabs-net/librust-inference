@@ -40,12 +40,29 @@ pub enum MetalError {
 
 /// Storage dtype of a [`GpuTensor`]. Activations stay fp32; fp16/bf16 are
 /// GEMM weight formats (halved VRAM + weight-read traffic, fp32 accumulate
-/// in the kernels — the backend dtype contract).
+/// in the kernels — the backend dtype contract). Q4_0/Q8_0/Q4_K/Q6_K —
+/// block-quantized GEMM weights (Ф1.3/1.4): dequant inside the kernel, raw
+/// block bytes in the buffer (ggml layouts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuDtype {
     F32,
     F16,
     BF16,
+    Q4_0,
+    Q8_0,
+    Q4_K,
+    Q6_K,
+}
+
+impl GpuDtype {
+    /// Элементов в квант-блоке (для проверки кратности K).
+    pub fn block_elems(self) -> Option<usize> {
+        match self {
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 => Some(32),
+            GpuDtype::Q4_K | GpuDtype::Q6_K => Some(256),
+            _ => None,
+        }
+    }
 }
 
 /// A contiguous tensor living in Metal memory (fp32 activations, or
@@ -80,7 +97,11 @@ impl GpuTensor {
             // would be UB, fail loudly instead.
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::F32 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F32,
+        })
     }
 
     /// Zero-filled buffer of the given shape (fp32).
@@ -95,7 +116,11 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::F32 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F32,
+        })
     }
 
     /// Upload fp16 GEMM weights (2 bytes/element; the gemm kernels decode
@@ -115,7 +140,11 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::F16 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F16,
+        })
     }
 
     /// Upload bf16 GEMM weights (2 bytes/element, bit-pattern passthrough).
@@ -134,7 +163,54 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::BF16 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::BF16,
+        })
+    }
+
+    /// Upload block-quantized GEMM weights (Ф1.3/1.4): raw ggml-блоки как есть
+    /// (Q4_0/Q8_0: 18/34 Б на 32 элемента; Q4_K/Q6_K: 148/210 Б на 256) —
+    /// деквантование внутри кернела. Размер данных проверяется по numel.
+    pub fn from_quantized(
+        device: &Device,
+        data: &[u8],
+        shape: Vec<usize>,
+        dtype: GpuDtype,
+    ) -> Result<Self, MetalError> {
+        let bytes_per_elem = match dtype {
+            GpuDtype::Q4_0 => 18.0 / 32.0,
+            GpuDtype::Q8_0 => 34.0 / 32.0,
+            GpuDtype::Q4_K => 148.0 / 256.0,
+            GpuDtype::Q6_K => 210.0 / 256.0,
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "from_quantized: {other:?} is not a quantized dtype"
+                )));
+            }
+        };
+        let numel: usize = shape.iter().product();
+        let expected = (numel as f32 * bytes_per_elem).ceil() as usize;
+        if data.len() != expected {
+            return Err(MetalError::Shape(format!(
+                "quantized data {} B, expected {expected} B for {numel} elems ({dtype:?})",
+                data.len()
+            )));
+        }
+        let buffer = device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        if buffer.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        Ok(Self {
+            buffer,
+            shape,
+            dtype,
+        })
     }
 
     /// Download to CPU (shared memory). First commits an EMPTY command
@@ -148,6 +224,9 @@ impl GpuTensor {
                 "to_cpu_f32 on a quantized (f16/bf16) tensor".into(),
             ));
         }
+        // The producer may be inside a batch — the kernel writes are not
+        // visible until the pending command buffer is committed+waited.
+        ctx.flush_batch()?;
         let barrier = ctx.queue.new_command_buffer();
         barrier.commit();
         barrier.wait_until_completed();
@@ -176,6 +255,34 @@ pub struct MetalCtx {
     pub device: Device,
     queue: CommandQueue,
     pipelines: Mutex<HashMap<&'static str, ComputePipelineState>>,
+    /// Persistent batch state: while `depth > 0`, every kernel dispatch
+    /// goes into ONE command buffer (no per-op commit+wait) and a single
+    /// [`MetalCtx::flush_batch`] syncs the GPU. The wake/VAD paths run a
+    /// whole window this way — per-op sync made a wake window (~60 small
+    /// ops) cost ~97 ms against an 80 ms real-time budget, so the engine
+    /// fell behind the mic and the wake word never fired live.
+    batch: Mutex<BatchState>,
+}
+
+struct BatchState {
+    depth: usize,
+    /// Owned (retained) command buffer — survives the autorelease pool of
+    /// the creating call, unlike `new_command_buffer()`'s borrowed ref.
+    cmd: Option<CommandBuffer>,
+    /// Diagnostics: how many times a batch was opened (tests assert the
+    /// wake path actually batches — a regression that drops begin_batch
+    /// reintroduces the per-op sync stall).
+    enters: u64,
+}
+
+impl Default for BatchState {
+    fn default() -> Self {
+        Self {
+            depth: 0,
+            cmd: None,
+            enters: 0,
+        }
+    }
 }
 
 impl MetalCtx {
@@ -186,6 +293,7 @@ impl MetalCtx {
             device,
             queue,
             pipelines: Mutex::new(HashMap::new()),
+            batch: Mutex::new(BatchState::default()),
         };
         // Compile the whole kernel library once; pipelines are built lazily
         // and cached.
@@ -274,6 +382,8 @@ impl MetalCtx {
 
     /// Run one kernel with a grid; single commit + wait, inside an autorelease
     /// pool so the borrowed Metal objects are released deterministically.
+    /// In batch mode (see [`Self::begin_batch`]) the kernel is appended to
+    /// the pending command buffer WITHOUT commit/wait.
     fn run(
         &self,
         kernel: &'static str,
@@ -281,6 +391,27 @@ impl MetalCtx {
         group: MTLSize,
         setup: impl FnOnce(&ComputeCommandEncoderRef),
     ) -> Result<(), MetalError> {
+        // Batch path: accumulate into one command buffer, no per-op sync.
+        {
+            let mut batch = self.batch.lock().unwrap();
+            if batch.depth > 0 {
+                if batch.cmd.is_none() {
+                    batch.cmd = Some(self.queue.new_command_buffer().to_owned());
+                }
+                let cmd = batch.cmd.as_ref().unwrap();
+                // Fetch the pipeline BEFORE opening the encoder: a pipeline
+                // error must not leave an active encoder on the pending
+                // command buffer (a later flush would commit a buffer with
+                // an unterminated encoder — an ObjC exception, process abort).
+                let pipeline = self.pipeline(kernel)?;
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                setup(enc);
+                enc.dispatch_threads(grid, group);
+                enc.end_encoding();
+                return Ok(());
+            }
+        }
         autoreleasepool(|| {
             let pipeline = self.pipeline(kernel)?;
             let cmd = self.queue.new_command_buffer();
@@ -293,6 +424,63 @@ impl MetalCtx {
             cmd.wait_until_completed();
             Ok(())
         })
+    }
+
+    /// Enter batch mode (nestable). Ops accumulate until the matching
+    /// [`Self::end_batch`] — or an explicit [`Self::flush_batch`].
+    pub fn begin_batch(&self) {
+        let mut batch = self.batch.lock().unwrap();
+        batch.depth += 1;
+        batch.enters += 1;
+    }
+
+    /// How many batches were opened since the context was created
+    /// (diagnostics/tests).
+    pub fn batch_enter_count(&self) -> u64 {
+        self.batch.lock().unwrap().enters
+    }
+
+    /// Leave batch mode; on the outermost exit, commit+wait the pending
+    /// command buffer once.
+    pub fn end_batch(&self) -> Result<(), MetalError> {
+        let mut batch = self.batch.lock().unwrap();
+        if batch.depth > 0 {
+            batch.depth -= 1;
+        }
+        if batch.depth == 0 {
+            if let Some(cmd) = batch.cmd.take() {
+                cmd.commit();
+                cmd.wait_until_completed();
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit+wait the pending batch WITHOUT leaving batch mode. Required
+    /// before any host-side read ([`GpuTensor::to_cpu_f32`]) — the shared
+    /// buffer's contents are only valid after the GPU finished.
+    ///
+    /// A Metal command buffer can fail SILENTLY: waitUntilCompleted returns
+    /// even when the buffer's status is Error, and the buffers hold stale
+    /// garbage. The wake engine's batch runs ~60 kernels — one failed kernel
+    /// poisons the whole window's mel/embedding/phrase, which shows up as a
+    /// CONSTANT near-zero phrase probability on any input (the live symptom
+    /// 2026-08-22: offline 0.35 on the same audio, daemon 0.0001). Log the
+    /// status + error when it happens instead of shipping the garbage.
+    pub fn flush_batch(&self) -> Result<(), MetalError> {
+        let mut batch = self.batch.lock().unwrap();
+        if let Some(cmd) = batch.cmd.take() {
+            cmd.commit();
+            cmd.wait_until_completed();
+            let status = cmd.status();
+            if status != metal::MTLCommandBufferStatus::Completed {
+                tracing::error!(
+                    status = ?status,
+                    "Metal batch command buffer failed — results are garbage"
+                );
+            }
+        }
+        Ok(())
     }
 
     // ── ops ──
@@ -314,6 +502,12 @@ impl MetalCtx {
             GpuDtype::F32 => "gemm_f32",
             GpuDtype::F16 => "gemm_f16",
             GpuDtype::BF16 => "gemm_bf16",
+            // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K => {
+                return Err(MetalError::Shape(
+                    "gemm_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
+                ));
+            }
         };
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
@@ -565,7 +759,12 @@ impl MetalCtx {
     }
 
     /// Elementwise max with a scalar floor: Y = max(X, floor).
-    pub fn max_scalar_f32(&self, x: &GpuTensor, y: &GpuTensor, floor: f32) -> Result<(), MetalError> {
+    pub fn max_scalar_f32(
+        &self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        floor: f32,
+    ) -> Result<(), MetalError> {
         let n = x.numel();
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
@@ -618,8 +817,20 @@ impl MetalCtx {
             enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
             enc.set_buffer(3, Some(&y.buffer), 0);
             let consts = [
-                n, ci, hi, wi, co, kh, kw, oh, ow, pad_h, pad_w, stride_t,
-                stride_f, time_major_out as usize,
+                n,
+                ci,
+                hi,
+                wi,
+                co,
+                kh,
+                kw,
+                oh,
+                ow,
+                pad_h,
+                pad_w,
+                stride_t,
+                stride_f,
+                time_major_out as usize,
             ];
             for (i, v) in consts.iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
@@ -694,7 +905,12 @@ impl MetalCtx {
 
     /// C = A·Bᵀ: A (M,K), B (N,K), C (M,N) — for y = x @ Wᵀ with W stored
     /// row-major [N,K].
-    pub fn gemm_nt_f32(&self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> Result<(), MetalError> {
+    pub fn gemm_nt_f32(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
         let m = a.shape[0];
         let k = a.shape[1];
         let n = b.shape[0];
@@ -710,6 +926,12 @@ impl MetalCtx {
             GpuDtype::F32 => "gemm_nt_f32",
             GpuDtype::F16 => "gemm_nt_f16",
             GpuDtype::BF16 => "gemm_nt_bf16",
+            // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K => {
+                return Err(MetalError::Shape(
+                    "gemm_nt_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
+                ));
+            }
         };
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
@@ -720,6 +942,104 @@ impl MetalCtx {
             enc.set_bytes(3, 8, (&m as *const usize).cast());
             enc.set_bytes(4, 8, (&k as *const usize).cast());
             enc.set_bytes(5, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// C = A·Bᵀ с КВАНТОВАННЫМИ весами B [N, K] (Ф1.3): dequant-in-kernel,
+    /// fp32-аккумуляция. Требует K, кратного блоку формата (32/256).
+    pub fn gemm_nt_quantized(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let m = a.shape[0];
+        let k = a.shape[1];
+        let n = b.shape[0];
+        if a.shape[1] != b.shape[1] || c.shape != [m, n] {
+            return Err(MetalError::Shape(format!(
+                "gemm_nt_quantized {:?}x{:?}->{:?}",
+                a.shape, b.shape, c.shape
+            )));
+        }
+        let name = match b.dtype {
+            GpuDtype::Q4_0 => "gemm_nt_q4_0",
+            GpuDtype::Q8_0 => "gemm_nt_q8_0",
+            GpuDtype::Q4_K => "gemm_nt_q4_k",
+            GpuDtype::Q6_K => "gemm_nt_q6_k",
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "gemm_nt_quantized: B dtype {other:?} is not quantized"
+                )));
+            }
+        };
+        let block = b
+            .dtype
+            .block_elems()
+            .ok_or_else(|| MetalError::Shape("quantized block size unavailable".into()))?;
+        if !k.is_multiple_of(block) {
+            return Err(MetalError::Shape(format!(
+                "gemm_nt_quantized: K={k} not a multiple of block {block} ({:?})",
+                b.dtype
+            )));
+        }
+        let grid = MTLSize::new(m as u64, n as u64, 1);
+        let group = MTLSize::new(8, 8, 1);
+        self.run(name, grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_bytes(3, 8, (&m as *const usize).cast());
+            enc.set_bytes(4, 8, (&k as *const usize).cast());
+            enc.set_bytes(5, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// MV (decode, batch=1, Ф1.4): C[n] = Σ_k A[k]·B[n][k], B квантованный
+    /// [N, K]; A — вектор [K]. thread на выходной n.
+    pub fn mv_quantized(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let k = a.shape[0];
+        let n = b.shape[0];
+        if a.shape.len() != 1 || b.shape.len() != 2 || b.shape[1] != k || c.shape != [n] {
+            return Err(MetalError::Shape(format!(
+                "mv_quantized {:?}x{:?}->{:?}",
+                a.shape, b.shape, c.shape
+            )));
+        }
+        let name = match b.dtype {
+            GpuDtype::Q4_0 => "mv_q4_0",
+            GpuDtype::Q8_0 => "mv_q8_0",
+            GpuDtype::Q4_K => "mv_q4_k",
+            GpuDtype::Q6_K => "mv_q6_k",
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "mv_quantized: B dtype {other:?} is not quantized"
+                )));
+            }
+        };
+        let block = b
+            .dtype
+            .block_elems()
+            .ok_or_else(|| MetalError::Shape("quantized block size unavailable".into()))?;
+        if !k.is_multiple_of(block) {
+            return Err(MetalError::Shape(format!(
+                "mv_quantized: K={k} not a multiple of block {block} ({:?})",
+                b.dtype
+            )));
+        }
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(64, 1, 1);
+        self.run(name, grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_bytes(3, 8, (&k as *const usize).cast());
+            enc.set_bytes(4, 8, (&n as *const usize).cast());
         })
     }
 
@@ -767,7 +1087,10 @@ impl MetalCtx {
             for (i, v) in [t, cin, cout, k, cin_g].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
-            for (i, v) in [params.stride, params.pad, pad_r, params.dilation].iter().enumerate() {
+            for (i, v) in [params.stride, params.pad, pad_r, params.dilation]
+                .iter()
+                .enumerate()
+            {
                 enc.set_bytes((9 + i) as u64, 8, (v as *const usize).cast());
             }
             let tm = time_major as usize;
@@ -888,7 +1211,12 @@ impl MetalCtx {
     }
 
     /// Y = X + B elementwise (same shape; mask bias).
-    pub fn add_bias2d_f32(&self, x: &GpuTensor, b: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+    pub fn add_bias2d_f32(
+        &self,
+        x: &GpuTensor,
+        b: &GpuTensor,
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
         let n = x.numel();
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
@@ -962,11 +1290,7 @@ impl MetalCtx {
 
     /// Uniform attention fallback: V (B,H,KV,HD) → Y (B,H,T,HD) where each
     /// row is the mean over KV.
-    pub fn uniform_attn_f32(
-        &self,
-        v: &GpuTensor,
-        y: &GpuTensor,
-    ) -> Result<(), MetalError> {
+    pub fn uniform_attn_f32(&self, v: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let (b, h, kv, hd) = (v.shape[0], v.shape[1], v.shape[2], v.shape[3]);
         let t = y.shape[2];
         let grid = MTLSize::new(b as u64, h as u64, (t * hd) as u64);
@@ -1258,6 +1582,9 @@ impl MetalCtx {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
         })?;
+        // In batch mode the kernel has NOT executed yet — the host copy
+        // below would read the previous indices. Flush like to_cpu_f32 does.
+        self.flush_batch()?;
         let ptr = idx_buf.contents();
         if ptr.is_null() {
             return Err(MetalError::BufferAlloc);
@@ -1293,7 +1620,10 @@ impl MetalCtx {
             enc.set_buffer(2, Some(&v.buffer), 0);
             enc.set_buffer(3, mask.map(|m| &*m.buffer), 0);
             enc.set_buffer(4, Some(&y.buffer), 0);
-            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep].iter().enumerate() {
+            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
+                .iter()
+                .enumerate()
+            {
                 enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
             }
         })
@@ -1385,12 +1715,7 @@ impl MetalCtx {
     }
 
     /// Causal unpad along time: X (B,T,C) → Y (B,T-U,C), Y = X[:, U:, :].
-    pub fn slice_time_f32(
-        &self,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        u: usize,
-    ) -> Result<(), MetalError> {
+    pub fn slice_time_f32(&self, x: &GpuTensor, y: &GpuTensor, u: usize) -> Result<(), MetalError> {
         let (b, t, c) = (x.shape[0], x.shape[1], x.shape[2]);
         if y.shape != [b, t - u, c] {
             return Err(MetalError::Shape(format!(
@@ -1464,136 +1789,317 @@ pub struct MetalBackend {
 
 impl MetalBackend {
     pub fn new() -> Result<Self, MetalError> {
-        Ok(Self { ctx: MetalCtx::new()? })
+        Ok(Self {
+            ctx: MetalCtx::new()?,
+        })
     }
 }
 
 impl crate::backend::Backend for MetalBackend {
-    fn zeros(&self, shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::zeros(&self.ctx.device, shape)?))
+    fn supports_f16_weights(&self) -> bool {
+        true
     }
 
-    fn from_cpu_f32(&self, data: &[f32], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f32(&self.ctx.device, data, shape)?))
+    fn rope_standard(
+        &self,
+        x: &crate::backend::Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let y = self.zeros(vec![1, tq, d])?;
+        let xg = x.inner_metal();
+        let yg = y.inner_metal();
+        let grid = metal::MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
+        let group = metal::MTLSize::new(1, 4, 4);
+        self.ctx.run("rope_std_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&xg.buffer), 0);
+            enc.set_buffer(1, Some(&yg.buffer), 0);
+            enc.set_bytes(2, 8, (&tq as *const usize).cast());
+            enc.set_bytes(3, 8, (&d as *const usize).cast());
+            enc.set_bytes(4, 8, (&hd as *const usize).cast());
+            enc.set_bytes(5, 8, (&pos as *const usize).cast());
+            enc.set_bytes(6, 4, (&theta as *const f32).cast());
+        })?;
+        Ok(y)
+    }
+
+    fn zeros(
+        &self,
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::zeros(
+            &self.ctx.device,
+            shape,
+        )?))
+    }
+
+    fn from_cpu_f32(
+        &self,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f32(
+            &self.ctx.device,
+            data,
+            shape,
+        )?))
     }
 
     /// fp16 GEMM weights: stored as true fp16 (2 bytes/element) — the gemm
     /// kernels read them narrowed and accumulate in fp32.
-    fn from_cpu_f16(&self, data: &[half::f16], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f16(&self.ctx.device, data, shape)?))
+    fn from_cpu_f16(
+        &self,
+        data: &[half::f16],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f16(
+            &self.ctx.device,
+            data,
+            shape,
+        )?))
     }
 
     /// bf16 GEMM weights: stored as true bf16 (bit-pattern passthrough).
-    fn from_cpu_bf16(&self, data: &[half::bf16], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_bf16(&self.ctx.device, data, shape)?))
+    fn from_cpu_bf16(
+        &self,
+        data: &[half::bf16],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_bf16(
+            &self.ctx.device,
+            data,
+            shape,
+        )?))
     }
 
-    fn to_cpu_f32(&self, t: &crate::backend::Tensor) -> Result<Vec<f32>, crate::error::BackendError> {
+    fn to_cpu_f32(
+        &self,
+        t: &crate::backend::Tensor,
+    ) -> Result<Vec<f32>, crate::error::BackendError> {
         Ok(t.as_gpu().to_cpu_f32(&self.ctx)?)
     }
 
-    fn gemm(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn begin_batch(&self) -> Result<(), crate::error::BackendError> {
+        self.ctx.begin_batch();
+        Ok(())
+    }
+
+    fn end_batch(&self) -> Result<(), crate::error::BackendError> {
+        self.ctx.end_batch()?;
+        Ok(())
+    }
+
+    fn batch_enter_count(&self) -> u64 {
+        self.ctx.batch_enter_count()
+    }
+
+    fn gemm(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        c: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.gemm_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())?;
         Ok(())
     }
 
-    fn gemm_nt(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn gemm_nt(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        c: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.gemm_nt_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())?;
         Ok(())
     }
 
-    fn mul(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn mul(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.mul_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn add(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn add(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.add_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn sub(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn sub(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.sub_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn div(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn div(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.div_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn add_scalar(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, c: f32) -> Result<(), crate::error::BackendError> {
+    fn add_scalar(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        c: f32,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.add_scalar_f32(x.as_gpu(), y.as_gpu(), c)?;
         Ok(())
     }
 
-    fn scale(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, c: f32) -> Result<(), crate::error::BackendError> {
+    fn scale(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        c: f32,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.scale_f32(x.as_gpu(), y.as_gpu(), c)?;
         Ok(())
     }
 
-    fn add_bias(&self, x: &crate::backend::Tensor, bias: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
-        self.ctx.add_bias_f32(x.as_gpu(), bias.as_gpu(), y.as_gpu())?;
+    fn add_bias(
+        &self,
+        x: &crate::backend::Tensor,
+        bias: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .add_bias_f32(x.as_gpu(), bias.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn sqrt(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn sqrt(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.sqrt_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn log(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn log(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.log_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn max_scalar(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, floor: f32) -> Result<(), crate::error::BackendError> {
+    fn max_scalar(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        floor: f32,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.max_scalar_f32(x.as_gpu(), y.as_gpu(), floor)?;
         Ok(())
     }
 
-    fn relu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn relu(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.relu_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn leaky_relu_clip(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn leaky_relu_clip(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.leaky_relu_clip_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn sigmoid(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn sigmoid(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.sigmoid_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn tanh(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn tanh(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.tanh_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn silu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn silu(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.silu_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn gelu_tanh(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn gelu_tanh(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.gelu_tanh_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn snake(&self, x: &crate::backend::Tensor, a: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn snake(
+        &self,
+        x: &crate::backend::Tensor,
+        a: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.snake_f32(x.as_gpu(), a.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn rmsnorm(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.rmsnorm_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), eps)?;
+    fn rmsnorm(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .rmsnorm_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), eps)?;
         Ok(())
     }
 
-    fn layernorm(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.layernorm_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), eps)?;
+    fn layernorm(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .layernorm_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), eps)?;
         Ok(())
     }
 
@@ -1608,9 +2114,23 @@ impl crate::backend::Backend for MetalBackend {
         dil: usize,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        let params = Conv1dParams { stride, pad: pad_l, dilation: dil };
+        let params = Conv1dParams {
+            stride,
+            pad: pad_l,
+            dilation: dil,
+        };
         let dense = w.as_gpu().shape[1] == x.as_gpu().shape[2];
-        self.ctx.conv1d_groups_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), params, pad_r, true, true, dense, y.as_gpu())?;
+        self.ctx.conv1d_groups_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            params,
+            pad_r,
+            true,
+            true,
+            dense,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
@@ -1629,9 +2149,23 @@ impl crate::backend::Backend for MetalBackend {
         // The Metal kernel derives Cin_g from W (Cout, Cin_g, K); dense is
         // true when every out channel reads all Cin input channels.
         let _ = groups; // implied by W's Cin_g dim (see the kernel)
-        let params = Conv1dParams { stride, pad: pad_l, dilation: dil };
+        let params = Conv1dParams {
+            stride,
+            pad: pad_l,
+            dilation: dil,
+        };
         let dense = w.as_gpu().shape[1] == x.as_gpu().shape[2];
-        self.ctx.conv1d_groups_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), params, pad_r, true, true, dense, y.as_gpu())?;
+        self.ctx.conv1d_groups_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            params,
+            pad_r,
+            true,
+            true,
+            dense,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
@@ -1647,11 +2181,27 @@ impl crate::backend::Backend for MetalBackend {
         time_major_out: bool,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.conv2d_nchw_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), pad_h, pad_w, stride_t, stride_f, time_major_out, y.as_gpu())?;
+        self.ctx.conv2d_nchw_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            pad_h,
+            pad_w,
+            stride_t,
+            stride_f,
+            time_major_out,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
-    fn maxpool2d(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, kh: usize, kw: usize) -> Result<(), crate::error::BackendError> {
+    fn maxpool2d(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        kh: usize,
+        kw: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.maxpool2d_f32(x.as_gpu(), y.as_gpu(), kh, kw)?;
         Ok(())
     }
@@ -1664,7 +2214,13 @@ impl crate::backend::Backend for MetalBackend {
         stride: usize,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.conv_transpose1d_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), stride, y.as_gpu())?;
+        self.ctx.conv_transpose1d_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            stride,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
@@ -1678,7 +2234,8 @@ impl crate::backend::Backend for MetalBackend {
         dil: usize,
         tout: usize,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.im2col1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, pad_l, dil, tout)?;
+        self.ctx
+            .im2col1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, pad_l, dil, tout)?;
         Ok(())
     }
 
@@ -1690,82 +2247,188 @@ impl crate::backend::Backend for MetalBackend {
         stride: usize,
         tout: usize,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.im2col_t1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, tout)?;
+        self.ctx
+            .im2col_t1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, tout)?;
         Ok(())
     }
 
-    fn slice_last(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, off: usize) -> Result<(), crate::error::BackendError> {
+    fn slice_last(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        off: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.slice_last_f32(x.as_gpu(), y.as_gpu(), off)?;
         Ok(())
     }
 
-    fn slice_time(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, u: usize) -> Result<(), crate::error::BackendError> {
+    fn slice_time(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        u: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.slice_time_f32(x.as_gpu(), y.as_gpu(), u)?;
         Ok(())
     }
 
-    fn softmax_last_dim(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn softmax_last_dim(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.softmax_last_dim_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn embedding(&self, idx: &[u32], table: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn embedding(
+        &self,
+        idx: &[u32],
+        table: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn rope(&self, x: &crate::backend::Tensor, cos: &crate::backend::Tensor, sin: &crate::backend::Tensor, y: &crate::backend::Tensor, rope_dim: usize) -> Result<(), crate::error::BackendError> {
-        self.ctx.rope_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), rope_dim)?;
+    fn rope(
+        &self,
+        x: &crate::backend::Tensor,
+        cos: &crate::backend::Tensor,
+        sin: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        rope_dim: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .rope_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), rope_dim)?;
         Ok(())
     }
 
-    fn rope_interleaved(&self, x: &crate::backend::Tensor, cos: &crate::backend::Tensor, sin: &crate::backend::Tensor, y: &crate::backend::Tensor, rope_dim: usize, start: usize) -> Result<(), crate::error::BackendError> {
-        self.ctx.rope_interleaved_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), rope_dim, start)?;
+    fn rope_interleaved(
+        &self,
+        x: &crate::backend::Tensor,
+        cos: &crate::backend::Tensor,
+        sin: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        rope_dim: usize,
+        start: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.rope_interleaved_f32(
+            x.as_gpu(),
+            cos.as_gpu(),
+            sin.as_gpu(),
+            y.as_gpu(),
+            rope_dim,
+            start,
+        )?;
         Ok(())
     }
 
-    fn rope_head(&self, x: &crate::backend::Tensor, cos: &crate::backend::Tensor, sin: &crate::backend::Tensor, y: &crate::backend::Tensor, h: usize, rope_dim: usize) -> Result<(), crate::error::BackendError> {
-        self.ctx.rope_head_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), h, rope_dim)?;
+    fn rope_head(
+        &self,
+        x: &crate::backend::Tensor,
+        cos: &crate::backend::Tensor,
+        sin: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        h: usize,
+        rope_dim: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.rope_head_f32(
+            x.as_gpu(),
+            cos.as_gpu(),
+            sin.as_gpu(),
+            y.as_gpu(),
+            h,
+            rope_dim,
+        )?;
         Ok(())
     }
 
-    fn rmsnorm_head(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor, h: usize, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.rmsnorm_head_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), h, eps)?;
+    fn rmsnorm_head(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .rmsnorm_head_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), h, eps)?;
         Ok(())
     }
 
-    fn layernorm_head(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, h: usize, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.layernorm_head_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), h, eps)?;
+    fn layernorm_head(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .layernorm_head_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), h, eps)?;
         Ok(())
     }
 
-    fn mul_rows(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn mul_rows(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.mul_rows_f32(x.as_gpu(), w.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn mul_vec(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn mul_vec(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.mul_vec_f32(x.as_gpu(), w.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn glu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn glu(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.glu_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn repeat(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn repeat(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.repeat_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn add_scaled(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, scale: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.add_scaled_f32(a.as_gpu(), b.as_gpu(), y.as_gpu(), scale)?;
+    fn add_scaled(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        scale: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .add_scaled_f32(a.as_gpu(), b.as_gpu(), y.as_gpu(), scale)?;
         Ok(())
     }
 
-    fn add_bias2d(&self, x: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
-        self.ctx.add_bias2d_f32(x.as_gpu(), b.as_gpu(), y.as_gpu())?;
+    fn add_bias2d(
+        &self,
+        x: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .add_bias2d_f32(x.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
@@ -1780,7 +2443,16 @@ impl crate::backend::Backend for MetalBackend {
         kv_heads: usize,
         hd: usize,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.attn_ar_f32(q.as_gpu(), k.as_gpu(), v.as_gpu(), mask.map(|m| m.as_gpu()), y.as_gpu(), n_heads, kv_heads, hd)?;
+        self.ctx.attn_ar_f32(
+            q.as_gpu(),
+            k.as_gpu(),
+            v.as_gpu(),
+            mask.map(|m| m.as_gpu()),
+            y.as_gpu(),
+            n_heads,
+            kv_heads,
+            hd,
+        )?;
         Ok(())
     }
 
@@ -1794,22 +2466,274 @@ impl crate::backend::Backend for MetalBackend {
         mode: u32,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.mhsa_f32(q.as_gpu(), k.as_gpu(), v.as_gpu(), sc.as_gpu(), mask.map(|m| m.as_gpu()), mode, y.as_gpu())?;
+        self.ctx.mhsa_f32(
+            q.as_gpu(),
+            k.as_gpu(),
+            v.as_gpu(),
+            sc.as_gpu(),
+            mask.map(|m| m.as_gpu()),
+            mode,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
-    fn uniform_attn(&self, v: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn uniform_attn(
+        &self,
+        v: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.uniform_attn_f32(v.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn kv_update(&self, dst: &crate::backend::Tensor, src: &crate::backend::Tensor, pos: usize) -> Result<(), crate::error::BackendError> {
+    fn kv_update(
+        &self,
+        dst: &crate::backend::Tensor,
+        src: &crate::backend::Tensor,
+        pos: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.kv_update_f32(dst.as_gpu(), src.as_gpu(), pos)?;
         Ok(())
     }
 
-    fn codebook_search(&self, x: &crate::backend::Tensor, table: &crate::backend::Tensor, idx: &mut [u32]) -> Result<(), crate::error::BackendError> {
-        self.ctx.codebook_search_f32(x.as_gpu(), table.as_gpu(), idx)?;
+    fn codebook_search(
+        &self,
+        x: &crate::backend::Tensor,
+        table: &crate::backend::Tensor,
+        idx: &mut [u32],
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .codebook_search_f32(x.as_gpu(), table.as_gpu(), idx)?;
         Ok(())
+    }
+}
+
+// ── Квант-GEMM/MV: сверка с CPU-референсом (Ф1.3/1.4) ────────────────────────
+
+#[cfg(all(test, feature = "metal"))]
+mod quant_gemm_tests {
+    use super::*;
+    use crate::gguf;
+    use crate::weights_map::{WeightsMap, dequant_f32};
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// f32-веса источника (f16-фикстура — те же сиды, что у всех квантов).
+    fn source_f32(name: &str) -> Vec<f32> {
+        let buf = fixture(name);
+        let f = gguf::parse(&buf).unwrap();
+        let m = WeightsMap::from_gguf(&f).unwrap();
+        dequant_f32(m.get("token_embd.weight").unwrap())
+    }
+
+    // Тестовые энкодеры Q4_K/Q6_K (K=256-синтетика; логика как в fixture-gen).
+    fn enc_q4_k(w: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for sb in w.chunks_exact(256) {
+            let max = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let d = if max > 0.0 { max / 7.0 } else { 0.0 };
+            let dbits = (d.to_bits() >> 16) as u16;
+            out.extend_from_slice(&dbits.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // dmin
+            let mut scales = [0u8; 16];
+            let mut qs = [0u8; 128];
+            for (b, blk) in sb.chunks_exact(32).enumerate() {
+                let bmax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                let sc = if d > 0.0 && bmax > 0.0 {
+                    ((bmax / (d * 7.0)).round() as u8).clamp(1, 15)
+                } else {
+                    1
+                };
+                scales[b / 2] |= sc << ((b % 2) * 4);
+                for (j, pair) in blk.chunks_exact(2).enumerate() {
+                    let q0 = ((pair[0] / (d * sc as f32)).round() as i32 + 8).clamp(0, 15) as u8;
+                    let q1 = ((pair[1] / (d * sc as f32)).round() as i32 + 8).clamp(0, 15) as u8;
+                    qs[b * 16 + j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+                }
+            }
+            out.extend_from_slice(&scales);
+            out.extend_from_slice(&qs);
+        }
+        out
+    }
+
+    fn enc_q6_k(w: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for sb in w.chunks_exact(256) {
+            let max = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let d = if max > 0.0 { max / 31.0 } else { 0.0 };
+            let dbits = (d.to_bits() >> 16) as u16;
+            out.extend_from_slice(&dbits.to_le_bytes());
+            let mut ql = [0u8; 128];
+            let mut qh = [0u8; 64];
+            let mut scales = [0u8; 16];
+            for (b, blk) in sb.chunks_exact(32).enumerate() {
+                let bmax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                let sc = if d > 0.0 && bmax > 0.0 {
+                    ((bmax / (d * 31.0)).round() as u8).clamp(1, 255)
+                } else {
+                    1
+                };
+                scales[b] = sc & 0x0F;
+                scales[b + 8] = sc >> 4;
+                for (j, &w) in blk.iter().enumerate() {
+                    let q = ((w / (d * sc as f32)).round() as i32 + 32).clamp(0, 63) as u8;
+                    let idx = b * 32 + j;
+                    if j % 2 == 0 {
+                        ql[idx / 2] = q & 0x0F;
+                    } else {
+                        ql[idx / 2] |= (q & 0x0F) << 4;
+                    }
+                    qh[idx / 4] |= ((q >> 4) & 0x03) << ((idx % 4) * 2);
+                }
+            }
+            out.extend_from_slice(&ql);
+            out.extend_from_slice(&qh);
+            out.extend_from_slice(&scales);
+        }
+        out
+    }
+
+    /// (bytes, shape[N,K], dtype, per-elem tol) — источники для GPU-теста.
+    fn cases() -> Vec<(Vec<u8>, Vec<usize>, GpuDtype, f32)> {
+        let src: Vec<f32> = (0..8 * 256)
+            .map(|i| ((i as f32 * 7919.0).sin() * 0.5))
+            .collect();
+        vec![
+            (enc_q4_k(&src), vec![8, 256], GpuDtype::Q4_K, 0.15),
+            (enc_q6_k(&src), vec![8, 256], GpuDtype::Q6_K, 0.06),
+            // Q4_0/Q8_0 — прямо из фикстур (K=32, те же веса, что у f16)
+            (
+                {
+                    let buf = fixture("mini-q4_0.gguf");
+                    let f = gguf::parse(&buf).unwrap();
+                    let m = WeightsMap::from_gguf(&f).unwrap();
+                    m.get("token_embd.weight").unwrap().raw().to_vec()
+                },
+                vec![64, 32],
+                GpuDtype::Q4_0,
+                0.15,
+            ),
+            (
+                {
+                    let buf = fixture("mini-q8_0.gguf");
+                    let f = gguf::parse(&buf).unwrap();
+                    let m = WeightsMap::from_gguf(&f).unwrap();
+                    m.get("token_embd.weight").unwrap().raw().to_vec()
+                },
+                vec![64, 32],
+                GpuDtype::Q8_0,
+                0.02,
+            ),
+        ]
+    }
+
+    /// CPU-референс: деквант → C[m,n] = Σ A[m,k]·Bf[n,k].
+    fn cpu_ref(a: &[f32], m: usize, k: usize, bf: &[f32], n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for mm in 0..m {
+            for nn in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += a[mm * k + kk] * bf[nn * k + kk];
+                }
+                c[mm * n + nn] = acc;
+            }
+        }
+        c
+    }
+
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn quantized_gemm_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        for (bytes, shape, dtype, tol) in cases() {
+            let n = shape[0];
+            let k = shape[1];
+            let m = 3usize;
+            let b = GpuTensor::from_quantized(dev, &bytes, shape.clone(), dtype).unwrap();
+            // CPU-референс: деквант тех же байт
+            let tmp = WeightsMap {
+                arch: "t".into(),
+                tensors: vec![crate::weights_map::WeightTensor {
+                    name: "w".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format: match dtype {
+                        GpuDtype::Q4_0 => crate::dtype::WeightFormat::Q4_0,
+                        GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
+                        GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
+                        GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        _ => unreachable!(),
+                    },
+                    offset: 0,
+                    data: &bytes,
+                }],
+                storage: vec![],
+            };
+            let bf = dequant_f32(&tmp.tensors[0]);
+            let a_data: Vec<f32> = (0..m * k).map(|i| ((i as f32 * 104729.0).sin())).collect();
+            let c_ref = cpu_ref(&a_data, m, k, &bf, n);
+
+            let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![m, k]).unwrap();
+            let c = GpuTensor::zeros(dev, vec![m, n]).unwrap();
+            ctx.gemm_nt_quantized(&a, &b, &c).unwrap();
+            let got = c.to_cpu_f32(&ctx).unwrap();
+            let bound = tol * k as f32 * 1.5;
+            let diff = max_diff(&got, &c_ref);
+            assert!(diff <= bound, "{dtype:?}: |Δ| max {diff} > {bound}");
+        }
+    }
+
+    #[test]
+    fn quantized_mv_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        for (bytes, shape, dtype, tol) in cases() {
+            let n = shape[0];
+            let k = shape[1];
+            let b = GpuTensor::from_quantized(dev, &bytes, shape.clone(), dtype).unwrap();
+            let tmp = WeightsMap {
+                arch: "t".into(),
+                tensors: vec![crate::weights_map::WeightTensor {
+                    name: "w".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format: match dtype {
+                        GpuDtype::Q4_0 => crate::dtype::WeightFormat::Q4_0,
+                        GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
+                        GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
+                        GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        _ => unreachable!(),
+                    },
+                    offset: 0,
+                    data: &bytes,
+                }],
+                storage: vec![],
+            };
+            let bf = dequant_f32(&tmp.tensors[0]);
+            let a_data: Vec<f32> = (0..k).map(|i| ((i as f32 * 15485863.0).sin())).collect();
+            let c_ref = cpu_ref(&a_data, 1, k, &bf, n);
+
+            let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![k]).unwrap();
+            let c = GpuTensor::zeros(dev, vec![n]).unwrap();
+            ctx.mv_quantized(&a, &b, &c).unwrap();
+            let got = c.to_cpu_f32(&ctx).unwrap();
+            let bound = tol * k as f32 * 1.5;
+            let diff = max_diff(&got, &c_ref);
+            assert!(diff <= bound, "{dtype:?} mv: |Δ| max {diff} > {bound}");
+        }
     }
 }

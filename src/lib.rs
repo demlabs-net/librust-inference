@@ -18,20 +18,25 @@
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
 
 pub mod backend;
+pub mod chat_template;
+pub mod concurrency;
 #[cfg(feature = "cpu")]
 pub mod cpu;
-pub mod nn;
-pub mod concurrency;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dtype;
 pub mod error;
+pub mod gguf;
 #[cfg(feature = "cpu")]
 pub mod harness;
 pub mod inference;
 #[cfg(feature = "metal")]
 pub mod metal;
+pub mod nn;
+pub mod qwen3;
+pub mod tokenizer;
 pub mod weights;
+pub mod weights_map;
 
 pub use backend::{Backend, Tensor};
 pub use dtype::{Dtype, KvFormat, QuantConfig, WeightFormat};

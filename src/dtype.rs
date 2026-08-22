@@ -53,12 +53,15 @@ impl Dtype {
 /// nominal) and are dequantized inside the fused GEMM kernel — the point is
 /// real VRAM/bandwidth savings, not fake-quantized f16 tensors.
 ///
-/// Variant names keep the canonical llama.cpp format names (Q8_0, Q6_K).
+/// Variant names keep the canonical llama.cpp format names (Q8_0, Q6_K,
+/// Q4_0, Q4_K — последний входит в схему Q4_K_M на уровне тензоров).
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeightFormat {
     Plain(Dtype),
+    Q4_0,
     Q8_0,
+    Q4_K,
     Q6_K,
     Int4,
     Nf4,
@@ -69,9 +72,11 @@ impl WeightFormat {
     pub fn bits_per_weight(self) -> f32 {
         match self {
             WeightFormat::Plain(d) => (d.bytes() * 8) as f32,
-            WeightFormat::Q8_0 => 8.5,  // 32 × 8 bit + 32-bit scale over 32 elems
+            WeightFormat::Q4_0 => 4.5, // 32 × 4 bit + f16 scale over 32 elems
+            WeightFormat::Q8_0 => 8.5, // 32 × 8 bit + 32-bit scale over 32 elems
+            WeightFormat::Q4_K => 4.625, // 256-elem super-block: 148 B (k-quants)
             WeightFormat::Q6_K => 6.5625, // 256-elem super-block, k-quants layout
-            WeightFormat::Int4 => 4.5,  // group 128: 4 bit + f32 scale/offset
+            WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
     }
@@ -83,7 +88,9 @@ impl WeightFormat {
     pub fn name(self) -> String {
         match self {
             WeightFormat::Plain(d) => d.name().to_string(),
+            WeightFormat::Q4_0 => "q4_0".into(),
             WeightFormat::Q8_0 => "q8_0".into(),
+            WeightFormat::Q4_K => "q4_k".into(),
             WeightFormat::Q6_K => "q6_k".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
@@ -134,17 +141,29 @@ pub struct QuantConfig {
 
 impl QuantConfig {
     pub fn fp32_reference() -> Self {
-        Self { activation: Dtype::F32, weights: WeightFormat::Plain(Dtype::F32), kv: KvFormat::F32 }
+        Self {
+            activation: Dtype::F32,
+            weights: WeightFormat::Plain(Dtype::F32),
+            kv: KvFormat::F32,
+        }
     }
 
     /// The user-scenario preset: activations f16, weights and KV in Q8.
     pub fn balanced_f16_q8() -> Self {
-        Self { activation: Dtype::F16, weights: WeightFormat::Q8_0, kv: KvFormat::Q8_0 }
+        Self {
+            activation: Dtype::F16,
+            weights: WeightFormat::Q8_0,
+            kv: KvFormat::Q8_0,
+        }
     }
 
     /// Max capacity preset (Phase 7.3 candidates; needs quality-gate).
     pub fn max_capacity() -> Self {
-        Self { activation: Dtype::F16, weights: WeightFormat::Int4, kv: KvFormat::Q8_0 }
+        Self {
+            activation: Dtype::F16,
+            weights: WeightFormat::Int4,
+            kv: KvFormat::Q8_0,
+        }
     }
 }
 
@@ -185,7 +204,11 @@ mod tests {
         assert_eq!(WeightFormat::Plain(Dtype::BF16).bits_per_weight(), 16.0);
         assert_eq!(WeightFormat::Q8_0.bits_per_weight(), 8.5);
         assert!((WeightFormat::Q6_K.bits_per_weight() - 6.5625).abs() < 1e-6);
+        assert!((WeightFormat::Q4_0.bits_per_weight() - 4.5).abs() < 1e-6);
+        assert!((WeightFormat::Q4_K.bits_per_weight() - 4.625).abs() < 1e-6);
         assert!(WeightFormat::Q8_0.is_quantized());
+        assert!(WeightFormat::Q4_0.is_quantized());
+        assert!(WeightFormat::Q4_K.is_quantized());
         assert!(!WeightFormat::Plain(Dtype::F16).is_quantized());
     }
 
@@ -200,27 +223,51 @@ mod tests {
     #[test]
     fn validate_ok_combinations() {
         for act in [Dtype::F32, Dtype::BF16, Dtype::F16] {
-            validate(QuantConfig { activation: act, weights: WeightFormat::Q8_0, kv: KvFormat::Q8_0 }).unwrap();
-            validate(QuantConfig { activation: act, weights: WeightFormat::Plain(Dtype::F32), kv: KvFormat::F16 }).unwrap();
+            validate(QuantConfig {
+                activation: act,
+                weights: WeightFormat::Q8_0,
+                kv: KvFormat::Q8_0,
+            })
+            .unwrap();
+            validate(QuantConfig {
+                activation: act,
+                weights: WeightFormat::Plain(Dtype::F32),
+                kv: KvFormat::F16,
+            })
+            .unwrap();
         }
-        validate(QuantConfig { activation: Dtype::BF16, weights: WeightFormat::Plain(Dtype::BF16), kv: KvFormat::F32 }).unwrap();
-        validate(QuantConfig { activation: Dtype::F16, weights: WeightFormat::Plain(Dtype::F16), kv: KvFormat::Q4_0 }).unwrap();
+        validate(QuantConfig {
+            activation: Dtype::BF16,
+            weights: WeightFormat::Plain(Dtype::BF16),
+            kv: KvFormat::F32,
+        })
+        .unwrap();
+        validate(QuantConfig {
+            activation: Dtype::F16,
+            weights: WeightFormat::Plain(Dtype::F16),
+            kv: KvFormat::Q4_0,
+        })
+        .unwrap();
     }
 
     #[test]
     fn validate_rejects_mismatched_plain() {
-        assert!(validate(QuantConfig {
-            activation: Dtype::F16,
-            weights: WeightFormat::Plain(Dtype::BF16),
-            kv: KvFormat::F32,
-        })
-        .is_err());
-        assert!(validate(QuantConfig {
-            activation: Dtype::BF16,
-            weights: WeightFormat::Plain(Dtype::F16),
-            kv: KvFormat::F32,
-        })
-        .is_err());
+        assert!(
+            validate(QuantConfig {
+                activation: Dtype::F16,
+                weights: WeightFormat::Plain(Dtype::BF16),
+                kv: KvFormat::F32,
+            })
+            .is_err()
+        );
+        assert!(
+            validate(QuantConfig {
+                activation: Dtype::BF16,
+                weights: WeightFormat::Plain(Dtype::F16),
+                kv: KvFormat::F32,
+            })
+            .is_err()
+        );
     }
 
     #[test]

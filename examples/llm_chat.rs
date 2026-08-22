@@ -60,35 +60,81 @@ fn main() -> Result<(), Box<dyn Error>> {
             String::from_utf8_lossy(tok.piece(bos)).into_owned(),
         );
     }
-    let tpl = Template::compile(tpl_src, special)?;
-    let ctx = TemplateContext {
-        messages: vec![std::collections::HashMap::from([
-            ("role".to_string(), "user".to_string()),
-            ("content".to_string(), prompt.clone()),
-        ])],
-        extra: std::collections::HashMap::new(),
-    }
-    .add_generation_prompt(true);
-    let prompt_text = tpl.render(&ctx)?;
+    let prompt_text = match Template::compile(tpl_src, special) {
+        Ok(tpl) => {
+            let ctx = TemplateContext {
+                messages: vec![std::collections::HashMap::from([
+                    ("role".to_string(), "user".to_string()),
+                    ("content".to_string(), prompt.clone()),
+                ])],
+                extra: std::collections::HashMap::new(),
+            }
+            .add_generation_prompt(true);
+            tpl.render(&ctx)?
+        }
+        Err(rust_inference::chat_template::TemplateError::Unsupported(_)) => {
+            // Реальный Qwen3-шаблон использует {% set ns = namespace(...) %}
+            // (tool-calling-обвязка) — вне minja-подмножества v1; классический
+            // im_start-формат эквивалентен для валидации движка (Ф1.7).
+            format!(
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            )
+        }
+        Err(e) => return Err(e.into()),
+    };
     let ids = tok.encode(&prompt_text);
     eprintln!(
         "cfg: dim={} layers={} heads={}/{} ffn={} vocab={}",
         cfg.dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size
     );
     eprintln!("prompt tokens: {} ({} chars)", ids.len(), prompt_text.len());
+    for n in [
+        "blk.0.attn_q_norm.weight",
+        "blk.0.attn_k_norm.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.ffn_norm.weight",
+        "output_norm.weight",
+    ] {
+        if let Some(t) = wm.get(n) {
+            eprintln!("SHAPE {n}: {:?}", t.shape);
+        }
+    }
 
     let backend = MetalBackend::new()?;
     let mut model = Qwen3Model::load(&backend, &wm, cfg.clone())?;
 
     // prefill + TTFT
     let t0 = Instant::now();
-    let mut logits = model.prefill(&backend, &ids)?;
+    let mut logits = model.decode(&backend, ids[0])?;
+    for &id in &ids[1..] {
+        logits = model.decode(&backend, id)?;
+    }
     let ttft = t0.elapsed();
     eprintln!(
         "prefill {} tokens in {:.2}s (TTFT)",
         ids.len(),
         ttft.as_secs_f32()
     );
+
+    // top-5 первого шага
+    let v0 = backend.to_cpu_f32(&logits)?;
+    let n = cfg.vocab_size;
+    let last = &v0[v0.len() - n..];
+    let mut top: Vec<(u32, f32)> = last
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i as u32, x))
+        .collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("top-5 first step:");
+    for (id, s) in top.iter().take(5) {
+        eprintln!(
+            "  {:>6} {:.4} {:?}",
+            id,
+            s,
+            String::from_utf8_lossy(tok.piece(*id))
+        );
+    }
 
     // greedy decode
     let mut decoder = IncrementalDecoder::new();
@@ -97,6 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut out = String::new();
     loop {
         let v = backend.to_cpu_f32(&logits)?;
+
         let n = cfg.vocab_size;
         let last = &v[v.len() - n..];
         let next = last

@@ -133,10 +133,17 @@ impl Qwen3Model {
             let qn = t(&p("attn_q_norm.weight"))?;
             let kn = t(&p("attn_k_norm.weight"))?;
             let attn = Attention {
-                wqkv: upload_w(backend, &wqkv, vec![3 * cfg.dim, cfg.dim])?,
+                wqkv: upload_w(
+                    backend,
+                    &wqkv,
+                    vec![
+                        cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
+                        cfg.dim,
+                    ],
+                )?,
                 wo: upload_w(backend, &wo, vec![cfg.dim, cfg.dim])?,
-                q_norm: Some(backend.from_cpu_f32(&qn, vec![cfg.dim])?),
-                k_norm: Some(backend.from_cpu_f32(&kn, vec![cfg.dim])?),
+                q_norm: Some(backend.from_cpu_f32(&qn, vec![cfg.head_dim])?),
+                k_norm: Some(backend.from_cpu_f32(&kn, vec![cfg.head_dim])?),
                 n_heads: cfg.n_heads,
                 n_kv_heads: cfg.n_kv_heads,
                 head_dim: cfg.head_dim,
@@ -428,11 +435,12 @@ mod tests {
             for (n, shape) in [
                 ("attn_norm.weight", vec![c.dim]),
                 ("attn_q.weight", vec![c.dim, c.dim]),
-                ("attn_k.weight", vec![c.dim, c.dim]),
-                ("attn_v.weight", vec![c.dim, c.dim]),
+                // GQA: k/v высотой n_kv_heads*head_dim
+                ("attn_k.weight", vec![c.n_kv_heads * c.head_dim, c.dim]),
+                ("attn_v.weight", vec![c.n_kv_heads * c.head_dim, c.dim]),
                 ("attn_output.weight", vec![c.dim, c.dim]),
-                ("attn_q_norm.weight", vec![c.dim]),
-                ("attn_k_norm.weight", vec![c.dim]),
+                ("attn_q_norm.weight", vec![c.head_dim]),
+                ("attn_k_norm.weight", vec![c.head_dim]),
                 ("ffn_norm.weight", vec![c.dim]),
                 ("ffn_gate.weight", vec![c.ffn_dim, c.dim]),
                 ("ffn_up.weight", vec![c.ffn_dim, c.dim]),

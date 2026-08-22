@@ -357,7 +357,16 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
         metadata.push((key, value));
     }
 
-    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    // Tensor infos: оффсеты в GGUF ОТНОСИТЕЛЬНЫ начала секции данных
+    // (llama.cpp: data_offset + tensor.offset). Секция данных начинается
+    // сразу после таблицы тензоров, с выравниванием 32.
+    struct RawInfo {
+        name: String,
+        dims: Vec<u64>,
+        ggml_type: GgmlType,
+        rel_offset: u64,
+    }
+    let mut raw = Vec::with_capacity(tensor_count as usize);
     for _ in 0..tensor_count {
         let name = read_string(buf, &mut pos)?;
         let n_dims = read_u32(buf, &mut pos)?;
@@ -371,8 +380,34 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
         let raw_type = read_u32(buf, &mut pos)?;
         let ggml_type =
             GgmlType::from_raw(raw_type).ok_or(GgufError::InvalidTensorType(raw_type))?;
-        let offset = read_u64(buf, &mut pos)?;
+        let rel_offset = read_u64(buf, &mut pos)?;
+        raw.push(RawInfo {
+            name,
+            dims,
+            ggml_type,
+            rel_offset,
+        });
+    }
+    let mut data_base = pos as u64;
+    while data_base % TENSOR_ALIGN != 0 {
+        data_base += 1;
+    }
 
+    let mut tensors = Vec::with_capacity(raw.len());
+    for info in raw {
+        let RawInfo {
+            name,
+            dims,
+            ggml_type,
+            rel_offset,
+        } = info;
+        let offset = data_base
+            .checked_add(rel_offset)
+            .ok_or(GgufError::TensorOverflow {
+                name: name.clone(),
+                offset: rel_offset,
+                size: 0,
+            })?;
         let numel: u64 = dims
             .iter()
             .try_fold(1u64, |acc, &d| acc.checked_mul(d))
@@ -395,7 +430,7 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
                 offset,
                 size,
             })?;
-        if offset % TENSOR_ALIGN != 0 {
+        if rel_offset % TENSOR_ALIGN != 0 {
             return Err(GgufError::UnalignedTensor { name, offset });
         }
         tensors.push(GgufTensor {

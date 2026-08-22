@@ -1192,3 +1192,253 @@ kernel void im2col_t1d_f32(
     }
     Xc[(b * Tout + t) * (Cin * K) + ck] = v;
 }
+
+// ── Quantized GEMM / MV: A fp32 × B quantized [N, K], fp32 accumulate ───────
+// Block layouts (ggml, reimplemented): Q4_0 18 B/32, Q8_0 34 B/32,
+// Q4_K 148 B/256, Q6_K 210 B/256. Activations read directly from the block
+// bytes; CPU reference: weights_map::dequant_f32 (tests).
+
+static inline half load_half_unaligned(device const uchar* p) {
+    // даже смещения блоков (18/34/148/210 кратны 2) — выравнивание ushort ок
+    return as_type<half>(*(device const ushort*)p);
+}
+
+kernel void gemm_nt_q4_0(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 18;
+        float d = (float)load_half_unaligned(blk);
+        device const uchar* q = blk + 2;
+        uint k0 = b * 32;
+        for (uint j = 0; j < 16; ++j) {
+            uchar v = q[j];
+            acc += A[m * K + k0 + j * 2 + 0] * ((float)(v & 0xF) - 8.0f) * d;
+            acc += A[m * K + k0 + j * 2 + 1] * ((float)(v >> 4) - 8.0f) * d;
+        }
+    }
+    C[m * N + n] = acc;
+}
+
+kernel void gemm_nt_q8_0(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 34;
+        float d = (float)load_half_unaligned(blk);
+        device const int8_t* q = (device const int8_t*)(blk + 2);
+        uint k0 = b * 32;
+        for (uint j = 0; j < 32; ++j) {
+            acc += A[m * K + k0 + j] * (float)q[j] * d;
+        }
+    }
+    C[m * N + n] = acc;
+}
+
+// Q4_K: суперблок 256: d(f16), dmin(f16), scales[16] (4-бит sc: байты 0..7,
+// 4-бит m: байты 8..15), qs[128]. y = d*dmin + d*sc*(q - 8).
+kernel void gemm_nt_q4_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint superblocks = K / 256;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < superblocks; ++sb) {
+        device const uchar* s = B + (n * superblocks + sb) * 148;
+        float d = (float)load_half_unaligned(s);
+        float dmin = (float)load_half_unaligned(s + 2);
+        float min = d * dmin;
+        device const uchar* qs = s + 20;
+        uint k0 = sb * 256;
+        for (uint b = 0; b < 8; ++b) {
+            uchar scn = s[4 + b / 2];
+            float sc = (float)((b % 2 == 0) ? (scn & 0xF) : (scn >> 4));
+            uint kb = k0 + b * 32;
+            for (uint j = 0; j < 16; ++j) {
+                uchar v = qs[b * 16 + j];
+                acc += A[m * K + kb + j * 2 + 0] * (min + d * sc * ((float)(v & 0xF) - 8.0f));
+                acc += A[m * K + kb + j * 2 + 1] * (min + d * sc * ((float)(v >> 4) - 8.0f));
+            }
+        }
+    }
+    C[m * N + n] = acc;
+}
+
+// Q6_K: суперблок 256: d(f16), ql[128] (4 бит), qh[64] (2 бит), scales[16]
+// (8 низких + 8 высоких нибблов = 16 × 8-бит). q = ql | (qh<<4); y = d*sc*(q-32).
+kernel void gemm_nt_q6_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint superblocks = K / 256;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < superblocks; ++sb) {
+        device const uchar* s = B + (n * superblocks + sb) * 210;
+        float d = (float)load_half_unaligned(s);
+        device const uchar* ql = s + 2;
+        device const uchar* qh = s + 130;
+        device const uchar* scales = s + 194;
+        uint k0 = sb * 256;
+        for (uint b = 0; b < 8; ++b) {
+            float sc = (float)((scales[b] & 0xF) | ((scales[b + 8] & 0xF) << 4));
+            uint kb = k0 + b * 32;
+            for (uint j = 0; j < 32; ++j) {
+                uint idx = b * 32 + j;
+                uchar lo = (j % 2 == 0) ? (ql[idx / 2] & 0xF) : (ql[idx / 2] >> 4);
+                uchar hi = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x3;
+                float q = (float)(lo | (hi << 4));
+                acc += A[m * K + kb + j] * d * sc * (q - 32.0f);
+            }
+        }
+    }
+    C[m * N + n] = acc;
+}
+
+// ── MV-варианты (decode, batch=1): A — вектор [K], thread на выходной n ────
+
+kernel void mv_q4_0(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 18;
+        float d = (float)load_half_unaligned(blk);
+        device const uchar* q = blk + 2;
+        uint k0 = b * 32;
+        for (uint j = 0; j < 16; ++j) {
+            uchar v = q[j];
+            acc += A[k0 + j * 2 + 0] * ((float)(v & 0xF) - 8.0f) * d;
+            acc += A[k0 + j * 2 + 1] * ((float)(v >> 4) - 8.0f) * d;
+        }
+    }
+    C[n] = acc;
+}
+
+kernel void mv_q8_0(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 34;
+        float d = (float)load_half_unaligned(blk);
+        device const int8_t* q = (device const int8_t*)(blk + 2);
+        uint k0 = b * 32;
+        for (uint j = 0; j < 32; ++j) {
+            acc += A[k0 + j] * (float)q[j] * d;
+        }
+    }
+    C[n] = acc;
+}
+
+kernel void mv_q4_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint superblocks = K / 256;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < superblocks; ++sb) {
+        device const uchar* s = B + (n * superblocks + sb) * 148;
+        float d = (float)load_half_unaligned(s);
+        float dmin = (float)load_half_unaligned(s + 2);
+        float min = d * dmin;
+        device const uchar* qs = s + 20;
+        uint k0 = sb * 256;
+        for (uint b = 0; b < 8; ++b) {
+            uchar scn = s[4 + b / 2];
+            float sc = (float)((b % 2 == 0) ? (scn & 0xF) : (scn >> 4));
+            uint kb = k0 + b * 32;
+            for (uint j = 0; j < 16; ++j) {
+                uchar v = qs[b * 16 + j];
+                acc += A[kb + j * 2 + 0] * (min + d * sc * ((float)(v & 0xF) - 8.0f));
+                acc += A[kb + j * 2 + 1] * (min + d * sc * ((float)(v >> 4) - 8.0f));
+            }
+        }
+    }
+    C[n] = acc;
+}
+
+kernel void mv_q6_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint superblocks = K / 256;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < superblocks; ++sb) {
+        device const uchar* s = B + (n * superblocks + sb) * 210;
+        float d = (float)load_half_unaligned(s);
+        device const uchar* ql = s + 2;
+        device const uchar* qh = s + 130;
+        device const uchar* scales = s + 194;
+        uint k0 = sb * 256;
+        for (uint b = 0; b < 8; ++b) {
+            float sc = (float)((scales[b] & 0xF) | ((scales[b + 8] & 0xF) << 4));
+            uint kb = k0 + b * 32;
+            for (uint j = 0; j < 32; ++j) {
+                uint idx = b * 32 + j;
+                uchar lo = (j % 2 == 0) ? (ql[idx / 2] & 0xF) : (ql[idx / 2] >> 4);
+                uchar hi = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x3;
+                float q = (float)(lo | (hi << 4));
+                acc += A[kb + j] * d * sc * (q - 32.0f);
+            }
+        }
+    }
+    C[n] = acc;
+}

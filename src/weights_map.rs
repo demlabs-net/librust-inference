@@ -14,9 +14,9 @@ use crate::gguf::{GgmlType, GgufError, GgufFile};
 
 /// Сырое хранилище тензора (после tied-дедупликации).
 #[derive(Debug, Clone, PartialEq)]
-struct Storage<'a> {
-    offset: u64,
-    data: &'a [u8],
+pub(crate) struct Storage<'a> {
+    pub(crate) offset: u64,
+    pub(crate) data: &'a [u8],
 }
 
 /// Один тензор модели в нормализованном виде.
@@ -27,8 +27,8 @@ pub struct WeightTensor<'a> {
     /// GGUF-файле; для матриц: [rows, cols]).
     pub shape: Vec<u64>,
     pub format: WeightFormat,
-    offset: u64,
-    data: &'a [u8],
+    pub(crate) offset: u64,
+    pub(crate) data: &'a [u8],
 }
 
 impl<'a> WeightTensor<'a> {
@@ -45,9 +45,9 @@ impl<'a> WeightTensor<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeightsMap<'a> {
     pub arch: String,
-    tensors: Vec<WeightTensor<'a>>,
+    pub(crate) tensors: Vec<WeightTensor<'a>>,
     /// Стораж-индекс для tied-дедупликации (по (offset, size)).
-    storage: Vec<Storage<'a>>,
+    pub(crate) storage: Vec<Storage<'a>>,
 }
 
 impl<'a> WeightsMap<'a> {

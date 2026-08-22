@@ -40,12 +40,29 @@ pub enum MetalError {
 
 /// Storage dtype of a [`GpuTensor`]. Activations stay fp32; fp16/bf16 are
 /// GEMM weight formats (halved VRAM + weight-read traffic, fp32 accumulate
-/// in the kernels — the backend dtype contract).
+/// in the kernels — the backend dtype contract). Q4_0/Q8_0/Q4_K/Q6_K —
+/// block-quantized GEMM weights (Ф1.3/1.4): dequant inside the kernel, raw
+/// block bytes in the buffer (ggml layouts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuDtype {
     F32,
     F16,
     BF16,
+    Q4_0,
+    Q8_0,
+    Q4_K,
+    Q6_K,
+}
+
+impl GpuDtype {
+    /// Элементов в квант-блоке (для проверки кратности K).
+    pub fn block_elems(self) -> Option<usize> {
+        match self {
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 => Some(32),
+            GpuDtype::Q4_K | GpuDtype::Q6_K => Some(256),
+            _ => None,
+        }
+    }
 }
 
 /// A contiguous tensor living in Metal memory (fp32 activations, or
@@ -150,6 +167,49 @@ impl GpuTensor {
             buffer,
             shape,
             dtype: GpuDtype::BF16,
+        })
+    }
+
+    /// Upload block-quantized GEMM weights (Ф1.3/1.4): raw ggml-блоки как есть
+    /// (Q4_0/Q8_0: 18/34 Б на 32 элемента; Q4_K/Q6_K: 148/210 Б на 256) —
+    /// деквантование внутри кернела. Размер данных проверяется по numel.
+    pub fn from_quantized(
+        device: &Device,
+        data: &[u8],
+        shape: Vec<usize>,
+        dtype: GpuDtype,
+    ) -> Result<Self, MetalError> {
+        let bytes_per_elem = match dtype {
+            GpuDtype::Q4_0 => 18.0 / 32.0,
+            GpuDtype::Q8_0 => 34.0 / 32.0,
+            GpuDtype::Q4_K => 148.0 / 256.0,
+            GpuDtype::Q6_K => 210.0 / 256.0,
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "from_quantized: {other:?} is not a quantized dtype"
+                )));
+            }
+        };
+        let numel: usize = shape.iter().product();
+        let expected = (numel as f32 * bytes_per_elem).ceil() as usize;
+        if data.len() != expected {
+            return Err(MetalError::Shape(format!(
+                "quantized data {} B, expected {expected} B for {numel} elems ({dtype:?})",
+                data.len()
+            )));
+        }
+        let buffer = device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        if buffer.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        Ok(Self {
+            buffer,
+            shape,
+            dtype,
         })
     }
 
@@ -442,6 +502,12 @@ impl MetalCtx {
             GpuDtype::F32 => "gemm_f32",
             GpuDtype::F16 => "gemm_f16",
             GpuDtype::BF16 => "gemm_bf16",
+            // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K => {
+                return Err(MetalError::Shape(
+                    "gemm_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
+                ));
+            }
         };
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
@@ -860,6 +926,12 @@ impl MetalCtx {
             GpuDtype::F32 => "gemm_nt_f32",
             GpuDtype::F16 => "gemm_nt_f16",
             GpuDtype::BF16 => "gemm_nt_bf16",
+            // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K => {
+                return Err(MetalError::Shape(
+                    "gemm_nt_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
+                ));
+            }
         };
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
@@ -870,6 +942,104 @@ impl MetalCtx {
             enc.set_bytes(3, 8, (&m as *const usize).cast());
             enc.set_bytes(4, 8, (&k as *const usize).cast());
             enc.set_bytes(5, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// C = A·Bᵀ с КВАНТОВАННЫМИ весами B [N, K] (Ф1.3): dequant-in-kernel,
+    /// fp32-аккумуляция. Требует K, кратного блоку формата (32/256).
+    pub fn gemm_nt_quantized(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let m = a.shape[0];
+        let k = a.shape[1];
+        let n = b.shape[0];
+        if a.shape[1] != b.shape[1] || c.shape != [m, n] {
+            return Err(MetalError::Shape(format!(
+                "gemm_nt_quantized {:?}x{:?}->{:?}",
+                a.shape, b.shape, c.shape
+            )));
+        }
+        let name = match b.dtype {
+            GpuDtype::Q4_0 => "gemm_nt_q4_0",
+            GpuDtype::Q8_0 => "gemm_nt_q8_0",
+            GpuDtype::Q4_K => "gemm_nt_q4_k",
+            GpuDtype::Q6_K => "gemm_nt_q6_k",
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "gemm_nt_quantized: B dtype {other:?} is not quantized"
+                )));
+            }
+        };
+        let block = b
+            .dtype
+            .block_elems()
+            .ok_or_else(|| MetalError::Shape("quantized block size unavailable".into()))?;
+        if k % block != 0 {
+            return Err(MetalError::Shape(format!(
+                "gemm_nt_quantized: K={k} not a multiple of block {block} ({:?})",
+                b.dtype
+            )));
+        }
+        let grid = MTLSize::new(m as u64, n as u64, 1);
+        let group = MTLSize::new(8, 8, 1);
+        self.run(name, grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_bytes(3, 8, (&m as *const usize).cast());
+            enc.set_bytes(4, 8, (&k as *const usize).cast());
+            enc.set_bytes(5, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// MV (decode, batch=1, Ф1.4): C[n] = Σ_k A[k]·B[n][k], B квантованный
+    /// [N, K]; A — вектор [K]. thread на выходной n.
+    pub fn mv_quantized(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let k = a.shape[0];
+        let n = b.shape[0];
+        if a.shape.len() != 1 || b.shape.len() != 2 || b.shape[1] != k || c.shape != [n] {
+            return Err(MetalError::Shape(format!(
+                "mv_quantized {:?}x{:?}->{:?}",
+                a.shape, b.shape, c.shape
+            )));
+        }
+        let name = match b.dtype {
+            GpuDtype::Q4_0 => "mv_q4_0",
+            GpuDtype::Q8_0 => "mv_q8_0",
+            GpuDtype::Q4_K => "mv_q4_k",
+            GpuDtype::Q6_K => "mv_q6_k",
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "mv_quantized: B dtype {other:?} is not quantized"
+                )));
+            }
+        };
+        let block = b
+            .dtype
+            .block_elems()
+            .ok_or_else(|| MetalError::Shape("quantized block size unavailable".into()))?;
+        if k % block != 0 {
+            return Err(MetalError::Shape(format!(
+                "mv_quantized: K={k} not a multiple of block {block} ({:?})",
+                b.dtype
+            )));
+        }
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(64, 1, 1);
+        self.run(name, grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), 0);
+            enc.set_buffer(1, Some(&b.buffer), 0);
+            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_bytes(3, 8, (&k as *const usize).cast());
+            enc.set_bytes(4, 8, (&n as *const usize).cast());
         })
     }
 
@@ -2307,5 +2477,234 @@ impl crate::backend::Backend for MetalBackend {
         self.ctx
             .codebook_search_f32(x.as_gpu(), table.as_gpu(), idx)?;
         Ok(())
+    }
+}
+
+// ── Квант-GEMM/MV: сверка с CPU-референсом (Ф1.3/1.4) ────────────────────────
+
+#[cfg(all(test, feature = "metal"))]
+mod quant_gemm_tests {
+    use super::*;
+    use crate::gguf;
+    use crate::weights_map::{WeightsMap, dequant_f32};
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+    }
+
+    /// f32-веса источника (f16-фикстура — те же сиды, что у всех квантов).
+    fn source_f32(name: &str) -> Vec<f32> {
+        let buf = fixture(name);
+        let f = gguf::parse(&buf).unwrap();
+        let m = WeightsMap::from_gguf(&f).unwrap();
+        dequant_f32(m.get("token_embd.weight").unwrap())
+    }
+
+    // Тестовые энкодеры Q4_K/Q6_K (K=256-синтетика; логика как в fixture-gen).
+    fn enc_q4_k(w: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for sb in w.chunks_exact(256) {
+            let max = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let d = if max > 0.0 { max / 7.0 } else { 0.0 };
+            let dbits = (d.to_bits() >> 16) as u16;
+            out.extend_from_slice(&dbits.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // dmin
+            let mut scales = [0u8; 16];
+            let mut qs = [0u8; 128];
+            for (b, blk) in sb.chunks_exact(32).enumerate() {
+                let bmax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                let sc = if d > 0.0 && bmax > 0.0 {
+                    ((bmax / (d * 7.0)).round() as u8).clamp(1, 15)
+                } else {
+                    1
+                };
+                scales[b / 2] |= sc << ((b % 2) * 4);
+                for (j, pair) in blk.chunks_exact(2).enumerate() {
+                    let q0 = ((pair[0] / (d * sc as f32)).round() as i32 + 8).clamp(0, 15) as u8;
+                    let q1 = ((pair[1] / (d * sc as f32)).round() as i32 + 8).clamp(0, 15) as u8;
+                    qs[b * 16 + j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+                }
+            }
+            out.extend_from_slice(&scales);
+            out.extend_from_slice(&qs);
+        }
+        out
+    }
+
+    fn enc_q6_k(w: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for sb in w.chunks_exact(256) {
+            let max = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let d = if max > 0.0 { max / 31.0 } else { 0.0 };
+            let dbits = (d.to_bits() >> 16) as u16;
+            out.extend_from_slice(&dbits.to_le_bytes());
+            let mut ql = [0u8; 128];
+            let mut qh = [0u8; 64];
+            let mut scales = [0u8; 16];
+            for (b, blk) in sb.chunks_exact(32).enumerate() {
+                let bmax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                let sc = if d > 0.0 && bmax > 0.0 {
+                    ((bmax / (d * 31.0)).round() as u8).clamp(1, 255)
+                } else {
+                    1
+                };
+                scales[b] = sc & 0x0F;
+                scales[b + 8] = sc >> 4;
+                for (j, &w) in blk.iter().enumerate() {
+                    let q = ((w / (d * sc as f32)).round() as i32 + 32).clamp(0, 63) as u8;
+                    let idx = b * 32 + j;
+                    if j % 2 == 0 {
+                        ql[idx / 2] = q & 0x0F;
+                    } else {
+                        ql[idx / 2] |= (q & 0x0F) << 4;
+                    }
+                    qh[idx / 4] |= ((q >> 4) & 0x03) << ((idx % 4) * 2);
+                }
+            }
+            out.extend_from_slice(&ql);
+            out.extend_from_slice(&qh);
+            out.extend_from_slice(&scales);
+        }
+        out
+    }
+
+    /// (bytes, shape[N,K], dtype, per-elem tol) — источники для GPU-теста.
+    fn cases() -> Vec<(Vec<u8>, Vec<usize>, GpuDtype, f32)> {
+        let src: Vec<f32> = (0..8 * 256)
+            .map(|i| ((i as f32 * 7919.0).sin() * 0.5))
+            .collect();
+        vec![
+            (enc_q4_k(&src), vec![8, 256], GpuDtype::Q4_K, 0.15),
+            (enc_q6_k(&src), vec![8, 256], GpuDtype::Q6_K, 0.06),
+            // Q4_0/Q8_0 — прямо из фикстур (K=32, те же веса, что у f16)
+            (
+                {
+                    let buf = fixture("mini-q4_0.gguf");
+                    let f = gguf::parse(&buf).unwrap();
+                    let m = WeightsMap::from_gguf(&f).unwrap();
+                    m.get("token_embd.weight").unwrap().raw().to_vec()
+                },
+                vec![64, 32],
+                GpuDtype::Q4_0,
+                0.15,
+            ),
+            (
+                {
+                    let buf = fixture("mini-q8_0.gguf");
+                    let f = gguf::parse(&buf).unwrap();
+                    let m = WeightsMap::from_gguf(&f).unwrap();
+                    m.get("token_embd.weight").unwrap().raw().to_vec()
+                },
+                vec![64, 32],
+                GpuDtype::Q8_0,
+                0.02,
+            ),
+        ]
+    }
+
+    /// CPU-референс: деквант → C[m,n] = Σ A[m,k]·Bf[n,k].
+    fn cpu_ref(a: &[f32], m: usize, k: usize, bf: &[f32], n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for mm in 0..m {
+            for nn in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += a[mm * k + kk] * bf[nn * k + kk];
+                }
+                c[mm * n + nn] = acc;
+            }
+        }
+        c
+    }
+
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn quantized_gemm_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        for (bytes, shape, dtype, tol) in cases() {
+            let n = shape[0];
+            let k = shape[1];
+            let m = 3usize;
+            let b = GpuTensor::from_quantized(dev, &bytes, shape.clone(), dtype).unwrap();
+            // CPU-референс: деквант тех же байт
+            let tmp = WeightsMap {
+                arch: "t".into(),
+                tensors: vec![crate::weights_map::WeightTensor {
+                    name: "w".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format: match dtype {
+                        GpuDtype::Q4_0 => crate::dtype::WeightFormat::Q4_0,
+                        GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
+                        GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
+                        GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        _ => unreachable!(),
+                    },
+                    offset: 0,
+                    data: &bytes,
+                }],
+                storage: vec![],
+            };
+            let bf = dequant_f32(&tmp.tensors[0]);
+            let a_data: Vec<f32> = (0..m * k).map(|i| ((i as f32 * 104729.0).sin())).collect();
+            let c_ref = cpu_ref(&a_data, m, k, &bf, n);
+
+            let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![m, k]).unwrap();
+            let c = GpuTensor::zeros(dev, vec![m, n]).unwrap();
+            ctx.gemm_nt_quantized(&a, &b, &c).unwrap();
+            let got = c.to_cpu_f32(&ctx).unwrap();
+            let bound = tol * k as f32 * 1.5;
+            let diff = max_diff(&got, &c_ref);
+            assert!(diff <= bound, "{dtype:?}: |Δ| max {diff} > {bound}");
+        }
+    }
+
+    #[test]
+    fn quantized_mv_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        for (bytes, shape, dtype, tol) in cases() {
+            let n = shape[0];
+            let k = shape[1];
+            let b = GpuTensor::from_quantized(dev, &bytes, shape.clone(), dtype).unwrap();
+            let tmp = WeightsMap {
+                arch: "t".into(),
+                tensors: vec![crate::weights_map::WeightTensor {
+                    name: "w".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format: match dtype {
+                        GpuDtype::Q4_0 => crate::dtype::WeightFormat::Q4_0,
+                        GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
+                        GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
+                        GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        _ => unreachable!(),
+                    },
+                    offset: 0,
+                    data: &bytes,
+                }],
+                storage: vec![],
+            };
+            let bf = dequant_f32(&tmp.tensors[0]);
+            let a_data: Vec<f32> = (0..k).map(|i| ((i as f32 * 15485863.0).sin())).collect();
+            let c_ref = cpu_ref(&a_data, 1, k, &bf, n);
+
+            let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![k]).unwrap();
+            let c = GpuTensor::zeros(dev, vec![n]).unwrap();
+            ctx.mv_quantized(&a, &b, &c).unwrap();
+            let got = c.to_cpu_f32(&ctx).unwrap();
+            let bound = tol * k as f32 * 1.5;
+            let diff = max_diff(&got, &c_ref);
+            assert!(diff <= bound, "{dtype:?} mv: |Δ| max {diff} > {bound}");
+        }
     }
 }

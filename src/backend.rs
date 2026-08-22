@@ -75,6 +75,12 @@ impl Tensor {
             crate::metal::GpuDtype::F32 => Dtype::F32,
             crate::metal::GpuDtype::F16 => Dtype::F16,
             crate::metal::GpuDtype::BF16 => Dtype::BF16,
+            // Квантованные веса — сырое байтовое хранилище; используются
+            // только через metal-специфичные quantized-API (не Backend-трейт).
+            crate::metal::GpuDtype::Q4_0
+            | crate::metal::GpuDtype::Q8_0
+            | crate::metal::GpuDtype::Q4_K
+            | crate::metal::GpuDtype::Q6_K => Dtype::I8,
         };
         Self {
             inner: TensorInner::Metal(t),

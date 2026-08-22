@@ -442,10 +442,11 @@ pub trait Backend: Send + Sync {
                     let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
                     let c = (p * inv).cos();
                     let s = (p * inv).sin();
-                    let idx = (tt * d + h * hd + 2 * i) as usize;
-                    let (x0, x1) = (xd[idx], xd[idx + 1]);
+                    // NEOX/halves (HF rotate-half): пары (i, i + hd/2)
+                    let idx = (tt * d + h * hd + i) as usize;
+                    let (x0, x1) = (xd[idx], xd[idx + hd / 2]);
                     yd[idx] = x0 * c - x1 * s;
-                    yd[idx + 1] = x1 * c + x0 * s;
+                    yd[idx + hd / 2] = x1 * c + x0 * s;
                 }
             }
         }

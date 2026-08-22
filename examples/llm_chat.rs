@@ -93,6 +93,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         cfg.dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size
     );
     eprintln!("prompt tokens: {} ({} chars)", ids.len(), prompt_text.len());
+    if std::env::var("LLM_DBG_TOKENS").is_ok() {
+        for (i, &id) in ids.iter().enumerate().take(12) {
+            eprintln!("  tok[{i}]={id} {:?}", String::from_utf8_lossy(tok.piece(id)));
+        }
+        eprintln!("  roundtrip: {:?}", tok.decode(&ids));
+    }
     for n in [
         "blk.0.attn_q_norm.weight",
         "blk.0.attn_k_norm.weight",
@@ -104,15 +110,46 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("SHAPE {n}: {:?}", t.shape);
         }
     }
+    if std::env::var("LLM_DBG_TOKENS").is_ok() {
+        let specials = [tok.bos, tok.eos, tok.pad];
+        eprintln!("special ids: {:?}", specials);
+        for n in ["blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.0.attn_output.weight", "blk.0.ffn_gate.weight", "blk.3.attn_q.weight"] {
+            if let Some(t) = wm.get(n) {
+                let d = rust_inference::weights_map::dequant_f32(t);
+                let rms = (d.iter().map(|v| (v * v) as f64).sum::<f64>() / d.len() as f64).sqrt();
+                eprintln!("DBG {n}: shape={:?} rms={rms:.5}", t.shape);
+            }
+        }
+        let mut hits: Vec<(u32, String)> = Vec::new();
+        for id in 0..vocab_size as u32 {
+            let piece = String::from_utf8_lossy(tok.piece(id)).into_owned();
+            if piece.contains("think") || piece.contains("<|") || piece.starts_with('<') {
+                hits.push((id, piece));
+            }
+        }
+        let think_hits: Vec<_> = hits
+            .iter()
+            .filter(|(_, p)| p.contains("think") || p.contains("<|"))
+            .collect();
+        eprintln!("think/special tokens ({}):", think_hits.len());
+        for (id, p) in think_hits {
+            eprintln!("  {id:>6} {:?}", p);
+        }
+    }
 
-    let backend = MetalBackend::new()?;
-    let mut model = Qwen3Model::load(&backend, &wm, cfg.clone())?;
+    let backend: Box<dyn rust_inference::backend::Backend> =
+        if std::env::var("BACKEND").as_deref() == Ok("cpu") {
+            Box::new(rust_inference::cpu::CpuBackend)
+        } else {
+            Box::new(MetalBackend::new()?)
+        };
+    let mut model = Qwen3Model::load(backend.as_ref(), &wm, cfg.clone())?;
 
     // prefill + TTFT
     let t0 = Instant::now();
-    let mut logits = model.decode(&backend, ids[0])?;
+    let mut logits = model.decode(&*backend, ids[0])?;
     for &id in &ids[1..] {
-        logits = model.decode(&backend, id)?;
+        logits = model.decode(&*backend, id)?;
     }
     let ttft = t0.elapsed();
     eprintln!(
@@ -121,7 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ttft.as_secs_f32()
     );
 
-    // top-5 первого шага
+    // top-20 первого шага
     let v0 = backend.to_cpu_f32(&logits)?;
     let n = cfg.vocab_size;
     let last = &v0[v0.len() - n..];
@@ -131,13 +168,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|(i, &x)| (i as u32, x))
         .collect();
     top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    eprintln!("top-5 first step:");
-    for (id, s) in top.iter().take(5) {
+    eprintln!("top-20 first step:");
+    for (id, s) in top.iter().take(20) {
         eprintln!(
             "  {:>6} {:.4} {:?}",
             id,
             s,
             String::from_utf8_lossy(tok.piece(*id))
+        );
+    }
+    // думающий канал Qwen3: <think>=151667, </think>=151668 — где они в наших логитах?
+    for probe in [151667u32, 151668, 27, 29, 26865, 151645] {
+        let rank = top.iter().position(|(id, _)| *id == probe);
+        let score = top
+            .iter()
+            .find(|(id, _)| *id == probe)
+            .map(|(_, s)| *s)
+            .unwrap_or(f32::NAN);
+        eprintln!(
+            "  probe {probe} ({:?}): rank={:?} score={:.4}",
+            String::from_utf8_lossy(tok.piece(probe)),
+            rank,
+            score
         );
     }
 
@@ -146,6 +198,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut generated: usize = 0;
     let d0 = Instant::now();
     let mut out = String::new();
+    if std::env::var("LLM_DUMP_LOGITS").is_ok() {
+        let vd = backend.to_cpu_f32(&logits)?;
+        let n = cfg.vocab_size;
+        let last = &vd[vd.len() - n..];
+        for (i, s) in last.iter().enumerate() {
+            println!("LOGIT {i} {s:.6}");
+        }
+    }
     loop {
         let v = backend.to_cpu_f32(&logits)?;
 
@@ -157,6 +217,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(i, _)| i as u32)
             .unwrap();
+        if std::env::var("LLM_DBG_TOKENS").is_ok() && generated % 5 == 0 {
+            let mut top: Vec<(u32, f32)> = last
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| (i as u32, x))
+                .collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("top-5 step {generated}:");
+            for (id, s) in top.iter().take(5) {
+                eprintln!(
+                    "  {:>6} {:.4} {:?}",
+                    id,
+                    s,
+                    String::from_utf8_lossy(tok.piece(*id))
+                );
+            }
+        }
         let max_tokens: usize = std::env::var("LLM_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -164,12 +241,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         if tok.eos == Some(next) || generated >= max_tokens {
             break;
         }
-        let piece = tok.piece(next).to_vec();
-        let text = decoder.push(&piece);
+        let text = decoder.push(tok.decode_piece(next).as_bytes());
         out.push_str(&text);
         print!("{text}");
         std::io::stdout().flush()?;
-        logits = model.decode(&backend, next)?;
+        logits = model.decode(&*backend, next)?;
         generated += 1;
     }
     out.push_str(&decoder.finish());

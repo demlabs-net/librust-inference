@@ -1462,9 +1462,10 @@ kernel void rope_std_f32(
     float inv = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
     float c = cos(p * inv);
     float s = sin(p * inv);
-    uint base = (t * D + h * HD + 2 * i);
+    // NEOX/halves (HF rotate-half): пары (i, i + HD/2)
+    uint base = t * D + h * HD + i;
     float x0 = X[base];
-    float x1 = X[base + 1];
+    float x1 = X[base + HD / 2];
     Y[base] = x0 * c - x1 * s;
-    Y[base + 1] = x1 * c + x0 * s;
+    Y[base + HD / 2] = x1 * c + x0 * s;
 }

@@ -153,13 +153,31 @@ impl Tokenizer {
             .unwrap_or(&[])
     }
 
-    /// Encode: байты → начальные токены (по одно-байтовым кускам словаря) →
-    /// жадный BPE по рангам merges. Неизвестные байты пропускаются (v1).
+    /// Encode: tiktoken-претокенизация (пробел→Ġ, перенос→Ċ — словарь Qwen3),
+    /// затем байты → начальные токены → жадный BPE по рангам merges.
+    /// Неизвестные байты пропускаются (v1).
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mapped: String = text
+            .chars()
+            .map(|c| match c {
+                ' ' => '\u{0120}',
+                '\n' => '\u{010A}',
+                c => c,
+            })
+            .collect();
+        // инициализация по СИМВОЛАМ (tiktoken-стиль): каждый символ — токен;
+        // неизвестные символы — фоллбэк на байты (byte-fallback токены 0x00-0xFF).
         let mut ids: Vec<u32> = Vec::new();
-        for &b in text.as_bytes() {
-            if let Some(&id) = self.id_of.get(&[b][..]) {
+        for ch in mapped.chars() {
+            let piece = ch.to_string().into_bytes();
+            if let Some(&id) = self.id_of.get(&piece[..]) {
                 ids.push(id);
+                continue;
+            }
+            for &b in &piece {
+                if let Some(&id) = self.id_of.get(&[b][..]) {
+                    ids.push(id);
+                }
             }
         }
         // жадный проход: ищем merge с наименьшим рангом среди соседних пар
@@ -190,13 +208,19 @@ impl Tokenizer {
         ids
     }
 
-    /// Decode: конкатенация кусков (lossy для битых последовательностей).
+    /// Decode: конкатенация кусков + обратная tiktoken-маппинг (Ġ→пробел, Ċ→\n).
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut out = Vec::new();
         for &id in ids {
             out.extend_from_slice(self.piece(id));
         }
-        String::from_utf8_lossy(&out).into_owned()
+        let s = String::from_utf8_lossy(&out).into_owned();
+        unmap_tiktoken(&s)
+    }
+
+    /// Кусок токена как текст (для стриминга): обратная маппинг Ġ/Ċ.
+    pub fn decode_piece(&self, id: u32) -> String {
+        unmap_tiktoken(&String::from_utf8_lossy(self.piece(id)).into_owned())
     }
 }
 
@@ -245,6 +269,11 @@ impl IncrementalDecoder {
         self.pending.clear();
         s
     }
+}
+
+/// Обратная tiktoken-маппинг: Ġ (U+0120)→пробел, Ċ (U+010A)→\n.
+fn unmap_tiktoken(s: &str) -> String {
+    s.replace('\u{0120}', " ").replace('\u{010A}', "\n")
 }
 
 /// Длина UTF-8 символа по первому байту (0 = невалидный старт).
@@ -337,6 +366,30 @@ mod tests {
         assert_eq!(d.push(&[0x80]), "р");
         assert_eq!(d.push(b"!"), "!");
         assert_eq!(d.finish(), "");
+    }
+
+    #[test]
+    fn tiktoken_space_mapping() {
+        // словарь: байтовые токены + "Ġ" (символ) + "he"/"llo"/"hello" + merge
+        let mut vocab: Vec<Vec<u8>> = (0..=255).map(|b| vec![b]).collect();
+        let g: Vec<u8> = "\u{0120}".as_bytes().to_vec();
+        let he: Vec<u8> = b"he".to_vec();
+        let llo: Vec<u8> = b"llo".to_vec();
+        let hello: Vec<u8> = b"hello".to_vec();
+        vocab.push(g.clone());
+        vocab.push(he.clone());
+        vocab.push(llo.clone());
+        vocab.push(hello.clone());
+        let ids_of = |p: &[u8]| -> u32 { vocab.iter().position(|v| v == p).unwrap() as u32 };
+        let hello_id = ids_of(&hello);
+        let merges = vec![((ids_of(&he), ids_of(&llo)), hello_id)];
+        let t = Tokenizer::from_parts(vocab, merges, None, None, None);
+        let ids = t.encode("hi hello");
+        // пробел → символ Ġ (id 256); полная merge-цепочка — отдельный тест
+        assert!(ids.contains(&256), "Ġ token missing: ids={ids:?}");
+        let _ = hello_id;
+        assert_eq!(t.decode(&ids), "hi hello");
+        assert_eq!(t.decode_piece(256), " ");
     }
 
     #[test]

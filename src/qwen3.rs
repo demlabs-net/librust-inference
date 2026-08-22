@@ -49,8 +49,13 @@ impl Qwen3Config {
         let n_kv_heads = u("qwen3.attention.head_count_kv")?;
         let ffn_dim = u("qwen3.feed_forward_length")?;
         let n_layers = u("qwen3.block_count")?;
+        // head_dim: llama.cpp хранит его отдельно (qwen3.attention.key_length);
+        // fallback — dim/n_heads (classic).
+        let head_dim = u("qwen3.attention.key_length")
+            .unwrap_or(dim / n_heads);
         let theta = file
-            .get("qwen3.attention.rope_theta")
+            .get("qwen3.rope.freq_base")
+            .or_else(|| file.get("qwen3.attention.rope_theta"))
             .and_then(|v| match v {
                 GgufValue::F32(f) => Some(*f as f64),
                 GgufValue::F64(f) => Some(*f),
@@ -70,7 +75,7 @@ impl Qwen3Config {
             n_layers,
             n_heads,
             n_kv_heads,
-            head_dim: dim / n_heads,
+            head_dim,
             ffn_dim,
             vocab_size,
             rope_theta: theta,
@@ -141,7 +146,11 @@ impl Qwen3Model {
                         cfg.dim,
                     ],
                 )?,
-                wo: upload_w(backend, &wo, vec![cfg.dim, cfg.dim])?,
+                wo: upload_w(
+                    backend,
+                    &wo,
+                    vec![cfg.dim, cfg.n_heads * cfg.head_dim],
+                )?,
                 q_norm: Some(backend.from_cpu_f32(&qn, vec![cfg.head_dim])?),
                 k_norm: Some(backend.from_cpu_f32(&kn, vec![cfg.head_dim])?),
                 n_heads: cfg.n_heads,
@@ -199,7 +208,17 @@ impl Qwen3Model {
         let t = ids.len();
         let mut x = self.embed.forward(backend, ids, t)?;
         let pos = self.caches[0].pos;
-        for (i, layer) in self.layers.iter().enumerate() {
+        let no_ffn = std::env::var("LLM_NO_FFN").is_ok();
+        let max_layers: usize = std::env::var("LLM_MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(self.layers.len());
+        for (i, layer) in self.layers.iter().take(max_layers).enumerate() {
+            if std::env::var("LLM_DBG_HIDDEN").is_ok() {
+                let xn = backend.to_cpu_f32(&x)?;
+                let norm2 = xn.iter().map(|v| (v * v) as f64).sum::<f64>().sqrt();
+                eprintln!("layer {i}: ||x|| = {norm2:.3}");
+            }
             let h = layer.attn_norm.forward(backend, &x)?;
             let h = Self::rope_and_attn(
                 &self.cfg,
@@ -211,6 +230,9 @@ impl Qwen3Model {
                 t,
             )?;
             x = backend_add(backend, &x, &h)?;
+            if no_ffn {
+                continue;
+            }
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
@@ -263,20 +285,38 @@ impl Qwen3Model {
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
-        let (q, k) = if let (Some(qn), Some(kn)) = (&attn.q_norm, &attn.k_norm) {
+        // Временные диагностические флаги (Ф1.7 отладка качества):
+        // LLM_NO_ROPE / LLM_NO_QKNORM / LLM_NO_MASK / LLM_NO_ATTN / LLM_NO_FFN
+        // выключают компоненты для бисекции форварда против эталона.
+        let no_rope = std::env::var("LLM_NO_ROPE").is_ok();
+        let no_qk = std::env::var("LLM_NO_QKNORM").is_ok();
+        let no_mask = std::env::var("LLM_NO_MASK").is_ok();
+        let no_attn = std::env::var("LLM_NO_ATTN").is_ok();
+        if no_attn {
+            return Ok(h.clone());
+        }
+        let (q, k) = if !no_qk && attn.q_norm.is_some() && attn.k_norm.is_some() {
             (
-                qk_norm(backend, &q, qn, attn.n_heads)?,
-                qk_norm(backend, &k, kn, attn.n_kv_heads)?,
+                qk_norm(backend, &q, attn.q_norm.as_ref().unwrap(), attn.n_heads)?,
+                qk_norm(backend, &k, attn.k_norm.as_ref().unwrap(), attn.n_kv_heads)?,
             )
         } else {
             (q, k)
         };
-        let q = rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?;
-        let k = rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?;
+        let q = if no_rope {
+            q
+        } else {
+            rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?
+        };
+        let k = if no_rope {
+            k
+        } else {
+            rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?
+        };
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
         cache.update(backend, &k, &v)?;
-        let mask = if t > 1 {
+        let mask = if t > 1 && !no_mask {
             Some(crate::nn::build_causal_mask(backend, t, cache.pos, pos)?)
         } else {
             None
@@ -323,6 +363,10 @@ fn upload_w(
     shape: Vec<usize>,
 ) -> Result<Tensor, BackendError> {
     if backend.supports_f16_weights() {
+        let n: usize = shape.iter().product();
+        if n != data.len() {
+            eprintln!("DBG upload_w MISMATCH shape={shape:?} data={}", data.len());
+        }
         let f16: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
         backend.from_cpu_f16(&f16, shape)
     } else {
@@ -367,10 +411,10 @@ fn backend_add(backend: &dyn Backend, a: &Tensor, b: &Tensor) -> Result<Tensor, 
     Ok(y)
 }
 
-#[cfg(all(test, feature = "cpu"))]
+#[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::*;
-    use crate::cpu::CpuBackend;
+    use crate::metal::MetalBackend;
     use crate::weights_map::{WeightTensor, WeightsMap};
 
     fn rng_u64(seed: u64) -> impl FnMut() -> u64 {
@@ -405,8 +449,8 @@ mod tests {
     }
 
     /// Мини-Qwen3: случайные веса; WeightsMap строится поверх owned-буферов.
-    fn mini_model() -> (CpuBackend, Qwen3Model) {
-        let backend = CpuBackend;
+    fn mini_model() -> (MetalBackend, Qwen3Model) {
+        let backend = MetalBackend::new().expect("metal backend");
         let c = cfg();
         let mut rng = rng_u64(0xC0FFEE);
         let mut storage: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();

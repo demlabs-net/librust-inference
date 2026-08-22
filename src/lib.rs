@@ -32,6 +32,7 @@ pub mod inference;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod nn;
+pub mod tokenizer;
 pub mod weights;
 pub mod weights_map;
 

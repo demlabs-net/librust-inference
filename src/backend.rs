@@ -81,11 +81,13 @@ impl Tensor {
 
     #[cfg(feature = "metal")]
     pub(crate) fn as_gpu(&self) -> &GpuTensor {
-        match &self.inner {
-            TensorInner::Metal(g) => g,
-            #[cfg(feature = "cpu")]
-            TensorInner::Cpu(_) => panic!("as_gpu() on a CPU-backed tensor"),
-        }
+        // let-else keeps the match exhaustive when several storage features
+        // are enabled together (metal+cuda dev builds) — listing the arms
+        // here broke the combination.
+        let TensorInner::Metal(g) = &self.inner else {
+            panic!("as_gpu() on a non-Metal tensor");
+        };
+        g
     }
 
     /// CPU-reference storage (Phase 2 backend). The CPU backend owns its data

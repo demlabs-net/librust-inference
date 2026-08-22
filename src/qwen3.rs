@@ -180,6 +180,7 @@ impl Qwen3Model {
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 crate::dtype::KvFormat::F32,
+                crate::dtype::KvFormat::F32,
             )?);
         }
 

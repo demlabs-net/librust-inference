@@ -543,6 +543,75 @@ extern "C" __global__ void kv_update_f16_f32(
     dst[(bi * cap + pos + ti) * d + dj] = __half2float(src[i]);
 }
 
+/// kv_update with q8_0 storage: src f32 (b, tq, d) → i8 data + per-32-block
+/// f32 scales at pos (d must be a multiple of 32). Quantize on write;
+/// attention dequantizes inline (kv_read_q8).
+extern "C" __global__ void kv_update_q8(
+    const float* __restrict__ src,
+    signed char* __restrict__ dst,
+    float* __restrict__ dsc,
+    int b,
+    int tq,
+    int pos,
+    int d,
+    int cap)
+{
+    int nb = d >> 5; // 32-value blocks per row
+    int total = b * tq * nb;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int bi = i / (tq * nb);
+    int rem = i % (tq * nb);
+    int ti = rem / nb;
+    int blk = rem % nb;
+    const float* s = src + (bi * tq + ti) * d + (blk << 5);
+    signed char* dd = dst + (bi * cap + pos + ti) * d + (blk << 5);
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        float v = fabsf(s[j]);
+        amax = fmaxf(amax, v);
+    }
+    dsc[(bi * cap + pos + ti) * nb + blk] = amax / 127.0f;
+    if (amax == 0.f) {
+#pragma unroll
+        for (int j = 0; j < 32; ++j) dd[j] = 0;
+        return;
+    }
+    float inv = 127.0f / amax;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        dd[j] = (signed char)__float2int_rn(s[j] * inv);
+    }
+}
+
+/// kv_update copying q8_0 → q8_0 (KV grow: same format, copy i8 + scales).
+extern "C" __global__ void kv_update_q8_q8(
+    const signed char* __restrict__ src,
+    const float* __restrict__ ssc,
+    signed char* __restrict__ dst,
+    float* __restrict__ dsc,
+    int b,
+    int tq,
+    int pos,
+    int d,
+    int cap)
+{
+    int nb = d >> 5;
+    int total = b * tq * d;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int bi = i / (tq * d);
+    int rem = i % (tq * d);
+    int ti = rem / d;
+    int dj = rem % d;
+    dst[(bi * cap + pos + ti) * d + dj] = src[(bi * tq + ti) * d + dj];
+    // One lane per 32-block copies its scale (same index space).
+    if ((dj & 31) == 0) {
+        dsc[(bi * cap + pos + ti) * nb + (dj >> 5)] = ssc[(bi * tq + ti) * nb + (dj >> 5)];
+    }
+}
+
 /// y (len(idx), d) = table (v, d)[idx[i]]
 extern "C" __global__ void embedding_f32(
     const unsigned int* __restrict__ idx,
@@ -829,161 +898,316 @@ extern "C" __global__ void rmsnorm_v2_f32(
 /// (b,h,t) kernel that made TTS decode O(tkv·hd) serial per head — the
 /// dominant cost of generation (30..186 ms per token at pos 16..273).
 /// Same contract as attn_ar_f32: mask is a bias (0 / -inf); tkv <= 4096.
-extern "C" __global__ void attn_ar_v2_f32(
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
-    const float* __restrict__ mask,
-    float* __restrict__ y,
-    int b,
-    int tq,
-    int tkv,
-    int n_heads,
-    int kv_heads,
-    int hd,
-    int n_rep,
-    int has_mask)
-{
-    int bi = blockIdx.z;
-    int hh = blockIdx.y;
-    int t = blockIdx.x;
-    if (bi >= b || hh >= n_heads || t >= tq) return;
-    int kvh = hh / n_rep;
-    const float* qrow = q + (bi * tq + t) * (n_heads * hd) + hh * hd;
-    __shared__ float scores[4096];
-    __shared__ float exps[4096];
-    __shared__ float red[256];
-    __shared__ float smx;
-    float scale = rsqrtf((float)hd);
-    if (tkv > 4096) return;
-    if (threadIdx.x == 0) smx = -INFINITY;
-    __syncthreads();
+// Type-erased KV readers (each branch is a no-op at runtime unless selected;
+// the casts are only type-checked, not executed, in the dead branches).
+__device__ inline float kv_read_f32(const float* p, const float* sc, int j) { return p[j]; }
+__device__ inline float kv_read_f16(const __half* p, const float* sc, int j) { return __half2float(p[j]); }
+__device__ inline float kv_read_q8(const signed char* p, const float* sc, int j) { return (float)p[j] * sc[j >> 5]; }
 
-    // Phase 1: scores[tk] = q·k[tk] * scale (+mask), block-reduced over hd.
-    for (int tk = 0; tk < tkv; ++tk) {
-        const float* krow = k + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd;
-        float acc = 0.0f;
-        for (int j = threadIdx.x; j < hd; j += blockDim.x) acc += qrow[j] * krow[j];
-        red[threadIdx.x] = acc;
+#define KV_READ(FMT, ptr, sc, j)                                            \
+    ((FMT) == 0 ? kv_read_f32((const float*)(ptr), (sc), (j)) :             \
+     (FMT) == 1 ? kv_read_f16((const __half*)(ptr), (sc), (j)) :            \
+                 kv_read_q8((const signed char*)(ptr), (sc), (j)))
+
+// attn_ar_v4 for all K/V storage pairs: F=0 f32, F=1 f16, F=2 q8_0.
+// q/activations/mask stay f32; k/v are read through KV_READ (f16
+// dequant inline, q8_0 block-dequant).
+//
+// Two-kernel warp-chunked attention. The v3 kernel still paid 2
+// syncthreads per tk (~300 us at pos 1000 — 36 layers × that reaches the
+// 46 ms/token real-time budget at pos ~2000). v4 splits the window into
+// CHUNK-sized pieces: one block per (batch, head, query, chunk), each warp
+// independently runs the ONLINE softmax over its chunk with warp shuffles
+// ONLY — zero block-level syncs in the hot loop — and writes one partial
+// (max, sum-exp, weighted-V[32 columns]) per warp. `attn_ar_v4_combine`
+// merges the partials. No full-window score array: any tkv ≤ max_seq 32768.
+#define ATTN_AR_V4_PARTIAL(NAME, KT, VT, KS, VS)                            \
+extern "C" __global__ void NAME(                                           \
+    const float* __restrict__ q,                                           \
+    const KT* __restrict__ k,                                              \
+    const VT* __restrict__ v,                                              \
+    const float* __restrict__ mask,                                        \
+    float* __restrict__ part,      /* (chunk, warp) slots of 34 f32 */     \
+    int b, int tq, int tkv, int n_heads, int kv_heads, int hd, int n_rep,  \
+    int has_mask, int nwarps, int nchunks,                                 \
+    const float* __restrict__ ksc, const float* __restrict__ vsc)          \
+{                                                                          \
+    const int CHUNK = 64;                                                  \
+    int bi = blockIdx.z / nchunks;                                         \
+    int chunk = blockIdx.z % nchunks;                                      \
+    int hh = blockIdx.y;                                                   \
+    int t = blockIdx.x;                                                    \
+    if (bi >= b || hh >= n_heads || t >= tq) return;                       \
+    int kvh = hh / n_rep;                                                  \
+    int tid = threadIdx.x;                                                 \
+    int warp = tid >> 5;                                                   \
+    int lane = tid & 31;                                                   \
+    if (warp >= nwarps) return;                                            \
+    int c0 = chunk * CHUNK;                                                \
+    int cnt = tkv - c0;                                                    \
+    if (cnt > CHUNK) cnt = CHUNK;                                          \
+    const float* qrow = q + (bi * tq + t) * (n_heads * hd) + hh * hd;      \
+    int col = warp * 32 + lane;                                            \
+    float scale = rsqrtf((float)hd);                                       \
+    /* Pass 1: warp-local partial dots for every tk of the chunk — a       \
+       warp's shuffle only sums ITS 32 columns, so the full score needs    \
+       all nwarps' partials. Store them to shared, one sync per chunk. */  \
+    __shared__ float sh_p[8][64];                                          \
+    for (int tk = 0; tk < cnt; ++tk) {                                     \
+        float s = 0.0f;                                                    \
+        if (col < hd) {                                                    \
+            const KT* krow = k + (bi * tkv + c0 + tk) * (kv_heads * hd) + kvh * hd; \
+            const float* kscrow = ksc + ((bi * tkv + c0 + tk) * kv_heads + kvh) * (hd >> 5); \
+            s = qrow[col] * KV_READ(KS, krow, kscrow, col);                \
+        }                                                                  \
+        for (int off = 16; off > 0; off >>= 1) {                           \
+            s += __shfl_xor_sync(0xffffffffu, s, off);                     \
+        }                                                                  \
+        if (lane == 0) sh_p[warp][tk] = s;                                 \
+    }                                                                      \
+    __syncthreads();                                                       \
+    /* Pass 2: full score = Σ warp partials, online softmax, warp-local    \
+       (all lanes agree on m/sum; each lane owns its column's V sum). */   \
+    float m = -INFINITY;                                                   \
+    float sum = 0.0f;                                                      \
+    float acc = 0.0f;                                                      \
+    for (int tk = 0; tk < cnt; ++tk) {                                     \
+        float sc = 0.0f;                                                   \
+        for (int w = 0; w < nwarps; ++w) sc += sh_p[w][tk];                \
+        float score = sc * scale;                                          \
+        if (has_mask) score += mask[t * tkv + c0 + tk];                    \
+        float m_new = fmaxf(m, score);                                     \
+        float rescale = __expf(m - m_new);                                 \
+        sum *= rescale;                                                    \
+        acc *= rescale;                                                    \
+        float e = __expf(score - m_new);                                   \
+        sum += e;                                                          \
+        if (col < hd) {                                                    \
+            const VT* vrow = v + (bi * tkv + c0 + tk) * (kv_heads * hd) + kvh * hd; \
+            const float* vscrow = vsc + ((bi * tkv + c0 + tk) * kv_heads + kvh) * (hd >> 5); \
+            acc += e * KV_READ(VS, vrow, vscrow, col);                     \
+        }                                                                  \
+        m = m_new;                                                         \
+    }                                                                      \
+    float* slot = part + ((((bi * tq + t) * n_heads + hh) * nchunks + chunk) * nwarps + warp) * 34; \
+    slot[0] = m;                                                           \
+    slot[1] = sum;                                                         \
+    slot[2 + lane] = acc;                                                  \
+}
+
+#define ATTN_AR_V4_COMBINE(NAME)                                           \
+extern "C" __global__ void NAME(                                           \
+    const float* __restrict__ part,      /* (chunk, warp) slots of 34 */   \
+    float* __restrict__ y,               /* (b, tq, n_heads·hd) */         \
+    int b, int tq, int n_heads, int hd, int nwarps, int nchunks)           \
+{                                                                          \
+    int bi = blockIdx.z;                                                   \
+    int hh = blockIdx.y;                                                   \
+    int t = blockIdx.x;                                                    \
+    if (bi >= b || hh >= n_heads || t >= tq) return;                       \
+    int tid = threadIdx.x;                                                 \
+    int base = ((bi * tq + t) * n_heads + hh) * nchunks * nwarps * 34;     \
+    int nslot = nchunks * nwarps;                                          \
+    /* global max over the partials */                                     \
+    float M = -INFINITY;                                                   \
+    for (int i = tid; i < nslot; i += 256) M = fmaxf(M, part[base + i * 34]); \
+    __shared__ float red[256];                                             \
+    red[tid] = M;                                                          \
+    __syncthreads();                                                       \
+    for (int s = 256 / 2; s > 0; s >>= 1) {                                \
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);             \
+        __syncthreads();                                                   \
+    }                                                                      \
+    M = red[0];                                                            \
+    if (tid < hd) {                                                        \
+        int col = tid;                                                     \
+        int mywarp = col / 32;                                             \
+        float l = 0.0f;                                                    \
+        float acc = 0.0f;                                                  \
+        /* All warps of a chunk see the SAME scores, so their (m, sum)     \
+           are equal — count each chunk's sum ONCE (warp 0's slot).        \
+           The V-sums live per warp: a column takes its acc only from      \
+           its own warp's slot. */                                         \
+        for (int c = 0; c < nchunks; ++c) {                                \
+            const float* s0 = part + base + c * nwarps * 34;               \
+            float e = __expf(s0[0] - M);                                   \
+            l += s0[1] * e;                                                \
+            const float* sw = part + base + (c * nwarps + mywarp) * 34;    \
+            acc += sw[2 + (col & 31)] * e;                                 \
+        }                                                                  \
+        y[(bi * tq + t) * (n_heads * hd) + hh * hd + col] = acc / l;       \
+    }                                                                      \
+}
+
+// Name order is {K}{V} — matches the cuda.rs dispatch table
+// ((kfmt, vfmt) → kernel name). SUF is the K storage, the suffix is V.
+#define ATTN_K(SUF, KT, KS)                                                \
+    ATTN_AR_V4_PARTIAL(ATTN_M(attn_ar_v4_, SUF, f32), KT, float, KS, 0)    \
+    ATTN_AR_V4_PARTIAL(ATTN_M(attn_ar_v4_, SUF, f16), KT, __half, KS, 1)   \
+    ATTN_AR_V4_PARTIAL(ATTN_M(attn_ar_v4_, SUF, q8), KT, signed char, KS, 2)
+
+#define ATTN_M(A, B, C) ATTN_M_I(A, B, C)
+#define ATTN_M_I(A, B, C) A##B##C
+
+ATTN_K(f32, float, 0)
+ATTN_K(f16, __half, 1)
+ATTN_K(q8, signed char, 2)
+
+ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
+
+// ─────────────────── relative-position attention (NeMo/Zipformer) ───────
+// Bidirectional MHSA with relative position scores:
+//   ac = (q + u) · kᵀ                          content–content (over dk)
+//   bd = (q + v) · pᵀ                          content–position (over dp)
+//   mode 0 (NeMo Transformer-XL): bd [T, 2T−1] shifted with the XL pad:
+//     shifted[t][t'] = bd_pad[((t'+1)·T + t) / (2T)][((t'+1)·T + t) % (2T)]
+//     with bd_pad[r][0] = 0;  u/v = pos_bias_u/v (per-head, flattened).
+//   mode 1 (icefall zipformer): shifted[t][t'] = bd[t][T−1 + t' − t]
+//     (no padding, no u/v biases — pass zeros).
+// scores = (ac + bd)/√dk; softmax over keys; y = softmax·v (over dk cols).
+// When `w0` is non-null the head-0 post-softmax weights [T, T] are written
+// there (zipformer nonlin attention).
+// One block per (head, query-chunk of Q); scores staged in shared
+// (Q·T ≤ 32 KB → Q=4 at T ≤ 2048 — the STT frame cap).
+extern "C" __global__ void mhsa_rel_pos_f32(
+    const float* __restrict__ q,    // (T, H·dk) content queries
+    const float* __restrict__ k,    // (T, H·dk)
+    const float* __restrict__ v,    // (T, H·dk)
+    const float* __restrict__ qp,   // (T, H·dp) position queries (zipformer p-slice; NeMo: = q)
+    const float* __restrict__ p,    // (2T−1, H·dp)
+    const float* __restrict__ u,    // (H·dk) pos_bias_u (flattened per head)
+    const float* __restrict__ vb,   // (H·dp) pos_bias_v (flattened per head)
+    float* __restrict__ y,          // (T, H·dk)
+    float* __restrict__ wfull,      // (H, T, T) post-softmax weights or null
+    int T,
+    int dk,
+    int dp,
+    int H,
+    int mode)
+{
+    const int Q = 4;
+    __shared__ float scs[Q][2048];
+    __shared__ float red[256];
+    int hh = blockIdx.y;
+    int t0 = blockIdx.x * Q;
+    int tid = threadIdx.x;
+    const float* qh = q + hh * dk;
+    const float* kh = k + hh * dk;
+    const float* vh = v + hh * dk;
+    const float* qph = qp + hh * dp;
+    const float* ph = p + hh * dp;
+    const float* uh = u + hh * dk;
+    const float* vbh = vb + hh * dp;
+    float scale = rsqrtf((float)dk);
+    // ── scores for the chunk's Q query rows ──
+    int pairs = Q * T;
+    for (int i = tid; i < pairs; i += 256) {
+        int ql = i / T;
+        int t1 = i % T;
+        int qt = t0 + ql;
+        if (qt >= T) { scs[ql][t1] = 0.0f; continue; }
+        const float* qrow = qh + qt * (H * dk);
+        const float* krow = kh + t1 * (H * dk);
+        float ac = 0.0f;
+        for (int j = 0; j < dk; ++j) {
+            ac += (qrow[j] + uh[j]) * krow[j];
+        }
+        float bd = 0.0f;
+        if (mode == 0) {
+            int flat = (t1 + 1) * T + qt;
+            int qrow_i = flat / (2 * T);
+            int poff = flat % (2 * T);
+            if (poff > 0) {
+                const float* qr = qh + qrow_i * (H * dk);
+                const float* pr = ph + (poff - 1) * (H * dp);
+                for (int j = 0; j < dp; ++j) {
+                    bd += (qr[j] + vbh[j]) * pr[j];
+                }
+            }
+        } else {
+            int poff = T - 1 + t1 - qt;
+            const float* qpr = qph + qt * (H * dp);
+            const float* pr = ph + poff * (H * dp);
+            for (int j = 0; j < dp; ++j) {
+                bd += (qpr[j] + vbh[j]) * pr[j];
+            }
+        }
+        scs[ql][t1] = (ac + bd) * scale;
+    }
+    __syncthreads();
+    // ── per-row softmax + weighted V ──
+    for (int ql = 0; ql < Q; ++ql) {
+        int qt = t0 + ql;
+        if (qt >= T) continue;
+        // row max
+        float mx = -INFINITY;
+        for (int i = tid; i < T; i += 256) mx = fmaxf(mx, scs[ql][i]);
+        red[tid] = mx;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        for (int s = 256 / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
             __syncthreads();
         }
-        if (threadIdx.x == 0) {
-            float sc = red[0] * scale;
-            if (has_mask) sc += mask[t * tkv + tk];
-            scores[tk] = sc;
-            smx = fmaxf(smx, sc);
+        float row_max = red[0];
+        // exp → sum
+        float sum = 0.0f;
+        for (int i = tid; i < T; i += 256) {
+            float e = __expf(scs[ql][i] - row_max);
+            scs[ql][i] = e;
+            sum += e;
+        }
+        red[tid] = sum;
+        __syncthreads();
+        for (int s = 256 / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        float inv = 1.0f / red[0];
+        // post-softmax weights out (zipformer SelfAttention / NonlinAttention)
+        if (wfull != NULL) {
+            for (int i = tid; i < T; i += 256) {
+                wfull[hh * T * T + qt * T + i] = scs[ql][i] * inv;
+            }
+        }
+        // weighted V: thread j owns output column j of this row
+        if (tid < dk) {
+            float acc = 0.0f;
+            const float* vcol = vh + tid;
+            const float* srow = scs[ql];
+            for (int t1 = 0; t1 < T; ++t1) {
+                acc += srow[t1] * vcol[t1 * (H * dk)];
+            }
+            y[(qt) * (H * dk) + hh * dk + tid] = acc * inv;
         }
         __syncthreads();
-    }
-
-    // Phase 2: exp/sum (softmax denominator).
-    float sum = 0.0f;
-    for (int tk = threadIdx.x; tk < tkv; tk += blockDim.x) {
-        float e = __expf(scores[tk] - smx);
-        exps[tk] = e;
-        sum += e;
-    }
-    red[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    float inv = 1.0f / red[0];
-
-    // Phase 3: out[j] = Σ_tk exps[tk]·inv·v[tk][j], j = threadIdx.x.
-    float* out = y + (bi * tq + t) * (n_heads * hd) + hh * hd;
-    for (int j = threadIdx.x; j < hd; j += blockDim.x) {
-        float acc = 0.0f;
-        for (int tk = 0; tk < tkv; ++tk) {
-            const float* vrow = v + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd;
-            acc += exps[tk] * inv * vrow[j];
-        }
-        out[j] = acc;
     }
 }
 
-extern "C" __global__ void attn_ar_v2_f16(
-    const float* __restrict__ q,
-    const __half* __restrict__ k,
-    const __half* __restrict__ v,
-    const float* __restrict__ mask,
-    float* __restrict__ y,
-    int b,
-    int tq,
-    int tkv,
-    int n_heads,
-    int kv_heads,
-    int hd,
-    int n_rep,
-    int has_mask)
+/// Per-head attention application (zipformer SelfAttention / NonlinAttention):
+/// y (T, H·vh) = w (H, T, T) · x (T, H·vh), the post-softmax weights applied
+/// over time. One block per head.
+extern "C" __global__ void mhsa_apply_weights_f32(
+    const float* __restrict__ w,    // (H, T, T) post-softmax weights
+    const float* __restrict__ x,    // (T, H·vh)
+    float* __restrict__ y,          // (T, H·vh)
+    int T,
+    int vh,
+    int H)
 {
-    int bi = blockIdx.z;
     int hh = blockIdx.y;
-    int t = blockIdx.x;
-    if (bi >= b || hh >= n_heads || t >= tq) return;
-    int kvh = hh / n_rep;
-    const float* qrow = q + (bi * tq + t) * (n_heads * hd) + hh * hd;
-    __shared__ float scores[4096];
-    __shared__ float exps[4096];
-    __shared__ float red[256];
-    __shared__ float smx;
-    float scale = rsqrtf((float)hd);
-    if (tkv > 4096) return;
-    if (threadIdx.x == 0) smx = -INFINITY;
-    __syncthreads();
-
-    // Phase 1: scores[tk] = q·k[tk] * scale (+mask), block-reduced over hd.
-    for (int tk = 0; tk < tkv; ++tk) {
-        const __half* krow = k + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd;
+    int n = T * vh;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        int t = i / vh;
+        int j = i % vh;
+        const float* wrow = w + hh * T * T + t * T;
+        const float* xcol = x + hh * vh + j;
         float acc = 0.0f;
-        for (int j = threadIdx.x; j < hd; j += blockDim.x) acc += qrow[j] * __half2float(krow[j]);
-        red[threadIdx.x] = acc;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __syncthreads();
+        for (int t1 = 0; t1 < T; ++t1) {
+            acc += wrow[t1] * xcol[t1 * (H * vh)];
         }
-        if (threadIdx.x == 0) {
-            float sc = red[0] * scale;
-            if (has_mask) sc += mask[t * tkv + tk];
-            scores[tk] = sc;
-            smx = fmaxf(smx, sc);
-        }
-        __syncthreads();
-    }
-
-    // Phase 2: exp/sum (softmax denominator).
-    float sum = 0.0f;
-    for (int tk = threadIdx.x; tk < tkv; tk += blockDim.x) {
-        float e = __expf(scores[tk] - smx);
-        exps[tk] = e;
-        sum += e;
-    }
-    red[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    float inv = 1.0f / red[0];
-
-    // Phase 3: out[j] = Σ_tk exps[tk]·inv·v[tk][j], j = threadIdx.x.
-    float* out = y + (bi * tq + t) * (n_heads * hd) + hh * hd;
-    for (int j = threadIdx.x; j < hd; j += blockDim.x) {
-        float acc = 0.0f;
-        for (int tk = 0; tk < tkv; ++tk) {
-            const __half* vrow = v + (bi * tkv + tk) * (kv_heads * hd) + kvh * hd;
-            acc += exps[tk] * inv * __half2float(vrow[j]);
-        }
-        out[j] = acc;
+        y[t * (H * vh) + hh * vh + j] = acc;
     }
 }
-
-
 /// Autoregressive GQA attention (TTS): q (b, tq, n_heads·hd),
 /// k/v (b, tkv, kv_heads·hd), mask (tq, tkv) bias (0 / -inf) or null.
 /// One thread per (b, head, tq) — softmax over tkv in f32.
@@ -1230,6 +1454,34 @@ extern "C" __global__ void gemm_i8_mn_splitk(
 /// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
 /// Combine the split-k partials: C[col] = Σ_s Cpart[s·n + col].
 
+/// int8 GEMM, m = 1 without split-k (n % 16 != 0 — the split-k path needs
+/// 16-byte aligned columns): one thread per column, serial dot over k.
+extern "C" __global__ void gemm_i8_m1(
+    const signed char* __restrict__ A,   // (1, k)
+    const float* __restrict__ asc,       // (1, k/32)
+    const signed char* __restrict__ B,   // (k, n) row-major
+    const float* __restrict__ wsc,       // (k/32, n)
+    float* __restrict__ C,               // (1, n)
+    int k,
+    int n)
+{
+    int col = blockIdx.x * 256 + threadIdx.x;
+    if (col >= n) return;
+    int nblk = k >> 5;
+    int acc = 0;
+    for (int b = 0; b < nblk; ++b) {
+        int s = 0;
+        const signed char* a = A + b * 32;
+        const signed char* w = B + b * 32 * n + col;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            s += (int)a[j] * (int)w[j * n];
+        }
+        acc += (int)(s * (asc[b] * wsc[b * n + col]));
+    }
+    C[col] = (float)acc;
+}
+
 /// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
 extern "C" __global__ void gemm_i8_reduce(
     const float* __restrict__ Cpart,   // (S·m, n)
@@ -1357,6 +1609,331 @@ extern "C" __global__ void gemm_i8_tiled(
             int col = n0 + tx * 2 + cc;
             if (col < n) C[row * n + col] = acc_f[rr][cc];
         }
+    }
+}
+
+// ─────────────────────── Q6_K GEMM (packed weights) ───────────────────────
+// Canonical llama.cpp Q6_K layout, 210 bytes per 256-weight super-block:
+//   ql[128]  — low 4 bits (2 weights per byte)
+//   qh[64]   — high 2 bits (4 weights per byte)
+//   scales[16] — int8 sub-scales (16-elem sub-blocks)
+//   d[2]     — f16 super-block scale (bytes 208..210)
+// Dequant of weight j (0..255): q = ((ql|qh) & 0x3F) - 32, w = d·sc[j]·q.
+// Weights uploaded col-major: block (col, kb) at (col·nsuper + kb)·210 —
+// same layout as the quantizer/to_cpu_f32.
+__device__ inline float q6k_weight(const unsigned char* blk, int j) {
+    int nchunk = j >> 7;          // 0..1 (128-weight halves)
+    int lane = j & 31;
+    int q = (j >> 5) & 3;         // 0..3 (4 weights share one qh byte)
+    int qlb = nchunk * 64 + lane + ((q & 1) << 5);
+    int qhb = nchunk * 32 + lane;
+    int scb = nchunk * 8 + (lane >> 4) + (q << 1);
+    // q1/q2 read the low nibble of their ql byte, q3/q4 the high nibble.
+    int low = ((q >> 1) & 1) ? (blk[qlb] >> 4) : (blk[qlb] & 0xF);
+    int high = (blk[128 + qhb] >> (q << 1)) & 3;
+    int qv = (low | (high << 4)) - 32;
+    float d = __half2float(*(const __half*)(blk + 208));
+    return d * (float)(signed char)blk[192 + scb] * (float)qv;
+}
+
+/// Q4_0 canonical layout, 18 bytes per 32-weight block: f16 d (bytes 0..2)
+/// + 16 bytes of 4-bit nibbles. Dequant: w = ((nib & 0xF) - 8)·d (the -8
+/// offset is baked into the dequant — no stored zero-point).
+__device__ inline float q4k_weight(const unsigned char* blk, int j) {
+    float d = __half2float(*(const __half*)(blk));
+    int nib = blk[2 + (j >> 1)];
+    int q = (j & 1) ? (nib >> 4) : (nib & 0xF);
+    return (float)(q - 8) * d;
+}
+
+// Q6_K / Q4_0 packed-weight GEMMs. Weights are stored kb-major — block
+// (kb, col) at (kb·rows + col)·BLK_BYTES — so one k-block's BN columns are
+// ONE contiguous segment; the kernels stage it into shared with vectorized
+// (uchar4) cooperative loads (the old per-column scattered byte loads ran
+// 70-100x slower than fp16 cuBLAS) and dequantize from shared.
+// BN: 128 for Q6_K (26.9 KB tile — 48 KB static-shared limit), 256 for
+// Q4_0 (4.6 KB). No activation staging: A is re-read per k-block and
+// broadcasts across the block's threads (L2-resident).
+#define DEFINE_Q_GEMMS(SUF, WREAD, NSUP_SHIFT, WPB, BLK_BYTES, BN)          \
+/* m ≤ 64 (TTS fill/decode): split-k over k-slices. Grid                  \
+   (ceil(n/BN)·m, S); each block: one output row × BN columns, per         \
+   k-block a cooperative tile load + full WPB-weight dot from shared.      \
+   S=1 needs no shared A window (activations read from global) — one       \
+   kernel covers every k. `gemm_i8_reduce` combines the partials. */       \
+extern "C" __global__ void SUF##_splitk(                                    \
+    const float* __restrict__ A,        /* (m, k) */                        \
+    const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
+    float* __restrict__ Cpart,          /* (S·m, n) */                      \
+    int k, int n, int S, int m)                                             \
+{                                                                           \
+    __shared__ unsigned char Bs[BN * BLK_BYTES];                            \
+    int tid = threadIdx.x;                                                  \
+    int bx = blockIdx.x;                                                    \
+    int row = bx % m;                                                       \
+    int nb = bx / m;                                                        \
+    int col0 = nb * BN;                                                     \
+    int ks = k / S;                                                         \
+    int nblk_s = ks >> NSUP_SHIFT;                                          \
+    int nsup = k >> NSUP_SHIFT;                                             \
+    int kb0 = blockIdx.y * nblk_s;                                          \
+    const float* arow = A + (size_t)row * k;                                \
+    float acc = 0.0f;                                                       \
+    const int tile_bytes = BN * BLK_BYTES;                                  \
+    const int tile_v4 = tile_bytes >> 4;                                    \
+    for (int t = 0; t < nblk_s; ++t) {                                      \
+        int kb = kb0 + t;                                                   \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK_BYTES; \
+        /* Fast path: (kb·n + col0)·BLK_BYTES is 16-aligned when n % 8 == 0 \
+           (all real TTS/STT n) — uint4 vector loads, fully coalesced.     \
+           Otherwise per-column byte loads (never OOB; garbage columns     \
+           zeroed — their outputs are masked). */                           \
+        if (col0 + BN <= n && (n & 7) == 0) {                               \
+            for (int i = tid; i < tile_v4; i += 256) {                      \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);     \
+            }                                                               \
+        } else if (tid < BN) {                                              \
+            int c = col0 + tid;                                             \
+            if (c < n) {                                                    \
+                const unsigned char* s = src + (size_t)tid * BLK_BYTES;     \
+                unsigned char* d = Bs + tid * BLK_BYTES;                    \
+                /* Byte copy: BLK_BYTES is not 16-aligned, the per-column   \
+                   source is misaligned — vector loads are not allowed. */  \
+                for (int i = 0; i < BLK_BYTES; ++i) d[i] = s[i];            \
+            } else {                                                        \
+                for (int i = 0; i < BLK_BYTES; ++i) Bs[tid * BLK_BYTES + i] = 0; \
+            }                                                               \
+        }                                                                   \
+        __syncthreads();                                                    \
+        if (col0 + tid < n && tid < BN) {                                   \
+            const unsigned char* blk = Bs + tid * BLK_BYTES;                \
+            /* Modest unroll: full 256-way unrolling of the dequant+FMA     \
+               chain spills registers; 8-way keeps the dequant latency      \
+               hidden without pressure. */                                  \
+            _Pragma("unroll 8")                                             \
+            for (int j = 0; j < WPB; ++j) {                                 \
+                acc += arow[kb * WPB + j] * WREAD(blk, j);                  \
+            }                                                               \
+        }                                                                   \
+        __syncthreads();                                                    \
+    }                                                                       \
+    if (col0 + tid < n && tid < BN) {                                       \
+        Cpart[(blockIdx.y * m + row) * n + col0 + tid] = acc;               \
+    }                                                                       \
+}                                                                           \
+/* m > 64 (STT one-shot frames): block per (32 rows × BN cols), 32 row     \
+   accumulators in registers; B staged once per k-block, reused by all     \
+   32 rows — B read once per row-chunk, not per row. */                    \
+extern "C" __global__ void SUF##_tiled(                                     \
+    const float* __restrict__ A,        /* (m, k) */                        \
+    const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
+    float* __restrict__ C,              /* (m, n) */                        \
+    int m, int k, int n)                                                    \
+{                                                                           \
+    const int BM = 32;                                                      \
+    __shared__ unsigned char Bs[BN * BLK_BYTES];                            \
+    int tid = threadIdx.x;                                                  \
+    int col0 = blockIdx.x * BN;                                             \
+    int r0 = blockIdx.y * BM;                                               \
+    int nsup = k >> NSUP_SHIFT;                                             \
+    float acc[BM];                                                          \
+    for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                         \
+    const int tile_bytes = BN * BLK_BYTES;                                  \
+    const int tile_v4 = tile_bytes >> 4;                                    \
+    for (int kb = 0; kb < nsup; ++kb) {                                     \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK_BYTES; \
+        if (col0 + BN <= n && (n & 7) == 0) {                               \
+            for (int i = tid; i < tile_v4; i += 256) {                      \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);     \
+            }                                                               \
+        } else if (tid < BN) {                                              \
+            int c = col0 + tid;                                             \
+            if (c < n) {                                                    \
+                const unsigned char* s = src + (size_t)tid * BLK_BYTES;     \
+                unsigned char* d = Bs + tid * BLK_BYTES;                    \
+                for (int i = 0; i < BLK_BYTES; ++i) d[i] = s[i];            \
+            } else {                                                        \
+                for (int i = 0; i < BLK_BYTES; ++i) Bs[tid * BLK_BYTES + i] = 0; \
+            }                                                               \
+        }                                                                   \
+        __syncthreads();                                                    \
+        if (col0 + tid < n && tid < BN) {                                   \
+            const unsigned char* blk = Bs + tid * BLK_BYTES;                \
+            for (int j = 0; j < WPB; ++j) {                                 \
+                float w = WREAD(blk, j);                                    \
+                const float* a0 = A + (size_t)r0 * k + kb * WPB + j;        \
+                for (int rr = 0; rr < BM; ++rr) {                           \
+                    if (r0 + rr < m) acc[rr] += a0[rr * k] * w;             \
+                }                                                           \
+            }                                                               \
+        }                                                                   \
+        __syncthreads();                                                    \
+    }                                                                       \
+    if (col0 + tid >= n || tid >= BN) return;                               \
+    float* c0 = C + (size_t)r0 * n + col0 + tid;                            \
+    for (int rr = 0; rr < BM; ++rr) {                                       \
+        if (r0 + rr < m) c0[rr * n] = acc[rr];                              \
+    }                                                                       \
+}
+
+DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18, 256)
+
+// ─────────────────── Q6_K GEMM v2 (dequant-amortized) ───────────────────
+// The v1 splitk dequantized inline per FMA: 3 shared byte loads + ~12 ALU
+// per weight, strided 210 B (gcd(210,32)=2 — 2-way bank conflicts) — 49 us
+// for the qkv shape vs 10 us fp16. v2 amortizes: per k-block, 256 threads
+// cooperatively dequantize the 32-column tile ONCE into a TRANSPOSED f32
+// tile (TILE[j][col] — consecutive threads read consecutive columns, bank
+// conflict-free), then the compute is pure FMA. BN=32: Bs 6.7 KB + f32
+// tile 32 KB fits the 48 KB static-shared budget.
+extern "C" __global__ void gemm_q6k_splitk_v2(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ Cpart,          // (S·m, n)
+    int k,
+    int n,
+    int S,
+    int m)
+{
+    const int BN = 32;
+    __shared__ unsigned char Bs[BN * 210];
+    __shared__ float T[256][BN];
+    __shared__ float As[256];
+    int tid = threadIdx.x;
+    int bx = blockIdx.x;
+    int row = bx % m;
+    int nb = bx / m;
+    int col0 = nb * BN;
+    int nsup = k >> 8;
+    int nblk_s = (k / S) >> 8;
+    int kb0 = blockIdx.y * nblk_s;
+    const float* arow = A + (size_t)row * k;
+    float acc = 0.0f;
+    for (int t = 0; t < nblk_s; ++t) {
+        int kb = kb0 + t;
+        // Activation k-block (shared — the compute's 32 threads would not
+        // hide 256 global loads per thread otherwise).
+        As[tid] = arow[kb * 256 + tid];
+        const unsigned char* src = B + (size_t)(kb * n + col0) * 210;
+        // Flat coalesced tile load (interior: 6720 B contiguous; edge:
+        // per-column byte copy, garbage columns zeroed — masked later).
+        if (col0 + BN <= n && (n & 7) == 0) {
+            for (int i = tid; i < (BN * 210) / 16; i += 256) {
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);
+            }
+        } else if (tid < BN) {
+            int c = col0 + tid;
+            if (c < n) {
+                const unsigned char* s = src + (size_t)tid * 210;
+                unsigned char* d = Bs + tid * 210;
+                for (int i = 0; i < 210; ++i) d[i] = s[i];
+            } else {
+                for (int i = 0; i < 210; ++i) Bs[tid * 210 + i] = 0;
+            }
+        }
+        __syncthreads();
+        // Dequant pass: thread (col, jg) → TILE[j][col] (transposed —
+        // conflict-free writes and reads).
+        int col = tid & 31;
+        int jg = tid >> 5;
+        {
+            const unsigned char* blk = Bs + col * 210;
+            float d = __half2float(*(const __half*)(blk + 208));
+            for (int r = 0; r < 32; ++r) {
+                int j = jg * 32 + r;
+                // For j = jg·32+r: lane = r, q = jg&3 (r < 32 → lane = r).
+                int nchunk = j >> 7;
+                int lane = r;
+                int q = jg & 3;
+                int qlb = nchunk * 64 + lane + ((q & 1) << 5);
+                int qhb = nchunk * 32 + lane;
+                int scb = nchunk * 8 + (lane >> 4) + (q << 1);
+                int low = ((q >> 1) & 1) ? (blk[qlb] >> 4) : (blk[qlb] & 0xF);
+                int high = (blk[128 + qhb] >> (q << 1)) & 3;
+                int qv = (low | (high << 4)) - 32;
+                T[j][col] = d * (float)(signed char)blk[192 + scb] * (float)qv;
+            }
+        }
+        __syncthreads();
+        // Compute: 32 threads (one per column), pure FMA over the f32 tile.
+        if (tid < BN && col0 + tid < n) {
+            for (int j = 0; j < 256; ++j) {
+                acc += As[j] * T[j][tid];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < BN && col0 + tid < n) {
+        Cpart[(blockIdx.y * m + row) * n + col0 + tid] = acc;
+    }
+}
+
+/// Q6_K GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
+/// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The
+/// 32×256 activation tile is staged in shared (the v1 read A from global
+/// per (j, row): 8192 loads/thread/k-block — the m=16 variant measured
+/// 1.7 ms); the packed B tile is staged too and the dequant is broadcast
+/// per column (the 4 row-threads of a column read the same bytes).
+extern "C" __global__ void gemm_q6k_tiled_v3(
+    const float* __restrict__ A,        // (m, k)
+    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
+    float* __restrict__ C,              // (m, n)
+    int m,
+    int k,
+    int n)
+{
+    const int BM = 32, BN = 64;
+    __shared__ unsigned char Bs[BN * 210];
+    __shared__ float As[BM * 256];
+    int tid = threadIdx.x;
+    int col0 = blockIdx.x * BN;
+    int r0 = blockIdx.y * BM;
+    int nsup = k >> 8;
+    int col = tid & 63;
+    int rq = tid >> 6;      // 0..3 — eight rows per thread
+    float acc[8];
+    for (int q = 0; q < 8; ++q) acc[q] = 0.0f;
+    for (int kb = 0; kb < nsup; ++kb) {
+        const unsigned char* src = B + (size_t)(kb * n + col0) * 210;
+        if (col0 + BN <= n && (n & 7) == 0) {
+            for (int i = tid; i < (BN * 210) / 16; i += 256) {
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);
+            }
+        } else if (tid < BN) {
+            int c = col0 + tid;
+            if (c < n) {
+                const unsigned char* s = src + (size_t)tid * 210;
+                unsigned char* d = Bs + tid * 210;
+                for (int i = 0; i < 210; ++i) d[i] = s[i];
+            } else {
+                for (int i = 0; i < 210; ++i) Bs[tid * 210 + i] = 0;
+            }
+        }
+        // Activation tile: 32 rows × 256 j — 4 rows per thread (i = r·256+j,
+        // j = i&255, r = i>>8 → thread rq covers rows rq, rq+8, rq+16, rq+24).
+        for (int i = tid; i < BM * 256; i += 256) {
+            int j = i & 255;
+            int rr = i >> 8;
+            int r = r0 + rr;
+            As[rr * 256 + j] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : 0.0f;
+        }
+        __syncthreads();
+        if (col0 + col < n) {
+            const unsigned char* blk = Bs + col * 210;
+            for (int j = 0; j < 256; ++j) {
+                float w = q6k_weight(blk, j);
+                for (int q = 0; q < 8; ++q) {
+                    int rr = rq + 4 * (q & 3) + 16 * (q >> 2);
+                    if (r0 + rr < m) acc[q] += As[rr * 256 + j] * w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (col0 + col >= n) return;
+    float* c0 = C + (size_t)r0 * n + col0 + col;
+    for (int q = 0; q < 8; ++q) {
+        int rr = rq + 4 * (q & 3) + 16 * (q >> 2);
+        if (r0 + rr < m) c0[rr * n] = acc[q];
     }
 }
 

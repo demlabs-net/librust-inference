@@ -147,10 +147,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // prefill + TTFT
     let t0 = Instant::now();
-    let mut logits = model.decode(&*backend, ids[0])?;
-    for &id in &ids[1..] {
-        logits = model.decode(&*backend, id)?;
-    }
+    let mut logits = if std::env::var("LLM_BATCH").is_ok() {
+        model.prefill(&*backend, &ids)?
+    } else {
+        let mut l = model.decode(&*backend, ids[0])?;
+        for &id in &ids[1..] {
+            l = model.decode(&*backend, id)?;
+        }
+        l
+    };
     let ttft = t0.elapsed();
     eprintln!(
         "prefill {} tokens in {:.2}s (TTFT)",

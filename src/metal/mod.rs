@@ -1658,8 +1658,11 @@ impl MetalCtx {
         h: usize,
         eps: f32,
     ) -> Result<(), MetalError> {
-        let rows = x.shape[0];
-        let hd = x.shape[1] / h;
+        // X (B, T, H·HD) or (rows, H·HD); rows = all leading dims flattened
+        // (batched tokens must ALL be normalized — shape[0] alone is wrong
+        // for prefill batches). HD lives on the LAST axis.
+        let hd = x.shape[x.shape.len() - 1] / h;
+        let rows = x.shape.iter().product::<usize>() / (h * hd);
         let grid = MTLSize::new(rows as u64, h as u64, hd as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("rmsnorm_head_f32", grid, group, |enc| {

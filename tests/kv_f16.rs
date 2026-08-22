@@ -1,4 +1,5 @@
 //! KV-f16/q8 correctness: attn_ar_v2_f16 and kv_update_f16 vs the CPU f32
+#![cfg(all(feature = "cuda", feature = "cpu"))]
 //! oracle. `cargo test --release --features "cuda cpu" --test kv_f16 -- --nocapture`.
 
 use rust_inference::Backend;

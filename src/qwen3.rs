@@ -209,17 +209,7 @@ impl Qwen3Model {
         let t = ids.len();
         let mut x = self.embed.forward(backend, ids, t)?;
         let pos = self.caches[0].pos;
-        let no_ffn = std::env::var("LLM_NO_FFN").is_ok();
-        let max_layers: usize = std::env::var("LLM_MAX_LAYERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(self.layers.len());
-        for (i, layer) in self.layers.iter().take(max_layers).enumerate() {
-            if std::env::var("LLM_DBG_HIDDEN").is_ok() {
-                let xn = backend.to_cpu_f32(&x)?;
-                let norm2 = xn.iter().map(|v| (v * v) as f64).sum::<f64>().sqrt();
-                eprintln!("layer {i}: ||x|| = {norm2:.3}");
-            }
+        for (i, layer) in self.layers.iter().enumerate() {
             let h = layer.attn_norm.forward(backend, &x)?;
             let h = Self::rope_and_attn(
                 &self.cfg,
@@ -231,9 +221,6 @@ impl Qwen3Model {
                 t,
             )?;
             x = backend_add(backend, &x, &h)?;
-            if no_ffn {
-                continue;
-            }
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
@@ -286,17 +273,7 @@ impl Qwen3Model {
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
-        // Временные диагностические флаги (Ф1.7 отладка качества):
-        // LLM_NO_ROPE / LLM_NO_QKNORM / LLM_NO_MASK / LLM_NO_ATTN / LLM_NO_FFN
-        // выключают компоненты для бисекции форварда против эталона.
-        let no_rope = std::env::var("LLM_NO_ROPE").is_ok();
-        let no_qk = std::env::var("LLM_NO_QKNORM").is_ok();
-        let no_mask = std::env::var("LLM_NO_MASK").is_ok();
-        let no_attn = std::env::var("LLM_NO_ATTN").is_ok();
-        if no_attn {
-            return Ok(h.clone());
-        }
-        let (q, k) = if !no_qk && attn.q_norm.is_some() && attn.k_norm.is_some() {
+        let (q, k) = if attn.q_norm.is_some() && attn.k_norm.is_some() {
             (
                 qk_norm(backend, &q, attn.q_norm.as_ref().unwrap(), attn.n_heads)?,
                 qk_norm(backend, &k, attn.k_norm.as_ref().unwrap(), attn.n_kv_heads)?,
@@ -304,20 +281,12 @@ impl Qwen3Model {
         } else {
             (q, k)
         };
-        let q = if no_rope {
-            q
-        } else {
-            rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?
-        };
-        let k = if no_rope {
-            k
-        } else {
-            rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?
-        };
+        let q = rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?;
+        let k = rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?;
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
         cache.update(backend, &k, &v)?;
-        let mask = if t > 1 && !no_mask {
+        let mask = if t > 1 {
             Some(crate::nn::build_causal_mask(backend, t, cache.pos, pos)?)
         } else {
             None

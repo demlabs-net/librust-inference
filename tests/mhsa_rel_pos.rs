@@ -1,4 +1,5 @@
 //! mhsa_rel_pos / mhsa_apply_weights vs the CPU oracle (both shift modes).
+#![cfg(all(feature = "cuda", feature = "cpu"))]
 //! `cargo test --release --features "cuda cpu" --test mhsa_rel_pos -- --nocapture`
 
 use rust_inference::cpu::CpuBackend;

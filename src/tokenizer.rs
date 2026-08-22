@@ -44,6 +44,8 @@ pub struct Tokenizer {
     id_of: HashMap<Vec<u8>, u32>,
     /// merge (left_id, right_id) → merged_id; порядок вектора = ранг.
     merges: Vec<((u32, u32), u32)>,
+    /// Спец-токены (CONTROL/USER_DEFINED из token_type), longest-first.
+    special: Vec<(Vec<u8>, u32)>,
     pub bos: Option<u32>,
     pub eos: Option<u32>,
     pub pad: Option<u32>,
@@ -67,6 +69,7 @@ impl Tokenizer {
             vocab,
             id_of,
             merges,
+            special: Vec::new(),
             bos,
             eos,
             pad,
@@ -132,10 +135,32 @@ impl Tokenizer {
                     .ok_or(TokenizerError::MissingTokenId(key)),
             }
         };
+
+        // Спец-токены из token_type (ggml): 1=NORMAL, 2=UNKNOWN, 3=CONTROL,
+        // 4=USER_DEFINED, 5=UNUSED, 6=BYTE. CONTROL/USER_DEFINED вырезаются
+        // едиными кусками до BPE (иначе `<|im_start|>` распадается на части —
+        // модель видит не тот промпт).
+        let mut special: Vec<(Vec<u8>, u32)> = Vec::new();
+        if let Some(arr) = file
+            .get("tokenizer.ggml.token_type")
+            .and_then(GgufValue::as_array)
+        {
+            for (i, t) in arr.iter().enumerate() {
+                if let Some(tt) = t.as_u32() {
+                    if (tt == 3 || tt == 4) && vocab[i].len() > 1 {
+                        special.push((vocab[i].clone(), i as u32));
+                    }
+                }
+            }
+        }
+        // longest-first: жадный матч берёт самый длинный спец-токен.
+        special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
         Ok(Self {
             vocab,
             id_of,
             merges,
+            special,
             bos: tid("tokenizer.ggml.bos_token_id")?,
             eos: tid("tokenizer.ggml.eos_token_id")?,
             pad: tid("tokenizer.ggml.padding_token_id")?,
@@ -167,18 +192,35 @@ impl Tokenizer {
             .collect();
         // инициализация по СИМВОЛАМ (tiktoken-стиль): каждый символ — токен;
         // неизвестные символы — фоллбэк на байты (byte-fallback токены 0x00-0xFF).
+        // Спец-токены (CONTROL/USER_DEFINED) вырезаются едиными кусками ДО BPE.
+        let mapped_bytes = mapped.as_bytes();
         let mut ids: Vec<u32> = Vec::new();
-        for ch in mapped.chars() {
-            let piece = ch.to_string().into_bytes();
-            if let Some(&id) = self.id_of.get(&piece[..]) {
-                ids.push(id);
-                continue;
-            }
-            for &b in &piece {
-                if let Some(&id) = self.id_of.get(&[b][..]) {
-                    ids.push(id);
+        let mut i = 0usize;
+        while i < mapped_bytes.len() {
+            let mut matched: Option<(usize, u32)> = None;
+            for (piece, id) in &self.special {
+                if mapped_bytes[i..].starts_with(piece) {
+                    matched = Some((piece.len(), *id));
+                    break;
                 }
             }
+            if let Some((len, id)) = matched {
+                ids.push(id);
+                i += len;
+                continue;
+            }
+            let ch_len = utf8_len(mapped_bytes[i]);
+            let piece = &mapped_bytes[i..i + ch_len];
+            if let Some(&id) = self.id_of.get(piece) {
+                ids.push(id);
+            } else {
+                for &b in piece {
+                    if let Some(&id) = self.id_of.get(&[b][..]) {
+                        ids.push(id);
+                    }
+                }
+            }
+            i += ch_len;
         }
         // жадный проход: ищем merge с наименьшим рангом среди соседних пар
         loop {
@@ -398,5 +440,18 @@ mod tests {
         assert_eq!(d.push(b"hel"), "hel");
         assert_eq!(d.push(b"lo"), "lo");
         assert_eq!(d.finish(), "");
+    }
+}
+
+/// Число байт UTF-8-символа по первому байту.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else {
+        4
     }
 }

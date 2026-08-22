@@ -699,6 +699,13 @@ impl Backend for CpuBackend {
                     "embedding: index {ix} >= vocab {v}"
                 )));
             }
+            if std::env::var("LLM_DBG_ATTN").is_ok() && i == 0 {
+                eprintln!(
+                    "CPU_EMB ix={ix} v={v} d={d} table[..8]: {:?} table[ix*d..]: {:?}",
+                    &td[..8],
+                    &td[ix as usize * d..ix as usize * d + 8]
+                );
+            }
             yd[i * d..(i + 1) * d].copy_from_slice(&td[ix as usize * d..(ix as usize + 1) * d]);
         }
         Ok(())
@@ -808,9 +815,11 @@ impl Backend for CpuBackend {
         h: usize,
         eps: f32,
     ) -> Result<(), BackendError> {
-        // X (rows, h·hd), w (hd) shared across heads.
-        let rows = x.shape()[0];
-        let hd = x.shape()[1] / h;
+        // X (rows, h·hd), w (hd) shared across heads. X may be 2D/3D
+        // (batched tokens); rows = all leading dims flattened.
+        let last = x.shape().len() - 1;
+        let hd = x.shape()[last] / h;
+        let rows = x.numel() / (h * hd);
         check_len(x, y.numel())?;
         let (xd, wd) = (data(x).to_vec(), data(w).to_vec());
         let mut yd = data_mut(y);
@@ -836,8 +845,8 @@ impl Backend for CpuBackend {
         h: usize,
         eps: f32,
     ) -> Result<(), BackendError> {
-        let rows = x.shape()[0];
-        let hd = x.shape()[1] / h;
+        let hd = x.shape()[x.shape().len() - 1] / h;
+        let rows = x.numel() / (h * hd);
         check_len(x, y.numel())?;
         let (xd, wd, bd) = (data(x), data(w), data(b));
         let mut yd = data_mut(y);

@@ -25,7 +25,10 @@ impl Lcg {
         Self(seed)
     }
     pub fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as u32
     }
     /// Uniform in [0, 1).
@@ -60,7 +63,9 @@ pub struct GoldenCase {
 }
 
 fn golden_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
 }
 
 pub fn golden_path(op: &str) -> PathBuf {
@@ -69,7 +74,9 @@ pub fn golden_path(op: &str) -> PathBuf {
 
 /// True when the golden files should be (re)generated instead of compared.
 pub fn regen_enabled() -> bool {
-    std::env::var("REGEN_GOLDEN").map(|v| v == "1").unwrap_or(false)
+    std::env::var("REGEN_GOLDEN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 pub fn save_golden(case: &GoldenCase) -> std::io::Result<()> {
@@ -97,7 +104,9 @@ pub fn assert_close(actual: &[f32], expected: &[f32], rtol: f32, atol: f32) -> R
             (a - e).abs() <= atol + rtol * e.abs()
         };
         if !ok {
-            return Err(format!("index {i}: got {a}, expected {e} (rtol {rtol}, atol {atol})"));
+            return Err(format!(
+                "index {i}: got {a}, expected {e} (rtol {rtol}, atol {atol})"
+            ));
         }
     }
     Ok(())
@@ -131,13 +140,20 @@ where
             let n: usize = shape.iter().product();
             let mut data = vec![0.0f32; n];
             lcg.fill(&mut data);
-            inputs.push(TensorData { name: name.to_string(), shape: shape.clone(), data });
+            inputs.push(TensorData {
+                name: name.to_string(),
+                shape: shape.clone(),
+                data,
+            });
         }
     }
 
     let tensors: Vec<Tensor> = inputs
         .iter()
-        .map(|t| b.from_cpu_f32(&t.data, t.shape.clone()).expect("upload input"))
+        .map(|t| {
+            b.from_cpu_f32(&t.data, t.shape.clone())
+                .expect("upload input")
+        })
         .collect();
 
     let produced = run(&b, &tensors);
@@ -146,7 +162,11 @@ where
         .map(|(name, shape, data)| TensorData { name, shape, data })
         .collect();
 
-    let case = GoldenCase { op: op.to_string(), inputs, outputs };
+    let case = GoldenCase {
+        op: op.to_string(),
+        inputs,
+        outputs,
+    };
 
     if regen_enabled() {
         save_golden(&case).expect("write golden");
@@ -158,7 +178,11 @@ where
     });
     let (rtol, atol) = standard_tolerance();
     for (got, exp) in case.outputs.iter().zip(golden.outputs.iter()) {
-        assert_eq!(got.shape, exp.shape, "op {op}: shape mismatch for {}", got.name);
+        assert_eq!(
+            got.shape, exp.shape,
+            "op {op}: shape mismatch for {}",
+            got.name
+        );
         assert_close(&got.data, &exp.data, rtol, atol)
             .unwrap_or_else(|e| panic!("op {op} tensor {}: {e}", got.name));
     }
@@ -190,7 +214,10 @@ where
     for ((n1, s1, d1), (n2, s2, d2)) in first.iter().zip(second.iter()) {
         assert_eq!(n1, n2, "op {op}: output name mismatch");
         assert_eq!(s1, s2, "op {op}: output shape mismatch for {n1}");
-        assert_eq!(d1, d2, "op {op}: output NOT bit-identical for {n1} (determinism violated)");
+        assert_eq!(
+            d1, d2,
+            "op {op}: output NOT bit-identical for {n1} (determinism violated)"
+        );
     }
 }
 

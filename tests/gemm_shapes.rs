@@ -3,10 +3,10 @@
 
 #![cfg(all(feature = "cuda", feature = "cpu"))]
 
+use rust_inference::Backend;
 use rust_inference::cpu::CpuBackend;
 use rust_inference::cuda::CudaBackend;
 use rust_inference::harness::Lcg;
-use rust_inference::Backend;
 
 fn check(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
     let seed = (m * 7919 + k * 104729 + n) as u64;
@@ -49,13 +49,13 @@ fn gemm_nt_shapes() {
     let gpu = CudaBackend::new(0).unwrap();
     let cpu = CpuBackend;
     // TTS slow/fast AR: logits, qkv (3·d), attention out, FFN up/down.
-    check(&gpu, &cpu, 1, 2048, 400);   // logits: (1,1,d) x (vocab,d)
-    check(&gpu, &cpu, 1, 2048, 2048);  // single-token dense
-    check(&gpu, &cpu, 4, 2048, 6144);  // qkv, 4 tokens
-    check(&gpu, &cpu, 8, 2048, 6144);  // qkv, 8 tokens
-    check(&gpu, &cpu, 8, 2048, 2048);  // attn out
-    check(&gpu, &cpu, 8, 2048, 8192);  // FFN up
-    check(&gpu, &cpu, 8, 8192, 2048);  // FFN down
+    check(&gpu, &cpu, 1, 2048, 400); // logits: (1,1,d) x (vocab,d)
+    check(&gpu, &cpu, 1, 2048, 2048); // single-token dense
+    check(&gpu, &cpu, 4, 2048, 6144); // qkv, 4 tokens
+    check(&gpu, &cpu, 8, 2048, 6144); // qkv, 8 tokens
+    check(&gpu, &cpu, 8, 2048, 2048); // attn out
+    check(&gpu, &cpu, 8, 2048, 8192); // FFN up
+    check(&gpu, &cpu, 8, 8192, 2048); // FFN down
     check(&gpu, &cpu, 64, 2048, 2048);
     check(&gpu, &cpu, 1, 1024, 1024);
     check(&gpu, &cpu, 8, 1024, 4096);
@@ -99,7 +99,9 @@ fn check_i8(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
     for r in 0..n {
         for blk in 0..nblk {
             let base = r * k + blk * 32;
-            let mx = b[base..base + 32].iter().fold(0f32, |mm, &v| mm.max(v.abs()));
+            let mx = b[base..base + 32]
+                .iter()
+                .fold(0f32, |mm, &v| mm.max(v.abs()));
             let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
             sc[r * nblk + blk] = s;
             for j in 0..32 {
@@ -146,10 +148,20 @@ fn check_i8(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
     for i in 0..g.len() {
         let ok = (g[i] - c[i]).abs() <= tol;
         if !ok && bad < 8 {
-            eprintln!("int8 [{m}x{k}x{n}] row {} col {}: gpu {} cpu {}", i / n, i % n, g[i], c[i]);
+            eprintln!(
+                "int8 [{m}x{k}x{n}] row {} col {}: gpu {} cpu {}",
+                i / n,
+                i % n,
+                g[i],
+                c[i]
+            );
             bad += 1;
         }
-        assert!(ok, "int8 gemm_nt [{m}x{k}x{n}] [{i}]: gpu {} cpu {}", g[i], c[i]);
+        assert!(
+            ok,
+            "int8 gemm_nt [{m}x{k}x{n}] [{i}]: gpu {} cpu {}",
+            g[i], c[i]
+        );
     }
     println!("gemm_nt int8 {m:>4}x{k:>4}x{n:>4} ok");
 }

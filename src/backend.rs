@@ -76,7 +76,11 @@ impl Tensor {
             crate::metal::GpuDtype::F16 => Dtype::F16,
             crate::metal::GpuDtype::BF16 => Dtype::BF16,
         };
-        Self { inner: TensorInner::Metal(t), shape, dtype }
+        Self {
+            inner: TensorInner::Metal(t),
+            shape,
+            dtype,
+        }
     }
 
     #[cfg(feature = "metal")]
@@ -94,7 +98,11 @@ impl Tensor {
     /// as plain f32 — this is the test oracle, not a production path.
     #[cfg(feature = "cpu")]
     pub(crate) fn from_cpu(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        Self { inner: TensorInner::Cpu(Arc::new(parking_lot::RwLock::new(data))), shape, dtype: Dtype::F32 }
+        Self {
+            inner: TensorInner::Cpu(Arc::new(parking_lot::RwLock::new(data))),
+            shape,
+            dtype: Dtype::F32,
+        }
     }
 
     /// CPU-reference read guard (test oracle).
@@ -105,7 +113,10 @@ impl Tensor {
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("cpu_read() on a non-CPU tensor"),
             #[cfg(feature = "cuda")]
-            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("cpu_read() on a non-CPU tensor"),
+            TensorInner::Cuda(_)
+            | TensorInner::CudaF16(_)
+            | TensorInner::CudaBF16(_)
+            | TensorInner::CudaI8 { .. } => panic!("cpu_read() on a non-CPU tensor"),
         }
     }
 
@@ -117,7 +128,10 @@ impl Tensor {
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("cpu_write() on a non-CPU tensor"),
             #[cfg(feature = "cuda")]
-            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("cpu_write() on a non-CPU tensor"),
+            TensorInner::Cuda(_)
+            | TensorInner::CudaF16(_)
+            | TensorInner::CudaBF16(_)
+            | TensorInner::CudaI8 { .. } => panic!("cpu_write() on a non-CPU tensor"),
         }
     }
 
@@ -138,19 +152,37 @@ impl Tensor {
     /// that returns itself to the backend pool on last-drop.
     #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda(b: Arc<crate::cuda::CudaBuffer>, shape: Vec<usize>) -> Self {
-        Self { inner: TensorInner::Cuda(b), shape, dtype: Dtype::F32 }
+        Self {
+            inner: TensorInner::Cuda(b),
+            shape,
+            dtype: Dtype::F32,
+        }
     }
 
     /// fp16 tensor from a CUDA buffer (weights for fp16 GEMMs).
     #[cfg(feature = "cuda")]
-    pub(crate) fn from_cuda_f16(b: cudarc::driver::CudaSlice<half::f16>, shape: Vec<usize>) -> Self {
-        Self { inner: TensorInner::CudaF16(b), shape, dtype: Dtype::F16 }
+    pub(crate) fn from_cuda_f16(
+        b: cudarc::driver::CudaSlice<half::f16>,
+        shape: Vec<usize>,
+    ) -> Self {
+        Self {
+            inner: TensorInner::CudaF16(b),
+            shape,
+            dtype: Dtype::F16,
+        }
     }
 
     /// bf16 tensor from a CUDA buffer (weights for bf16 GEMMs).
     #[cfg(feature = "cuda")]
-    pub(crate) fn from_cuda_bf16(b: cudarc::driver::CudaSlice<half::bf16>, shape: Vec<usize>) -> Self {
-        Self { inner: TensorInner::CudaBF16(b), shape, dtype: Dtype::BF16 }
+    pub(crate) fn from_cuda_bf16(
+        b: cudarc::driver::CudaSlice<half::bf16>,
+        shape: Vec<usize>,
+    ) -> Self {
+        Self {
+            inner: TensorInner::CudaBF16(b),
+            shape,
+            dtype: Dtype::BF16,
+        }
     }
 
     /// int8 tensor with a per-channel fp32 scale (weights for int8 GEMMs).
@@ -160,14 +192,20 @@ impl Tensor {
         scale: cudarc::driver::CudaSlice<f32>,
         shape: Vec<usize>,
     ) -> Self {
-        Self { inner: TensorInner::CudaI8 { data, scale }, shape, dtype: Dtype::I8 }
+        Self {
+            inner: TensorInner::CudaI8 { data, scale },
+            shape,
+            dtype: Dtype::I8,
+        }
     }
 
     #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda(&self) -> &cudarc::driver::CudaSlice<f32> {
         match &self.inner {
             TensorInner::Cuda(b) => b.as_slice(),
-            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("as_cuda() on a half/int8 tensor"),
+            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => {
+                panic!("as_cuda() on a half/int8 tensor")
+            }
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda() on a non-CUDA tensor"),
             #[cfg(feature = "cpu")]
@@ -192,7 +230,12 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn as_cuda_i8(&self) -> (&cudarc::driver::CudaSlice<i8>, &cudarc::driver::CudaSlice<f32>) {
+    pub(crate) fn as_cuda_i8(
+        &self,
+    ) -> (
+        &cudarc::driver::CudaSlice<i8>,
+        &cudarc::driver::CudaSlice<f32>,
+    ) {
         match &self.inner {
             TensorInner::CudaI8 { data, scale } => (data, scale),
             _ => panic!("as_cuda_i8() on a non-CudaI8 tensor"),
@@ -207,7 +250,9 @@ impl Tensor {
             TensorInner::Cuda(b) => unsafe {
                 &mut *Arc::as_ptr(b).cast_mut().as_mut().unwrap().as_slice_mut()
             },
-            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => panic!("as_cuda_mut() on a half/int8 tensor"),
+            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } => {
+                panic!("as_cuda_mut() on a half/int8 tensor")
+            }
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda_mut() on a non-CUDA tensor"),
             #[cfg(feature = "cpu")]
@@ -263,7 +308,11 @@ impl Tensor {
             }
         }
         #[allow(unreachable_code)]
-        Tensor { inner: self.inner.clone(), shape, dtype }
+        Tensor {
+            inner: self.inner.clone(),
+            shape,
+            dtype,
+        }
     }
 }
 
@@ -274,6 +323,12 @@ impl Tensor {
 /// `cpu`/`cuda`/`metal` — the feature must be compiled in; the GPU-only rule
 /// keeps CPU behind an explicit opt-in).
 pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
+    // Переменная используется только при включённых фичах GPU-бэкендов;
+    // без фич сборка обязана упасть в BackendUnavailable (GPU-only правило).
+    #[cfg_attr(
+        not(any(feature = "metal", feature = "cuda", feature = "cpu")),
+        allow(unused_variables)
+    )]
     let requested = std::env::var("BACKEND").ok();
     #[cfg(feature = "metal")]
     if requested.as_deref().map(|r| r == "metal").unwrap_or(true) {
@@ -308,14 +363,23 @@ pub trait Backend: Send + Sync {
     }
 
     /// Upload bf16 data (GEMM weight storage). Default: convert to f32.
-    fn from_cpu_bf16(&self, data: &[half::bf16], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+    fn from_cpu_bf16(
+        &self,
+        data: &[half::bf16],
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
         let f32s: Vec<f32> = data.iter().map(|h| f32::from(*h)).collect();
         self.from_cpu_f32(&f32s, shape)
     }
 
     /// Upload int8 weights with a per-channel fp32 scale (GEMM storage).
     /// Default: dequantize to f32.
-    fn from_cpu_i8(&self, data: &[i8], scale: &[f32], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+    fn from_cpu_i8(
+        &self,
+        data: &[i8],
+        scale: &[f32],
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
         // The int8 upload (rust-inference-speech::quant) stores data and
         // scale TRANSPOSED for coalesced kernel reads: element (r, kk)
         // lives at data[kk*rows + r], its per-32-block scale at
@@ -405,7 +469,14 @@ pub trait Backend: Send + Sync {
 
     // ── norms ──
     fn rmsnorm(&self, x: &Tensor, w: &Tensor, y: &Tensor, eps: f32) -> Result<(), BackendError>;
-    fn layernorm(&self, x: &Tensor, w: &Tensor, b: &Tensor, y: &Tensor, eps: f32) -> Result<(), BackendError>;
+    fn layernorm(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        b: &Tensor,
+        y: &Tensor,
+        eps: f32,
+    ) -> Result<(), BackendError>;
 
     // ── convs ──
     /// Dense 1D conv (groups=1): X (B,T,Cin), W (Cout,Cin,K), Y (B,Tout,Cout).
@@ -512,20 +583,58 @@ pub trait Backend: Send + Sync {
     // ── RoPE ──
     /// Halved RoPE: X (T, head_dim) rotated by (cos, sin) buffers, applying to
     /// the first `rope_dim` columns. Angles computed in f32.
-    fn rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, y: &Tensor, rope_dim: usize) -> Result<(), BackendError>;
+    fn rope(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        y: &Tensor,
+        rope_dim: usize,
+    ) -> Result<(), BackendError>;
     /// Interleaved RoPE (fishaudio convention): pairs (x0, x1) rotate together.
     /// `start` is the absolute position offset — cos/sin are indexed at
     /// (t + start) so cached tokens keep their original rotation.
-    fn rope_interleaved(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, y: &Tensor, rope_dim: usize, start: usize) -> Result<(), BackendError>;
+    fn rope_interleaved(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        y: &Tensor,
+        rope_dim: usize,
+        start: usize,
+    ) -> Result<(), BackendError>;
     /// Per-head RoPE: X (B, T, h·hd) with `h` heads of `hd` dims; rotates the
     /// first `rope_dim` columns of every head.
-    fn rope_head(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, y: &Tensor, h: usize, rope_dim: usize) -> Result<(), BackendError>;
+    fn rope_head(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        y: &Tensor,
+        h: usize,
+        rope_dim: usize,
+    ) -> Result<(), BackendError>;
 
     // ── head norms (f32-compute) ──
     /// RMSNorm applied per head: X (rows, h·hd), w per head-dim (hd), h heads.
-    fn rmsnorm_head(&self, x: &Tensor, w: &Tensor, y: &Tensor, h: usize, eps: f32) -> Result<(), BackendError>;
+    fn rmsnorm_head(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        y: &Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), BackendError>;
     /// LayerNorm applied per head: X (rows, h·hd), w/b per head-dim (hd).
-    fn layernorm_head(&self, x: &Tensor, w: &Tensor, b: &Tensor, y: &Tensor, h: usize, eps: f32) -> Result<(), BackendError>;
+    fn layernorm_head(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        b: &Tensor,
+        y: &Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), BackendError>;
 
     // ── row/vec products ──
     /// Row-wise scale: X (rows, D) · w (rows,) → Y (rows, D) (each row scaled
@@ -545,7 +654,13 @@ pub trait Backend: Send + Sync {
 
     // ── fused add forms ──
     /// Y = A + scale·B (elementwise, same shapes).
-    fn add_scaled(&self, a: &Tensor, b: &Tensor, y: &Tensor, scale: f32) -> Result<(), BackendError>;
+    fn add_scaled(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        y: &Tensor,
+        scale: f32,
+    ) -> Result<(), BackendError>;
     /// 2D bias add — ELEMENTWISE (x + b, same shapes; legacy Metal name).
     /// Use [`Backend::add`] for the same semantics; kept for parity with the
     /// Metal engine's `add_bias2d_f32` kernel.
@@ -596,5 +711,10 @@ pub trait Backend: Send + Sync {
     // ── codebook search (DAC) ──
     /// For every row of X (B·T, D) find the nearest row of `table` (V, D)
     /// (L2) and write its index into `idx` (host buffer, len B·T).
-    fn codebook_search(&self, x: &Tensor, table: &Tensor, idx: &mut [u32]) -> Result<(), BackendError>;
+    fn codebook_search(
+        &self,
+        x: &Tensor,
+        table: &Tensor,
+        idx: &mut [u32],
+    ) -> Result<(), BackendError>;
 }

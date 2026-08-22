@@ -33,6 +33,7 @@ pub mod inference;
 pub mod metal;
 pub mod nn;
 pub mod weights;
+pub mod weights_map;
 
 pub use backend::{Backend, Tensor};
 pub use dtype::{Dtype, KvFormat, QuantConfig, WeightFormat};

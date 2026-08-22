@@ -80,7 +80,11 @@ impl GpuTensor {
             // would be UB, fail loudly instead.
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::F32 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F32,
+        })
     }
 
     /// Zero-filled buffer of the given shape (fp32).
@@ -95,7 +99,11 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::F32 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F32,
+        })
     }
 
     /// Upload fp16 GEMM weights (2 bytes/element; the gemm kernels decode
@@ -115,7 +123,11 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::F16 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F16,
+        })
     }
 
     /// Upload bf16 GEMM weights (2 bytes/element, bit-pattern passthrough).
@@ -134,7 +146,11 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        Ok(Self { buffer, shape, dtype: GpuDtype::BF16 })
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::BF16,
+        })
     }
 
     /// Download to CPU (shared memory). First commits an EMPTY command
@@ -201,7 +217,11 @@ struct BatchState {
 
 impl Default for BatchState {
     fn default() -> Self {
-        Self { depth: 0, cmd: None, enters: 0 }
+        Self {
+            depth: 0,
+            cmd: None,
+            enters: 0,
+        }
     }
 }
 
@@ -379,11 +399,26 @@ impl MetalCtx {
     /// Commit+wait the pending batch WITHOUT leaving batch mode. Required
     /// before any host-side read ([`GpuTensor::to_cpu_f32`]) — the shared
     /// buffer's contents are only valid after the GPU finished.
+    ///
+    /// A Metal command buffer can fail SILENTLY: waitUntilCompleted returns
+    /// even when the buffer's status is Error, and the buffers hold stale
+    /// garbage. The wake engine's batch runs ~60 kernels — one failed kernel
+    /// poisons the whole window's mel/embedding/phrase, which shows up as a
+    /// CONSTANT near-zero phrase probability on any input (the live symptom
+    /// 2026-08-22: offline 0.35 on the same audio, daemon 0.0001). Log the
+    /// status + error when it happens instead of shipping the garbage.
     pub fn flush_batch(&self) -> Result<(), MetalError> {
         let mut batch = self.batch.lock().unwrap();
         if let Some(cmd) = batch.cmd.take() {
             cmd.commit();
             cmd.wait_until_completed();
+            let status = cmd.status();
+            if status != metal::MTLCommandBufferStatus::Completed {
+                tracing::error!(
+                    status = ?status,
+                    "Metal batch command buffer failed — results are garbage"
+                );
+            }
         }
         Ok(())
     }
@@ -658,7 +693,12 @@ impl MetalCtx {
     }
 
     /// Elementwise max with a scalar floor: Y = max(X, floor).
-    pub fn max_scalar_f32(&self, x: &GpuTensor, y: &GpuTensor, floor: f32) -> Result<(), MetalError> {
+    pub fn max_scalar_f32(
+        &self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        floor: f32,
+    ) -> Result<(), MetalError> {
         let n = x.numel();
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
@@ -711,8 +751,20 @@ impl MetalCtx {
             enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
             enc.set_buffer(3, Some(&y.buffer), 0);
             let consts = [
-                n, ci, hi, wi, co, kh, kw, oh, ow, pad_h, pad_w, stride_t,
-                stride_f, time_major_out as usize,
+                n,
+                ci,
+                hi,
+                wi,
+                co,
+                kh,
+                kw,
+                oh,
+                ow,
+                pad_h,
+                pad_w,
+                stride_t,
+                stride_f,
+                time_major_out as usize,
             ];
             for (i, v) in consts.iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
@@ -787,7 +839,12 @@ impl MetalCtx {
 
     /// C = A·Bᵀ: A (M,K), B (N,K), C (M,N) — for y = x @ Wᵀ with W stored
     /// row-major [N,K].
-    pub fn gemm_nt_f32(&self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> Result<(), MetalError> {
+    pub fn gemm_nt_f32(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
         let m = a.shape[0];
         let k = a.shape[1];
         let n = b.shape[0];
@@ -860,7 +917,10 @@ impl MetalCtx {
             for (i, v) in [t, cin, cout, k, cin_g].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
-            for (i, v) in [params.stride, params.pad, pad_r, params.dilation].iter().enumerate() {
+            for (i, v) in [params.stride, params.pad, pad_r, params.dilation]
+                .iter()
+                .enumerate()
+            {
                 enc.set_bytes((9 + i) as u64, 8, (v as *const usize).cast());
             }
             let tm = time_major as usize;
@@ -981,7 +1041,12 @@ impl MetalCtx {
     }
 
     /// Y = X + B elementwise (same shape; mask bias).
-    pub fn add_bias2d_f32(&self, x: &GpuTensor, b: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+    pub fn add_bias2d_f32(
+        &self,
+        x: &GpuTensor,
+        b: &GpuTensor,
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
         let n = x.numel();
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
@@ -1055,11 +1120,7 @@ impl MetalCtx {
 
     /// Uniform attention fallback: V (B,H,KV,HD) → Y (B,H,T,HD) where each
     /// row is the mean over KV.
-    pub fn uniform_attn_f32(
-        &self,
-        v: &GpuTensor,
-        y: &GpuTensor,
-    ) -> Result<(), MetalError> {
+    pub fn uniform_attn_f32(&self, v: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let (b, h, kv, hd) = (v.shape[0], v.shape[1], v.shape[2], v.shape[3]);
         let t = y.shape[2];
         let grid = MTLSize::new(b as u64, h as u64, (t * hd) as u64);
@@ -1389,7 +1450,10 @@ impl MetalCtx {
             enc.set_buffer(2, Some(&v.buffer), 0);
             enc.set_buffer(3, mask.map(|m| &*m.buffer), 0);
             enc.set_buffer(4, Some(&y.buffer), 0);
-            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep].iter().enumerate() {
+            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
+                .iter()
+                .enumerate()
+            {
                 enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
             }
         })
@@ -1481,12 +1545,7 @@ impl MetalCtx {
     }
 
     /// Causal unpad along time: X (B,T,C) → Y (B,T-U,C), Y = X[:, U:, :].
-    pub fn slice_time_f32(
-        &self,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        u: usize,
-    ) -> Result<(), MetalError> {
+    pub fn slice_time_f32(&self, x: &GpuTensor, y: &GpuTensor, u: usize) -> Result<(), MetalError> {
         let (b, t, c) = (x.shape[0], x.shape[1], x.shape[2]);
         if y.shape != [b, t - u, c] {
             return Err(MetalError::Shape(format!(
@@ -1560,31 +1619,66 @@ pub struct MetalBackend {
 
 impl MetalBackend {
     pub fn new() -> Result<Self, MetalError> {
-        Ok(Self { ctx: MetalCtx::new()? })
+        Ok(Self {
+            ctx: MetalCtx::new()?,
+        })
     }
 }
 
 impl crate::backend::Backend for MetalBackend {
-    fn zeros(&self, shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::zeros(&self.ctx.device, shape)?))
+    fn zeros(
+        &self,
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::zeros(
+            &self.ctx.device,
+            shape,
+        )?))
     }
 
-    fn from_cpu_f32(&self, data: &[f32], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f32(&self.ctx.device, data, shape)?))
+    fn from_cpu_f32(
+        &self,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f32(
+            &self.ctx.device,
+            data,
+            shape,
+        )?))
     }
 
     /// fp16 GEMM weights: stored as true fp16 (2 bytes/element) — the gemm
     /// kernels read them narrowed and accumulate in fp32.
-    fn from_cpu_f16(&self, data: &[half::f16], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f16(&self.ctx.device, data, shape)?))
+    fn from_cpu_f16(
+        &self,
+        data: &[half::f16],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_f16(
+            &self.ctx.device,
+            data,
+            shape,
+        )?))
     }
 
     /// bf16 GEMM weights: stored as true bf16 (bit-pattern passthrough).
-    fn from_cpu_bf16(&self, data: &[half::bf16], shape: Vec<usize>) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_bf16(&self.ctx.device, data, shape)?))
+    fn from_cpu_bf16(
+        &self,
+        data: &[half::bf16],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        Ok(crate::backend::Tensor::from_gpu(GpuTensor::from_cpu_bf16(
+            &self.ctx.device,
+            data,
+            shape,
+        )?))
     }
 
-    fn to_cpu_f32(&self, t: &crate::backend::Tensor) -> Result<Vec<f32>, crate::error::BackendError> {
+    fn to_cpu_f32(
+        &self,
+        t: &crate::backend::Tensor,
+    ) -> Result<Vec<f32>, crate::error::BackendError> {
         Ok(t.as_gpu().to_cpu_f32(&self.ctx)?)
     }
 
@@ -1602,108 +1696,211 @@ impl crate::backend::Backend for MetalBackend {
         self.ctx.batch_enter_count()
     }
 
-    fn gemm(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn gemm(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        c: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.gemm_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())?;
         Ok(())
     }
 
-    fn gemm_nt(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn gemm_nt(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        c: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.gemm_nt_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())?;
         Ok(())
     }
 
-    fn mul(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn mul(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.mul_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn add(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn add(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.add_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn sub(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn sub(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.sub_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn div(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn div(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.div_f32(a.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn add_scalar(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, c: f32) -> Result<(), crate::error::BackendError> {
+    fn add_scalar(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        c: f32,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.add_scalar_f32(x.as_gpu(), y.as_gpu(), c)?;
         Ok(())
     }
 
-    fn scale(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, c: f32) -> Result<(), crate::error::BackendError> {
+    fn scale(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        c: f32,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.scale_f32(x.as_gpu(), y.as_gpu(), c)?;
         Ok(())
     }
 
-    fn add_bias(&self, x: &crate::backend::Tensor, bias: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
-        self.ctx.add_bias_f32(x.as_gpu(), bias.as_gpu(), y.as_gpu())?;
+    fn add_bias(
+        &self,
+        x: &crate::backend::Tensor,
+        bias: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .add_bias_f32(x.as_gpu(), bias.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn sqrt(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn sqrt(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.sqrt_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn log(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn log(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.log_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn max_scalar(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, floor: f32) -> Result<(), crate::error::BackendError> {
+    fn max_scalar(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        floor: f32,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.max_scalar_f32(x.as_gpu(), y.as_gpu(), floor)?;
         Ok(())
     }
 
-    fn relu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn relu(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.relu_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn leaky_relu_clip(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn leaky_relu_clip(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.leaky_relu_clip_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn sigmoid(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn sigmoid(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.sigmoid_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn tanh(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn tanh(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.tanh_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn silu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn silu(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.silu_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn gelu_tanh(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn gelu_tanh(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.gelu_tanh_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn snake(&self, x: &crate::backend::Tensor, a: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn snake(
+        &self,
+        x: &crate::backend::Tensor,
+        a: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.snake_f32(x.as_gpu(), a.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn rmsnorm(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.rmsnorm_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), eps)?;
+    fn rmsnorm(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .rmsnorm_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), eps)?;
         Ok(())
     }
 
-    fn layernorm(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.layernorm_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), eps)?;
+    fn layernorm(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .layernorm_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), eps)?;
         Ok(())
     }
 
@@ -1718,9 +1915,23 @@ impl crate::backend::Backend for MetalBackend {
         dil: usize,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        let params = Conv1dParams { stride, pad: pad_l, dilation: dil };
+        let params = Conv1dParams {
+            stride,
+            pad: pad_l,
+            dilation: dil,
+        };
         let dense = w.as_gpu().shape[1] == x.as_gpu().shape[2];
-        self.ctx.conv1d_groups_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), params, pad_r, true, true, dense, y.as_gpu())?;
+        self.ctx.conv1d_groups_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            params,
+            pad_r,
+            true,
+            true,
+            dense,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
@@ -1739,9 +1950,23 @@ impl crate::backend::Backend for MetalBackend {
         // The Metal kernel derives Cin_g from W (Cout, Cin_g, K); dense is
         // true when every out channel reads all Cin input channels.
         let _ = groups; // implied by W's Cin_g dim (see the kernel)
-        let params = Conv1dParams { stride, pad: pad_l, dilation: dil };
+        let params = Conv1dParams {
+            stride,
+            pad: pad_l,
+            dilation: dil,
+        };
         let dense = w.as_gpu().shape[1] == x.as_gpu().shape[2];
-        self.ctx.conv1d_groups_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), params, pad_r, true, true, dense, y.as_gpu())?;
+        self.ctx.conv1d_groups_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            params,
+            pad_r,
+            true,
+            true,
+            dense,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
@@ -1757,11 +1982,27 @@ impl crate::backend::Backend for MetalBackend {
         time_major_out: bool,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.conv2d_nchw_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), pad_h, pad_w, stride_t, stride_f, time_major_out, y.as_gpu())?;
+        self.ctx.conv2d_nchw_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            pad_h,
+            pad_w,
+            stride_t,
+            stride_f,
+            time_major_out,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
-    fn maxpool2d(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, kh: usize, kw: usize) -> Result<(), crate::error::BackendError> {
+    fn maxpool2d(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        kh: usize,
+        kw: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.maxpool2d_f32(x.as_gpu(), y.as_gpu(), kh, kw)?;
         Ok(())
     }
@@ -1774,7 +2015,13 @@ impl crate::backend::Backend for MetalBackend {
         stride: usize,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.conv_transpose1d_f32(x.as_gpu(), w.as_gpu(), bias.map(|b| b.as_gpu()), stride, y.as_gpu())?;
+        self.ctx.conv_transpose1d_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            bias.map(|b| b.as_gpu()),
+            stride,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
@@ -1788,7 +2035,8 @@ impl crate::backend::Backend for MetalBackend {
         dil: usize,
         tout: usize,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.im2col1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, pad_l, dil, tout)?;
+        self.ctx
+            .im2col1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, pad_l, dil, tout)?;
         Ok(())
     }
 
@@ -1800,82 +2048,188 @@ impl crate::backend::Backend for MetalBackend {
         stride: usize,
         tout: usize,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.im2col_t1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, tout)?;
+        self.ctx
+            .im2col_t1d_f32(x.as_gpu(), xc.as_gpu(), k, stride, tout)?;
         Ok(())
     }
 
-    fn slice_last(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, off: usize) -> Result<(), crate::error::BackendError> {
+    fn slice_last(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        off: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.slice_last_f32(x.as_gpu(), y.as_gpu(), off)?;
         Ok(())
     }
 
-    fn slice_time(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor, u: usize) -> Result<(), crate::error::BackendError> {
+    fn slice_time(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        u: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.slice_time_f32(x.as_gpu(), y.as_gpu(), u)?;
         Ok(())
     }
 
-    fn softmax_last_dim(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn softmax_last_dim(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.softmax_last_dim_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn embedding(&self, idx: &[u32], table: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn embedding(
+        &self,
+        idx: &[u32],
+        table: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn rope(&self, x: &crate::backend::Tensor, cos: &crate::backend::Tensor, sin: &crate::backend::Tensor, y: &crate::backend::Tensor, rope_dim: usize) -> Result<(), crate::error::BackendError> {
-        self.ctx.rope_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), rope_dim)?;
+    fn rope(
+        &self,
+        x: &crate::backend::Tensor,
+        cos: &crate::backend::Tensor,
+        sin: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        rope_dim: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .rope_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), rope_dim)?;
         Ok(())
     }
 
-    fn rope_interleaved(&self, x: &crate::backend::Tensor, cos: &crate::backend::Tensor, sin: &crate::backend::Tensor, y: &crate::backend::Tensor, rope_dim: usize, start: usize) -> Result<(), crate::error::BackendError> {
-        self.ctx.rope_interleaved_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), rope_dim, start)?;
+    fn rope_interleaved(
+        &self,
+        x: &crate::backend::Tensor,
+        cos: &crate::backend::Tensor,
+        sin: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        rope_dim: usize,
+        start: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.rope_interleaved_f32(
+            x.as_gpu(),
+            cos.as_gpu(),
+            sin.as_gpu(),
+            y.as_gpu(),
+            rope_dim,
+            start,
+        )?;
         Ok(())
     }
 
-    fn rope_head(&self, x: &crate::backend::Tensor, cos: &crate::backend::Tensor, sin: &crate::backend::Tensor, y: &crate::backend::Tensor, h: usize, rope_dim: usize) -> Result<(), crate::error::BackendError> {
-        self.ctx.rope_head_f32(x.as_gpu(), cos.as_gpu(), sin.as_gpu(), y.as_gpu(), h, rope_dim)?;
+    fn rope_head(
+        &self,
+        x: &crate::backend::Tensor,
+        cos: &crate::backend::Tensor,
+        sin: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        h: usize,
+        rope_dim: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.rope_head_f32(
+            x.as_gpu(),
+            cos.as_gpu(),
+            sin.as_gpu(),
+            y.as_gpu(),
+            h,
+            rope_dim,
+        )?;
         Ok(())
     }
 
-    fn rmsnorm_head(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor, h: usize, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.rmsnorm_head_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), h, eps)?;
+    fn rmsnorm_head(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .rmsnorm_head_f32(x.as_gpu(), w.as_gpu(), y.as_gpu(), h, eps)?;
         Ok(())
     }
 
-    fn layernorm_head(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, h: usize, eps: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.layernorm_head_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), h, eps)?;
+    fn layernorm_head(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        h: usize,
+        eps: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .layernorm_head_f32(x.as_gpu(), w.as_gpu(), b.as_gpu(), y.as_gpu(), h, eps)?;
         Ok(())
     }
 
-    fn mul_rows(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn mul_rows(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.mul_rows_f32(x.as_gpu(), w.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn mul_vec(&self, x: &crate::backend::Tensor, w: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn mul_vec(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.mul_vec_f32(x.as_gpu(), w.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn glu(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn glu(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.glu_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn repeat(&self, x: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn repeat(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.repeat_f32(x.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn add_scaled(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor, scale: f32) -> Result<(), crate::error::BackendError> {
-        self.ctx.add_scaled_f32(a.as_gpu(), b.as_gpu(), y.as_gpu(), scale)?;
+    fn add_scaled(
+        &self,
+        a: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        scale: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .add_scaled_f32(a.as_gpu(), b.as_gpu(), y.as_gpu(), scale)?;
         Ok(())
     }
 
-    fn add_bias2d(&self, x: &crate::backend::Tensor, b: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
-        self.ctx.add_bias2d_f32(x.as_gpu(), b.as_gpu(), y.as_gpu())?;
+    fn add_bias2d(
+        &self,
+        x: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .add_bias2d_f32(x.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
@@ -1890,7 +2244,16 @@ impl crate::backend::Backend for MetalBackend {
         kv_heads: usize,
         hd: usize,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.attn_ar_f32(q.as_gpu(), k.as_gpu(), v.as_gpu(), mask.map(|m| m.as_gpu()), y.as_gpu(), n_heads, kv_heads, hd)?;
+        self.ctx.attn_ar_f32(
+            q.as_gpu(),
+            k.as_gpu(),
+            v.as_gpu(),
+            mask.map(|m| m.as_gpu()),
+            y.as_gpu(),
+            n_heads,
+            kv_heads,
+            hd,
+        )?;
         Ok(())
     }
 
@@ -1904,22 +2267,45 @@ impl crate::backend::Backend for MetalBackend {
         mode: u32,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.mhsa_f32(q.as_gpu(), k.as_gpu(), v.as_gpu(), sc.as_gpu(), mask.map(|m| m.as_gpu()), mode, y.as_gpu())?;
+        self.ctx.mhsa_f32(
+            q.as_gpu(),
+            k.as_gpu(),
+            v.as_gpu(),
+            sc.as_gpu(),
+            mask.map(|m| m.as_gpu()),
+            mode,
+            y.as_gpu(),
+        )?;
         Ok(())
     }
 
-    fn uniform_attn(&self, v: &crate::backend::Tensor, y: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {
+    fn uniform_attn(
+        &self,
+        v: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.uniform_attn_f32(v.as_gpu(), y.as_gpu())?;
         Ok(())
     }
 
-    fn kv_update(&self, dst: &crate::backend::Tensor, src: &crate::backend::Tensor, pos: usize) -> Result<(), crate::error::BackendError> {
+    fn kv_update(
+        &self,
+        dst: &crate::backend::Tensor,
+        src: &crate::backend::Tensor,
+        pos: usize,
+    ) -> Result<(), crate::error::BackendError> {
         self.ctx.kv_update_f32(dst.as_gpu(), src.as_gpu(), pos)?;
         Ok(())
     }
 
-    fn codebook_search(&self, x: &crate::backend::Tensor, table: &crate::backend::Tensor, idx: &mut [u32]) -> Result<(), crate::error::BackendError> {
-        self.ctx.codebook_search_f32(x.as_gpu(), table.as_gpu(), idx)?;
+    fn codebook_search(
+        &self,
+        x: &crate::backend::Tensor,
+        table: &crate::backend::Tensor,
+        idx: &mut [u32],
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .codebook_search_f32(x.as_gpu(), table.as_gpu(), idx)?;
         Ok(())
     }
 }

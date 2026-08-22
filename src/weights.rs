@@ -1,13 +1,17 @@
 //! Multi-file safetensors index loading + weight-norm helpers.
+use anyhow::Context;
 use std::collections::HashMap;
 use std::path::Path;
-use anyhow::{Context};
 
-pub fn load_safetensors_index<P: AsRef<Path>>(index_path: P) -> anyhow::Result<HashMap<String, Vec<String>>> {
+pub fn load_safetensors_index<P: AsRef<Path>>(
+    index_path: P,
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
     let content = std::fs::read_to_string(&index_path)
         .with_context(|| format!("reading {}", index_path.as_ref().display()))?;
     let index: serde_json::Value = serde_json::from_str(&content)?;
-    let weight_map = index.get("weight_map").and_then(|m| m.as_object())
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|m| m.as_object())
         .ok_or_else(|| anyhow::anyhow!("missing weight_map"))?;
     let mut result: HashMap<String, Vec<String>> = HashMap::new();
     for (tensor_name, file_name) in weight_map {
@@ -16,7 +20,9 @@ pub fn load_safetensors_index<P: AsRef<Path>>(index_path: P) -> anyhow::Result<H
         // found" later).
         let file = file_name
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("weight_map[{tensor_name}]: expected string, got {file_name}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("weight_map[{tensor_name}]: expected string, got {file_name}")
+            })?
             .to_string();
         result.entry(file).or_default().push(tensor_name.clone());
     }
@@ -30,10 +36,15 @@ pub fn load_safetensors_index<P: AsRef<Path>>(index_path: P) -> anyhow::Result<H
 /// write) yields an error instead of a slicing panic inside a plugin.
 /// F32 native; F16/BF16 (e.g. the DAC codec checkpoint) are widened to f32
 /// here so every consumer sees fp32 host data.
-pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+pub fn read_safetensors_f32(
+    path: &Path,
+) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < 8 {
-        return Err(anyhow::anyhow!("safetensors: file too short ({} bytes)", bytes.len()));
+        return Err(anyhow::anyhow!(
+            "safetensors: file too short ({} bytes)",
+            bytes.len()
+        ));
     }
     let header_len = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
     let header_end = 8usize
@@ -68,22 +79,26 @@ pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<HashMap<String, (Vec<
         let shape: Vec<usize> = info
             .get("shape")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         let dtype = info.get("dtype").and_then(|v| v.as_str()).unwrap_or("F32");
         if shape.is_empty() {
             continue;
         }
-        let data = bytes
-            .get(start..end)
-            .ok_or_else(|| anyhow::anyhow!("tensor {name}: byte range {start}..{end} out of bounds"))?;
+        let data = bytes.get(start..end).ok_or_else(|| {
+            anyhow::anyhow!("tensor {name}: byte range {start}..{end} out of bounds")
+        })?;
         let n = match dtype {
             "F32" => data.len() / 4,
             "F16" | "BF16" => data.len() / 2,
             other => {
                 return Err(anyhow::anyhow!(
                     "tensor {name}: unsupported dtype {other} (F32/F16/BF16 only)"
-                ))
+                ));
             }
         };
         let mut vec = Vec::with_capacity(n);

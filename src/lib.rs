@@ -18,19 +18,20 @@
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
 
 pub mod backend;
+pub mod concurrency;
 #[cfg(feature = "cpu")]
 pub mod cpu;
-pub mod nn;
-pub mod concurrency;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dtype;
 pub mod error;
+pub mod gguf;
 #[cfg(feature = "cpu")]
 pub mod harness;
 pub mod inference;
 #[cfg(feature = "metal")]
 pub mod metal;
+pub mod nn;
 pub mod weights;
 
 pub use backend::{Backend, Tensor};

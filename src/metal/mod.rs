@@ -319,8 +319,12 @@ impl MetalCtx {
                     batch.cmd = Some(self.queue.new_command_buffer().to_owned());
                 }
                 let cmd = batch.cmd.as_ref().unwrap();
-                let enc = cmd.new_compute_command_encoder();
+                // Fetch the pipeline BEFORE opening the encoder: a pipeline
+                // error must not leave an active encoder on the pending
+                // command buffer (a later flush would commit a buffer with
+                // an unterminated encoder — an ObjC exception, process abort).
                 let pipeline = self.pipeline(kernel)?;
+                let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
                 setup(enc);
                 enc.dispatch_threads(grid, group);
@@ -1347,6 +1351,9 @@ impl MetalCtx {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
         })?;
+        // In batch mode the kernel has NOT executed yet — the host copy
+        // below would read the previous indices. Flush like to_cpu_f32 does.
+        self.flush_batch()?;
         let ptr = idx_buf.contents();
         if ptr.is_null() {
             return Err(MetalError::BufferAlloc);

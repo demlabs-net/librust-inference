@@ -316,12 +316,22 @@ pub trait Backend: Send + Sync {
     /// Upload int8 weights with a per-channel fp32 scale (GEMM storage).
     /// Default: dequantize to f32.
     fn from_cpu_i8(&self, data: &[i8], scale: &[f32], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        // The int8 upload (rust-inference-speech::quant) stores data and
+        // scale TRANSPOSED for coalesced kernel reads: element (r, kk)
+        // lives at data[kk*rows + r], its per-32-block scale at
+        // scale[(kk/32)*rows + r]. The default dequant must mirror BOTH the
+        // transposed read AND the un-transpose — the f32 tensor has to come
+        // back in the standard row-major layout the gemm kernels expect.
+        // The old code read scale[i/per] (block 0 of every row — wrong for
+        // every block > 0) and kept the transposed order.
         let rows = shape[0];
-        let mut f32s = Vec::with_capacity(data.len());
+        let per = shape[1..].iter().product::<usize>();
+        let mut f32s = vec![0.0f32; data.len()];
         for (i, &v) in data.iter().enumerate() {
-            f32s.push(v as f32 * scale[i / (shape[1..].iter().product::<usize>())]);
+            let r = i % rows;
+            let kk = i / rows;
+            f32s[r * per + kk] = v as f32 * scale[(kk / 32) * rows + r];
         }
-        let _ = rows;
         self.from_cpu_f32(&f32s, shape)
     }
     /// Download a tensor to host memory.
@@ -353,6 +363,24 @@ pub trait Backend: Send + Sync {
     fn gemm(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError>;
     /// C (M,N) = A (M,K) · Bᵀ (N,K).
     fn gemm_nt(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError>;
+
+    /// Transpose a 2D tensor (row-major (M,N) → (N,M)). Default: host
+    /// round-trip — only the LoRA trainer uses it, on tiny tensors, so the
+    /// Metal/CUDA backends inherit this without a kernel.
+    fn transpose(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        if x.shape().len() != 2 {
+            return Err(BackendError::Shape("transpose: 2D only".into()));
+        }
+        let (m, n) = (x.shape()[0], x.shape()[1]);
+        let data = self.to_cpu_f32(x)?;
+        let mut t = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                t[j * m + i] = data[i * n + j];
+            }
+        }
+        self.from_cpu_f32(&t, vec![n, m])
+    }
 
     // ── elementwise ──
     fn mul(&self, a: &Tensor, b: &Tensor, y: &Tensor) -> Result<(), BackendError>;

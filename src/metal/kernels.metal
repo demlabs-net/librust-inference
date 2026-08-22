@@ -1076,7 +1076,7 @@ kernel void attn_ar_f32(
         float acc = 0.0f;
         for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
         float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-        float s = acc * 0.08838834764831845f + m; // 1/sqrt(128)
+        float s = acc * (1.0f / sqrt((float)HD)) + m; // 1/sqrt(head_dim) — the runtime HD, not a hardcoded 128
         if (s > mx) mx = s;
         // stash raw scores in Y temporarily? no — recompute below
     }

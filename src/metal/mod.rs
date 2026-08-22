@@ -977,7 +977,7 @@ impl MetalCtx {
             .dtype
             .block_elems()
             .ok_or_else(|| MetalError::Shape("quantized block size unavailable".into()))?;
-        if k % block != 0 {
+        if !k.is_multiple_of(block) {
             return Err(MetalError::Shape(format!(
                 "gemm_nt_quantized: K={k} not a multiple of block {block} ({:?})",
                 b.dtype
@@ -1026,7 +1026,7 @@ impl MetalCtx {
             .dtype
             .block_elems()
             .ok_or_else(|| MetalError::Shape("quantized block size unavailable".into()))?;
-        if k % block != 0 {
+        if !k.is_multiple_of(block) {
             return Err(MetalError::Shape(format!(
                 "mv_quantized: K={k} not a multiple of block {block} ({:?})",
                 b.dtype

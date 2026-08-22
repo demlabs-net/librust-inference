@@ -141,6 +141,15 @@ impl Tensor {
         }
     }
 
+    /// Доступ к Metal-тензору (для кернел-диспетчеров того же крейта).
+    #[cfg(feature = "metal")]
+    pub(crate) fn inner_metal(&self) -> &crate::metal::GpuTensor {
+        match &self.inner {
+            TensorInner::Metal(g) => g,
+            _ => panic!("inner_metal() on a non-Metal tensor"),
+        }
+    }
+
     /// Whether both tensors share the same CPU storage (in-place aliasing).
     /// Ops like `silu(&a, &a)` or `add_bias(&y, bias, &y)` alias input and
     /// output — the CPU reference must not take a read+write lock on the
@@ -412,6 +421,35 @@ pub trait Backend: Send + Sync {
     /// Metal — да (кернелы gemm_nt_f16/bf16); CPU-референс — только f32.
     fn supports_f16_weights(&self) -> bool {
         false
+    }
+    /// Стандартный rotate-half RoPE (HF/Qwen3): X (1, T, D) → Y, позиции
+    /// pos..pos+T. CPU-референс — прямое вычисление; Metal — кернел.
+    fn rope_standard(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = vec![0.0f32; xd.len()];
+        let half = hd / 2;
+        for tt in 0..tq {
+            let p = (pos + tt) as f32;
+            for h in 0..d / hd {
+                for i in 0..half {
+                    let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
+                    let c = (p * inv).cos();
+                    let s = (p * inv).sin();
+                    let idx = (tt * d + h * hd + 2 * i) as usize;
+                    let (x0, x1) = (xd[idx], xd[idx + 1]);
+                    yd[idx] = x0 * c - x1 * s;
+                    yd[idx + 1] = x1 * c + x0 * s;
+                }
+            }
+        }
+        self.from_cpu_f32(&yd, x.shape().to_vec())
     }
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;

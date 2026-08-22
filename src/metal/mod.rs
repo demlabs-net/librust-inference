@@ -1799,6 +1799,32 @@ impl crate::backend::Backend for MetalBackend {
     fn supports_f16_weights(&self) -> bool {
         true
     }
+
+    fn rope_standard(
+        &self,
+        x: &crate::backend::Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let y = self.zeros(vec![1, tq, d])?;
+        let xg = x.inner_metal();
+        let yg = y.inner_metal();
+        let grid = metal::MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
+        let group = metal::MTLSize::new(1, 4, 4);
+        self.ctx.run("rope_std_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&xg.buffer), 0);
+            enc.set_buffer(1, Some(&yg.buffer), 0);
+            enc.set_bytes(2, 8, (&tq as *const usize).cast());
+            enc.set_bytes(3, 8, (&d as *const usize).cast());
+            enc.set_bytes(4, 8, (&hd as *const usize).cast());
+            enc.set_bytes(5, 8, (&pos as *const usize).cast());
+            enc.set_bytes(6, 4, (&theta as *const f32).cast());
+        })?;
+        Ok(y)
+    }
+
     fn zeros(
         &self,
         shape: Vec<usize>,

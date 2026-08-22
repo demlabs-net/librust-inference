@@ -1442,3 +1442,29 @@ kernel void mv_q6_k(
     }
     C[n] = acc;
 }
+
+// ── Стандартный rotate-half RoPE (HF/Qwen3) — Ф1.7 perf ─────────────────────
+// y[t,h,i] = rotate_half(x) с cos/sin(theta^(-2i/HD)) на абсолютной позиции
+// (pos + t). Замена CPU-хелпера rope_standard в qwen3.rs.
+kernel void rope_std_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& tq [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    constant uint& pos [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, h = gid.y, i = gid.z;
+    if (t >= tq || h >= D / HD || i >= HD / 2) return;
+    float p = (float)(pos + t);
+    float inv = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
+    float c = cos(p * inv);
+    float s = sin(p * inv);
+    uint base = (t * D + h * HD + 2 * i);
+    float x0 = X[base];
+    float x1 = X[base + 1];
+    Y[base] = x0 * c - x1 * s;
+    Y[base + 1] = x1 * c + x0 * s;
+}

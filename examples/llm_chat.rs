@@ -60,27 +60,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             String::from_utf8_lossy(tok.piece(bos)).into_owned(),
         );
     }
-    let prompt_text = match Template::compile(tpl_src, special) {
-        Ok(tpl) => {
-            let ctx = TemplateContext {
-                messages: vec![std::collections::HashMap::from([
-                    ("role".to_string(), "user".to_string()),
-                    ("content".to_string(), prompt.clone()),
-                ])],
-                extra: std::collections::HashMap::new(),
+    let prompt_text = if std::env::var("LLM_RAW_PROMPT").is_ok() {
+        // базовые модели не следуют чат-шаблону — чистое продолжение текста
+        prompt.clone()
+    } else {
+        match Template::compile(tpl_src, special) {
+            Ok(tpl) => {
+                let ctx = TemplateContext {
+                    messages: vec![std::collections::HashMap::from([
+                        ("role".to_string(), "user".to_string()),
+                        ("content".to_string(), prompt.clone()),
+                    ])],
+                    extra: std::collections::HashMap::new(),
+                }
+                .add_generation_prompt(true);
+                tpl.render(&ctx)?
             }
-            .add_generation_prompt(true);
-            tpl.render(&ctx)?
+            Err(rust_inference::chat_template::TemplateError::Unsupported(_)) => {
+                // Реальный Qwen3-шаблон использует {% set ns = namespace(...) %}
+                // (tool-calling-обвязка) — вне minja-подмножества v1; классический
+                // im_start-формат эквивалентен для валидации движка (Ф1.7).
+                format!(
+                    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                )
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(rust_inference::chat_template::TemplateError::Unsupported(_)) => {
-            // Реальный Qwen3-шаблон использует {% set ns = namespace(...) %}
-            // (tool-calling-обвязка) — вне minja-подмножества v1; классический
-            // im_start-формат эквивалентен для валидации движка (Ф1.7).
-            format!(
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-            )
-        }
-        Err(e) => return Err(e.into()),
     };
     let ids = tok.encode(&prompt_text);
     eprintln!(
@@ -152,7 +157,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(i, _)| i as u32)
             .unwrap();
-        if tok.eos == Some(next) || generated >= 256 {
+        let max_tokens: usize = std::env::var("LLM_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        if tok.eos == Some(next) || generated >= max_tokens {
             break;
         }
         let piece = tok.piece(next).to_vec();

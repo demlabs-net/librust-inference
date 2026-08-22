@@ -315,35 +315,6 @@ fn qk_norm(
     Ok(y)
 }
 
-/// Стандартный rotate-half RoPE (HF), CPU-хелпер (v1; кернел — перф-фаза).
-fn rope_standard(
-    backend: &dyn Backend,
-    x: &Tensor,
-    pos: usize,
-    t: usize,
-    hd: usize,
-    theta: f32,
-) -> Result<Tensor, BackendError> {
-    let (_b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-    let mut v = backend.to_cpu_f32(x)?; // [b, tq, d]
-    let half = hd / 2;
-    for tt in 0..tq {
-        let p = (pos + tt) as f32;
-        for h in 0..d / hd {
-            for i in 0..half {
-                let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                let c = (p * inv).cos();
-                let s = (p * inv).sin();
-                let idx = (tt * d + h * hd + 2 * i) as usize;
-                let (x0, x1) = (v[idx], v[idx + 1]);
-                v[idx] = x0 * c - x1 * s;
-                v[idx + 1] = x1 * c + x0 * s;
-            }
-        }
-    }
-    backend.from_cpu_f32(&v, x.shape().to_vec())
-}
-
 /// Загрузка GEMM-весов: f16 на бэкендах с поддержкой (Metal — вдвое меньше
 /// VRAM), f32-фоллбэк (CPU-референс).
 fn upload_w(
@@ -357,6 +328,20 @@ fn upload_w(
     } else {
         backend.from_cpu_f32(data, shape)
     }
+}
+
+/// Стандартный rotate-half RoPE (HF/Qwen3) через backend-оп
+/// (Metal — кернел rope_std_f32; CPU — референс-вычисление).
+fn rope_standard(
+    backend: &dyn Backend,
+    x: &Tensor,
+    pos: usize,
+    t: usize,
+    hd: usize,
+    theta: f32,
+) -> Result<Tensor, BackendError> {
+    let _ = t;
+    backend.rope_standard(x, pos, hd, theta)
 }
 
 fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor, BackendError> {

@@ -137,12 +137,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    #[cfg(feature = "cpu")]
     let backend: Box<dyn rust_inference::backend::Backend> =
         if std::env::var("BACKEND").as_deref() == Ok("cpu") {
             Box::new(rust_inference::cpu::CpuBackend)
         } else {
             Box::new(MetalBackend::new()?)
         };
+    #[cfg(not(feature = "cpu"))]
+    let backend: Box<dyn rust_inference::backend::Backend> =
+        Box::new(MetalBackend::new()?);
     let mut model = Qwen3Model::load(backend.as_ref(), &wm, cfg.clone())?;
 
     // prefill + TTFT

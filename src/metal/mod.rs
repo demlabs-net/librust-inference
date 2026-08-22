@@ -72,11 +72,35 @@ pub struct GpuTensor {
     pub buffer: Buffer,
     pub shape: Vec<usize>,
     pub dtype: GpuDtype,
+    /// Byte offset into `buffer` (view into a larger allocation — KV
+    /// compact / paged-KV read windows without copies).
+    pub offset: usize,
 }
 
 impl GpuTensor {
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
+    }
+
+    /// Bytes per element for this dtype (contiguous row-major storage).
+    pub fn elem_size(&self) -> usize {
+        match self.dtype {
+            GpuDtype::F32 => 4,
+            GpuDtype::F16 | GpuDtype::BF16 => 2,
+            GpuDtype::Q8_0 | GpuDtype::Q4_0 => 1,
+            GpuDtype::Q4_K | GpuDtype::Q6_K => 1,
+        }
+    }
+
+    /// View into this tensor starting `elem_offset` elements in (same
+    /// buffer, byte offset carried through every kernel dispatch).
+    pub fn view_offset(&self, shape: Vec<usize>, elem_offset: usize) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            shape,
+            dtype: self.dtype,
+            offset: self.offset + elem_offset * self.elem_size(),
+        }
     }
 
     /// Upload fp32 data into a new shared-mode buffer.
@@ -101,6 +125,7 @@ impl GpuTensor {
             buffer,
             shape,
             dtype: GpuDtype::F32,
+            offset: 0,
         })
     }
 
@@ -120,6 +145,7 @@ impl GpuTensor {
             buffer,
             shape,
             dtype: GpuDtype::F32,
+            offset: 0,
         })
     }
 
@@ -144,6 +170,7 @@ impl GpuTensor {
             buffer,
             shape,
             dtype: GpuDtype::F16,
+            offset: 0,
         })
     }
 
@@ -167,6 +194,7 @@ impl GpuTensor {
             buffer,
             shape,
             dtype: GpuDtype::BF16,
+            offset: 0,
         })
     }
 
@@ -210,6 +238,7 @@ impl GpuTensor {
             buffer,
             shape,
             dtype,
+            offset: 0,
         })
     }
 
@@ -512,9 +541,9 @@ impl MetalCtx {
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
             enc.set_bytes(3, 8, (&m as *const usize).cast());
             enc.set_bytes(4, 8, (&k as *const usize).cast());
             enc.set_bytes(5, 8, (&n as *const usize).cast());
@@ -546,10 +575,10 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, t_out as u64, cout as u64);
         let group = MTLSize::new(1, 4, 4);
         self.run("conv1d_direct_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, cin, cout, k].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -587,8 +616,8 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, tout as u64, (cin * k) as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("im2col1d_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&xc.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&xc.buffer), xc.offset as u64);
             for (i, v) in [t, cin, k].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -621,8 +650,8 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, tout as u64, (cin * k) as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("im2col_t1d_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&xc.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&xc.buffer), xc.offset as u64);
             for (i, v) in [tin, cin, k].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -639,8 +668,8 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(1, 1, 1);
         self.run("softmax_last_dim_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&rows as *const usize).cast());
             enc.set_bytes(3, 8, (&cols as *const usize).cast());
         })
@@ -652,8 +681,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("silu_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -664,8 +693,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("relu_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -676,8 +705,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("sigmoid_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -688,9 +717,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("add_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&n as *const usize).cast());
         })
     }
@@ -701,8 +730,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("add_scalar_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
             enc.set_bytes(3, 4, (&c as *const f32).cast());
         })
@@ -714,9 +743,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("sub_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&n as *const usize).cast());
         })
     }
@@ -727,9 +756,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("div_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&n as *const usize).cast());
         })
     }
@@ -740,8 +769,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("sqrt_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -752,8 +781,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("log_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -769,8 +798,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("max_scalar_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
             enc.set_bytes(3, 4, (&floor as *const f32).cast());
         })
@@ -782,8 +811,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("leaky_relu_clip_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -812,10 +841,10 @@ impl MetalCtx {
         let grid = MTLSize::new((oh * ow) as u64, n as u64, co as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("conv2d_nchw_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             let consts = [
                 n,
                 ci,
@@ -851,8 +880,8 @@ impl MetalCtx {
         let grid = MTLSize::new((oh * ow) as u64, n as u64, c as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("maxpool2d_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             for (i, v) in [n, c, hi, wi, oh, ow, kh, kw].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -871,9 +900,9 @@ impl MetalCtx {
         let grid = MTLSize::new(cols as u64, rows as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run("add_bias_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&bias.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&bias.buffer), bias.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&cols as *const usize).cast());
         })
     }
@@ -893,10 +922,10 @@ impl MetalCtx {
         let grid = MTLSize::new(t as u64, head_dim as u64, 1);
         let group = MTLSize::new(1, 8, 1);
         self.run("rope_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&cos_buf.buffer), 0);
-            enc.set_buffer(2, Some(&sin_buf.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&cos_buf.buffer), cos_buf.offset as u64);
+            enc.set_buffer(2, Some(&sin_buf.buffer), sin_buf.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(4, 8, (&t as *const usize).cast());
             enc.set_bytes(5, 8, (&head_dim as *const usize).cast());
             enc.set_bytes(6, 8, (&rope_dim as *const usize).cast());
@@ -936,9 +965,9 @@ impl MetalCtx {
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
             enc.set_bytes(3, 8, (&m as *const usize).cast());
             enc.set_bytes(4, 8, (&k as *const usize).cast());
             enc.set_bytes(5, 8, (&n as *const usize).cast());
@@ -986,9 +1015,9 @@ impl MetalCtx {
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
             enc.set_bytes(3, 8, (&m as *const usize).cast());
             enc.set_bytes(4, 8, (&k as *const usize).cast());
             enc.set_bytes(5, 8, (&n as *const usize).cast());
@@ -1035,9 +1064,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(64, 1, 1);
         self.run(name, grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&c.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
             enc.set_bytes(3, 8, (&k as *const usize).cast());
             enc.set_bytes(4, 8, (&n as *const usize).cast());
         })
@@ -1080,10 +1109,10 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, t_out as u64, cout as u64);
         let group = MTLSize::new(1, 4, 4);
         self.run("conv1d_groups_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, cin, cout, k, cin_g].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1135,10 +1164,10 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, cout as u64, (t_out * f_out) as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("conv2d_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [cin, t, f, cout, kt, kf].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1163,9 +1192,9 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(1, 1, 1);
         self.run("rmsnorm_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&rows as *const usize).cast());
             enc.set_bytes(4, 8, (&d as *const usize).cast());
             enc.set_bytes(5, 4, (&eps as *const f32).cast());
@@ -1186,10 +1215,10 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(1, 1, 1);
         self.run("layernorm_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, Some(&b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(4, 8, (&rows as *const usize).cast());
             enc.set_bytes(5, 8, (&d as *const usize).cast());
             enc.set_bytes(6, 4, (&eps as *const f32).cast());
@@ -1203,8 +1232,8 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, d as u64, 1);
         let group = MTLSize::new(4, 8, 1);
         self.run("glu_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&rows as *const usize).cast());
             enc.set_bytes(3, 8, (&d as *const usize).cast());
         })
@@ -1221,9 +1250,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("add_bias2d_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&n as *const usize).cast());
         })
     }
@@ -1240,9 +1269,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("add_scaled_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&n as *const usize).cast());
             enc.set_bytes(4, 4, (&scale as *const f32).cast());
         })
@@ -1254,8 +1283,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("scale_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
             enc.set_bytes(3, 4, (&scale as *const f32).cast());
         })
@@ -1277,10 +1306,10 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, h as u64, hd as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("layernorm_head_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, Some(&b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [rows, h, hd].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1296,8 +1325,8 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, h as u64, (t * hd) as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("uniform_attn_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&v.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, h, t, kv, hd].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1310,9 +1339,9 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("mul_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&a.buffer), 0);
-            enc.set_buffer(1, Some(&b.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&n as *const usize).cast());
         })
     }
@@ -1324,8 +1353,8 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, t as u64, d as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("repeat_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, t, t_out, d].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1351,12 +1380,12 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, h as u64, t as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("mhsa_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&q.buffer), 0);
-            enc.set_buffer(1, Some(&k.buffer), 0);
-            enc.set_buffer(2, Some(&v.buffer), 0);
-            enc.set_buffer(3, Some(&sc.buffer), 0);
-            enc.set_buffer(4, mask.map(|m| &*m.buffer), 0);
-            enc.set_buffer(5, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+            enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+            enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(3, Some(&sc.buffer), sc.offset as u64);
+            enc.set_buffer(4, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
+            enc.set_buffer(5, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, t, h, hd].iter().enumerate() {
                 enc.set_bytes((6 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1380,10 +1409,10 @@ impl MetalCtx {
         let grid = MTLSize::new((b * h) as u64, t as u64, d as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("rope_head_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&cos_buf.buffer), 0);
-            enc.set_buffer(2, Some(&sin_buf.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&cos_buf.buffer), cos_buf.offset as u64);
+            enc.set_buffer(2, Some(&sin_buf.buffer), sin_buf.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, t, h, hd, rope_dim].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1415,10 +1444,10 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, t_out as u64, cout as u64);
         let group = MTLSize::new(1, 4, 4);
         self.run("conv_transpose1d_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, cin, cout, k].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1438,9 +1467,9 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, c as u64, 1);
         let group = MTLSize::new(64, 8, 1);
         self.run("snake_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&alpha.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&alpha.buffer), alpha.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&rows as *const usize).cast());
             enc.set_bytes(4, 8, (&c as *const usize).cast());
         })
@@ -1452,8 +1481,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("gelu_tanh_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -1485,8 +1514,8 @@ impl MetalCtx {
         let group = MTLSize::new(1, 4, 8);
         self.run("embedding_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&idx_buf), 0);
-            enc.set_buffer(1, Some(&table.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, n, d].iter().enumerate() {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1508,10 +1537,10 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, t as u64, d as u64);
         let group = MTLSize::new(1, 4, 8);
         self.run("rope_interleaved_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&cos_buf.buffer), 0);
-            enc.set_buffer(2, Some(&sin_buf.buffer), 0);
-            enc.set_buffer(3, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&cos_buf.buffer), cos_buf.offset as u64);
+            enc.set_buffer(2, Some(&sin_buf.buffer), sin_buf.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, t, d, hd, start].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1530,9 +1559,9 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, cols as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run("mul_vec_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(3, 8, (&rows as *const usize).cast());
             enc.set_bytes(4, 8, (&cols as *const usize).cast());
         })
@@ -1544,8 +1573,8 @@ impl MetalCtx {
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("tanh_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
         })
     }
@@ -1575,8 +1604,8 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("codebook_search_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&table.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
             enc.set_buffer(2, Some(&idx_buf), 0);
             for (i, v) in [rows, n].iter().enumerate() {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
@@ -1615,11 +1644,11 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
         let group = MTLSize::new(1, 1, 1);
         self.run("attn_ar_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&q.buffer), 0);
-            enc.set_buffer(1, Some(&k.buffer), 0);
-            enc.set_buffer(2, Some(&v.buffer), 0);
-            enc.set_buffer(3, mask.map(|m| &*m.buffer), 0);
-            enc.set_buffer(4, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+            enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+            enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(3, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
+            enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
                 .iter()
                 .enumerate()
@@ -1641,8 +1670,8 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, tq as u64, d as u64);
         let group = MTLSize::new(1, 4, 4);
         self.run("kv_update_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&dst.buffer), 0);
-            enc.set_buffer(1, Some(&src.buffer), 0);
+            enc.set_buffer(0, Some(&dst.buffer), dst.offset as u64);
+            enc.set_buffer(1, Some(&src.buffer), src.offset as u64);
             for (i, v) in [b, tq, pos, d, cap].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1666,9 +1695,9 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, h as u64, hd as u64);
         let group = MTLSize::new(1, 1, 8);
         self.run("rmsnorm_head_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             for (i, v) in [rows, h, hd].iter().enumerate() {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1687,9 +1716,9 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, d as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run("mul_rows_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&w.buffer), 0);
-            enc.set_buffer(2, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             for (i, v) in [rows, d].iter().enumerate() {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1709,8 +1738,8 @@ impl MetalCtx {
         let grid = MTLSize::new(rows as u64, d0 as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run("slice_last_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             for (i, v) in [rows, d, off, d0].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1730,8 +1759,8 @@ impl MetalCtx {
         let grid = MTLSize::new(b as u64, (t - u) as u64, c as u64);
         let group = MTLSize::new(1, 4, 4);
         self.run("slice_time_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), 0);
-            enc.set_buffer(1, Some(&y.buffer), 0);
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, t, u, c].iter().enumerate() {
                 enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
             }
@@ -1817,8 +1846,8 @@ impl crate::backend::Backend for MetalBackend {
         let grid = metal::MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
         let group = metal::MTLSize::new(1, 4, 4);
         self.ctx.run("rope_std_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&xg.buffer), 0);
-            enc.set_buffer(1, Some(&yg.buffer), 0);
+            enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+            enc.set_buffer(1, Some(&yg.buffer), yg.offset as u64);
             enc.set_bytes(2, 8, (&tq as *const usize).cast());
             enc.set_bytes(3, 8, (&d as *const usize).cast());
             enc.set_bytes(4, 8, (&hd as *const usize).cast());

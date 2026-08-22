@@ -34,6 +34,8 @@ pub struct Qwen3Config {
     pub rope_theta: f32,
     pub rope_max_seq: usize,
     pub norm_eps: f32,
+    /// Sliding-window attention (gemma-style); None = full causal context.
+    pub swa_window: Option<usize>,
 }
 
 impl Qwen3Config {
@@ -81,6 +83,10 @@ impl Qwen3Config {
             rope_theta: theta,
             rope_max_seq: 8192,
             norm_eps: eps,
+            swa_window: file
+                .get("qwen3.attention.sliding_window")
+                .and_then(GgufValue::as_u32)
+                .map(|v| v as usize),
         })
     }
 }
@@ -287,7 +293,7 @@ impl Qwen3Model {
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
         cache.update(backend, &k, &v)?;
         let mask = if t > 1 {
-            Some(crate::nn::build_causal_mask(backend, t, cache.pos, pos)?)
+            Some(crate::nn::build_causal_mask(backend, t, cache.pos, pos, cfg.swa_window)?)
         } else {
             None
         };
@@ -415,6 +421,7 @@ mod tests {
             rope_theta: 10_000.0,
             rope_max_seq: 128,
             norm_eps: 1e-6,
+            swa_window: None,
         }
     }
 

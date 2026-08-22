@@ -334,6 +334,25 @@ impl Tensor {
         self.view_inner(shape)
     }
 
+    /// View starting `elem_offset` elements into the buffer (Metal only —
+    /// CPU/CUDA tensors are contiguous copies and ignore the offset view).
+    /// Used by KV compaction (drop the oldest half without a host round-trip).
+    pub fn view_offset(&self, shape: Vec<usize>, elem_offset: usize) -> Tensor {
+        debug_assert!(shape.iter().product::<usize>() + elem_offset <= self.numel());
+        #[cfg(feature = "metal")]
+        {
+            if let TensorInner::Metal(g) = &self.inner {
+                return Tensor {
+                    inner: TensorInner::Metal(g.view_offset(shape.clone(), elem_offset)),
+                    shape,
+                    dtype: self.dtype,
+                };
+            }
+        }
+        #[allow(unreachable_code)]
+        self.view_restricted(shape)
+    }
+
     fn view_inner(&self, shape: Vec<usize>) -> Tensor {
         let dtype = self.dtype;
         #[cfg(feature = "metal")]
@@ -344,6 +363,7 @@ impl Tensor {
                         buffer: g.buffer.clone(),
                         shape: shape.clone(),
                         dtype: g.dtype,
+                        offset: g.offset,
                     }),
                     shape,
                     dtype,

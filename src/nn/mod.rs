@@ -330,7 +330,7 @@ impl Attention {
         let ck = cache.view();
         let cv = cache.view_v();
         let mask = if t > 1 {
-            Some(build_causal_mask(backend, t, cache.pos, pos)?)
+            Some(build_causal_mask(backend, t, cache.pos, pos, None)?)
         } else {
             None
         };
@@ -365,6 +365,8 @@ pub struct KvCache {
     cap: usize,
     k_format: crate::dtype::KvFormat,
     v_format: crate::dtype::KvFormat,
+    /// Context-window limit; None = grow without bound.
+    max_cap: Option<usize>,
 }
 
 const KV_CACHE_INIT_CAPACITY: usize = 256;
@@ -419,7 +421,40 @@ impl KvCache {
             cap,
             k_format,
             v_format,
+            max_cap: None,
         })
+    }
+
+    /// Context-window limit (n_ctx). When `update` would exceed it, the
+    /// cache compacts: the oldest half of the window is dropped (the
+    /// standard long-context roll: newest positions are kept, absolute
+    /// positions shift — attention stays correct because RoPE positions
+    /// are tracked by the caller, not by the cache).
+    pub fn set_max_cap(&mut self, max: Option<usize>) {
+        self.max_cap = max;
+    }
+
+    /// Drop the oldest half of the window — entirely on the GPU: an
+    /// offset view reads k[shift..pos] and the data is moved through a
+    /// temp buffer (the source and destination overlap, so a direct
+    /// self-copy would race in the parallel kernel).
+    fn compact(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
+        let d = self.k.shape()[2];
+        let shift = self.pos / 2;
+        if shift == 0 {
+            return Ok(());
+        }
+        let keep = self.pos - shift;
+        let k_src = self.k.view_offset(vec![1, keep, d], shift * d);
+        let v_src = self.v.view_offset(vec![1, keep, d], shift * d);
+        let tmp_k = make_kv_tensor(backend, self.k_format, keep, d)?;
+        let tmp_v = make_kv_tensor(backend, self.v_format, keep, d)?;
+        backend.kv_update(&tmp_k, &k_src, 0)?;
+        backend.kv_update(&tmp_v, &v_src, 0)?;
+        backend.kv_update(&self.k, &tmp_k, 0)?;
+        backend.kv_update(&self.v, &tmp_v, 0)?;
+        self.pos = keep;
+        Ok(())
     }
 
     fn ensure(&mut self, backend: &dyn Backend, needed: usize) -> Result<(), BackendError> {
@@ -453,6 +488,12 @@ impl KvCache {
         v: &Tensor,
     ) -> Result<(), BackendError> {
         let tq = k.shape()[1];
+        // Context-window roll: drop the oldest half before it overflows.
+        if let Some(max) = self.max_cap {
+            if self.pos + tq > max {
+                self.compact(backend)?;
+            }
+        }
         self.ensure(backend, self.pos + tq)?;
         backend.kv_update(&self.k, k, self.pos)?;
         backend.kv_update(&self.v, v, self.pos)?;
@@ -505,6 +546,7 @@ impl KvCache {
             cap,
             k_format: crate::dtype::KvFormat::F32,
             v_format: crate::dtype::KvFormat::F32,
+            max_cap: None,
         })
     }
 
@@ -555,6 +597,7 @@ impl KvCache {
             buffer: self.k.as_gpu().buffer.clone(),
             shape: vec![1, self.pos, self.k.shape()[2]],
             dtype: crate::metal::GpuDtype::F32,
+            offset: 0,
         }
     }
 
@@ -564,6 +607,7 @@ impl KvCache {
             buffer: self.v.as_gpu().buffer.clone(),
             shape: vec![1, self.pos, self.v.shape()[2]],
             dtype: crate::metal::GpuDtype::F32,
+            offset: 0,
         }
     }
 }
@@ -610,16 +654,22 @@ fn rope_apply(
 }
 
 /// Causal attention mask: (1, Tq, Tkv), 0.0 for j ≤ pos + i, -inf elsewhere.
+/// `window` (SWA, gemma-style) additionally hides j < pos+i+1-window.
 pub fn build_causal_mask(
     backend: &dyn Backend,
     tq: usize,
     tkv: usize,
     pos: usize,
+    window: Option<usize>,
 ) -> Result<Tensor, BackendError> {
     let mut data = vec![0.0f32; tq * tkv];
     for i in 0..tq {
         for j in 0..tkv {
-            if j as isize > (pos + i) as isize {
+            let future = j as isize > (pos + i) as isize;
+            let outside = window
+                .map(|w| (pos + i) as isize - j as isize >= w as isize)
+                .unwrap_or(false);
+            if future || outside {
                 data[i * tkv + j] = f32::NEG_INFINITY;
             }
         }

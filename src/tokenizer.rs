@@ -11,7 +11,7 @@
 //! Decode — конкатенация кусков; [`IncrementalDecoder`] корректно склеивает
 //! неполные UTF-8 последовательности на границах чанков стрима ([А-3]).
 
-use crate::gguf::{GgufError, GgufFile, GgufValue};
+use crate::gguf::{GgufFile, GgufValue};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

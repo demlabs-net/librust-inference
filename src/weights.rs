@@ -31,14 +31,15 @@ pub fn load_safetensors_index<P: AsRef<Path>>(
 
 // ─────────────────────── safetensors (fp32 reader) ───────────────────────
 
+/// Результат чтения safetensors: имя тензора → (данные f32, shape).
+pub type F32Tensors = HashMap<String, (Vec<f32>, Vec<usize>)>;
+
 /// Read all fp32 tensors from a safetensors file: name → (data, shape).
 /// Bounds-checked: a truncated/corrupt file (partial download, cut-off
 /// write) yields an error instead of a slicing panic inside a plugin.
 /// F32 native; F16/BF16 (e.g. the DAC codec checkpoint) are widened to f32
 /// here so every consumer sees fp32 host data.
-pub fn read_safetensors_f32(
-    path: &Path,
-) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<F32Tensors> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < 8 {
         return Err(anyhow::anyhow!(

@@ -348,6 +348,10 @@ pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
     ))
 }
 
+/// Методы `from_*` принимают `&self` намеренно: контракт диспатчится через
+/// `&dyn Backend`, а реализации аллоцируют в своём рантайме (входной массив
+/// не конвертируется в Self). Отключаем педантичный wrong_self_convention.
+#[allow(clippy::wrong_self_convention)]
 pub trait Backend: Send + Sync {
     /// Allocate a zero-initialized tensor of `shape`.
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;

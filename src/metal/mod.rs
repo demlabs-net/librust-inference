@@ -1796,6 +1796,9 @@ impl MetalBackend {
 }
 
 impl crate::backend::Backend for MetalBackend {
+    fn supports_f16_weights(&self) -> bool {
+        true
+    }
     fn zeros(
         &self,
         shape: Vec<usize>,

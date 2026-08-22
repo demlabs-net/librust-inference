@@ -132,28 +132,26 @@ impl Qwen3Model {
             let wo = t(&p("attn_output.weight"))?;
             let qn = t(&p("attn_q_norm.weight"))?;
             let kn = t(&p("attn_k_norm.weight"))?;
-            let attn = Attention::from_weights(
-                backend,
-                wqkv,
-                wo,
-                Some(qn),
-                Some(kn),
-                cfg.dim,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-            )?;
+            let attn = Attention {
+                wqkv: upload_w(backend, &wqkv, vec![3 * cfg.dim, cfg.dim])?,
+                wo: upload_w(backend, &wo, vec![cfg.dim, cfg.dim])?,
+                q_norm: Some(backend.from_cpu_f32(&qn, vec![cfg.dim])?),
+                k_norm: Some(backend.from_cpu_f32(&kn, vec![cfg.dim])?),
+                n_heads: cfg.n_heads,
+                n_kv_heads: cfg.n_kv_heads,
+                head_dim: cfg.head_dim,
+            };
             let attn_norm =
                 RmsNorm::from_weights(backend, t(&p("attn_norm.weight"))?, cfg.norm_eps)?;
             let ffn_norm = RmsNorm::from_weights(backend, t(&p("ffn_norm.weight"))?, cfg.norm_eps)?;
-            // ffn: gate/up [ffn, D], down [D, ffn]
+            // ffn: gate/up [ffn, D], down [D, ffn] — GEMM-веса в f16 (Metal)
             let gate = t(&p("ffn_gate.weight"))?;
             let up = t(&p("ffn_up.weight"))?;
             let down = t(&p("ffn_down.weight"))?;
             let ffn = SwiGLU {
-                w1: backend.from_cpu_f32(&gate, vec![cfg.ffn_dim, cfg.dim])?,
-                w3: backend.from_cpu_f32(&up, vec![cfg.ffn_dim, cfg.dim])?,
-                w2: backend.from_cpu_f32(&down, vec![cfg.dim, cfg.ffn_dim])?,
+                w1: upload_w(backend, &gate, vec![cfg.ffn_dim, cfg.dim])?,
+                w3: upload_w(backend, &up, vec![cfg.ffn_dim, cfg.dim])?,
+                w2: upload_w(backend, &down, vec![cfg.dim, cfg.ffn_dim])?,
             };
             layers.push(Qwen3Layer {
                 attn_norm,
@@ -173,10 +171,10 @@ impl Qwen3Model {
         // tied: output.weight может делить стораж с token_embd
         let output = match w.get("output.weight") {
             Some(_) if !w.tied_aliases("output.weight").is_empty() => {
-                backend.from_cpu_f32(&embed_w, vec![cfg.vocab_size, cfg.dim])?
+                upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?
             }
-            Some(_) => backend.from_cpu_f32(&t("output.weight")?, vec![cfg.vocab_size, cfg.dim])?,
-            None => backend.from_cpu_f32(&embed_w, vec![cfg.vocab_size, cfg.dim])?,
+            Some(_) => upload_w(backend, &t("output.weight")?, vec![cfg.vocab_size, cfg.dim])?,
+            None => upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?,
         };
 
         Ok(Self {
@@ -337,6 +335,21 @@ fn rope_standard(
         }
     }
     backend.from_cpu_f32(&v, x.shape().to_vec())
+}
+
+/// Загрузка GEMM-весов: f16 на бэкендах с поддержкой (Metal — вдвое меньше
+/// VRAM), f32-фоллбэк (CPU-референс).
+fn upload_w(
+    backend: &dyn Backend,
+    data: &[f32],
+    shape: Vec<usize>,
+) -> Result<Tensor, BackendError> {
+    if backend.supports_f16_weights() {
+        let f16: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
+        backend.from_cpu_f16(&f16, shape)
+    } else {
+        backend.from_cpu_f32(data, shape)
+    }
 }
 
 fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor, BackendError> {

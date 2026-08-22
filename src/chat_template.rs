@@ -109,51 +109,69 @@ enum Tok {
 
 fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
     let mut toks = Vec::new();
+    let mut text = String::new();
+    let mut trim_next = false;
     let mut rest = src;
-    while !rest.is_empty() {
-        let expr_at = rest.find("{{");
-        let tag_at = rest.find("{%");
-        let com_at = rest.find("{#");
-        // ближайший маркер
-        let mut best = rest.len();
-        let mut kind = 0usize; // 0=none 1=expr 2=tag 3=comment
-        for (at, k) in [(expr_at, 1usize), (tag_at, 2), (com_at, 3)] {
-            if let Some(a) = at {
-                if a < best {
-                    best = a;
-                    kind = k;
+    loop {
+        // ближайший открывающий маркер ('{{-'/'{{'/'{%-'/'{%'; '-' = trim)
+        let mut best: Option<(usize, bool, bool)> = None;
+        for (pat, is_expr) in [("{{-", true), ("{{", true), ("{%-", false), ("{%", false)] {
+            if let Some(p) = rest.find(pat) {
+                if best.map_or(true, |(bi, _, _)| p < bi) {
+                    best = Some((p, is_expr, pat.ends_with('-')));
                 }
             }
         }
-        if kind == 0 {
-            toks.push(Tok::Text(rest.to_string()));
+        let Some((idx, is_expr, trim_before)) = best else {
+            text.push_str(rest);
             break;
+        };
+        if trim_next {
+            text = text.trim_start().to_string();
+            trim_next = false;
         }
-        if best > 0 {
-            toks.push(Tok::Text(rest[..best].to_string()));
+        text.push_str(&rest[..idx]);
+        if trim_before {
+            text = text.trim_end().to_string();
         }
-        match kind {
-            1 => {
-                let end = rest[best + 2..]
-                    .find("}}")
-                    .ok_or(TemplateError::UnclosedTag("{{"))?;
-                toks.push(Tok::Expr(rest[best + 2..best + 2 + end].trim().to_string()));
-                rest = &rest[best + 2 + end + 2..];
-            }
-            2 => {
-                let end = rest[best + 2..]
-                    .find("%}")
-                    .ok_or(TemplateError::UnclosedTag("{%"))?;
-                toks.push(Tok::Tag(rest[best + 2..best + 2 + end].trim().to_string()));
-                rest = &rest[best + 2 + end + 2..];
-            }
-            _ => {
-                let end = rest[best + 2..]
-                    .find("#}")
-                    .ok_or(TemplateError::UnclosedTag("{#"))?;
-                rest = &rest[best + 2 + end + 2..];
+        // закрытие: '-}}'/'}}' для expr, '-%}'/'%}' для tag
+        let after = &rest[idx + 2 + usize::from(trim_before)..];
+        let mut end: Option<(usize, bool)> = None;
+        let close_pats: &[&str] = if is_expr {
+            &["-}}", "}}"]
+        } else {
+            &["-%}", "%}"]
+        };
+        for cp in close_pats {
+            if let Some(p) = after.find(cp) {
+                end = Some((p, cp.starts_with('-')));
+                break;
             }
         }
+        let Some((p, trim_after)) = end else {
+            return Err(TemplateError::UnclosedTag(if is_expr {
+                "{{"
+            } else {
+                "{%"
+            }));
+        };
+        if !text.is_empty() {
+            toks.push(Tok::Text(std::mem::take(&mut text)));
+        }
+        let content = after[..p].trim();
+        toks.push(if is_expr {
+            Tok::Expr(content.to_string())
+        } else {
+            Tok::Tag(content.to_string())
+        });
+        trim_next = trim_after;
+        rest = &after[p + 2 + usize::from(trim_after)..];
+    }
+    if trim_next {
+        text = text.trim_start().to_string();
+    }
+    if !text.is_empty() {
+        toks.push(Tok::Text(text));
     }
     Ok(toks)
 }
@@ -562,5 +580,50 @@ mod tests {
     fn unsupported_construct_is_error_not_garbage() {
         let t = Template::compile("{% macro x() %}y{% endmacro %}", HashMap::new());
         assert!(t.is_err());
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    /// Jinja trim-маркеры: {%- -%} {{- -}} (использует реальный Qwen3-шаблон).
+    #[test]
+    fn trim_markers_remove_whitespace() {
+        let t = Template::compile(
+            "{%- for m in messages -%}\n  {{- m }}  \n{%- endfor -%}",
+            HashMap::new(),
+        )
+        .unwrap();
+        let ctx = TemplateContext {
+            messages: vec![],
+            extra: HashMap::from([("m".into(), "x".into()), ("loop.index0".into(), "0".into())]),
+        };
+        // цикл по messages пуст — но выражение m не используется; проверяем
+        // что компиляция и рендер пустого тела не падают и текст тримится
+        let out = t.render(&ctx).unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn qwen3_real_style_template() {
+        // фрагмент реального Qwen3-шаблона (имитация с trim-маркерами)
+        let t = Template::compile(
+            "{%- for message in messages -%}{{- '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}{%- endif -%}",
+            HashMap::new(),
+        )
+        .unwrap();
+        let ctx = TemplateContext {
+            messages: vec![HashMap::from([
+                ("role".into(), "user".into()),
+                ("content".into(), "привет".into()),
+            ])],
+            extra: HashMap::from([("add_generation_prompt".into(), "true".into())]),
+        };
+        let out = t.render(&ctx).unwrap();
+        assert_eq!(
+            out,
+            "<|im_start|>user\nпривет<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }

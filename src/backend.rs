@@ -408,6 +408,11 @@ pub trait Backend: Send + Sync {
         }
         self.from_cpu_f32(&f32s, shape)
     }
+    /// Может ли бэкенд хранить GEMM-веса в f16 (halved VRAM/трафик)?
+    /// Metal — да (кернелы gemm_nt_f16/bf16); CPU-референс — только f32.
+    fn supports_f16_weights(&self) -> bool {
+        false
+    }
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
 

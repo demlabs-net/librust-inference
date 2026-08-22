@@ -18,6 +18,7 @@
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
 
 pub mod backend;
+pub mod chat_template;
 pub mod concurrency;
 #[cfg(feature = "cpu")]
 pub mod cpu;

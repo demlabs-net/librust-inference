@@ -95,8 +95,6 @@ pub struct Qwen3Model {
     out_norm: RmsNorm,
     /// Выходная проекция [V, D]; при tied-весах — тот же стораж, что у embed.
     output: Tensor,
-    /// identity-таблицы RoPE (cos=1, sin=0) для nn::Attention.
-    rope_identity: (Tensor, Tensor),
     caches: Vec<KvCache>,
 }
 
@@ -181,22 +179,12 @@ impl Qwen3Model {
             None => backend.from_cpu_f32(&embed_w, vec![cfg.vocab_size, cfg.dim])?,
         };
 
-        // identity-таблицы RoPE: (max_seq, hd/2)
-        let hd2 = cfg.head_dim / 2;
-        let ones = vec![1.0f32; cfg.rope_max_seq * hd2];
-        let zeros = vec![0.0f32; cfg.rope_max_seq * hd2];
-        let rope_identity = (
-            backend.from_cpu_f32(&ones, vec![cfg.rope_max_seq, hd2])?,
-            backend.from_cpu_f32(&zeros, vec![cfg.rope_max_seq, hd2])?,
-        );
-
         Ok(Self {
             cfg,
             embed,
             layers,
             out_norm,
             output,
-            rope_identity,
             caches,
         })
     }
@@ -331,7 +319,7 @@ fn rope_standard(
     hd: usize,
     theta: f32,
 ) -> Result<Tensor, BackendError> {
-    let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+    let (_b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let mut v = backend.to_cpu_f32(x)?; // [b, tq, d]
     let half = hd / 2;
     for tt in 0..tq {
@@ -348,7 +336,6 @@ fn rope_standard(
             }
         }
     }
-    let _ = b;
     backend.from_cpu_f32(&v, x.shape().to_vec())
 }
 

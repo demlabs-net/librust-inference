@@ -148,6 +148,9 @@ impl GpuTensor {
                 "to_cpu_f32 on a quantized (f16/bf16) tensor".into(),
             ));
         }
+        // The producer may be inside a batch — the kernel writes are not
+        // visible until the pending command buffer is committed+waited.
+        ctx.flush_batch()?;
         let barrier = ctx.queue.new_command_buffer();
         barrier.commit();
         barrier.wait_until_completed();
@@ -176,6 +179,30 @@ pub struct MetalCtx {
     pub device: Device,
     queue: CommandQueue,
     pipelines: Mutex<HashMap<&'static str, ComputePipelineState>>,
+    /// Persistent batch state: while `depth > 0`, every kernel dispatch
+    /// goes into ONE command buffer (no per-op commit+wait) and a single
+    /// [`MetalCtx::flush_batch`] syncs the GPU. The wake/VAD paths run a
+    /// whole window this way — per-op sync made a wake window (~60 small
+    /// ops) cost ~97 ms against an 80 ms real-time budget, so the engine
+    /// fell behind the mic and the wake word never fired live.
+    batch: Mutex<BatchState>,
+}
+
+struct BatchState {
+    depth: usize,
+    /// Owned (retained) command buffer — survives the autorelease pool of
+    /// the creating call, unlike `new_command_buffer()`'s borrowed ref.
+    cmd: Option<CommandBuffer>,
+    /// Diagnostics: how many times a batch was opened (tests assert the
+    /// wake path actually batches — a regression that drops begin_batch
+    /// reintroduces the per-op sync stall).
+    enters: u64,
+}
+
+impl Default for BatchState {
+    fn default() -> Self {
+        Self { depth: 0, cmd: None, enters: 0 }
+    }
 }
 
 impl MetalCtx {
@@ -186,6 +213,7 @@ impl MetalCtx {
             device,
             queue,
             pipelines: Mutex::new(HashMap::new()),
+            batch: Mutex::new(BatchState::default()),
         };
         // Compile the whole kernel library once; pipelines are built lazily
         // and cached.
@@ -274,6 +302,8 @@ impl MetalCtx {
 
     /// Run one kernel with a grid; single commit + wait, inside an autorelease
     /// pool so the borrowed Metal objects are released deterministically.
+    /// In batch mode (see [`Self::begin_batch`]) the kernel is appended to
+    /// the pending command buffer WITHOUT commit/wait.
     fn run(
         &self,
         kernel: &'static str,
@@ -281,6 +311,23 @@ impl MetalCtx {
         group: MTLSize,
         setup: impl FnOnce(&ComputeCommandEncoderRef),
     ) -> Result<(), MetalError> {
+        // Batch path: accumulate into one command buffer, no per-op sync.
+        {
+            let mut batch = self.batch.lock().unwrap();
+            if batch.depth > 0 {
+                if batch.cmd.is_none() {
+                    batch.cmd = Some(self.queue.new_command_buffer().to_owned());
+                }
+                let cmd = batch.cmd.as_ref().unwrap();
+                let enc = cmd.new_compute_command_encoder();
+                let pipeline = self.pipeline(kernel)?;
+                enc.set_compute_pipeline_state(&pipeline);
+                setup(enc);
+                enc.dispatch_threads(grid, group);
+                enc.end_encoding();
+                return Ok(());
+            }
+        }
         autoreleasepool(|| {
             let pipeline = self.pipeline(kernel)?;
             let cmd = self.queue.new_command_buffer();
@@ -293,6 +340,48 @@ impl MetalCtx {
             cmd.wait_until_completed();
             Ok(())
         })
+    }
+
+    /// Enter batch mode (nestable). Ops accumulate until the matching
+    /// [`Self::end_batch`] — or an explicit [`Self::flush_batch`].
+    pub fn begin_batch(&self) {
+        let mut batch = self.batch.lock().unwrap();
+        batch.depth += 1;
+        batch.enters += 1;
+    }
+
+    /// How many batches were opened since the context was created
+    /// (diagnostics/tests).
+    pub fn batch_enter_count(&self) -> u64 {
+        self.batch.lock().unwrap().enters
+    }
+
+    /// Leave batch mode; on the outermost exit, commit+wait the pending
+    /// command buffer once.
+    pub fn end_batch(&self) -> Result<(), MetalError> {
+        let mut batch = self.batch.lock().unwrap();
+        if batch.depth > 0 {
+            batch.depth -= 1;
+        }
+        if batch.depth == 0 {
+            if let Some(cmd) = batch.cmd.take() {
+                cmd.commit();
+                cmd.wait_until_completed();
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit+wait the pending batch WITHOUT leaving batch mode. Required
+    /// before any host-side read ([`GpuTensor::to_cpu_f32`]) — the shared
+    /// buffer's contents are only valid after the GPU finished.
+    pub fn flush_batch(&self) -> Result<(), MetalError> {
+        let mut batch = self.batch.lock().unwrap();
+        if let Some(cmd) = batch.cmd.take() {
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+        Ok(())
     }
 
     // ── ops ──
@@ -1490,6 +1579,20 @@ impl crate::backend::Backend for MetalBackend {
 
     fn to_cpu_f32(&self, t: &crate::backend::Tensor) -> Result<Vec<f32>, crate::error::BackendError> {
         Ok(t.as_gpu().to_cpu_f32(&self.ctx)?)
+    }
+
+    fn begin_batch(&self) -> Result<(), crate::error::BackendError> {
+        self.ctx.begin_batch();
+        Ok(())
+    }
+
+    fn end_batch(&self) -> Result<(), crate::error::BackendError> {
+        self.ctx.end_batch()?;
+        Ok(())
+    }
+
+    fn batch_enter_count(&self) -> u64 {
+        self.ctx.batch_enter_count()
     }
 
     fn gemm(&self, a: &crate::backend::Tensor, b: &crate::backend::Tensor, c: &crate::backend::Tensor) -> Result<(), crate::error::BackendError> {

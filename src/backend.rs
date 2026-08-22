@@ -327,6 +327,27 @@ pub trait Backend: Send + Sync {
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
 
+    // ── batching ──
+    /// Start accumulating GPU kernels into ONE command buffer: many small
+    /// ops (wake word, VAD) pay per-op commit+wait sync otherwise, which
+    /// makes them slower than the audio arrives (observed: ~97 ms per 80 ms
+    /// wake window — the engine could never keep up with the mic). Nested
+    /// calls are allowed; [`Self::end_batch`] must be paired per call.
+    /// Defaults are no-ops — only backends with per-op GPU sync (Metal)
+    /// implement this.
+    fn begin_batch(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    /// Flush the pending batch (one commit+wait) and leave batch mode.
+    fn end_batch(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    /// Diagnostics: how many batches were opened (tests assert that
+    /// latency-sensitive paths — the wake word — actually batch).
+    fn batch_enter_count(&self) -> u64 {
+        0
+    }
+
     // ── gemm ──
     /// C (M,N) = A (M,K) · B (K,N).
     fn gemm(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError>;

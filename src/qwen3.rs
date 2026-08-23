@@ -213,7 +213,33 @@ impl Qwen3Model {
     /// Prefill: ids [T] → logits [1, T, V]; KV-кэши пополняются.
     pub fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         let t = ids.len();
-        let mut x = self.embed.forward(backend, ids, t)?;
+        let x = self.embed.forward(backend, ids, t)?;
+        self.forward_layers(backend, x, t)
+    }
+
+    /// Prefill с vision-эмбеддингами (Ф1.11): токены == `vision_token`
+    /// заменяются строками vision-энкодера (по порядку появления) — всё на
+    /// GPU (embedding_override).
+    pub fn prefill_with_vision(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        vision: &Tensor,
+        vision_token: u32,
+    ) -> Result<Tensor, BackendError> {
+        let t = ids.len();
+        let x = backend.zeros(vec![1, t, self.cfg.dim])?;
+        backend.embedding_override(ids, &self.embed.table, vision, &x, vision_token)?;
+        self.forward_layers(backend, x, t)
+    }
+
+    /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
+    fn forward_layers(
+        &mut self,
+        backend: &dyn Backend,
+        mut x: Tensor,
+        t: usize,
+    ) -> Result<Tensor, BackendError> {
         let pos = self.caches[0].pos;
         for (i, layer) in self.layers.iter().enumerate() {
             let h = layer.attn_norm.forward(backend, &x)?;

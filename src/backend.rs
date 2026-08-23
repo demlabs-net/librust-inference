@@ -701,6 +701,50 @@ pub trait Backend: Send + Sync {
     /// Gather rows of `table` (V, D) by `idx` → Y (len(idx), D). f32-compute.
     fn embedding(&self, idx: &[u32], table: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// Embedding with vision-token override (Ф1.11): токены == override_id
+    /// заменяются строками из `vision` (по порядку появления). Всё на GPU.
+    fn embedding_override(
+        &self,
+        idx: &[u32],
+        table: &Tensor,
+        vision: &Tensor,
+        y: &Tensor,
+        override_id: u32,
+    ) -> Result<(), BackendError> {
+        // Default: CPU-совместимый путь (используется CPU-референсом и как
+        // fallback; Metal переопределяет кернелом).
+        let (v, d) = (table.shape()[0], table.shape()[1]);
+        if y.numel() != idx.len() * d {
+            return Err(BackendError::Shape(format!(
+                "embedding_override: y numel {} != {}",
+                y.numel(),
+                idx.len() * d
+            )));
+        }
+        let td = self.to_cpu_f32(table)?;
+        let vd = self.to_cpu_f32(vision)?;
+        let mut yd = self.to_cpu_f32(y)?;
+        let nv = vision.shape()[0];
+        let mut vi = 0usize;
+        for (i, &id) in idx.iter().enumerate() {
+            let dst = &mut yd[i * d..(i + 1) * d];
+            if id == override_id {
+                if vi < nv {
+                    dst.copy_from_slice(&vd[vi * d..(vi + 1) * d]);
+                } else {
+                    dst.fill(0.0);
+                }
+                vi += 1;
+            } else {
+                let row = (id as usize).min(v - 1);
+                dst.copy_from_slice(&td[row * d..(row + 1) * d]);
+            }
+        }
+        let out = self.from_cpu_f32(&yd, vec![1, idx.len(), d])?;
+        let _ = &out;
+        Ok(())
+    }
+
     // ── RoPE ──
     /// Halved RoPE: X (T, head_dim) rotated by (cos, sin) buffers, applying to
     /// the first `rope_dim` columns. Angles computed in f32.

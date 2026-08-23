@@ -711,6 +711,43 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn embedding_override(
+        &self,
+        idx: &[u32],
+        table: &Tensor,
+        vision: &Tensor,
+        y: &Tensor,
+        override_id: u32,
+    ) -> Result<(), BackendError> {
+        let (v, d) = (table.shape()[0], table.shape()[1]);
+        if y.numel() != idx.len() * d {
+            return Err(BackendError::Shape(format!(
+                "embedding_override: y numel {} != {}",
+                y.numel(),
+                idx.len() * d
+            )));
+        }
+        let (td, vd) = (data(table).to_vec(), data(vision).to_vec());
+        let mut yd = data_mut(y);
+        let nv = vision.shape()[0];
+        let mut vi = 0usize;
+        for (i, &id) in idx.iter().enumerate() {
+            let dst = &mut yd[i * d..(i + 1) * d];
+            if id == override_id {
+                if vi < nv {
+                    dst.copy_from_slice(&vd[vi * d..(vi + 1) * d]);
+                } else {
+                    dst.fill(0.0);
+                }
+                vi += 1;
+            } else {
+                let row = (id as usize).min(v - 1);
+                dst.copy_from_slice(&td[row * d..(row + 1) * d]);
+            }
+        }
+        Ok(())
+    }
+
     fn rope(
         &self,
         x: &Tensor,

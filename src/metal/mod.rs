@@ -1678,6 +1678,43 @@ impl MetalCtx {
         })
     }
 
+    pub fn embedding_override_f32(
+        &self,
+        idx: &[u32],
+        table: &GpuTensor,
+        vision: &GpuTensor,
+        y: &GpuTensor,
+        override_id: u32,
+    ) -> Result<(), MetalError> {
+        let t = y.shape[1];
+        let n = table.shape[0];
+        let d = table.shape[1];
+        let v = vision.shape[0];
+        if idx.len() != t {
+            return Err(MetalError::Shape(format!(
+                "embedding_override: idx {} != T {t}",
+                idx.len()
+            )));
+        }
+        let bytes = (t * 4) as u64;
+        let idx_buf = self.device.new_buffer_with_data(
+            idx.as_ptr().cast(),
+            bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let grid = MTLSize::new(1, t as u64, d as u64);
+        let group = MTLSize::new(1, 4, 8);
+        self.run("embedding_override_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&idx_buf), 0);
+            enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
+            enc.set_buffer(2, Some(&vision.buffer), vision.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+            for (i, val) in [t, n, d, override_id as usize, v].iter().enumerate() {
+                enc.set_bytes((4 + i) as u64, 8, (val as *const usize).cast());
+            }
+        })
+    }
+
     /// RMSNorm per head (QK-norm): X (rows, H*HD) → Y, W (HD).
     pub fn rmsnorm_head_f32(
         &self,
@@ -2320,6 +2357,19 @@ impl crate::backend::Backend for MetalBackend {
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
         self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
+    fn embedding_override(
+        &self,
+        idx: &[u32],
+        table: &crate::backend::Tensor,
+        vision: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        override_id: u32,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .embedding_override_f32(idx, table.as_gpu(), vision.as_gpu(), y.as_gpu(), override_id)?;
         Ok(())
     }
 

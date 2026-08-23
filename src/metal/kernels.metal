@@ -1469,3 +1469,38 @@ kernel void rope_std_f32(
     Y[base] = x0 * c - x1 * s;
     Y[base + HD / 2] = x1 * c + x0 * s;
 }
+
+// ── Embedding with vision-token override (Ф1.11) ───────────────────────────
+// Токены id == override_id заменяются строками из VISION (по порядку);
+// остальные — обычный lookup. Y: (T, D); VISION: (V, D).
+kernel void embedding_override_f32(
+    device const uint* idx [[buffer(0)]],
+    device const float* table [[buffer(1)]],
+    device const float* vision [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& T [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& override_id [[buffer(7)]],
+    constant uint& V [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x, t = gid.y, d = gid.z;
+    if (b >= 1u || t >= T || d >= D) return;
+    uint row = idx[b * T + t];
+    if (row == override_id) {
+        // порядковый номер vision-токена среди встреченных
+        uint vi = 0;
+        for (uint tt = 0u; tt < t; ++tt) {
+            if (idx[b * T + tt] == override_id) vi++;
+        }
+        if (vi < V) {
+            Y[(b * T + t) * D + d] = vision[vi * D + d];
+        } else {
+            Y[(b * T + t) * D + d] = 0.0f;
+        }
+    } else {
+        if (row >= N) row = N - 1u;
+        Y[(b * T + t) * D + d] = table[row * D + d];
+    }
+}

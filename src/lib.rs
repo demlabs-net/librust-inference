@@ -34,6 +34,7 @@ pub mod inference;
 pub mod metal;
 pub mod nn;
 pub mod qwen3;
+pub mod vision;
 pub mod tokenizer;
 pub mod weights;
 pub mod weights_map;

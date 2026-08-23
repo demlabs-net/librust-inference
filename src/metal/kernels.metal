@@ -1087,7 +1087,7 @@ kernel void attn_ar_f32(
         float acc = 0.0f;
         for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
         float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-        float s = acc * 0.08838834764831845f + m;
+        float s = acc * (1.0f / sqrt((float)HD)) + m;
         sum += exp(s - mx);
     }
     device float* yrow = Y + (b * Tq + t) * D + h * HD;
@@ -1099,7 +1099,7 @@ kernel void attn_ar_f32(
             float qk = 0.0f;
             for (uint dd = 0u; dd < HD; ++dd) qk += qrow[dd] * krow[dd];
             float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-            float s = qk * 0.08838834764831845f + m;
+            float s = qk * (1.0f / sqrt((float)HD)) + m;
             acc += exp(s - mx) / sum * vrow[d];
         }
         yrow[d] = acc;
@@ -1542,3 +1542,95 @@ kernel void rope_mrope_text_f32(
     Y[base] = x0 * c - x1 * s;
     Y[base + hhalf] = x0 * s + x1 * c;
 }
+
+// ── GELU (erf, A&S 7.1.26) — vision (clip/Qwen3-VL) ────────────────────────
+kernel void gelu_erf_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint i = gid;
+    if (i >= n) return;
+    float x = X[i];
+    float y = x * 0.70710678118654752440f; // x / sqrt(2)
+    float ax = fabs(y);
+    float t = 1.0f / (1.0f + 0.3275911f * ax);
+    float poly = 0.254829592f * t
+               - 0.284496736f * t * t
+               + 1.421413741f * t * t * t
+               - 1.453152027f * t * t * t * t
+               + 1.061405429f * t * t * t * t * t;
+    float erf = (y < 0.0f ? -1.0f : 1.0f) * (1.0f - poly * exp(-ax * ax));
+    Y[i] = 0.5f * x * (1.0f + erf);
+}
+
+// ── Qwen3-VL vision layout ops (all pure GPU, no host round-trips) ─────────
+// merge 2×2 + patch_bias + position_embd: conv grid (per×per) → same grid,
+// each output block (by,bx) takes 4 neighbour patches in (c0a0,c1a0,c0a1,c1a1)
+// order; pos_embd is permuted identically (same src row).
+// X/POS: [per², d] patch rows; BIAS: [d]; Y: [per², d].
+kernel void merge2x2_add_f32(
+    device const float* X [[buffer(0)]],
+    device const float* BIAS [[buffer(1)]],
+    device const float* POS [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& per [[buffer(4)]],
+    constant uint& d [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint blk = gid.x, j = gid.y; // j = token-in-block 0..3
+    if (blk >= per * per / 4 || j >= 4) return;
+    uint hp = per / 2;
+    uint by = blk / hp, bx = blk % hp;
+    // src patch row for this position in the block
+    uint sy = 2 * by + (j / 2); // j: 0,1 → a0; 2,3 → a1
+    uint sx = 2 * bx + (j % 2); // j: 0,2 → c0; 1,3 → c1
+    uint src = (sy * per + sx) * d;
+    uint dst = (blk * 4 + j) * d;
+    for (uint k = 0u; k < d; ++k) {
+        Y[dst + k] = X[src + k] + BIAS[k] + POS[src + k];
+    }
+}
+
+// group4: [n, d] → [n/4, 4·d], 4 consecutive rows concatenated in order.
+// X: [n, d]; Y: [n/4, 4d]; out[i*4d + j*d + k] = X[(i*4+j)*d + k].
+kernel void group4_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& d [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = (n / 4) * 4 * d;
+    if (gid >= total) return;
+    uint k = gid % d;
+    uint rem = gid / d;
+    uint j = rem % 4;
+    uint i = rem / 4;
+    Y[i * 4 * d + j * d + k] = X[(i * 4 + j) * d + k];
+}
+
+// concat 4 chunks [nq, proj] → [4·nq, proj] row-interleaved:
+// Y[(q*4+j)*proj + p] = chunk_j[q*proj + p]. Y: [4·nq, proj].
+kernel void concat4_f32(
+    device const float* C0 [[buffer(0)]],
+    device const float* C1 [[buffer(1)]],
+    device const float* C2 [[buffer(2)]],
+    device const float* C3 [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& nq [[buffer(5)]],
+    constant uint& proj [[buffer(6)]],
+    constant uint& nchunks [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= nq * 4 * proj) return;
+    uint p = gid % proj;
+    uint rem = gid / proj;
+    uint j = rem % 4;
+    uint q = rem / 4;
+    if (j >= nchunks) return;
+    device const float* C = (j == 0) ? C0 : (j == 1) ? C1 : (j == 2) ? C2 : C3;
+    Y[gid] = C[q * proj + p];
+}
+

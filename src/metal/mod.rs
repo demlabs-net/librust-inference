@@ -1487,6 +1487,80 @@ impl MetalCtx {
         })
     }
 
+    /// GELU (erf) — vision (clip/Qwen3-VL): 0.5·x·(1+erf(x/√2)).
+    pub fn gelu_erf_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("gelu_erf_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// Vision patch layout: merge 2×2 blocks + patch_bias + position_embd.
+    /// X/POS [per², d] → Y [per², d]; one thread per (block-row, token-in-block).
+    pub fn merge2x2_add_f32(
+        &self,
+        x: &GpuTensor,
+        bias: &GpuTensor,
+        pos: &GpuTensor,
+        y: &GpuTensor,
+        per: usize,
+    ) -> Result<(), MetalError> {
+        let d = x.shape[1];
+        let grid = MTLSize::new((per * per / 4) as u64, 4, 1);
+        let group = MTLSize::new(64, 1, 1);
+        self.run("merge2x2_add_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&bias.buffer), bias.offset as u64);
+            enc.set_buffer(2, Some(&pos.buffer), pos.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(4, 8, (&per as *const usize).cast());
+            enc.set_bytes(5, 8, (&d as *const usize).cast());
+        })
+    }
+
+    /// Vision deepstack/post_ln group: [n, d] → [n/4, 4·d].
+    pub fn group4_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.shape[0];
+        let d = x.shape[1];
+        let total = (n / 4) * 4 * d;
+        let grid = MTLSize::new(total as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("group4_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+            enc.set_bytes(3, 8, (&d as *const usize).cast());
+        })
+    }
+
+    /// Vision merger concat: chunks ([nq, proj] ×nchunks, ≤4) → [4·nq, proj],
+    /// rows interleaved: out[q·4+j] = chunk_j[q].
+    pub fn concat4_f32(
+        &self,
+        chunks: &[GpuTensor],
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let nq = y.shape[0] / 4;
+        let proj = y.shape[1];
+        let total = nq * 4 * proj;
+        let grid = MTLSize::new(total as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("concat4_f32", grid, group, |enc| {
+            for (i, c) in chunks.iter().take(4).enumerate() {
+                enc.set_buffer(i as u64, Some(&c.buffer), c.offset as u64);
+            }
+            enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
+            let nchunks = chunks.len().min(4);
+            enc.set_bytes(5, 8, (&nq as *const usize).cast());
+            enc.set_bytes(6, 8, (&proj as *const usize).cast());
+            enc.set_bytes(7, 8, (&nchunks as *const usize).cast());
+        })
+    }
+
     /// Embedding lookup: idx (B,T) u32, table (N,D) → Y (B,T,D). Batch fixed
     /// to 1 in the kernel (codec decode path). The idx buffer is uploaded
     /// per call (small: T×4 bytes).
@@ -2160,6 +2234,47 @@ impl crate::backend::Backend for MetalBackend {
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
         self.ctx.gelu_tanh_f32(x.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
+    fn gelu_erf(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.gelu_erf_f32(x.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
+    fn merge2x2_add(
+        &self,
+        x: &crate::backend::Tensor,
+        bias: &crate::backend::Tensor,
+        pos: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        per: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx
+            .merge2x2_add_f32(x.as_gpu(), bias.as_gpu(), pos.as_gpu(), y.as_gpu(), per)?;
+        Ok(())
+    }
+
+    fn group4(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.group4_f32(x.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
+    fn concat4(
+        &self,
+        chunks: &[crate::backend::Tensor],
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        let gpus: Vec<_> = chunks.iter().map(|c| c.as_gpu().clone()).collect();
+        self.ctx.concat4_f32(&gpus, y.as_gpu())?;
         Ok(())
     }
 

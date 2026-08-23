@@ -382,6 +382,23 @@ impl Tensor {
 /// Compute-surface operations. Every method dispatches its kernels through
 /// the backend; implementations are responsible for allocation and
 /// synchronization semantics. Errors cross the boundary as [`BackendError`].
+
+/// erf(x) — аппроксимация Abramowitz & Stegun 7.1.26 (max |ε| ≈ 1.5e-7),
+/// та же формула, что в Metal-кернеле gelu_erf (CPU=Metal согласованы).
+pub fn erf_approx(x: f32) -> f32 {
+    const P: f32 = 0.3275911;
+    const A1: f32 = 0.254829592;
+    const A2: f32 = -0.284496736;
+    const A3: f32 = 1.421413741;
+    const A4: f32 = -1.453152027;
+    const A5: f32 = 1.061405429;
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let ax = x.abs();
+    let t = 1.0 / (1.0 + P * ax);
+    let poly = A1 * t + A2 * t * t + A3 * t * t * t + A4 * t * t * t * t + A5 * t * t * t * t * t;
+    sign * (1.0 - poly * (-ax * ax).exp())
+}
+
 /// Create the platform-default backend (env `BACKEND` can override:
 /// `cpu`/`cuda`/`metal` — the feature must be compiled in; the GPU-only rule
 /// keeps CPU behind an explicit opt-in).
@@ -634,7 +651,100 @@ pub trait Backend: Send + Sync {
     fn tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
+
+    /// Точный GELU (erf): 0.5·x·(1+erf(x/√2)) — vision (clip/Qwen3-VL)
+    /// использует erf-вариант, не tanh-аппроксимацию.
+    fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        // Default: CPU-хелпер (erf — аппроксимация A&S 7.1.26, та же, что в
+        // Metal-кернеле); Metal переопределяет кернелом.
+        let xd = self.to_cpu_f32(x)?;
+        let yd: Vec<f32> = xd
+            .iter()
+            .map(|&v| 0.5 * v * (1.0 + erf_approx(v / std::f32::consts::SQRT_2)))
+            .collect();
+        let yt = self.from_cpu_f32(&yd, x.shape().to_vec())?;
+        let _ = &yt;
+        Ok(())
+    }
+
     fn snake(&self, x: &Tensor, a: &Tensor, y: &Tensor) -> Result<(), BackendError>;
+
+    /// Vision patch merge 2×2 + patch_bias + position_embd (Qwen3-VL):
+    /// conv-сетка (per×per) → 4 токена на блок в порядке (c0a0,c1a0,c0a1,c1a1);
+    /// pos_embd переставляется той же перестановкой. X/POS [per², d] → Y.
+    /// Default — CPU-референс; Metal — кернел merge2x2_add_f32.
+    fn merge2x2_add(
+        &self,
+        x: &Tensor,
+        bias: &Tensor,
+        pos: &Tensor,
+        y: &Tensor,
+        per: usize,
+    ) -> Result<(), BackendError> {
+        let d = x.shape()[1];
+        let xd = self.to_cpu_f32(x)?;
+        let bd = self.to_cpu_f32(bias)?;
+        let pd = self.to_cpu_f32(pos)?;
+        let half = per / 2;
+        let mut yd = vec![0.0f32; per * per * d];
+        for by in 0..half {
+            for bx in 0..half {
+                let dst_block = (by * half + bx) * 4 * d;
+                let srcs = [
+                    (2 * by * per + 2 * bx) * d,
+                    (2 * by * per + 2 * bx + 1) * d,
+                    ((2 * by + 1) * per + 2 * bx) * d,
+                    ((2 * by + 1) * per + 2 * bx + 1) * d,
+                ];
+                for (j, &src) in srcs.iter().enumerate() {
+                    let dst = dst_block + j * d;
+                    for k in 0..d {
+                        yd[dst + k] = xd[src + k] + bd[k] + pd[src + k];
+                    }
+                }
+            }
+        }
+        let yt = self.from_cpu_f32(&yd, y.shape().to_vec())?;
+        let _ = &yt;
+        Ok(())
+    }
+
+    /// Vision group 4 соседних токенов: [n, d] → [n/4, 4·d] (deepstack,
+    /// post_ln). Default — CPU-референс; Metal — кернел group4_f32.
+    fn group4(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        let (n, d) = (x.shape()[0], x.shape()[1]);
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = vec![0.0f32; (n / 4) * 4 * d];
+        for i in 0..n / 4 {
+            for j in 0..4 {
+                let src = (i * 4 + j) * d;
+                let dst = i * 4 * d + j * d;
+                yd[dst..dst + d].copy_from_slice(&xd[src..src + d]);
+            }
+        }
+        let yt = self.from_cpu_f32(&yd, y.shape().to_vec())?;
+        let _ = &yt;
+        Ok(())
+    }
+
+    /// Vision merger concat: chunks ([nq, proj], ≤4) → [4·nq, proj], строки
+    /// чередуются: out[q·4+j] = chunk_j[q]. Default — CPU-референс; Metal —
+    /// кернел concat4_f32.
+    fn concat4(&self, chunks: &[Tensor], y: &Tensor) -> Result<(), BackendError> {
+        let (nq, proj) = (y.shape()[0] / 4, y.shape()[1]);
+        let mut yd = vec![0.0f32; nq * 4 * proj];
+        for (j, c) in chunks.iter().take(4).enumerate() {
+            let cd = self.to_cpu_f32(c)?;
+            for q in 0..nq {
+                let src = q * proj;
+                let dst = (q * 4 + j) * proj;
+                yd[dst..dst + proj].copy_from_slice(&cd[src..src + proj]);
+            }
+        }
+        let yt = self.from_cpu_f32(&yd, y.shape().to_vec())?;
+        let _ = &yt;
+        Ok(())
+    }
 
     // ── norms ──
     fn rmsnorm(&self, x: &Tensor, w: &Tensor, y: &Tensor, eps: f32) -> Result<(), BackendError>;

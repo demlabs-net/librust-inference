@@ -519,6 +519,54 @@ pub trait Backend: Send + Sync {
         }
         self.from_cpu_f32(&yd, x.shape().to_vec())
     }
+    /// M-RoPE text (Qwen3-VL IMROPE, ТОЛЬКО текст): пары HALVES (i, i+hd/2),
+    /// но e-секция (4-я позиция = 0 для текста) не ротируется. Категория
+    /// пары i по llama.cpp IMROPE: sector = i % sum(sections):
+    ///   sector % 3 == 0 && sector < 3*s0 → t (pos)
+    ///   sector % 3 == 1 && sector < 3*s1 → h (pos)
+    ///   sector % 3 == 2 && sector < 3*s2 → w (pos)
+    ///   иначе → e (позиция 0 — без ротации).
+    /// Для текста t=h=w=pos, поэтому ротируются все пары кроме e-категории.
+    /// Default — CPU-референс; Metal — кернел.
+    fn rope_mrope_text(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = vec![0.0f32; xd.len()];
+        let half = hd / 2;
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let (s0, s1, s2) = (sections[0], sections[1], sections[2]);
+        for tt in 0..tq {
+            let p = (pos + tt) as f32;
+            for h in 0..d / hd {
+                for i in 0..half {
+                    let sector = i % sect_dims;
+                    let is_e = !((sector % 3 == 0 && sector < 3 * s0)
+                        || (sector % 3 == 1 && sector < 3 * s1)
+                        || (sector % 3 == 2 && sector < 3 * s2));
+                    let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
+                    let idx = (tt * d + h * hd + i) as usize;
+                    if is_e {
+                        yd[idx] = xd[idx];
+                        yd[idx + half] = xd[idx + half];
+                    } else {
+                        let (c, s) = ((p * inv).cos(), (p * inv).sin());
+                        let (x0, x1) = (xd[idx], xd[idx + half]);
+                        yd[idx] = x0 * c - x1 * s;
+                        yd[idx + half] = x0 * s + x1 * c;
+                    }
+                }
+            }
+        }
+        self.from_cpu_f32(&yd, x.shape().to_vec())
+    }
+
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
 

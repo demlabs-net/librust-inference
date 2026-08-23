@@ -36,28 +36,38 @@ pub struct Qwen3Config {
     pub norm_eps: f32,
     /// Sliding-window attention (gemma-style); None = full causal context.
     pub swa_window: Option<usize>,
+    /// MROPE-секции (Qwen3-VL, IMROPE): [t, h, w, e] в парах; текст ротирует
+    /// t/h/w-пары позицией pos, e-пары — позицией 0 (не ротируются).
+    pub mrope_sections: Option<[usize; 4]>,
 }
 
 impl Qwen3Config {
     pub fn from_gguf(file: &GgufFile<'_>, vocab_size: usize) -> Result<Self, BackendError> {
+        // Qwen3 и Qwen3-VL (MROPE-текст = обычный rope с их freq_base).
+        let p = |s: &str| -> String {
+            if file.get("qwen3vl.block_count").is_some() {
+                format!("qwen3vl.{s}")
+            } else {
+                format!("qwen3.{s}")
+            }
+        };
         let u = |k: &str| -> Result<usize, BackendError> {
             file.get(k)
                 .and_then(GgufValue::as_u32)
                 .map(|v| v as usize)
                 .ok_or_else(|| BackendError::Shape(format!("missing {k}")))
         };
-        let dim = u("qwen3.embedding_length")?;
-        let n_heads = u("qwen3.attention.head_count")?;
-        let n_kv_heads = u("qwen3.attention.head_count_kv")?;
-        let ffn_dim = u("qwen3.feed_forward_length")?;
-        let n_layers = u("qwen3.block_count")?;
-        // head_dim: llama.cpp хранит его отдельно (qwen3.attention.key_length);
+        let dim = u(&p("embedding_length"))?;
+        let n_heads = u(&p("attention.head_count"))?;
+        let n_kv_heads = u(&p("attention.head_count_kv"))?;
+        let ffn_dim = u(&p("feed_forward_length"))?;
+        let n_layers = u(&p("block_count"))?;
+        // head_dim: llama.cpp хранит его отдельно (…attention.key_length);
         // fallback — dim/n_heads (classic).
-        let head_dim = u("qwen3.attention.key_length")
-            .unwrap_or(dim / n_heads);
+        let head_dim = u(&p("attention.key_length")).unwrap_or(dim / n_heads);
         let theta = file
-            .get("qwen3.rope.freq_base")
-            .or_else(|| file.get("qwen3.attention.rope_theta"))
+            .get(&p("rope.freq_base"))
+            .or_else(|| file.get(&p("attention.rope_theta")))
             .and_then(|v| match v {
                 GgufValue::F32(f) => Some(*f as f64),
                 GgufValue::F64(f) => Some(*f),
@@ -65,7 +75,7 @@ impl Qwen3Config {
             })
             .unwrap_or(1_000_000.0) as f32;
         let eps = file
-            .get("qwen3.attention.layer_norm_rms_epsilon")
+            .get(&p("attention.layer_norm_rms_epsilon"))
             .and_then(|v| match v {
                 GgufValue::F32(f) => Some(*f),
                 GgufValue::F64(f) => Some(*f as f32),
@@ -84,9 +94,19 @@ impl Qwen3Config {
             rope_max_seq: 8192,
             norm_eps: eps,
             swa_window: file
-                .get("qwen3.attention.sliding_window")
+                .get(&p("attention.sliding_window"))
                 .and_then(GgufValue::as_u32)
                 .map(|v| v as usize),
+            mrope_sections: file
+                .get(&p("rope.dimension_sections"))
+                .and_then(GgufValue::as_array)
+                .map(|arr| {
+                    let mut out = [0usize; 4];
+                    for (i, v) in arr.iter().take(4).enumerate() {
+                        out[i] = v.as_u32().unwrap_or(0) as usize;
+                    }
+                    out
+                }),
         })
     }
 }
@@ -313,8 +333,16 @@ impl Qwen3Model {
         } else {
             (q, k)
         };
-        let q = rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?;
-        let k = rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?;
+        let q = if let Some(sects) = cfg.mrope_sections {
+            backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?
+        } else {
+            rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?
+        };
+        let k = if let Some(sects) = cfg.mrope_sections {
+            backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?
+        } else {
+            rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?
+        };
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
         cache.update(backend, &k, &v)?;
@@ -448,6 +476,7 @@ mod tests {
             rope_max_seq: 128,
             norm_eps: 1e-6,
             swa_window: None,
+            mrope_sections: None,
         }
     }
 

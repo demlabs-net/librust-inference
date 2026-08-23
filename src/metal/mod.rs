@@ -1894,6 +1894,32 @@ impl crate::backend::Backend for MetalBackend {
         Ok(y)
     }
 
+    fn rope_mrope_text(
+        &self,
+        x: &crate::backend::Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let g = x.as_gpu();
+        let (tq, d) = (g.shape[1], g.shape[2]);
+        let y = GpuTensor::zeros(&self.ctx.device, vec![1, tq, d])?;
+        let grid = MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
+        let group = MTLSize::new(1, 1, 8);
+        self.ctx.run("rope_mrope_text_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&g.buffer), g.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(2, 8, (&tq as *const usize).cast());
+            enc.set_bytes(3, 8, (&d as *const usize).cast());
+            enc.set_bytes(4, 8, (&hd as *const usize).cast());
+            enc.set_bytes(5, 8, (&pos as *const usize).cast());
+            enc.set_bytes(6, 4, (&theta as *const f32).cast());
+            enc.set_bytes(7, 16, (sections.as_ptr() as *const u8).cast());
+        })?;
+        Ok(crate::backend::Tensor::from_gpu(y))
+    }
+
     fn zeros(
         &self,
         shape: Vec<usize>,

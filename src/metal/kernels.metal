@@ -1504,3 +1504,41 @@ kernel void embedding_override_f32(
         Y[(b * T + t) * D + d] = table[row * D + d];
     }
 }
+
+// ── Interleaved RoPE (Qwen2/Qwen3-VL IMROPE text): пары (2i, 2i+1) ────────
+kernel void rope_mrope_text_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& tq [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    constant uint& pos [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    constant uint4& sections [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, h = gid.y, i = gid.z;
+    if (t >= tq || h >= D / HD || i >= HD / 2) return;
+    // M-RoPE text: halves-пары; e-секция (4-я позиция = 0) не ротируется.
+    uint sect_dims = sections.x + sections.y + sections.z + sections.w;
+    if (sect_dims == 0u) sect_dims = 1u;
+    uint sector = i % sect_dims;
+    bool is_e = !((sector % 3u == 0u && sector < 3u * sections.x)
+               || (sector % 3u == 1u && sector < 3u * sections.y)
+               || (sector % 3u == 2u && sector < 3u * sections.z));
+    uint base = t * D + h * HD + i;
+    uint hhalf = HD / 2;
+    if (is_e) {
+        Y[base] = X[base];
+        Y[base + hhalf] = X[base + hhalf];
+        return;
+    }
+    float p = (float)(pos + t);
+    float inv = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
+    float c = cos(p * inv);
+    float s = sin(p * inv);
+    float x0 = X[base];
+    float x1 = X[base + hhalf];
+    Y[base] = x0 * c - x1 * s;
+    Y[base + hhalf] = x0 * s + x1 * c;
+}

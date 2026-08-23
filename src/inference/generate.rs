@@ -165,6 +165,7 @@ mod tests {
             rope_max_seq: 128,
             norm_eps: 1e-6,
             swa_window: None,
+            mrope_sections: None,
         };
         let mut rng: u64 = 0xC0FFEE;
         let mut next = || {

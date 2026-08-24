@@ -1,6 +1,7 @@
 //! gemm_nt_f16 для больших k (2048) и m>1 — сверка с CPU (Qwen3VL-размеры).
 //! cargo test --release --features metal --test gemm_nt_f16_big
 
+#![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::metal::MetalBackend;
 

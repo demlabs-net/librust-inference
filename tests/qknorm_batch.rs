@@ -1,4 +1,5 @@
 //! qk_norm (rmsnorm_head): rows=21 vs rows=1 — сверка строки (Metal).
+#![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::metal::MetalBackend;
 

@@ -1,4 +1,5 @@
 //! add_f32 для больших тензоров (21×2048) — сверка с CPU.
+#![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::metal::MetalBackend;
 

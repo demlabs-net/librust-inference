@@ -1,4 +1,5 @@
 //! gemm_nt_f16: честный эталон (b округлён до f16) — строки 0/10/20.
+#![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::metal::MetalBackend;
 

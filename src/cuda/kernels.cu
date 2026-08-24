@@ -980,18 +980,24 @@ extern "C" __global__ void NAME(                                           \
         for (int w = 0; w < nwarps; ++w) sc += sh_p[w][tk];                \
         float score = sc * scale;                                          \
         if (has_mask) score += mask[t * tkv + c0 + tk];                    \
-        float m_new = fmaxf(m, score);                                     \
-        float rescale = __expf(m - m_new);                                 \
-        sum *= rescale;                                                    \
-        acc *= rescale;                                                    \
-        float e = __expf(score - m_new);                                   \
-        sum += e;                                                          \
-        if (col < hd) {                                                    \
-            const VT* vrow = v + (bi * tkv + c0 + tk) * (kv_heads * hd) + kvh * hd; \
-            const float* vscrow = vsc + ((bi * tkv + c0 + tk) * kv_heads + kvh) * (hd >> 5); \
-            acc += e * KV_READ(VS, vrow, vscrow, col);                     \
+        /* Masked (-inf) positions contribute nothing. Skipping them also  \
+           avoids expf(-inf - -inf) = NaN when CONSECUTIVE masked keys     \
+           follow an unmasked max (online-softmax rescale degenerates);    \
+           the first finite score initializes m. */                        \
+        if (score > -INFINITY) {                                           \
+            float m_new = fmaxf(m, score);                                 \
+            float rescale = __expf(m - m_new);                             \
+            sum *= rescale;                                                \
+            acc *= rescale;                                                \
+            float e = __expf(score - m_new);                               \
+            sum += e;                                                      \
+            if (col < hd) {                                                \
+                const VT* vrow = v + (bi * tkv + c0 + tk) * (kv_heads * hd) + kvh * hd; \
+                const float* vscrow = vsc + ((bi * tkv + c0 + tk) * kv_heads + kvh) * (hd >> 5); \
+                acc += e * KV_READ(VS, vrow, vscrow, col);                 \
+            }                                                              \
+            m = m_new;                                                     \
         }                                                                  \
-        m = m_new;                                                         \
     }                                                                      \
     float* slot = part + ((((bi * tq + t) * n_heads + hh) * nchunks + chunk) * nwarps + warp) * 34; \
     slot[0] = m;                                                           \

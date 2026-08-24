@@ -1,4 +1,5 @@
 //! rmsnorm (обычный): rows=21 vs rows=1 — сверка строки.
+#![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::metal::MetalBackend;
 

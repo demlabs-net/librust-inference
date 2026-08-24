@@ -1,4 +1,5 @@
 //! slice_last для qkv [21, 4096]: q (0, 2048), k (2048, 1024), v (3072, 1024).
+#![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::metal::MetalBackend;
 

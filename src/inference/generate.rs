@@ -166,6 +166,7 @@ mod tests {
             norm_eps: 1e-6,
             swa_window: None,
             mrope_sections: None,
+            n_deepstack: None,
         };
         let mut rng: u64 = 0xC0FFEE;
         let mut next = || {

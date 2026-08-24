@@ -66,6 +66,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let norm0 = (v[..2048].iter().map(|x| (x * x) as f64).sum::<f64>()).sqrt();
     println!("rust row0[0..16]: {row0:?}");
     println!("rust norm row0: {norm0:.4}");
+    if std::env::var("VISION_DUMP").is_ok() {
+        // полный выход для сверки с python-эталоном (vision_py.npy)
+        let mut out = String::new();
+        for val in v.iter().take(2304 * 2048) {
+            out.push_str(&format!("{val:.9}\n"));
+        }
+        std::fs::write("/tmp/vision_rust.txt", out)?;
+        println!("dumped /tmp/vision_rust.txt");
+    }
     println!("VISION SMOKE OK");
     let _ = rust_inference::vision_qwen3vl::merge_2x2(&[], 0, 0); // keep import
     let _ = rust_inference::vision_qwen3vl::group4(&[], 0, 0);

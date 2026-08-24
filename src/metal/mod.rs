@@ -121,6 +121,8 @@ impl GpuTensor {
             // would be UB, fail loudly instead.
             return Err(MetalError::BufferAlloc);
         }
+        let buffer = buffer.clone(); // retain (см. zeros)
+        let buffer = buffer.clone(); // второй retain: анти-use-after-free
         Ok(Self {
             buffer,
             shape,
@@ -141,6 +143,9 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
+        let buffer = buffer.clone(); // retain (см. zeros)
+        let buffer = buffer.clone(); // второй retain: Metal может вернуть
+        // память autoreleased-буферов при живом тензоре (use-after-free)
         Ok(Self {
             buffer,
             shape,
@@ -166,6 +171,7 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
+        let buffer = buffer.clone(); // retain (см. zeros)
         Ok(Self {
             buffer,
             shape,
@@ -190,6 +196,7 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
+        let buffer = buffer.clone(); // retain (см. zeros)
         Ok(Self {
             buffer,
             shape,
@@ -234,6 +241,7 @@ impl GpuTensor {
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
+        let buffer = buffer.clone(); // retain (см. zeros)
         Ok(Self {
             buffer,
             shape,
@@ -376,7 +384,9 @@ impl MetalCtx {
             "slice_last_f32",
             "slice_time_f32",
             "codebook_search_f32",
-            "attn_ar_f32",
+            "attn_scores_f32",
+            "attn_softmax_f32",
+            "attn_out_f32",
             "kv_update_f32",
             "rmsnorm_head_f32",
             "mul_rows_f32",
@@ -451,6 +461,10 @@ impl MetalCtx {
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            let status = cmd.status();
+            if status != metal::MTLCommandBufferStatus::Completed {
+                tracing::error!(kernel, status = ?status, "Metal kernel failed");
+            }
             Ok(())
         })
     }
@@ -1584,8 +1598,15 @@ impl MetalCtx {
             bytes,
             MTLResourceOptions::StorageModeShared,
         );
+        let idx_buf = idx_buf.clone(); // retain
         let grid = MTLSize::new(1, t as u64, d as u64);
         let group = MTLSize::new(1, 4, 8);
+        if std::env::var("Q3_DBG_X20").is_ok() {
+            eprintln!("Q3_DBG embed y={} table={} idx={} t={t}",
+                y.buffer.contents() as usize,
+                table.buffer.contents() as usize,
+                idx_buf.contents() as usize);
+        }
         self.run("embedding_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&idx_buf), 0);
             enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
@@ -1675,6 +1696,7 @@ impl MetalCtx {
             bytes,
             MTLResourceOptions::StorageModeShared,
         );
+        let idx_buf = idx_buf.clone(); // retain
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
         self.run("codebook_search_f32", grid, group, |enc| {
@@ -1715,21 +1737,43 @@ impl MetalCtx {
         let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
         let tkv = k.shape[1];
         let n_rep = n_heads / kv_heads;
-        let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
-        let group = MTLSize::new(1, 1, 1);
-        self.run("attn_ar_f32", grid, group, |enc| {
+        let scores = GpuTensor::zeros(&self.device, vec![b, tq, tkv])?;
+        if std::env::var("Q3_PTRS").is_ok() {
+            eprintln!("Q3_PTRS mask={:?} scores={:?}", mask.map(|m| m.buffer.contents() as usize), scores.buffer.contents() as usize);
+        }
+        let grid1 = MTLSize::new(tkv as u64, (b * tq) as u64, n_heads as u64);
+        self.run("attn_scores_f32", grid1, MTLSize::new(8, 4, 1), |enc| {
             enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
             enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
-            enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
-            enc.set_buffer(3, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
-            enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
+            enc.set_buffer(2, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
+            enc.set_buffer(3, Some(&scores.buffer), scores.offset as u64);
             for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
                 .iter()
                 .enumerate()
             {
-                enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
+                enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
             }
-        })
+        })?;
+        let grid2 = MTLSize::new((b * tq) as u64, n_heads as u64, 1);
+        self.run("attn_softmax_f32", grid2, MTLSize::new(1, 1, 1), |enc| {
+            enc.set_buffer(0, Some(&scores.buffer), scores.offset as u64);
+            for (i, v) in [tq, tkv, n_heads].iter().enumerate() {
+                enc.set_bytes((1 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })?;
+        let grid3 = MTLSize::new(hd as u64, (b * tq) as u64, n_heads as u64);
+        self.run("attn_out_f32", grid3, MTLSize::new(8, 4, 1), |enc| {
+            enc.set_buffer(0, Some(&scores.buffer), scores.offset as u64);
+            enc.set_buffer(1, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
+                .iter()
+                .enumerate()
+            {
+                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })?;
+        Ok(())
     }
 
     /// KV-cache update: dst (B,cap,D)[b, pos+t, d] = src (B,Tq,D)[b, t, d].
@@ -1763,7 +1807,8 @@ impl MetalCtx {
         let t = y.shape[1];
         let n = table.shape[0];
         let d = table.shape[1];
-        let v = vision.shape[0];
+        // число vision-строк: vision может быть [V, D] или [1, V, D]
+        let v = vision.shape.iter().product::<usize>() / d;
         if idx.len() != t {
             return Err(MetalError::Shape(format!(
                 "embedding_override: idx {} != T {t}",
@@ -1776,6 +1821,7 @@ impl MetalCtx {
             bytes,
             MTLResourceOptions::StorageModeShared,
         );
+        let idx_buf = idx_buf.clone(); // retain
         let grid = MTLSize::new(1, t as u64, d as u64);
         let group = MTLSize::new(1, 4, 8);
         self.run("embedding_override_f32", grid, group, |enc| {
@@ -1989,7 +2035,51 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(4, 8, (&hd as *const usize).cast());
             enc.set_bytes(5, 8, (&pos as *const usize).cast());
             enc.set_bytes(6, 4, (&theta as *const f32).cast());
-            enc.set_bytes(7, 16, (sections.as_ptr() as *const u8).cast());
+            let sects32: [u32; 4] = [
+                sections[0] as u32,
+                sections[1] as u32,
+                sections[2] as u32,
+                sections[3] as u32,
+            ];
+            enc.set_bytes(7, 16, (sects32.as_ptr() as *const u8).cast());
+        })?;
+        Ok(crate::backend::Tensor::from_gpu(y))
+    }
+
+    fn rope_mrope(
+        &self,
+        x: &crate::backend::Tensor,
+        pos4d: &[u32],
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let g = x.as_gpu();
+        let (tq, d) = (g.shape[1], g.shape[2]);
+        let y = GpuTensor::zeros(&self.ctx.device, vec![1, tq, d])?;
+        let grid = MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
+        let group = MTLSize::new(1, 1, 8);
+        let pos_buf = self.ctx.device.new_buffer_with_data(
+            pos4d.as_ptr().cast(),
+            (pos4d.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let pos_buf = pos_buf.clone(); // retain
+        self.ctx.run("rope_mrope_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&g.buffer), g.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(2, 8, (&tq as *const usize).cast());
+            enc.set_bytes(3, 8, (&d as *const usize).cast());
+            enc.set_bytes(4, 8, (&hd as *const usize).cast());
+            enc.set_buffer(5, Some(&pos_buf), 0);
+            enc.set_bytes(6, 4, (&theta as *const f32).cast());
+            let sects32: [u32; 4] = [
+                sections[0] as u32,
+                sections[1] as u32,
+                sections[2] as u32,
+                sections[3] as u32,
+            ];
+            enc.set_bytes(7, 16, (sects32.as_ptr() as *const u8).cast());
         })?;
         Ok(crate::backend::Tensor::from_gpu(y))
     }

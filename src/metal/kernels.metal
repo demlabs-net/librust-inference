@@ -1047,63 +1047,78 @@ kernel void kv_update_f32(
 // head h attends kv-head h / n_rep. scores scale = 1/sqrt(HD).
 // MASK: (B, Tq, Tkv) or null (generation: causal implicit — q row i sees
 // kv rows 0..=i).
-kernel void attn_ar_f32(
+// ── Fused attention (AR decode/prefill), 3 параллельных кернела ──────────
+kernel void attn_scores_f32(
     device const float* Q [[buffer(0)]],
     device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* MASK [[buffer(3)]],
-    device float* Y [[buffer(4)]],
-    constant uint& B [[buffer(5)]],
-    constant uint& Tq [[buffer(6)]],
-    constant uint& Tkv [[buffer(7)]],
-    constant uint& H [[buffer(8)]],
-    constant uint& KVH [[buffer(9)]],
-    constant uint& HD [[buffer(10)]],
-    constant uint& n_rep [[buffer(11)]],
+    device const float* MASK [[buffer(2)]],
+    device float* SCORES [[buffer(3)]],
+    constant uint& B [[buffer(4)]],
+    constant uint& Tq [[buffer(5)]],
+    constant uint& Tkv [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    constant uint& n_rep [[buffer(10)]],
     uint3 gid [[thread_position_in_grid]])
 {
-    uint b = gid.x, h = gid.y, t = gid.z;
-    if (b >= B || h >= H || t >= Tq) return;
+    uint j = gid.x, bt = gid.y, h = gid.z;
+    uint b = bt / Tq, t = bt % Tq;
+    if (b >= B || t >= Tq || h >= H || j >= Tkv) return;
     uint kvh = h / n_rep;
     uint D = H * HD;
     uint KVD = KVH * HD;
     const device float* qrow = Q + (b * Tq + t) * D + h * HD;
-    // all cached kv is visible; causality comes from MASK (prefill only)
-    uint kv_lim = Tkv;
+    const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
+    float acc = 0.0f;
+    for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
+    float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
+    SCORES[(b * Tq + t) * Tkv + j] = acc * (1.0f / sqrt((float)HD)) + m;
+}
+
+kernel void attn_softmax_f32(
+    device float* SCORES [[buffer(0)]],
+    constant uint& Tq [[buffer(1)]],
+    constant uint& Tkv [[buffer(2)]],
+    constant uint& H [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint bt = gid.x, h = gid.y;
+    if (bt >= Tq || h >= H) return;
+    const uint row = bt * Tkv;
     float mx = -INFINITY;
-    for (uint j = 0u; j < kv_lim; ++j) {
-        const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
-        float acc = 0.0f;
-        for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
-        float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-        float s = acc * (1.0f / sqrt((float)HD)) + m; // 1/sqrt(head_dim) — the runtime HD, not a hardcoded 128
-        if (s > mx) mx = s;
-        // stash raw scores in Y temporarily? no — recompute below
-    }
-    // recompute sums to avoid extra buffer: two passes over kv
+    for (uint j = 0u; j < Tkv; ++j) mx = max(mx, SCORES[row + j]);
     float sum = 0.0f;
-    for (uint j = 0u; j < kv_lim; ++j) {
-        const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
-        float acc = 0.0f;
-        for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
-        float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-        float s = acc * (1.0f / sqrt((float)HD)) + m;
-        sum += exp(s - mx);
+    for (uint j = 0u; j < Tkv; ++j) sum += exp(SCORES[row + j] - mx);
+    float inv = 1.0f / sum;
+    for (uint j = 0u; j < Tkv; ++j) SCORES[row + j] = exp(SCORES[row + j] - mx) * inv;
+}
+
+kernel void attn_out_f32(
+    device const float* SCORES [[buffer(0)]],
+    device const float* V [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& B [[buffer(3)]],
+    constant uint& Tq [[buffer(4)]],
+    constant uint& Tkv [[buffer(5)]],
+    constant uint& H [[buffer(6)]],
+    constant uint& KVH [[buffer(7)]],
+    constant uint& HD [[buffer(8)]],
+    constant uint& n_rep [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d = gid.x, bt = gid.y, h = gid.z;
+    uint b = bt / Tq, t = bt % Tq;
+    if (b >= B || t >= Tq || h >= H || d >= HD) return;
+    uint kvh = h / n_rep;
+    uint KVD = KVH * HD;
+    const uint row = (b * Tq + t) * Tkv;
+    const device float* vcol = V + (b * Tkv) * KVD + kvh * HD;
+    float acc = 0.0f;
+    for (uint j = 0u; j < Tkv; ++j) {
+        acc += SCORES[row + j] * vcol[j * KVD + d];
     }
-    device float* yrow = Y + (b * Tq + t) * D + h * HD;
-    for (uint d = 0u; d < HD; ++d) {
-        float acc = 0.0f;
-        for (uint j = 0u; j < kv_lim; ++j) {
-            const device float* vrow = V + (b * Tkv + j) * KVD + kvh * HD;
-            const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
-            float qk = 0.0f;
-            for (uint dd = 0u; dd < HD; ++dd) qk += qrow[dd] * krow[dd];
-            float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-            float s = qk * (1.0f / sqrt((float)HD)) + m;
-            acc += exp(s - mx) / sum * vrow[d];
-        }
-        yrow[d] = acc;
-    }
+    Y[(b * Tq + t) * (H * HD) + h * HD + d] = acc;
 }
 
 // ── RMSNorm per head: X (rows, H*HD) → Y, normalized per (row, head) ────────
@@ -1534,6 +1549,54 @@ kernel void rope_mrope_text_f32(
         return;
     }
     float p = (float)(pos + t);
+    float inv = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
+    float c = cos(p * inv);
+    float s = sin(p * inv);
+    float x0 = X[base];
+    float x1 = X[base + hhalf];
+    Y[base] = x0 * c - x1 * s;
+    Y[base + hhalf] = x0 * s + x1 * c;
+}
+
+// ── M-RoPE per-token 4D (Qwen3-VL IMROPE, картинки): как rope_mrope_text,
+// но позиция на токен из буфера POS4D [tq*4] = (t,h,w,e); e-категория не
+// ротируется. Позиции в llama.cpp mtmd для картинки: t=pos_0, h=pos_0+i/nx,
+// w=pos_0+i%nx, e=0; для текста t=h=w=pos.
+kernel void rope_mrope_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& tq [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    device const uint* POS4D [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    constant uint4& sections [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, h = gid.y, i = gid.z;
+    if (t >= tq || h >= D / HD || i >= HD / 2) return;
+    uint sect_dims = sections.x + sections.y + sections.z + sections.w;
+    if (sect_dims == 0u) sect_dims = 1u;
+    uint sector = i % sect_dims;
+    uint pos = 0u;
+    bool is_e;
+    if (sector % 3u == 0u && sector < 3u * sections.x) {
+        pos = POS4D[t * 4u + 0u]; is_e = false;
+    } else if (sector % 3u == 1u && sector < 3u * sections.y) {
+        pos = POS4D[t * 4u + 1u]; is_e = false;
+    } else if (sector % 3u == 2u && sector < 3u * sections.z) {
+        pos = POS4D[t * 4u + 2u]; is_e = false;
+    } else {
+        is_e = true;
+    }
+    uint base = t * D + h * HD + i;
+    uint hhalf = HD / 2;
+    if (is_e) {
+        Y[base] = X[base];
+        Y[base + hhalf] = X[base + hhalf];
+        return;
+    }
+    float p = (float)pos;
     float inv = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
     float c = cos(p * inv);
     float s = sin(p * inv);

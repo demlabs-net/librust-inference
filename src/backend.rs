@@ -635,6 +635,23 @@ pub trait Backend: Send + Sync {
         self.from_cpu_f32(&yd, x.shape().to_vec())
     }
 
+    /// Deepstack (Qwen3-VL): y[t] = x[t] + embd[t+shift] (для t+shift < T).
+    fn deepstack(&self, x: &Tensor, embd: &Tensor, shift: usize) -> Result<Tensor, BackendError> {
+        let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let xv = self.to_cpu_f32(x)?;
+        let ev = self.to_cpu_f32(embd)?;
+        let mut y = xv.clone();
+        for tt in 0..t {
+            let src = tt + shift;
+            if src < t {
+                for dd in 0..d {
+                    y[tt * d + dd] += ev[src * d + dd];
+                }
+            }
+        }
+        self.from_cpu_f32(&y, vec![b, t, d])
+    }
+
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
 

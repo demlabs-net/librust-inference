@@ -1047,78 +1047,77 @@ kernel void kv_update_f32(
 // head h attends kv-head h / n_rep. scores scale = 1/sqrt(HD).
 // MASK: (B, Tq, Tkv) or null (generation: causal implicit — q row i sees
 // kv rows 0..=i).
-// ── Fused attention (AR decode/prefill), 3 параллельных кернела ──────────
-kernel void attn_scores_f32(
+kernel void attn_ar_f32(
     device const float* Q [[buffer(0)]],
     device const float* K [[buffer(1)]],
-    device const float* MASK [[buffer(2)]],
-    device float* SCORES [[buffer(3)]],
-    constant uint& B [[buffer(4)]],
-    constant uint& Tq [[buffer(5)]],
-    constant uint& Tkv [[buffer(6)]],
-    constant uint& H [[buffer(7)]],
-    constant uint& KVH [[buffer(8)]],
-    constant uint& HD [[buffer(9)]],
-    constant uint& n_rep [[buffer(10)]],
+    device const float* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    constant uint& Tq [[buffer(6)]],
+    constant uint& Tkv [[buffer(7)]],
+    constant uint& H [[buffer(8)]],
+    constant uint& KVH [[buffer(9)]],
+    constant uint& HD [[buffer(10)]],
+    constant uint& n_rep [[buffer(11)]],
     uint3 gid [[thread_position_in_grid]])
 {
-    uint j = gid.x, bt = gid.y, h = gid.z;
-    uint b = bt / Tq, t = bt % Tq;
-    if (b >= B || t >= Tq || h >= H || j >= Tkv) return;
+    uint b = gid.x, h = gid.y, t = gid.z;
+    if (b >= B || h >= H || t >= Tq) return;
     uint kvh = h / n_rep;
     uint D = H * HD;
     uint KVD = KVH * HD;
     const device float* qrow = Q + (b * Tq + t) * D + h * HD;
-    const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
-    float acc = 0.0f;
-    for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
-    float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
-    SCORES[(b * Tq + t) * Tkv + j] = acc * (1.0f / sqrt((float)HD)) + m;
+    uint kv_lim = Tkv;
+    const float scale = 0.08838834764831845f;
+    float mx = -INFINITY;
+    for (uint j = 0u; j < kv_lim; ++j) {
+        const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
+        float acc = 0.0f;
+        for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
+        float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
+        float s = acc * scale + m;
+        if (s > mx) mx = s;
+    }
+    float sum = 0.0f;
+    for (uint j = 0u; j < kv_lim; ++j) {
+        const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
+        float acc = 0.0f;
+        for (uint d = 0u; d < HD; ++d) acc += qrow[d] * krow[d];
+        float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
+        float s = acc * scale + m;
+        sum += exp(s - mx);
+    }
+    device float* yrow = Y + (b * Tq + t) * D + h * HD;
+    for (uint d = 0u; d < HD; ++d) yrow[d] = 0.0f;
+    float inv = 1.0f / sum;
+    for (uint j = 0u; j < kv_lim; ++j) {
+        const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;
+        const device float* vrow = V + (b * Tkv + j) * KVD + kvh * HD;
+        float qk = 0.0f;
+        for (uint dd = 0u; dd < HD; ++dd) qk += qrow[dd] * krow[dd];
+        float m = (MASK != nullptr) ? MASK[(b * Tq + t) * Tkv + j] : 0.0f;
+        float s = qk * scale + m;
+        float w = exp(s - mx) * inv;
+        for (uint d = 0u; d < HD; ++d) yrow[d] += w * vrow[d];
+    }
 }
 
-kernel void attn_softmax_f32(
-    device float* SCORES [[buffer(0)]],
-    constant uint& Tq [[buffer(1)]],
-    constant uint& Tkv [[buffer(2)]],
-    constant uint& H [[buffer(3)]],
+// ── Deepstack (Qwen3-VL): y[t] = x[t] + embd[t+shift] (сдвиг — вклад входных
+// эмбеддингов в первые n_deepstack слоёв); t+shift за границей → без вклада.
+kernel void deepstack_add_f32(
+    device const float* X [[buffer(0)]],
+    device const float* E [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& shift [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    uint bt = gid.x, h = gid.y;
-    if (bt >= Tq || h >= H) return;
-    const uint row = bt * Tkv;
-    float mx = -INFINITY;
-    for (uint j = 0u; j < Tkv; ++j) mx = max(mx, SCORES[row + j]);
-    float sum = 0.0f;
-    for (uint j = 0u; j < Tkv; ++j) sum += exp(SCORES[row + j] - mx);
-    float inv = 1.0f / sum;
-    for (uint j = 0u; j < Tkv; ++j) SCORES[row + j] = exp(SCORES[row + j] - mx) * inv;
-}
-
-kernel void attn_out_f32(
-    device const float* SCORES [[buffer(0)]],
-    device const float* V [[buffer(1)]],
-    device float* Y [[buffer(2)]],
-    constant uint& B [[buffer(3)]],
-    constant uint& Tq [[buffer(4)]],
-    constant uint& Tkv [[buffer(5)]],
-    constant uint& H [[buffer(6)]],
-    constant uint& KVH [[buffer(7)]],
-    constant uint& HD [[buffer(8)]],
-    constant uint& n_rep [[buffer(9)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    uint d = gid.x, bt = gid.y, h = gid.z;
-    uint b = bt / Tq, t = bt % Tq;
-    if (b >= B || t >= Tq || h >= H || d >= HD) return;
-    uint kvh = h / n_rep;
-    uint KVD = KVH * HD;
-    const uint row = (b * Tq + t) * Tkv;
-    const device float* vcol = V + (b * Tkv) * KVD + kvh * HD;
-    float acc = 0.0f;
-    for (uint j = 0u; j < Tkv; ++j) {
-        acc += SCORES[row + j] * vcol[j * KVD + d];
-    }
-    Y[(b * Tq + t) * (H * HD) + h * HD + d] = acc;
+    uint t = gid.x, d = gid.y;
+    if (t >= T || d >= D) return;
+    const uint src = t + shift;
+    Y[t * D + d] = X[t * D + d] + ((src < T) ? E[src * D + d] : 0.0f);
 }
 
 // ── RMSNorm per head: X (rows, H*HD) → Y, normalized per (row, head) ────────

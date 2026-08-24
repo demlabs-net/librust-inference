@@ -19,6 +19,7 @@
 
 use metal::*;
 use objc::rc::autoreleasepool;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -384,9 +385,8 @@ impl MetalCtx {
             "slice_last_f32",
             "slice_time_f32",
             "codebook_search_f32",
-            "attn_scores_f32",
-            "attn_softmax_f32",
-            "attn_out_f32",
+            "deepstack_add_f32",
+            "attn_ar_f32",
             "kv_update_f32",
             "rmsnorm_head_f32",
             "mul_rows_f32",
@@ -1601,12 +1601,6 @@ impl MetalCtx {
         let idx_buf = idx_buf.clone(); // retain
         let grid = MTLSize::new(1, t as u64, d as u64);
         let group = MTLSize::new(1, 4, 8);
-        if std::env::var("Q3_DBG_X20").is_ok() {
-            eprintln!("Q3_DBG embed y={} table={} idx={} t={t}",
-                y.buffer.contents() as usize,
-                table.buffer.contents() as usize,
-                idx_buf.contents() as usize);
-        }
         self.run("embedding_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&idx_buf), 0);
             enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
@@ -1721,6 +1715,26 @@ impl MetalCtx {
     }
 
     /// GQA attention with KV cache: q (B,Tq,H*HD), k/v (B,Tkv,KVH*HD),
+    /// Deepstack: y[t] = x[t] + embd[t+shift] (vision-путь Qwen3-VL).
+    pub fn deepstack_add_f32(
+        &self,
+        x: &GpuTensor,
+        embd: &GpuTensor,
+        shift: usize,
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let (t, d) = (x.shape[1], x.shape[2]);
+        let grid = MTLSize::new(t as u64, d as u64, 1);
+        self.run("deepstack_add_f32", grid, MTLSize::new(16, 8, 1), |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&embd.buffer), embd.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+            for (i, v) in [t, shift, d].iter().enumerate() {
+                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })
+    }
+
     /// y (B,Tq,H*HD). Mask (B,Tq,Tkv) or None (generation, causal).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_ar_f32(
@@ -1737,40 +1751,19 @@ impl MetalCtx {
         let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
         let tkv = k.shape[1];
         let n_rep = n_heads / kv_heads;
-        let scores = GpuTensor::zeros(&self.device, vec![b, tq, tkv])?;
-        if std::env::var("Q3_PTRS").is_ok() {
-            eprintln!("Q3_PTRS mask={:?} scores={:?}", mask.map(|m| m.buffer.contents() as usize), scores.buffer.contents() as usize);
-        }
-        let grid1 = MTLSize::new(tkv as u64, (b * tq) as u64, n_heads as u64);
-        self.run("attn_scores_f32", grid1, MTLSize::new(8, 4, 1), |enc| {
+        let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
+        let group = MTLSize::new(1, 1, 1);
+        self.run("attn_ar_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
             enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
-            enc.set_buffer(2, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
-            enc.set_buffer(3, Some(&scores.buffer), scores.offset as u64);
+            enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(3, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
+            enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
                 .iter()
                 .enumerate()
             {
-                enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
-            }
-        })?;
-        let grid2 = MTLSize::new((b * tq) as u64, n_heads as u64, 1);
-        self.run("attn_softmax_f32", grid2, MTLSize::new(1, 1, 1), |enc| {
-            enc.set_buffer(0, Some(&scores.buffer), scores.offset as u64);
-            for (i, v) in [tq, tkv, n_heads].iter().enumerate() {
-                enc.set_bytes((1 + i) as u64, 8, (v as *const usize).cast());
-            }
-        })?;
-        let grid3 = MTLSize::new(hd as u64, (b * tq) as u64, n_heads as u64);
-        self.run("attn_out_f32", grid3, MTLSize::new(8, 4, 1), |enc| {
-            enc.set_buffer(0, Some(&scores.buffer), scores.offset as u64);
-            enc.set_buffer(1, Some(&v.buffer), v.offset as u64);
-            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
-            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
-                .iter()
-                .enumerate()
-            {
-                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
+                enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
             }
         })?;
         Ok(())
@@ -2138,6 +2131,17 @@ impl crate::backend::Backend for MetalBackend {
         t: &crate::backend::Tensor,
     ) -> Result<Vec<f32>, crate::error::BackendError> {
         Ok(t.as_gpu().to_cpu_f32(&self.ctx)?)
+    }
+
+    fn deepstack(
+        &self,
+        x: &crate::backend::Tensor,
+        embd: &crate::backend::Tensor,
+        shift: usize,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let y = GpuTensor::zeros(&self.ctx.device, x.as_gpu().shape.clone())?;
+        self.ctx.deepstack_add_f32(x.as_gpu(), embd.as_gpu(), shift, &y)?;
+        Ok(crate::backend::Tensor::from_gpu(y))
     }
 
     fn begin_batch(&self) -> Result<(), crate::error::BackendError> {

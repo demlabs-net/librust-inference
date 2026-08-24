@@ -55,34 +55,6 @@ impl Linear {
         let out = self.w.shape()[0];
         let x2 = view2(x);
         let y = backend.zeros(vec![b * t, out])?;
-        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
-        // backends must still compile (Linux cpu/cuda builds).
-        #[cfg(feature = "metal")]
-        if std::env::var("Q3_DBG_X20").is_ok() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static LIN_COUNT: AtomicUsize = AtomicUsize::new(0);
-            let c = LIN_COUNT.fetch_add(1, Ordering::Relaxed);
-            eprintln!("Q3_DBG L{c} y={} x={} w={}",
-                y.as_gpu().buffer.contents() as usize,
-                x.as_gpu().buffer.contents() as usize,
-                self.w.as_gpu().buffer.contents() as usize);
-            let xv = backend.to_cpu_f32(&x2)?;
-            if xv.iter().take(8).any(|&v| v.abs() > 2.0) {
-                eprintln!("Q3_DBG ANOM L{c} x={} y={} w={} x2[0..8]: {:?}",
-                    x.as_gpu().buffer.contents() as usize,
-                    y.as_gpu().buffer.contents() as usize,
-                    self.w.as_gpu().buffer.contents() as usize,
-                    &xv[..8.min(xv.len())]);
-            }
-            if c == 0 {
-                eprintln!("Q3_DBG linear x2 (c={c}) tok0  [0..8]: {:?}", &xv[..8]);
-                let d = x2.shape()[1];
-                if x2.shape()[0] > 20 {
-                    eprintln!("Q3_DBG linear x2 (c={c}) tok20 [{}..]: {:?}",
-                        20 * d, &xv[20 * d..20 * d + 8]);
-                }
-            }
-        }
         backend.gemm_nt(&x2, &self.w, &y)?;
         if let Some(bias) = &self.b {
             backend.add_bias(&y, bias, &y)?;
@@ -113,41 +85,7 @@ impl RmsNorm {
     pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let y = backend.zeros(vec![b * t, d])?;
-        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
-        // backends must still compile (Linux cpu/cuda builds).
-        #[cfg(feature = "metal")]
-        if std::env::var("Q3_DBG_X20").is_ok() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static RN_COUNT: AtomicUsize = AtomicUsize::new(0);
-            let c = RN_COUNT.fetch_add(1, Ordering::Relaxed);
-            if c == 0 {
-                let xv = backend.to_cpu_f32(&view2(x))?;
-                eprintln!("Q3_DBG rmsnorm prefill c0 x={} y={} x[0..4]: {:?}",
-                    x.as_gpu().buffer.contents() as usize,
-                    y.as_gpu().buffer.contents() as usize,
-                    &xv[..4]);
-            }
-            eprintln!("Q3_DBG rmsnorm c{c} y={} x={}",
-                y.as_gpu().buffer.contents() as usize,
-                x.as_gpu().buffer.contents() as usize);
-        }
         backend.rmsnorm(&view2(x), &self.w, &y, self.eps)?;
-        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
-        // backends must still compile (Linux cpu/cuda builds).
-        #[cfg(feature = "metal")]
-        if std::env::var("Q3_DBG_X20").is_ok() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static RN2_COUNT: AtomicUsize = AtomicUsize::new(0);
-            let c = RN2_COUNT.fetch_add(1, Ordering::Relaxed);
-            if c == 0 || c == 57 {
-                let yv = backend.to_cpu_f32(&y)?;
-                eprintln!("Q3_DBG rmsnorm y2 c{c} [0..4]: {:?}", &yv[..4]);
-            }
-            let yv2 = backend.to_cpu_f32(&y)?;
-            if yv2.iter().take(8).any(|&v| v.abs() > 2.0) {
-                eprintln!("Q3_DBG ANOM R{c} y2[0..8]: {:?}", &yv2[..8]);
-            }
-        }
         Ok(view3(&y, b, t, d))
     }
 }

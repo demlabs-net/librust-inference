@@ -1823,7 +1823,7 @@ DEFINE_Q8K_SPLITK(bf16, __nv_bfloat16)
 #define DEFINE_HALFW_SPLITK(ASUF, BSUF, AT, BT)                               \
 extern "C" __global__ void gemm_halfw_splitk_##ASUF##_##BSUF(                 \
     const AT* __restrict__ A,          /* (m, k) row-major activations */     \
-    const BT* __restrict__ B,          /* (n, k) row-major weights */         \
+    const BT* __restrict__ B,          /* kb-major (kb·n + col)·32 halves */  \
     float* __restrict__ Cpart,         /* (S·m, n) */                         \
     int k, int n, int S, int m)                                               \
 {                                                                             \
@@ -1836,11 +1836,11 @@ extern "C" __global__ void gemm_halfw_splitk_##ASUF##_##BSUF(                 \
     float acc = 0.0f;                                                         \
     if (col < n) {                                                            \
         const AT* arow = A + (size_t)row * k;                                 \
-        const BT* brow = B + (size_t)col * k;                                 \
         _Pragma("unroll 4")                                                   \
         for (int t = 0; t < (ks >> 5); ++t) {                                 \
-            const AT* aseg = arow + (size_t)(kb0 + t) * 32;                   \
-            const BT* bseg = brow + (size_t)(kb0 + t) * 32;                   \
+            int kb = kb0 + t;                                                 \
+            const AT* aseg = arow + (size_t)kb * 32;                          \
+            const BT* bseg = B + ((size_t)kb * n + col) * 32;                 \
             const uint4* bv = (const uint4*)bseg;                             \
             _Pragma("unroll 4")                                               \
             for (int v = 0; v < 4; ++v) {                                     \
@@ -1878,7 +1878,7 @@ DEFINE_HALFW_SPLITK(bf16, bf16, __nv_bfloat16, __nv_bfloat16)
 #define DEFINE_HALFW_TILED(ASUF, BSUF, AT, BT)                                \
 extern "C" __global__ void gemm_halfw_tiled_##ASUF##_##BSUF(                  \
     const AT* __restrict__ A,          /* (m, k) row-major activations */     \
-    const BT* __restrict__ B,          /* (n, k) row-major weights */         \
+    const BT* __restrict__ B,          /* kb-major (kb·n + col)·32 halves */  \
     float* __restrict__ Cpart,         /* (S·m, n) — grid.z k-slices */        \
     int m, int k, int n)                                                      \
 {                                                                             \
@@ -1891,7 +1891,7 @@ extern "C" __global__ void gemm_halfw_tiled_##ASUF##_##BSUF(                  \
     int col0 = blockIdx.x * BN;                                               \
     int r0 = blockIdx.y * BM;                                                 \
     int nsup = k >> 5;                                                        \
-    int nkz = (nsup + 3) >> 2;      /* k-split: grid.z=4 quadruples grid */   \
+    int nkz = (nsup + 7) >> 3;      /* k-split: grid.z=8 multiplies grid */   \
     int kb0 = blockIdx.z * nkz;                                               \
     if (kb0 >= nsup) return;                                                  \
     int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \
@@ -1899,7 +1899,7 @@ extern "C" __global__ void gemm_halfw_tiled_##ASUF##_##BSUF(                  \
     for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                           \
     for (int kb = kb0; kb < kb1; ++kb) {                                      \
         if (col0 + tid < n) {                                                 \
-            const BT* brow = B + (size_t)(col0 + tid) * k + kb * 32;          \
+            const BT* brow = B + ((size_t)kb * n + col0 + tid) * 32;          \
             const uint4* bv = (const uint4*)brow;                             \
             _Pragma("unroll")                                                 \
             for (int v = 0; v < 4; ++v) {                                     \
@@ -1974,7 +1974,7 @@ extern "C" __global__ void gemm_q8k_tiled_##SUF(                              \
     int col0 = blockIdx.x * BN;                                               \
     int r0 = blockIdx.y * BM;                                                 \
     int nsup = k >> 5;                                                        \
-    int nkz = (nsup + 3) >> 2;      /* k-split: grid.z=4 quadruples grid */   \
+    int nkz = (nsup + 7) >> 3;      /* k-split: grid.z=8 multiplies grid */   \
     int kb0 = blockIdx.z * nkz;                                               \
     if (kb0 >= nsup) return;                                                  \
     int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \

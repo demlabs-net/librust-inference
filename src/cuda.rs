@@ -276,15 +276,15 @@ impl CudaBackend {
             _ => KernA::F32(a),
         };
         if m > 1 {
-            // Tiled: 32 rows × 256 cols per block, grid.z=4 splits k into
-            // (4·m, n) partials — combined by gemm_i8_reduce. The z-slices
+            // Tiled: 32 rows × 256 cols per block, grid.z=8 splits k into
+            // (8·m, n) partials — combined by gemm_i8_reduce. The z-slices
             // write disjoint (row, col) tiles, so every element is summed
-            // 4× in a fixed order — deterministic.
-            let s4 = 4usize;
-            let cpart = self.take_pooled(s4 * m * n)?;
+            // 8× in a fixed order — deterministic.
+            let s8 = 8usize;
+            let cpart = self.take_pooled(s8 * m * n)?;
             let f = self.function(tiled_name)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 4),
+                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 8),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -310,18 +310,18 @@ impl CudaBackend {
             la.arg(&cpart);
             la.arg(c);
             la.arg(&n32);
-            let s4i = 4i32;
-            la.arg(&s4i);
+            let s8i = 8i32;
+            la.arg(&s8i);
             la.arg(&m32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool.lock().unwrap().entry(s4 * m * n).or_default().push(cpart);
+            self.pool.lock().unwrap().entry(s8 * m * n).or_default().push(cpart);
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
         let nblk = k / 32;
         let s = [32usize, 16, 8, 4, 2, 1]
             .into_iter()
-            .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
+            .find(|&s| nblk % s == 0)
             .unwrap_or(1);
         let cpart = self.take_pooled(s * m * n)?;
         let f = self.function(splitk_name)?;
@@ -498,8 +498,31 @@ impl Backend for CudaBackend {
                 data.len()
             )));
         }
+        // Half WEIGHTS are stored kb-major — block (kb, col) = 32 contiguous
+        // halves at (kb·rows + col)·32, the same packing as the int8 path:
+        // 4 neighbouring columns share one 128 B L1 line per k-block, while
+        // row-major pulls a separate line per column (measured 30-50% DRAM/
+        // L2 efficiency on the big lmh/w12 forms vs 85%+ kb-major).
+        // Non-2D tensors and k%32!=0 shapes (biases, non-GEMM uses) stay
+        // raw row-major — consumers must agree on the layout.
+        let packed: std::borrow::Cow<[half::f16]> =
+            if shape.len() == 2 && n > 0 && shape[1] % 32 == 0 {
+                let (rows, per) = (shape[0], shape[1]);
+                let nblk = per / 32;
+                let mut p = vec![half::f16::default(); n];
+                for r in 0..rows {
+                    for b in 0..nblk {
+                        for j in 0..32 {
+                            p[(b * rows + r) * 32 + j] = data[r * per + b * 32 + j];
+                        }
+                    }
+                }
+                std::borrow::Cow::Owned(p)
+            } else {
+                std::borrow::Cow::Borrowed(data)
+            };
         let mut s = unsafe { self.stream.alloc::<half::f16>(n) }.map_err(map_err)?;
-        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        self.stream.memcpy_htod(packed.as_ref(), &mut s).map_err(map_err)?;
         Ok(Tensor::from_cuda_f16(s, shape))
     }
 
@@ -515,8 +538,24 @@ impl Backend for CudaBackend {
                 data.len()
             )));
         }
+        let packed: std::borrow::Cow<[half::bf16]> =
+            if shape.len() == 2 && n > 0 && shape[1] % 32 == 0 {
+                let (rows, per) = (shape[0], shape[1]);
+                let nblk = per / 32;
+                let mut p = vec![half::bf16::default(); n];
+                for r in 0..rows {
+                    for b in 0..nblk {
+                        for j in 0..32 {
+                            p[(b * rows + r) * 32 + j] = data[r * per + b * 32 + j];
+                        }
+                    }
+                }
+                std::borrow::Cow::Owned(p)
+            } else {
+                std::borrow::Cow::Borrowed(data)
+            };
         let mut s = unsafe { self.stream.alloc::<half::bf16>(n) }.map_err(map_err)?;
-        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        self.stream.memcpy_htod(packed.as_ref(), &mut s).map_err(map_err)?;
         Ok(Tensor::from_cuda_bf16(s, shape))
     }
 
@@ -581,15 +620,49 @@ impl Backend for CudaBackend {
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
         // raw bits and widens on the CPU — same result as a device-side cast.
-        // q8_0 (CudaI8) dequantizes with its per-32-block scales.
+        // Half weights are kb-major (from_cpu_*) — un-packed back to the
+        // standard row-major layout here. q8_0 (CudaI8) dequantizes with
+        // its per-32-block scales.
         match &t.inner {
             crate::backend::TensorInner::CudaF16(b) => {
                 let raw: Vec<half::f16> = self.stream.clone_dtoh(b).map_err(map_err)?;
-                Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                let shape = t.shape();
+                if shape.len() == 2 && !raw.is_empty() && shape[1] % 32 == 0 {
+                    let (rows, per) = (shape[0], shape[1]);
+                    let nblk = per / 32;
+                    let mut out = vec![0f32; raw.len()];
+                    for r in 0..rows {
+                        for b in 0..nblk {
+                            for j in 0..32 {
+                                out[r * per + b * 32 + j] =
+                                    f32::from(raw[(b * rows + r) * 32 + j]);
+                            }
+                        }
+                    }
+                    Ok(out)
+                } else {
+                    Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                }
             }
             crate::backend::TensorInner::CudaBF16(b) => {
                 let raw: Vec<half::bf16> = self.stream.clone_dtoh(b).map_err(map_err)?;
-                Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                let shape = t.shape();
+                if shape.len() == 2 && !raw.is_empty() && shape[1] % 32 == 0 {
+                    let (rows, per) = (shape[0], shape[1]);
+                    let nblk = per / 32;
+                    let mut out = vec![0f32; raw.len()];
+                    for r in 0..rows {
+                        for b in 0..nblk {
+                            for j in 0..32 {
+                                out[r * per + b * 32 + j] =
+                                    f32::from(raw[(b * rows + r) * 32 + j]);
+                            }
+                        }
+                    }
+                    Ok(out)
+                } else {
+                    Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                }
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
                 let raw: Vec<i8> = self.stream.clone_dtoh(data).map_err(map_err)?;
@@ -753,11 +826,11 @@ impl Backend for CudaBackend {
                 _ => KernA::F32(a),
             };
             if m > 1 {
-                let s4 = 4usize;
-                let cpart = self.take_pooled(s4 * m * n)?;
+                let s8 = 8usize;
+                let cpart = self.take_pooled(s8 * m * n)?;
                 let f = self.function(tiled_name)?;
                 let cfg = LaunchConfig {
-                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 4),
+                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 8),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
@@ -784,18 +857,18 @@ impl Backend for CudaBackend {
                 la.arg(&cpart);
                 la.arg(c);
                 la.arg(&n32);
-                let s4i = 4i32;
-                la.arg(&s4i);
+                let s8i = 8i32;
+                la.arg(&s8i);
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s4 * m * n).or_default().push(cpart);
+                self.pool.lock().unwrap().entry(s8 * m * n).or_default().push(cpart);
                 self.pool_a_scratch(a_arg);
                 return Ok(());
             }
             let nblk = k / 32;
             let s = [32usize, 16, 8, 4, 2, 1]
                 .into_iter()
-                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
+                .find(|&s| nblk % s == 0)
                 .unwrap_or(1);
             let cpart = self.take_pooled(s * m * n)?;
             let f = self.function(splitk_name)?;

@@ -216,7 +216,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     loop {
+        let t_step = Instant::now();
         let v = backend.to_cpu_f32(&logits)?;
+        let t_tocpu = t_step.elapsed().as_secs_f64();
 
         let n = cfg.vocab_size;
         let last = &v[v.len() - n..];
@@ -226,6 +228,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(i, _)| i as u32)
             .unwrap();
+        if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {
+            let t_after = t_step.elapsed().as_secs_f64();
+            eprintln!("bench step {generated}: total {:.2}ms to_cpu {:.2}ms decode {:.2}ms",
+                t_after * 1e3, t_tocpu * 1e3, (t_after - t_tocpu) * 1e3);
+        }
         if std::env::var("LLM_DBG_TOKENS").is_ok() && generated % 5 == 0 {
             let mut top: Vec<(u32, f32)> = last
                 .iter()
@@ -254,7 +261,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         out.push_str(&text);
         print!("{text}");
         std::io::stdout().flush()?;
+        let t_dec = Instant::now();
         logits = model.decode(&*backend, next)?;
+        if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {
+            eprintln!("bench decode step {generated}: {:.2}ms",
+                t_dec.elapsed().as_secs_f64() * 1e3);
+        }
         generated += 1;
     }
     out.push_str(&decoder.finish());

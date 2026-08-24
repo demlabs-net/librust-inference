@@ -18,10 +18,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use metal::*;
-use objc::msg_send;
 use objc::rc::autoreleasepool;
-use objc::sel;
-use objc::sel_impl;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -403,8 +400,9 @@ pub struct MetalCtx {
 
 struct BatchState {
     depth: usize,
-    /// Owned (retained) command buffer батча — commit+wait в конце.
-    cmd: Option<CommandBuffer>,
+    /// Последний закоммиченный command buffer батча — end_batch ждёт его
+    /// (сериализация очереди гарантирует завершение всех предыдущих).
+    last: Option<CommandBuffer>,
     /// Diagnostics: how many times a batch was opened (tests assert the
     /// wake path actually batches — a regression that drops begin_batch
     /// reintroduces the per-op sync stall).
@@ -415,7 +413,7 @@ impl Default for BatchState {
     fn default() -> Self {
         Self {
             depth: 0,
-            cmd: None,
+            last: None,
             enters: 0,
         }
     }
@@ -528,32 +526,28 @@ impl MetalCtx {
         group: MTLSize,
         setup: impl FnOnce(&ComputeCommandEncoderRef),
     ) -> Result<(), MetalError> {
-        // Batch path: накопление в ОДИН command buffer без per-op sync.
-        // dispatch-и в одном command buffer НЕ имеют implicit memory barrier
-        // между собой — после каждого ставим ЛЁГКИЙ memoryBarrierWithScope
-        // (сериализует память внутри CB, без commit/wait). Отдельные CB на
-        // кернел давали ~0.5мс commit-оверхеда × 290 = тот же затык.
+        // Batch path: КАЖДЫЙ кернел — СВОЙ command buffer (commit без wait),
+        // один wait на последний в конце батча. Сериализация очереди Metal
+        // даёт implicit memory sync между command buffers — memoryBarrier
+        // внутри одного CB стоил ~0.2мс × ~270 кернелов (decode-шаг 65мс при
+        // GPU-времени 3мс). Пул при этом отложен (DEFERRED) до закрытия
+        // последнего батча — буферы невыполненных CB не переиспользуются.
         {
             let mut batch = self.batch.lock().unwrap();
             if batch.depth > 0 {
-                if batch.cmd.is_none() {
-                    batch.cmd = Some(self.queue.new_command_buffer().to_owned());
-                }
-                let cmd = batch.cmd.as_ref().unwrap();
                 // Fetch the pipeline BEFORE opening the encoder: a pipeline
                 // error must not leave an active encoder on the pending
                 // command buffer (a later flush would commit a buffer with
                 // an unterminated encoder — an ObjC exception, process abort).
                 let pipeline = self.pipeline(kernel)?;
+                let cmd = self.queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
                 setup(enc);
                 enc.dispatch_threads(grid, group);
-                // MTLBarrierScopeBuffers = 1 << 0 (msg_send — нет обёртки в metal-rs 0.31).
-                let _: () = unsafe {
-                    msg_send![enc, memoryBarrierWithScope: 1u64]
-                };
                 enc.end_encoding();
+                cmd.commit();
+                batch.last = Some(cmd.to_owned());
                 return Ok(());
             }
         }
@@ -599,8 +593,7 @@ impl MetalCtx {
             BATCH_DEPTH.fetch_sub(1, Ordering::Relaxed);
         }
         if batch.depth == 0 {
-            if let Some(cmd) = batch.cmd.take() {
-                cmd.commit();
+            if let Some(cmd) = batch.last.take() {
                 cmd.wait_until_completed();
                 let status = cmd.status();
                 if status != metal::MTLCommandBufferStatus::Completed {
@@ -637,8 +630,7 @@ impl MetalCtx {
     /// status + error when it happens instead of shipping the garbage.
     pub fn flush_batch(&self) -> Result<(), MetalError> {
         let mut batch = self.batch.lock().unwrap();
-        if let Some(cmd) = batch.cmd.take() {
-            cmd.commit();
+        if let Some(cmd) = batch.last.take() {
             cmd.wait_until_completed();
             let status = cmd.status();
             if status != metal::MTLCommandBufferStatus::Completed {
@@ -677,6 +669,22 @@ impl MetalCtx {
                 ));
             }
         };
+        // decode (m=1): векторизованный weight-stationary кернел (float4
+        // по n, half4-чтения) — в разы быстрее полного gemm с grid (1, N).
+        if m == 1 && b.dtype == GpuDtype::F16 {
+            let n4 = n.div_ceil(4);
+            let grid = MTLSize::new(1, n4 as u64, 1);
+            let group = MTLSize::new(1, 64, 1);
+            self.run("mv_f16_f4", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 8, (&m as *const usize).cast());
+                enc.set_bytes(4, 8, (&k as *const usize).cast());
+                enc.set_bytes(5, 8, (&n as *const usize).cast());
+            })?;
+            return Ok(());
+        }
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -1889,7 +1897,7 @@ impl MetalCtx {
         let n_rep = n_heads / kv_heads;
         let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
         let group = MTLSize::new(1, 1, 1);
-        self.run("attn_ar_f32", grid, group, |enc| {
+        self.run("attn_ar_f32_online", grid, group, |enc| {
             enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
             enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
             enc.set_buffer(2, Some(&v.buffer), v.offset as u64);

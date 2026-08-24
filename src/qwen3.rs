@@ -335,7 +335,11 @@ impl Qwen3Model {
         // эмбеддинги со сдвигом (il+1) токенов (llama.cpp t_inp_embd view);
         // для последних токенов сдвиг выходит за границу — вклад нулевой.
         let embd_in = x.clone();
+        let mut prof_attn = 0.0f64;
+        let mut prof_ffn = 0.0f64;
+        let prof = std::env::var("LLM_BENCH").is_ok() && t == 1;
         for (i, layer) in self.layers.iter().enumerate() {
+            let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
             let h = Self::rope_and_attn(
                 &self.cfg,
@@ -348,14 +352,17 @@ impl Qwen3Model {
                 mrope,
             )?;
             x = backend_add(backend, &x, &h)?;
+            if prof { prof_attn += t0.elapsed().as_secs_f64(); }
             if std::env::var("OMNI_REF").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let last = xv.len() - self.cfg.dim;
                 eprintln!("OMNI_REF after_attn_layer0[-1,:8]={:?}", &xv[last..last + 8]);
             }
+            let t1 = std::time::Instant::now();
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
+            if prof { prof_ffn += t1.elapsed().as_secs_f64(); }
             if std::env::var("OMNI_REF").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let last = xv.len() - self.cfg.dim;
@@ -379,8 +386,13 @@ impl Qwen3Model {
         let h = self.out_norm.forward(backend, &x)?;
         let (b, tq, d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
         let h2 = h.view(vec![b * tq, d]);
+        let t2 = std::time::Instant::now();
         let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;
+        if prof {
+            eprintln!("prof step: attn {:.1}ms ffn {:.1}ms lm_head {:.1}ms",
+                prof_attn * 1e3, prof_ffn * 1e3, t2.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(logits.view(vec![b, tq, self.cfg.vocab_size]))
     }
 
@@ -497,7 +509,9 @@ impl Qwen3Model {
         };
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
+        let t_upd = std::time::Instant::now();
         cache.update(backend, &k, &v)?;
+        let t_upd_d = t_upd.elapsed().as_secs_f64();
         let mask = if let Some(mrope) = mrope {
             if t > 1 {
                 Some(build_mrope_mask(backend, t, cache.pos, mrope)?)
@@ -512,16 +526,22 @@ impl Qwen3Model {
         let ck = cache.view();
         let cv = cache.view_v();
         let attn_out = backend.zeros(vec![b, tq, q_size])?;
-        backend.attn_ar(
-            &q,
-            &ck,
-            &cv,
-            mask.as_ref(),
-            &attn_out,
-            attn.n_heads,
-            attn.n_kv_heads,
-            attn.head_dim,
-        )?;
+        let t_at = std::time::Instant::now();
+        if std::env::var("Q3_SKIP_ATTN").is_err() {
+            backend.attn_ar(
+                &q,
+                &ck,
+                &cv,
+                mask.as_ref(),
+                &attn_out,
+                attn.n_heads,
+                attn.n_kv_heads,
+                attn.head_dim,
+            )?;
+        }
+        if std::env::var("LLM_BENCH").is_ok() && tq == 1 {
+            eprintln!("  attn_ar {:.2}ms kv_update {:.2}ms", t_at.elapsed().as_secs_f64() * 1e3, t_upd_d * 1e3);
+        }
 
         let out = Linear {
             w: attn.wo.clone(),

@@ -218,6 +218,22 @@ impl CudaBackend {
         Ok(y)
     }
 
+    /// Split factor for the m=1 split-k: the LARGEST divisor of k/32 with
+    /// at least 2 k-blocks per split (≤ nblk/2), partial buffer ≤16 MB and
+    /// grid ≤8192 blocks. The power-of-two list left the w2 shape at 160
+    /// blocks; the full-nblk grid (1 k-block per split) measured slightly
+    /// worse — 2 k-blocks per split balances grid density vs per-block work.
+    fn pick_split(&self, nblk: usize, m: usize, n: usize, grid_x: usize) -> usize {
+        let cap_cpart = 16 * 1024 * 1024 / 4; // elements (f32)
+        let cap_grid = 8192;
+        (1..=nblk / 2)
+            .rev()
+            .find(|&s| {
+                nblk % s == 0 && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid
+            })
+            .unwrap_or(1)
+    }
+
     /// Return the activation cast scratch (if any) to its pool.
     fn pool_a_scratch(&self, a_arg: KernA) {
         match a_arg {
@@ -319,6 +335,9 @@ impl CudaBackend {
             return Ok(());
         }
         let nblk = k / 32;
+        // Half kernel: power-of-two split list — the measured optimum
+        // (w2: 160 blocks beats the 3040-block grid; 4 uint4 per k-block
+        // already hides the latency).
         let s = [32usize, 16, 8, 4, 2, 1]
             .into_iter()
             .find(|&s| nblk % s == 0)
@@ -866,10 +885,7 @@ impl Backend for CudaBackend {
                 return Ok(());
             }
             let nblk = k / 32;
-            let s = [32usize, 16, 8, 4, 2, 1]
-                .into_iter()
-                .find(|&s| nblk % s == 0)
-                .unwrap_or(1);
+            let s = self.pick_split(nblk, m, n, grid_x);
             let cpart = self.take_pooled(s * m * n)?;
             let f = self.function(splitk_name)?;
             let cfg = LaunchConfig {

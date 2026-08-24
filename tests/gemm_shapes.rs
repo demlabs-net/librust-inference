@@ -109,12 +109,15 @@ fn check_i8(gpu: &CudaBackend, cpu: &CpuBackend, m: usize, k: usize, n: usize) {
             }
         }
     }
-    // Upload TRANSPOSED (k, n) + transposed scales (nblk, n) — matches
-    // upload_quant / the CUDA kernels.
+    // Upload kb-major (block (kb, col) = 32 contiguous i8 at
+    // (kb·rows + col)·32, scale at (kb·rows + col)) — matches upload_quant
+    // / the fused gemm_q8k_splitk kernels.
     let mut qt = vec![0i8; n * k];
     for r in 0..n {
-        for kk in 0..k {
-            qt[kk * n + r] = q[r * k + kk];
+        for b in 0..nblk {
+            for j in 0..32 {
+                qt[(b * n + r) * 32 + j] = q[r * k + b * 32 + j];
+            }
         }
     }
     let mut sct = vec![0f32; n * nblk];
@@ -183,4 +186,109 @@ fn gemm_nt_i8_shapes() {
     // Edge: m not a multiple of 64 / n not a multiple of 64 (tiled masks).
     check_i8(&gpu, &cpu, 65, 2048, 65);
     check_i8(&gpu, &cpu, 129, 1024, 400);
+}
+
+/// Half-weight (fp16/bf16) GEMM correctness vs the fp32 CPU reference —
+/// the own split-k kernels (gemm_halfw_splitk_*) replace cuBLAS gemm_ex
+/// for half weights, which refuses f32-A × half-B. The A operand follows
+/// the activation axis (fp32 default, fp16/bf16 cast the rows); the split
+/// factor S is picked per shape (grid cap ≤512, divisibility of k/32).
+/// Weights are rounded to the half dtype on the CPU and the reference runs
+/// against those exact rounded values — the tolerance covers only the
+/// operand rounding and the fp32 accumulation.
+fn check_half(
+    gpu: &CudaBackend,
+    cpu: &CpuBackend,
+    m: usize,
+    k: usize,
+    n: usize,
+    wf16: bool,
+    act: rust_inference::dtype::Dtype,
+) {
+    assert_eq!(k % 32, 0, "k must be a multiple of 32");
+    let seed = (m * 7919 + k * 104729 + n) as u64;
+    let a = {
+        let mut d = vec![0.0f32; m * k];
+        Lcg::new(seed).fill(&mut d);
+        gpu.from_cpu_f32(&d, vec![m, k]).unwrap()
+    };
+    let ac = {
+        let mut d = vec![0.0f32; m * k];
+        Lcg::new(seed).fill(&mut d);
+        cpu.from_cpu_f32(&d, vec![m, k]).unwrap()
+    };
+    let mut b = vec![0.0f32; n * k];
+    Lcg::new(seed + 1).fill(&mut b);
+    let bw = if wf16 {
+        let h: Vec<half::f16> = b.iter().map(|&x| half::f16::from_f32(x)).collect();
+        b = h.iter().map(|v| v.to_f32()).collect();
+        gpu.from_cpu_f16(&h, vec![n, k]).unwrap()
+    } else {
+        let h: Vec<half::bf16> = b.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        b = h.iter().map(|v| v.to_f32()).collect();
+        gpu.from_cpu_bf16(&h, vec![n, k]).unwrap()
+    };
+    let bdc = cpu.from_cpu_f32(&b, vec![n, k]).unwrap();
+    let y = gpu.zeros(vec![m, n]).unwrap();
+    let yc = cpu.zeros(vec![m, n]).unwrap();
+    gpu.set_activation_dtype(act).unwrap();
+    gpu.gemm_nt(&a, &bw, &y).unwrap();
+    gpu.synchronize().unwrap();
+    cpu.gemm_nt(&ac, &bdc, &yc).unwrap();
+    let g = gpu.to_cpu_f32(&y).unwrap();
+    let c = cpu.to_cpu_f32(&yc).unwrap();
+    let tol = 2e-2 + 2e-2 * c.iter().fold(0f32, |mm, &v| mm.max(v.abs()));
+    let mut bad = 0;
+    for i in 0..g.len() {
+        let ok = (g[i] - c[i]).abs() <= tol;
+        if !ok && bad < 8 {
+            eprintln!(
+                "half w={} act={:?} [{m}x{k}x{n}] row {} col {}: gpu {} cpu {}",
+                if wf16 { "f16" } else { "bf16" },
+                act,
+                i / n,
+                i % n,
+                g[i],
+                c[i]
+            );
+            bad += 1;
+        }
+        assert!(
+            ok,
+            "half gemm_nt [{m}x{k}x{n}] w={} act={:?} [{i}]: gpu {} cpu {}",
+            if wf16 { "f16" } else { "bf16" },
+            act,
+            g[i],
+            c[i]
+        );
+    }
+    println!(
+        "gemm_nt half w={} act={:?} {m:>4}x{k:>4}x{n:>4} ok",
+        if wf16 { "f16" } else { "bf16" },
+        act
+    );
+}
+
+#[test]
+fn gemm_nt_half_shapes() {
+    use rust_inference::dtype::Dtype;
+    let gpu = CudaBackend::new(0).unwrap();
+    let cpu = CpuBackend;
+    // Decode (m=1), fill (m>1) and guard-edge shapes: n not a multiple of
+    // 256 (col < n), grid-cap forced S=2 (m=65), small k (S=4).
+    let shapes = [
+        (1usize, 2048usize, 6144usize),
+        (1, 2048, 400),
+        (8, 8192, 2048),
+        (65, 1024, 400),
+        (1, 128, 300),
+        (4, 1280, 3840),
+    ];
+    for &(m, k, n) in &shapes {
+        for wf16 in [false, true] {
+            for act in [Dtype::F32, Dtype::F16, Dtype::BF16] {
+                check_half(&gpu, &cpu, m, k, n, wf16, act);
+            }
+        }
+    }
 }

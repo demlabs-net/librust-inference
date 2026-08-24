@@ -1345,39 +1345,6 @@ extern "C" __global__ void mhsa_f32(
 // 32-block, one fp32 FMA per block — 32 IMADs per dequant).
 // k must be a multiple of 32 (all TTS/STT GEMM dims are).
 
-/// Quantize activations f32 (m, k) → i8 + per-32-block scales (m, k/32).
-/// One thread per 32-element block; k%32==0 required (callers pad).
-extern "C" __global__ void quant_f32_i8_blk(
-    const float* __restrict__ x,
-    signed char* __restrict__ y,
-    float* __restrict__ sc,
-    int m,
-    int k)
-{
-    int nblk = k >> 5;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;   // over m*nblk blocks
-    if (i >= m * nblk) return;
-    int r = i / nblk;
-    int kb = i % nblk;
-    const float* src = x + r * k + kb * 32;
-    float mx = 0.0f;
-    float v[32];
-#pragma unroll
-    for (int j = 0; j < 32; ++j) {
-        v[j] = src[j];
-        mx = fmaxf(mx, fabsf(src[j]));
-    }
-    float s = mx / 127.0f;
-    if (s < 1e-12f) s = 1.0f;
-    sc[i] = s;
-    signed char* dst = y + r * k + kb * 32;
-#pragma unroll
-    for (int j = 0; j < 32; ++j) {
-        float q = fminf(127.0f, fmaxf(-128.0f, v[j] / s));
-        dst[j] = (signed char)__float2int_rn(q);
-    }
-}
-
 /// int8 GEMM, small m (1..=64 — TTS fill/decode), split-k variant.
 /// Grid (ceil(n/256)·m, S); each block computes the partial dot over its
 /// k-slice (k/S, a multiple of 32) for ONE output row × 256 columns. Small-m
@@ -1475,10 +1442,10 @@ extern "C" __global__ void gemm_i8_m1(
     int k,
     int n)
 {
-    int col = blockIdx.x * 256 + threadIdx.x;
+    int col = blockIdx.x * 64 + threadIdx.x;
     if (col >= n) return;
     int nblk = k >> 5;
-    int acc = 0;
+    float acc = 0.0f;
     for (int b = 0; b < nblk; ++b) {
         int s = 0;
         const signed char* a = A + b * 32;
@@ -1487,9 +1454,11 @@ extern "C" __global__ void gemm_i8_m1(
         for (int j = 0; j < 32; ++j) {
             s += (int)a[j] * (int)w[j * n];
         }
-        acc += (int)(s * (asc[b] * wsc[b * n + col]));
+        // Float accumulation (no per-block int truncation — the i32 dot
+        // alone would lose up to one LSB per 32-block).
+        acc += (float)s * (asc[b] * wsc[b * n + col]);
     }
-    C[col] = (float)acc;
+    C[col] = acc;
 }
 
 /// Combine the split-k partials: C[r,c] = Σ_s Cpart[(s·m+r)·n + c].
@@ -1786,6 +1755,113 @@ extern "C" __global__ void SUF##_tiled(                                     \
 }
 
 DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18, 256)
+
+// ─────────────────── Q8_0 GEMM splitk (kb-major, configurable A) ────────
+// Q8_0 (per-32-block i8 + f32 scale) — the q8_0 m=1 decode was 47-176 us
+// (m1 strided reads) or ~55 us (old i8 splitk: activation quantization per
+// gemm + byte IMADs) vs 8-12 us cuBLAS bf16. The ACTIVATIONS follow the
+// configured dtype (fp32 default; fp16/bf16 cast the A — the plan's
+// activation axis). The packed weights are kb-major — block (kb, col) = 32
+// contiguous i8 at (kb·n + col)·32 with the per-block scale at (kb·n + col).
+// v2 reads DIRECTLY (no shared tile, no syncthreads — the strided 32 B row
+// segments share 128 B L1 lines across 4 adjacent k-blocks, so the loads
+// stay L1-resident; the shared-tile v1 paid two barriers + a tile store per
+// k-block for nothing on the latency-bound m=1 grid).
+#define DEFINE_Q8K_SPLITK(SUF, AT)                                           \
+extern "C" __global__ void gemm_q8k_splitk_##SUF(                           \
+    const AT* __restrict__ A,          /* (m, k) activations */             \
+    const signed char* __restrict__ B, /* packed (kb·n + col)·32 i8 */      \
+    const float* __restrict__ wsc,     /* (kb·n + col) per-block scales */  \
+    float* __restrict__ Cpart,         /* (S·m, n) */                       \
+    int k, int n, int S, int m)                                             \
+{                                                                           \
+    int tid = threadIdx.x;                                                  \
+    int bx = blockIdx.x;                                                    \
+    int row = bx % m;                                                       \
+    int col = (bx / m) * 256 + tid;                                         \
+    int ks = k / S;                                                         \
+    int kb0 = blockIdx.y * (ks >> 5);                                       \
+    float acc = 0.0f;                                                       \
+    if (col < n) {                                                          \
+        const AT* arow = A + (size_t)row * k;                               \
+        _Pragma("unroll 4")                                                 \
+        for (int t = 0; t < (ks >> 5); ++t) {                               \
+            int kb = kb0 + t;                                               \
+            const uint4* bv = (const uint4*)(B + (size_t)(kb * n + col) * 32); \
+            float w = wsc[(size_t)kb * n + col];                            \
+            const AT* aseg = arow + (size_t)kb * 32;                        \
+            float dot = 0.0f;                                               \
+            _Pragma("unroll")                                               \
+            for (int v = 0; v < 2; ++v) {                                   \
+                uint4 ub = __ldg(&bv[v]);                                   \
+                const signed char* bh = (const signed char*)&ub;            \
+                _Pragma("unroll 8")                                         \
+                for (int j = 0; j < 16; ++j) {                              \
+                    dot += (float)aseg[v * 16 + j] * (float)bh[j];          \
+                }                                                           \
+            }                                                               \
+            acc += dot * w;                                                 \
+        }                                                                   \
+        Cpart[(blockIdx.y * m + row) * n + col] = acc;                      \
+    }                                                                       \
+}
+
+DEFINE_Q8K_SPLITK(f32, float)
+DEFINE_Q8K_SPLITK(f16, __half)
+DEFINE_Q8K_SPLITK(bf16, __nv_bfloat16)
+
+// ─────────────── Half-weight (fp16/bf16) GEMM splitk ───────────────
+// cuBLAS gemm_ex refuses f32-A × half-B (CUBLAS_STATUS_NOT_SUPPORTED) and
+// cudarc's safe Gemm forces fp16 output — the half-weight paths (bf16 DAC
+// codec, fp16 weights) therefore run this own split-k for every activation
+// dtype (the activation axis: fp32 default, fp16/bf16 cast the A rows).
+// B is plain (n, k) row-major (no layout change): each thread owns one
+// output column and walks its B row in 32-element k-blocks — a row segment
+// is 64 B contiguous (2 sectors), and the two k-blocks sharing a 128 B L1
+// line make the strided rows L1-resident (no shared tile, no sync). A is
+// the same 32-element segment for all 256 threads (L1 broadcast).
+#define DEFINE_HALFW_SPLITK(ASUF, BSUF, AT, BT)                               \
+extern "C" __global__ void gemm_halfw_splitk_##ASUF##_##BSUF(                 \
+    const AT* __restrict__ A,          /* (m, k) row-major activations */     \
+    const BT* __restrict__ B,          /* (n, k) row-major weights */         \
+    float* __restrict__ Cpart,         /* (S·m, n) */                         \
+    int k, int n, int S, int m)                                               \
+{                                                                             \
+    int tid = threadIdx.x;                                                    \
+    int bx = blockIdx.x;                                                      \
+    int row = bx % m;                                                         \
+    int col = (bx / m) * 256 + tid;                                           \
+    int ks = k / S;                                                           \
+    int kb0 = blockIdx.y * (ks >> 5);                                         \
+    float acc = 0.0f;                                                         \
+    if (col < n) {                                                            \
+        const AT* arow = A + (size_t)row * k;                                 \
+        const BT* brow = B + (size_t)col * k;                                 \
+        _Pragma("unroll 4")                                                   \
+        for (int t = 0; t < (ks >> 5); ++t) {                                 \
+            const AT* aseg = arow + (size_t)(kb0 + t) * 32;                   \
+            const BT* bseg = brow + (size_t)(kb0 + t) * 32;                   \
+            const uint4* bv = (const uint4*)bseg;                             \
+            _Pragma("unroll 4")                                               \
+            for (int v = 0; v < 4; ++v) {                                     \
+                uint4 ub = __ldg(&bv[v]);                                     \
+                const BT* bh = (const BT*)&ub;                                \
+                _Pragma("unroll 8")                                           \
+                for (int j = 0; j < 8; ++j) {                                 \
+                    acc += (float)aseg[v * 8 + j] * (float)bh[j];             \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+        Cpart[(blockIdx.y * m + row) * n + col] = acc;                        \
+    }                                                                         \
+}
+
+DEFINE_HALFW_SPLITK(f32, f16, float, __half)
+DEFINE_HALFW_SPLITK(f16, f16, __half, __half)
+DEFINE_HALFW_SPLITK(bf16, f16, __nv_bfloat16, __half)
+DEFINE_HALFW_SPLITK(f32, bf16, float, __nv_bfloat16)
+DEFINE_HALFW_SPLITK(f16, bf16, __half, __nv_bfloat16)
+DEFINE_HALFW_SPLITK(bf16, bf16, __nv_bfloat16, __nv_bfloat16)
 
 // ─────────────────── Q6_K GEMM v2 (dequant-amortized) ───────────────────
 // The v1 splitk dequantized inline per FMA: 3 shared byte loads + ~12 ALU

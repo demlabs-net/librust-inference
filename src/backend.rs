@@ -275,19 +275,6 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn as_cuda_i8(
-        &self,
-    ) -> (
-        &cudarc::driver::CudaSlice<i8>,
-        &cudarc::driver::CudaSlice<f32>,
-    ) {
-        match &self.inner {
-            TensorInner::CudaI8 { data, scale } => (data, scale),
-            _ => panic!("as_cuda_i8() on a non-CudaI8 tensor"),
-        }
-    }
-
-    #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda_mut(&self) -> &mut cudarc::driver::CudaSlice<f32> {
         // &mut through &self: the caller is the only holder of the backend
         // during an op (no concurrent mutation of this tensor's storage).
@@ -465,21 +452,22 @@ pub trait Backend: Send + Sync {
         scale: &[f32],
         shape: Vec<usize>,
     ) -> Result<Tensor, BackendError> {
-        // The int8 upload (rust-inference-speech::quant) stores data and
-        // scale TRANSPOSED for coalesced kernel reads: element (r, kk)
-        // lives at data[kk*rows + r], its per-32-block scale at
-        // scale[(kk/32)*rows + r]. The default dequant must mirror BOTH the
-        // transposed read AND the un-transpose — the f32 tensor has to come
-        // back in the standard row-major layout the gemm kernels expect.
-        // The old code read scale[i/per] (block 0 of every row — wrong for
-        // every block > 0) and kept the transposed order.
+        // The int8 upload (rust-inference-speech::quant) packs kb-major:
+        // block (kb, col) = 32 contiguous i8 at (kb·rows + col)·32, its
+        // per-32-block scale at (kb·rows + col). The default dequant
+        // mirrors the packing back into the standard row-major layout.
         let rows = shape[0];
         let per = shape[1..].iter().product::<usize>();
-        let mut f32s = vec![0.0f32; data.len()];
-        for (i, &v) in data.iter().enumerate() {
-            let r = i % rows;
-            let kk = i / rows;
-            f32s[r * per + kk] = v as f32 * scale[(kk / 32) * rows + r];
+        let nblk = per / 32;
+        let mut f32s = vec![0.0f32; rows * per];
+        for r in 0..rows {
+            for b in 0..nblk {
+                let s = scale[b * rows + r];
+                for j in 0..32 {
+                    f32s[r * per + b * 32 + j] =
+                        data[(b * rows + r) * 32 + j] as f32 * s;
+                }
+            }
         }
         self.from_cpu_f32(&f32s, shape)
     }
@@ -655,6 +643,15 @@ pub trait Backend: Send + Sync {
 
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
+
+    /// Activation compute dtype for GEMMs (the plan's activation axis:
+    /// `TTS_ACTIVATION`/`STT_ACTIVATION` = fp32 | fp16 | bf16, default fp32).
+    /// Backends that keep activations in a fixed dtype ignore it; the CUDA
+    /// backend casts the GEMM A-operand accordingly (fp16/bf16: half-width
+    /// A traffic; fp32: reference precision). Default: no-op.
+    fn set_activation_dtype(&self, _d: Dtype) -> Result<(), BackendError> {
+        Ok(())
+    }
 
     // ── batching ──
     /// Start accumulating GPU kernels into ONE command buffer: many small

@@ -41,6 +41,9 @@ objc = { version = "0.2", optional = true }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 metal = "0.31"
 
+[dev-dependencies]
+half = "2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

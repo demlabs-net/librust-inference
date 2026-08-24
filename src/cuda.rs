@@ -17,27 +17,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cudarc::cublas::result;
 use cudarc::cublas::safe::GemmConfig;
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cudaDataType};
 use cudarc::cublas::{CudaBlas, safe::Gemm};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
 use crate::backend::{Backend, Tensor};
 use crate::error::BackendError;
-
-/// Raw cuBLAS handle. cuBLAS handles are not Send/Sync by themselves; the
-/// backend serializes every use behind a mutex, matching what cudarc's own
-/// `CudaBlas` does for its handle field.
-#[derive(Clone, Copy)]
-pub(crate) struct RawCublas(pub(crate) cudarc::cublas::sys::cublasHandle_t);
-unsafe impl Send for RawCublas {}
-unsafe impl Sync for RawCublas {}
 
 /// Elementwise op codes — mirror `elementwise_f32` switch in kernels.cu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +48,14 @@ enum ElemOp {
     Silu = 13,
     GeluTanh = 14,
     GeluErf = 15,
+}
+
+/// The GEMM A-operand for the quantized-int8 kernels (the activation
+/// dtype is configurable — fp32 stays f32, fp16/bf16 get a half-width cast).
+enum KernA<'a> {
+    F32(&'a Tensor),
+    F16(cudarc::driver::CudaSlice<half::f16>),
+    BF16(cudarc::driver::CudaSlice<half::bf16>),
 }
 
 fn map_err(e: impl std::fmt::Display) -> BackendError {
@@ -126,22 +123,13 @@ pub struct CudaBackend {
     /// is unavailable (missing libcublas), GEMMs fall back to the naive PTX
     /// kernel — logged once, never fatal.
     cublas: Mutex<Option<Arc<CudaBlas>>>,
-    /// fp16 scratch pool (activations cast for fp16-weight GEMMs).
+    /// fp16 scratch pool (activations cast for fp16/bf16-weight GEMMs).
     pool_f16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::f16>>>>>,
-    /// int8 scratch pool (activations quantized for int8-weight GEMMs) —
-    /// raw cudaMalloc per quant call added ~10-20 us to every decode GEMM.
-    pool_i8: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<i8>>>>>,
-    /// Raw cuBLAS handle (fp16 gemm_ex path); destroyed on Drop.
-    cublas_raw: Mutex<Option<RawCublas>>,
-}
-
-impl Drop for CudaBackend {
-    fn drop(&mut self) {
-        use cudarc::cublas::sys;
-        if let Some(h) = *self.cublas_raw.lock().unwrap() {
-            unsafe { sys::cublasDestroy_v2(h.0) };
-        }
-    }
+    /// bf16 scratch pool (activations cast for the bf16 activation axis).
+    pool_bf16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::bf16>>>>>,
+    /// Activation compute dtype for GEMM A-operands (the plan's activation
+    /// axis — `set_activation_dtype`; 0=f32, 1=f16, 2=bf16).
+    activation: std::sync::atomic::AtomicU8,
 }
 
 impl CudaBackend {
@@ -161,9 +149,17 @@ impl CudaBackend {
             pool: Arc::new(Mutex::new(HashMap::new())),
             cublas: Mutex::new(None),
             pool_f16: Arc::new(Mutex::new(HashMap::new())),
-            pool_i8: Arc::new(Mutex::new(HashMap::new())),
-            cublas_raw: Mutex::new(None),
+            pool_bf16: Arc::new(Mutex::new(HashMap::new())),
+            activation: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    fn activation_dtype(&self) -> crate::dtype::Dtype {
+        match self.activation.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => crate::dtype::Dtype::F16,
+            2 => crate::dtype::Dtype::BF16,
+            _ => crate::dtype::Dtype::F32,
+        }
     }
 
     fn take_pooled_f16(
@@ -179,53 +175,23 @@ impl CudaBackend {
         unsafe { self.stream.alloc::<half::f16>(n) }.map_err(map_err)
     }
 
-    fn wrap_pooled_f16(
+    fn take_pooled_bf16(
         &self,
-        s: cudarc::driver::CudaSlice<half::f16>,
-    ) -> cudarc::driver::CudaSlice<half::f16> {
-        // Return to the pool on drop via a wrapper is not possible for a bare
-        // slice; keep a Vec<CudaSlice> pool and hand slices back explicitly
-        // in the f16 GEMM path below.
-        let _ = &s;
-        s
+        n: usize,
+    ) -> Result<cudarc::driver::CudaSlice<half::bf16>, BackendError> {
+        let mut pool = self.pool_bf16.lock().unwrap();
+        if let Some(bucket) = pool.get_mut(&n) {
+            if let Some(s) = bucket.pop() {
+                return Ok(s);
+            }
+        }
+        unsafe { self.stream.alloc::<half::bf16>(n) }.map_err(map_err)
     }
 
-    /// Raw cuBLAS handle bound to this backend's stream (gemm_ex fp16/bf16
-    /// path — CudaBlas hides its handle and its safe Gemm<f16> forces fp16
-    /// output). The returned guard MUST be held for the whole gemm_ex call:
-    /// cuBLAS handles are NOT thread-safe, and the TTS pool drives GEMMs from
-    /// several threads at once (generation + codec decoder) — a concurrent
-    /// gemm_ex on one handle returned CUDA_ERROR_INVALID_VALUE mid-decode
-    /// (seen live: "DAC decode failed" on bf16 codec weights).
-    fn cublas_raw_guard(
-        &self,
-    ) -> Result<
-        (
-            cudarc::cublas::sys::cublasHandle_t,
-            std::sync::MutexGuard<'_, Option<RawCublas>>,
-        ),
-        BackendError,
-    > {
-        use cudarc::cublas::sys;
-        let mut guard = self.cublas_raw.lock().unwrap();
-        if let Some(h) = *guard {
-            return Ok((h.0, guard));
-        }
-        let mut h = std::ptr::null_mut();
-        let st = unsafe { sys::cublasCreate_v2(&mut h) };
-        if st != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Err(map_err(format!("cublasCreate_v2: {st:?}")));
-        }
-        // No cublasSetStream: the backend uses the legacy (null) stream, which
-        // is cuBLAS's default — same ordering as every other kernel launch.
-        *guard = Some(RawCublas(h));
-        Ok((h, guard))
-    }
-
-    /// Cast x (f32) into a bf16 scratch buffer of the same size.
+    /// Cast x (f32) into a bf16 scratch buffer of the same size (pooled).
     fn cast_bf16(&self, x: &Tensor) -> Result<cudarc::driver::CudaSlice<half::bf16>, BackendError> {
         let n = x.numel();
-        let mut y = unsafe { self.stream.alloc::<half::bf16>(n) }.map_err(map_err)?;
+        let mut y = self.take_pooled_bf16(n)?;
         let f = self.function("cast_f32_bf16")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);
@@ -235,53 +201,6 @@ impl CudaBackend {
         la.arg(&n32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         Ok(y)
-    }
-
-    /// Quantize activations f32 (m, k) → int8 + per-32-block scales (m, k/32).
-    /// Q8_0 layout — matches `quant_f32_i8_blk` in kernels.cu. k must be a
-    /// multiple of 32 (all TTS/STT GEMM dims are; callers pad otherwise).
-    fn quant_i8_blk(
-        &self,
-        x: &Tensor,
-    ) -> Result<
-        (
-            cudarc::driver::CudaSlice<i8>,
-            cudarc::driver::CudaSlice<f32>,
-        ),
-        BackendError,
-    > {
-        let (m, k) = (x.shape()[0], x.shape()[1]);
-        if k % 32 != 0 {
-            return Err(BackendError::Shape(format!(
-                "quant_i8_blk: k={k} not a multiple of 32"
-            )));
-        }
-        let nblk = k / 32;
-        let q = {
-            let mut pool = self.pool_i8.lock().unwrap();
-            if let Some(bucket) = pool.get_mut(&(m * k)) {
-                if let Some(s) = bucket.pop() {
-                    s
-                } else {
-                    unsafe { self.stream.alloc::<i8>(m * k) }.map_err(map_err)?
-                }
-            } else {
-                unsafe { self.stream.alloc::<i8>(m * k) }.map_err(map_err)?
-            }
-        };
-        let sc = self.take_pooled(m * nblk)?;
-        let f = self.function("quant_f32_i8_blk")?;
-        let cfg = LaunchConfig::for_num_elems((m * nblk) as u32);
-        let mut la = self.stream.launch_builder(&f);
-        la.arg(x.as_cuda());
-        la.arg(&q);
-        la.arg(&sc);
-        let m32 = m as i32;
-        let k32 = k as i32;
-        la.arg(&m32);
-        la.arg(&k32);
-        unsafe { la.launch(cfg) }.map_err(map_err)?;
-        Ok((q, sc))
     }
 
     /// Cast x (f32) into an fp16 scratch buffer of the same size.
@@ -297,6 +216,107 @@ impl CudaBackend {
         la.arg(&n32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         Ok(y)
+    }
+
+    /// Return the activation cast scratch (if any) to its pool.
+    fn pool_a_scratch(&self, a_arg: KernA) {
+        match a_arg {
+            KernA::F16(sl) => {
+                self.pool_f16.lock().unwrap().entry(sl.len()).or_default().push(sl);
+            }
+            KernA::BF16(sl) => {
+                self.pool_bf16.lock().unwrap().entry(sl.len()).or_default().push(sl);
+            }
+            KernA::F32(_) => {}
+        }
+    }
+
+    /// Half-weight (fp16/bf16) GEMM on the own split-k kernels (see the
+    /// DEFINE_HALFW_SPLITK comment). Split factor S: for m=1 (decode) the
+    /// largest divisor of k/32 within a 512-block grid (the split divides
+    /// K — each (column, k-slice) is read once, so S only trades grid
+    /// density against the per-block k-loop length); m>1 reads B once
+    /// (S=1, no re-read). k must be a multiple of 32.
+    fn gemm_halfw_nt<T>(
+        &self,
+        a: &Tensor,
+        b: &cudarc::driver::CudaSlice<T>,
+        c: &Tensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        b_suf: &'static str,
+    ) -> Result<(), BackendError> {
+        let k32 = k as i32;
+        let n32 = n as i32;
+        let m32 = m as i32;
+        let c = c.as_cuda_mut();
+        let grid_x = (n + 255) / 256;
+        let nblk = k / 32;
+        let s = if m == 1 {
+            [32usize, 16, 8, 4, 2, 1]
+                .into_iter()
+                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let cpart = self.take_pooled(s * m * n)?;
+        let act = self.activation_dtype();
+        let (fname, a_arg): (&'static str, KernA) = match (b_suf, act) {
+            ("bf16", crate::dtype::Dtype::F16) => {
+                ("gemm_halfw_splitk_f16_bf16", KernA::F16(self.cast_f16(a)?))
+            }
+            ("bf16", crate::dtype::Dtype::BF16) => {
+                ("gemm_halfw_splitk_bf16_bf16", KernA::BF16(self.cast_bf16(a)?))
+            }
+            ("bf16", _) => ("gemm_halfw_splitk_f32_bf16", KernA::F32(a)),
+            ("f16", crate::dtype::Dtype::F16) => {
+                ("gemm_halfw_splitk_f16_f16", KernA::F16(self.cast_f16(a)?))
+            }
+            ("f16", crate::dtype::Dtype::BF16) => {
+                ("gemm_halfw_splitk_bf16_f16", KernA::BF16(self.cast_bf16(a)?))
+            }
+            ("f16", _) => ("gemm_halfw_splitk_f32_f16", KernA::F32(a)),
+            _ => unreachable!("gemm_halfw_nt: unknown weight suffix {b_suf}"),
+        };
+        let f = self.function(fname)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((grid_x * m) as u32, s as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        match &a_arg {
+            KernA::F32(t) => la.arg(t.as_cuda()),
+            KernA::F16(sl) => la.arg(sl),
+            KernA::BF16(sl) => la.arg(sl),
+        };
+        la.arg(b);
+        la.arg(&cpart);
+        la.arg(&k32);
+        la.arg(&n32);
+        let s32 = s as i32;
+        la.arg(&s32);
+        la.arg(&m32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // Combine the S partials (stream-ordered after splitk).
+        let f = self.function("gemm_i8_reduce")?;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(&cpart);
+        la.arg(c);
+        la.arg(&n32);
+        la.arg(&s32);
+        la.arg(&m32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        self.pool_a_scratch(a_arg);
+        Ok(())
     }
 
     /// cuBLAS GEMM (row-major semantics, see the two call sites). The handle
@@ -394,6 +414,18 @@ impl CudaBackend {
 }
 
 impl Backend for CudaBackend {
+    fn set_activation_dtype(&self, d: crate::dtype::Dtype) -> Result<(), BackendError> {
+        self.activation.store(
+            match d {
+                crate::dtype::Dtype::F16 => 1,
+                crate::dtype::Dtype::BF16 => 2,
+                _ => 0,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let n: usize = shape.iter().product();
         let mut s = self.take_pooled(n)?;
@@ -518,13 +550,22 @@ impl Backend for CudaBackend {
             crate::backend::TensorInner::CudaI8 { data, scale } => {
                 let raw: Vec<i8> = self.stream.clone_dtoh(data).map_err(map_err)?;
                 let sc: Vec<f32> = self.stream.clone_dtoh(scale).map_err(map_err)?;
-                let nblk = sc.len();
-                let per = raw.len() / nblk.max(1);
-                Ok(raw
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| f32::from(v) * sc[i / per.max(1)])
-                    .collect())
+                // kb-major packing: block (kb, col) = 32 i8 at
+                // (kb·rows + col)·32, scale at (kb·rows + col).
+                let rows = t.shape()[0];
+                let per: usize = t.shape()[1..].iter().product();
+                let nblk = per / 32;
+                let mut out = vec![0f32; rows * per];
+                for r in 0..rows {
+                    for b in 0..nblk {
+                        let s = sc[b * rows + r];
+                        let blk = &raw[(b * rows + r) * 32..(b * rows + r + 1) * 32];
+                        for j in 0..32 {
+                            out[r * per + b * 32 + j] = f32::from(blk[j]) * s;
+                        }
+                    }
+                }
+                Ok(out)
             }
             crate::backend::TensorInner::CudaQ6K(data) => {
                 let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
@@ -644,211 +685,95 @@ impl Backend for CudaBackend {
             scale: wscale,
         } = &b.inner
         {
-            // Q8_0-style int8 GEMM: per-32-block weight + activation scales,
-            // our own kernels (cuBLAS IGEMM was 10-50x slower than fp16 on
-            // decode shapes and cannot express block scales anyway). m==1
-            // (decode hot path) uses the split-k kernel (S slices over k —
-            // m=1 alone cannot fill the GPU: the old 1-byte-load kernel
-            // measured ~130 us vs 10.5 us fp16); m>1 uses the tiled one.
-            let (q, ascale) = self.quant_i8_blk(a)?;
+            // Q8_0-style int8 GEMM: per-32-block weight scales, f32
+            // activations (no activation quantization — it added a kernel +
+            // scratch per gemm for nothing). kb-major packed weights feed a
+            // Q4_0-style split-k: coalesced uint4 tile loads, f32 FMA dot
+            // with the per-column scale. The split factor follows the packed
+            // path's policy: for m=1 (decode) the largest S that divides
+            // k/32 within a 512-block grid (latency hiding); m>1 reads B
+            // once (S=1, no re-read).
             let k32 = k as i32;
             let n32 = n as i32;
             let m32 = m as i32;
             let c = c.as_cuda_mut();
-            let nblk = k / 32;
             let grid_x = (n + 255) / 256;
-            // Split-k: largest power-of-2 slice count that keeps the grid
-            // near the GPU's block capacity (m=1 leaves most SMs idle
-            // otherwise — e.g. 8 blocks for n=2048; m≤64 already has m× the
-            // row blocks, so the grid cap applies to m=1 only). Requires
-            // 16-byte aligned columns and a k-slice fitting the shared A.
+            let nblk = k / 32;
             let s = if m == 1 {
                 [32usize, 16, 8, 4, 2, 1]
-                    .iter()
-                    .copied()
-                    .find(|&s| nblk % s == 0 && (k / s) <= 2048 && grid_x * s <= 512)
+                    .into_iter()
+                    .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
                     .unwrap_or(1)
             } else {
-                [32usize, 16, 8, 4, 2, 1]
-                    .iter()
-                    .copied()
-                    .find(|&s| nblk % s == 0 && (k / s) <= 2048)
-                    .unwrap_or(1)
+                1
             };
-            let use_splitk = s > 1 && n % 16 == 0 && (k / s) <= 2048;
-            if m <= 64 && use_splitk {
-                // m≤64 (TTS fill/decode, m = tokens): one block per
-                // (row, 256 columns), split over k. The split-k kernel
-                // re-reads B from L2 once per output row — cheaper than the
-                // tiled kernel's latency-bound small-m occupancy (166 us vs
-                // 238 us at 32x6144x2048). m>64 (STT frames) uses tiled,
-                // which reads B exactly once.
-                let cpart = self.take_pooled(s * m * n)?;
-                let f = self.function("gemm_i8_mn_splitk")?;
-                let cfg = LaunchConfig {
-                    grid_dim: ((grid_x * m) as u32, s as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&q);
-                la.arg(&ascale);
-                la.arg(b8);
-                la.arg(wscale);
-                la.arg(&cpart);
-                la.arg(&k32);
-                la.arg(&n32);
-                let s32 = s as i32;
-                la.arg(&s32);
-                let m32i = m as i32;
-                la.arg(&m32i);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                // Combine the S partials (stream-ordered after splitk).
-                let f = self.function("gemm_i8_reduce")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&cpart);
-                la.arg(c);
-                la.arg(&n32);
-                la.arg(&s32);
-                la.arg(&m32i);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool
-                    .lock()
-                    .unwrap()
-                    .entry(s * m * n)
-                    .or_default()
-                    .push(cpart);
-            } else if m == 1 && !use_splitk {
-                let f = self.function("gemm_i8_m1")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&q);
-                la.arg(&ascale);
-                la.arg(b8);
-                la.arg(wscale);
-                la.arg(c);
-                la.arg(&k32);
-                la.arg(&n32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-            } else {
-                let f = self.function("gemm_i8_tiled")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((n + 31) / 32) as u32, ((m + 31) / 32) as u32, 1),
-                    block_dim: (16, 16, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&q);
-                la.arg(&ascale);
-                la.arg(b8);
-                la.arg(wscale);
-                la.arg(c);
-                la.arg(&m32);
-                la.arg(&k32);
-                la.arg(&n32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-            }
-            // Return the quant scratch to the pools — stream-ordered: the
-            // next quant/GEMM is queued after these kernels, so reuse is
-            // safe without a sync.
-            self.pool_i8
-                .lock()
-                .unwrap()
-                .entry(q.len())
-                .or_default()
-                .push(q);
+            let cpart = self.take_pooled(s * m * n)?;
+            let act = self.activation_dtype();
+            let (fname, a_arg) = match act {
+                crate::dtype::Dtype::F16 => {
+                    let a16 = self.cast_f16(a)?;
+                    ("gemm_q8k_splitk_f16", KernA::F16(a16))
+                }
+                crate::dtype::Dtype::BF16 => {
+                    let a16 = self.cast_bf16(a)?;
+                    ("gemm_q8k_splitk_bf16", KernA::BF16(a16))
+                }
+                _ => ("gemm_q8k_splitk_f32", KernA::F32(a)),
+            };
+            let f = self.function(fname)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((grid_x * m) as u32, s as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            match &a_arg {
+                KernA::F32(t) => la.arg(t.as_cuda()),
+                KernA::F16(sl) => la.arg(sl),
+                KernA::BF16(sl) => la.arg(sl),
+            };
+            la.arg(b8);
+            la.arg(wscale);
+            la.arg(&cpart);
+            la.arg(&k32);
+            la.arg(&n32);
+            let s32 = s as i32;
+            la.arg(&s32);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            // Combine the S partials (stream-ordered after splitk).
+            let f = self.function("gemm_i8_reduce")?;
+            let cfg = LaunchConfig {
+                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(&cpart);
+            la.arg(c);
+            la.arg(&n32);
+            la.arg(&s32);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
             self.pool
                 .lock()
                 .unwrap()
-                .entry(ascale.len())
+                .entry(s * m * n)
                 .or_default()
-                .push(ascale);
+                .push(cpart);
+            self.pool_a_scratch(a_arg);
             return Ok(());
         }
+        // fp16/bf16 weights: own split-k GEMM — cuBLAS gemm_ex refuses
+        // f32-A × half-B (CUBLAS_STATUS_NOT_SUPPORTED) and cudarc's safe
+        // Gemm forces fp16 output, so the half-weight paths never touch
+        // cuBLAS. The A operand follows the activation axis (f32 default,
+        // fp16/bf16 cast) — gemm_halfw_splitk_{f32,f16,bf16}_{f16,bf16}.
         if let crate::backend::TensorInner::CudaBF16(b16) = &b.inner {
-            let a16 = self.cast_bf16(a)?;
-            let (handle, _raw_guard) = self.cublas_raw_guard()?;
-            let alpha = 1.0f32;
-            let beta = 0.0f32;
-            let res = {
-                let (bptr, _br) = b16.device_ptr(&self.stream);
-                let (aptr, _ar) = a16.device_ptr(&self.stream);
-                let (cptr, _cr) = c.as_cuda_mut().device_ptr(&self.stream);
-                unsafe {
-                    result::gemm_ex(
-                        handle,
-                        cublasOperation_t::CUBLAS_OP_T,
-                        cublasOperation_t::CUBLAS_OP_N,
-                        n as i32,
-                        m as i32,
-                        k as i32,
-                        (&alpha as *const f32) as *const _,
-                        bptr as *const _,
-                        cudaDataType::CUDA_R_16BF,
-                        k as i32,
-                        aptr as *const _,
-                        cudaDataType::CUDA_R_16BF,
-                        k as i32,
-                        (&beta as *const f32) as *const _,
-                        cptr as *mut _,
-                        cudaDataType::CUDA_R_32F,
-                        n as i32,
-                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    )
-                }
-            };
-            return res.map_err(|e| map_err(format!("cublasGemmEx(bf16) [{m}x{k}x{n}]: {e}")));
+            return self.gemm_halfw_nt(a, b16, c, m, k, n, "bf16");
         }
         if let crate::backend::TensorInner::CudaF16(b16) = &b.inner {
-            let a16 = self.cast_f16(a)?;
-            let (handle, _raw_guard) = self.cublas_raw_guard()?;
-            let alpha = 1.0f32;
-            let beta = 0.0f32;
-            let res = {
-                let (bptr, _br) = b16.device_ptr(&self.stream);
-                let (aptr, _ar) = a16.device_ptr(&self.stream);
-                let (cptr, _cr) = c.as_cuda_mut().device_ptr(&self.stream);
-                unsafe {
-                    result::gemm_ex(
-                        handle,
-                        cublasOperation_t::CUBLAS_OP_T,
-                        cublasOperation_t::CUBLAS_OP_N,
-                        n as i32,
-                        m as i32,
-                        k as i32,
-                        (&alpha as *const f32) as *const _,
-                        bptr as *const _,
-                        cudaDataType::CUDA_R_16F,
-                        k as i32,
-                        aptr as *const _,
-                        cudaDataType::CUDA_R_16F,
-                        k as i32,
-                        (&beta as *const f32) as *const _,
-                        cptr as *mut _,
-                        cudaDataType::CUDA_R_32F,
-                        n as i32,
-                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    )
-                }
-            };
-            self.pool_f16
-                .lock()
-                .unwrap()
-                .entry(a16.len())
-                .or_default()
-                .push(a16);
-            return res.map_err(|e| map_err(format!("cublasGemmEx(f16): {e}")));
+            return self.gemm_halfw_nt(a, b16, c, m, k, n, "f16");
         }
         // Row-major C[m,n] = A[m,k]·B[n,k]ᵀ. B read as column-major [k,n] is
         // Bᵀ → op(T) gives B back; A as column-major [k,m] is Aᵀ → op(N) keeps

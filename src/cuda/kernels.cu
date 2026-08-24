@@ -1903,7 +1903,7 @@ extern "C" __global__ void gemm_halfw_tiled_##ASUF##_##BSUF(                  \
     int col0 = blockIdx.x * BN;                                               \
     int r0 = blockIdx.y * BM;                                                 \
     int nsup = k >> 5;                                                        \
-    int nkz = (nsup + 7) >> 3;      /* k-split: grid.z=8 multiplies grid */   \
+    int nkz = (nsup + 15) >> 4;     /* k-split: grid.z=16 multiplies grid */  \
     int kb0 = blockIdx.z * nkz;                                               \
     if (kb0 >= nsup) return;                                                  \
     int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \
@@ -1986,7 +1986,7 @@ extern "C" __global__ void gemm_q8k_tiled_##SUF(                              \
     int col0 = blockIdx.x * BN;                                               \
     int r0 = blockIdx.y * BM;                                                 \
     int nsup = k >> 5;                                                        \
-    int nkz = (nsup + 7) >> 3;      /* k-split: grid.z=8 multiplies grid */   \
+    int nkz = (nsup + 15) >> 4;     /* k-split: grid.z=16 multiplies grid */  \
     int kb0 = blockIdx.z * nkz;                                               \
     if (kb0 >= nsup) return;                                                  \
     int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \

@@ -301,11 +301,11 @@ impl CudaBackend {
             // (8·m, n) partials — combined by gemm_i8_reduce. The z-slices
             // write disjoint (row, col) tiles, so every element is summed
             // 8× in a fixed order — deterministic.
-            let s8 = 8usize;
-            let cpart = self.take_pooled(s8 * m * n)?;
+            let s16 = 16usize;
+            let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled_name)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 8),
+                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -331,11 +331,11 @@ impl CudaBackend {
             la.arg(&cpart);
             la.arg(c);
             la.arg(&n32);
-            let s8i = 8i32;
-            la.arg(&s8i);
+            let s16i = 16i32;
+            la.arg(&s16i);
             la.arg(&m32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool.lock().unwrap().entry(s8 * m * n).or_default().push(cpart);
+            self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -855,11 +855,11 @@ impl Backend for CudaBackend {
                 _ => KernA::F32(a),
             };
             if m > 1 {
-                let s8 = 8usize;
-                let cpart = self.take_pooled(s8 * m * n)?;
+                let s16 = 16usize;
+                let cpart = self.take_pooled(s16 * m * n)?;
                 let f = self.function(tiled_name)?;
                 let cfg = LaunchConfig {
-                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 8),
+                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
@@ -886,11 +886,11 @@ impl Backend for CudaBackend {
                 la.arg(&cpart);
                 la.arg(c);
                 la.arg(&n32);
-                let s8i = 8i32;
-                la.arg(&s8i);
+                let s16i = 16i32;
+                la.arg(&s16i);
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s8 * m * n).or_default().push(cpart);
+                self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
                 self.pool_a_scratch(a_arg);
                 return Ok(());
             }

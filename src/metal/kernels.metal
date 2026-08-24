@@ -1213,6 +1213,78 @@ kernel void attn_ar_f32_online(
     }
 }
 
+// GQA attention, полностью распараллеленный по (h, d4): grid.y = H*n4 —
+// 512 потоков на (b,t) вместо 16. Каждый поток держит СВОЙ float4 q/k/v;
+// полный score получается simd_sum-редукцией по d4-лейнам (n4=32 = один
+// simdgroup на голову — broadcast без барьеров). KV читается ОДИН раз
+// (не 3 прохода × 16 потоков): ~75× быстрее attn_ar_f32 на decode-шаге.
+kernel void attn_ar_f32_fused(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    constant uint& Tq [[buffer(6)]],
+    constant uint& Tkv [[buffer(7)]],
+    constant uint& H [[buffer(8)]],
+    constant uint& KVH [[buffer(9)]],
+    constant uint& HD [[buffer(10)]],
+    constant uint& n_rep [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x;
+    uint n4 = HD / 4u;
+    // ВСЕГДА 32 лейна на голову: при n4 < 32 (hd=64 → n4=16) неактивные
+    // лейны (lane >= n4) дают нулевой acc — simd_sum по 32 лейнам корректен;
+    // их y4-запись дублирует активную (одинаковые значения — безопасно).
+    uint h = gid.y / 32u;
+    uint lane = gid.y % 32u;
+    uint d4 = lane % n4;
+    uint t = gid.z;
+    if (b >= B || h >= H || t >= Tq) return;
+    uint kvh = h / n_rep;
+    uint D = H * HD;
+    uint KVD = KVH * HD;
+    const float scale = 1.0f / sqrt((float)HD);
+    const bool active = (lane < n4);
+    const device float4* qrow4 = (const device float4*)(Q + (b * Tq + t) * D + h * HD);
+    float4 q4 = qrow4[d4];
+    const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;
+
+    // проход 1: running max полного score (simd_sum — полный dot broadcast).
+    float mx_local = -INFINITY;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float4 k4 = krow4[d4];
+        float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
+        float s = simd_sum(acc) * scale;
+        if (maskrow != nullptr) s += maskrow[j];
+        mx_local = max(mx_local, s);
+    }
+    float mx = simd_max(mx_local);
+
+    // проход 2: sum + y4-накопление (KV читается второй раз — V и K).
+    float ssum_local = 0.0f;
+    float4 y4 = 0.0f;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float4 k4 = krow4[d4];
+        float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
+        float s = simd_sum(acc) * scale;
+        if (maskrow != nullptr) s += maskrow[j];
+        float w = exp(s - mx);
+        ssum_local += w;
+        const device float4* vrow4 = (const device float4*)(V + (b * Tkv + j) * KVD + kvh * HD);
+        y4 += w * vrow4[d4];
+    }
+    // ssum_local у каждого лейна УЖЕ полный (w — broadcast из simd_sum) —
+    // повторная simd_sum утроила бы его в 32 раза.
+    float inv = (ssum_local > 0.0f) ? 1.0f / ssum_local : 0.0f;
+    device float4* yrow4 = (device float4*)(Y + (b * Tq + t) * D + h * HD);
+    yrow4[d4] = y4 * inv;
+}
+
 // ── Deepstack (Qwen3-VL): y[t] = x[t] + embd[t+shift] (сдвиг — вклад входных
 // эмбеддингов в первые n_deepstack слоёв); t+shift за границей → без вклада.
 kernel void deepstack_add_f32(

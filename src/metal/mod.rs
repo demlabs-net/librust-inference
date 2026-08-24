@@ -1897,7 +1897,9 @@ impl MetalCtx {
         let n_rep = n_heads / kv_heads;
         let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
         let group = MTLSize::new(1, 1, 1);
-        self.run("attn_ar_f32_online", grid, group, |enc| {
+        let grid = MTLSize::new(b as u64, (n_heads * 32) as u64, tq as u64);
+        let group = MTLSize::new(1, 32, 1);
+        self.run("attn_ar_f32_fused", grid, group, |enc| {
             enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
             enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
             enc.set_buffer(2, Some(&v.buffer), v.offset as u64);

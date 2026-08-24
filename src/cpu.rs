@@ -226,6 +226,19 @@ impl Backend for CpuBackend {
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         elemwise(x, y, |v| v / (1.0 + (-v).exp()))
     }
+    fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError> {
+        let (n, d) = (y.numel(), y.shape().last().copied().unwrap_or(0));
+        let xr = x.cpu_read();
+        let mut yr = y.cpu_write();
+        for i in 0..n {
+            let row = i / d;
+            let g = xr[row * 2 * d + i % d];
+            let up = xr[row * 2 * d + d + i % d];
+            yr[i] = (g / (1.0 + (-g).exp())) * up;
+        }
+        let _ = ffn;
+        Ok(())
+    }
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // tanh approximation (GPT-2 style), f32 compute.
         elemwise(x, y, |v| {

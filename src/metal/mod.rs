@@ -834,6 +834,24 @@ impl MetalCtx {
         })
     }
 
+    /// Fused SwiGLU gate: Y[i] = silu(X[i]) * X[FFN + i]; X [rows, 2*FFN].
+    pub fn silu_mul_fused_f32(
+        &self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        ffn: usize,
+    ) -> Result<(), MetalError> {
+        let n = y.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("silu_mul_fused_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(2, 8, (&n as *const usize).cast());
+            enc.set_bytes(3, 8, (&ffn as *const usize).cast());
+        })
+    }
+
     /// ReLU: y[i] = max(x[i], 0) (same shape, may alias).
     pub fn relu_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let n = x.numel();
@@ -2470,6 +2488,16 @@ impl crate::backend::Backend for MetalBackend {
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
         self.ctx.silu_f32(x.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
+    fn silu_mul_fused(
+        &self,
+        x: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        ffn: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.silu_mul_fused_f32(x.as_gpu(), y.as_gpu(), ffn)?;
         Ok(())
     }
 

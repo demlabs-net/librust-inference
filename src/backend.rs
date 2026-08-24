@@ -321,9 +321,10 @@ impl Tensor {
         self.view_inner(shape)
     }
 
-    /// View starting `elem_offset` elements into the buffer (Metal only —
-    /// CPU/CUDA tensors are contiguous copies and ignore the offset view).
-    /// Used by KV compaction (drop the oldest half without a host round-trip).
+    /// View starting `elem_offset` elements into the buffer. Metal — zero-copy
+    /// view (offset через set_buffer); CPU/CUDA — contiguous КОПИЯ со сдвигом
+    /// (та же семантика результата, без разделяемого хранилища). Используется
+    /// KV compaction (Metal) и q/k/v-разрезкой fused-qkv (без slice-кернелов).
     pub fn view_offset(&self, shape: Vec<usize>, elem_offset: usize) -> Tensor {
         debug_assert!(shape.iter().product::<usize>() + elem_offset <= self.numel());
         #[cfg(feature = "metal")]
@@ -335,6 +336,15 @@ impl Tensor {
                     dtype: self.dtype,
                 };
             }
+        }
+        #[cfg(feature = "cpu")]
+        {
+            let n: usize = shape.iter().product();
+            let data = self.cpu_read();
+            let mut v = Vec::with_capacity(n);
+            v.extend_from_slice(&data[elem_offset..elem_offset + n]);
+            drop(data);
+            return Tensor::from_cpu(v, shape);
         }
         #[allow(unreachable_code)]
         self.view_restricted(shape)
@@ -716,6 +726,8 @@ pub trait Backend: Send + Sync {
     fn sigmoid(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
+    /// Fused SwiGLU gate: Y[i] = silu(X[i]) * X[ffn + i]; X [rows, 2*ffn].
+    fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError>;
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
     /// Точный GELU (erf): 0.5·x·(1+erf(x/√2)) — vision (clip/Qwen3-VL)

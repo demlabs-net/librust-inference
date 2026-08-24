@@ -342,6 +342,24 @@ kernel void silu_f32(
     Y[gid] = x / (1.0f + exp(-x));
 }
 
+// ── Fused SwiGLU gate: Y[i] = silu(X[i]) * X[row·2·FFN + FFN + i%FFN] ────────
+// X: [rows, 2*FFN] (fused gate|up), Y: [rows, FFN]. Заменяет silu + mul
+// (2 кернела) — и позволяет слить gate/up-проекции в один GEMM.
+kernel void silu_mul_fused_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& ffn [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    uint row = gid / ffn;
+    uint i = gid % ffn;
+    float g = X[row * 2u * ffn + i];
+    float up = X[row * 2u * ffn + ffn + i];
+    Y[gid] = (g / (1.0f + exp(-g))) * up;
+}
+
 // ── ReLU ─────────────────────────────────────────────────────────────────────
 kernel void relu_f32(
     device const float* X [[buffer(0)]],

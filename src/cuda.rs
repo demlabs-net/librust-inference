@@ -1040,6 +1040,21 @@ impl Backend for CudaBackend {
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         self.elementwise(ElemOp::Silu, x, None, y, 0.0)
     }
+    fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError> {
+        let n = y.numel() as i32;
+        let ffn_i = ffn as i32;
+        let xd = x.as_cuda();
+        let od = y.as_cuda();
+        let f = self.function("silu_mul_fused_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(xd);
+        la.arg(od);
+        la.arg(&n);
+        la.arg(&ffn_i);
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        Ok(())
+    }
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         self.elementwise(ElemOp::GeluTanh, x, None, y, 0.0)
     }

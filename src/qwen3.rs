@@ -229,9 +229,10 @@ impl Qwen3Model {
             let gate = t(&p("ffn_gate.weight"))?;
             let up = t(&p("ffn_up.weight"))?;
             let down = t(&p("ffn_down.weight"))?;
+            let mut gate_up = gate.clone();
+            gate_up.extend_from_slice(&up);
             let ffn = SwiGLU {
-                w1: upload_w(backend, &gate, vec![cfg.ffn_dim, cfg.dim])?,
-                w3: upload_w(backend, &up, vec![cfg.ffn_dim, cfg.dim])?,
+                w13: upload_w(backend, &gate_up, vec![2 * cfg.ffn_dim, cfg.dim])?,
                 w2: upload_w(backend, &down, vec![cfg.dim, cfg.ffn_dim])?,
             };
             layers.push(Qwen3Layer {
@@ -627,14 +628,12 @@ fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor
     // (проверено: python-эталон совпал с llama.cpp при silu(gate)*up, corr 1.0).
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let x2 = x.view(vec![b * t, d]);
-    let ffn_dim = ffn.w1.shape()[0];
-    let a = backend.zeros(vec![b * t, ffn_dim])?;
-    let g = backend.zeros(vec![b * t, ffn_dim])?;
+    let ffn_dim = ffn.w2.shape()[1];
+    let f = backend.zeros(vec![b * t, 2 * ffn_dim])?;
     let gm = backend.zeros(vec![b * t, ffn_dim])?;
-    backend.gemm_nt(&x2, &ffn.w1, &a)?; // a = gate (в silu)
-    backend.gemm_nt(&x2, &ffn.w3, &g)?; // g = up (линейный)
-    backend.silu(&a, &a)?;
-    backend.mul(&a, &g, &gm)?;
+    // fused gate|up GEMM + silu_mul: 2 кернела вместо 4 (w1+w3 gemm, silu, mul)
+    backend.gemm_nt(&x2, &ffn.w13, &f)?;
+    backend.silu_mul_fused(&f, &gm, ffn_dim)?;
     let y = backend.zeros(vec![b * t, d])?;
     backend.gemm_nt(&gm, &ffn.w2, &y)?;
     Ok(y.view(vec![b, t, d]))

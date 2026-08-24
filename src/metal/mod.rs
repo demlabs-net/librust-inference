@@ -85,24 +85,41 @@ impl BufferPoolState {
     fn acquire(&self, device: &Device, bytes: usize) -> Buffer {
         let class = (bytes + 4095) & !4095;
         let class = class.max(4096);
-        if let Some(buf) = self.free.lock().unwrap().get_mut(&class).and_then(|v| v.pop()) {
-            return buf;
+        if std::env::var("OMNI_NO_POOL").is_err() {
+            if let Some(buf) = self.free.lock().unwrap().get_mut(&class).and_then(|v| v.pop()) {
+                return buf;
+            }
         }
         let zeroed = vec![0u8; class];
-        autoreleasepool(|| {
-            device.new_buffer_with_data(
-                zeroed.as_ptr().cast(),
-                class as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        })
+        // newBufferWithBytes может вернуть +0 (autoreleased): тогда Rust
+        // держит мёртвую ссылку — Metal переиспользует память, данные
+        // портятся. Трюк: clone (retain — refcount 1) + forget оригинала —
+        // клон живёт (не переиспользуется), а его drop освобождает память.
+        let buf = device.new_buffer_with_data(
+            zeroed.as_ptr().cast(),
+            class as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let kept = buf.clone();
+        std::mem::forget(buf);
+        kept
     }
 
     /// Вернуть буфер в пул (retain — пул держит единственный refcount).
     fn push(&self, buf: &Buffer) {
         let class = (buf.length() as usize + 4095) & !4095;
         let class = class.max(4096);
-        self.free.lock().unwrap().entry(class).or_default().push(buf.clone());
+        let mut free = self.free.lock().unwrap();
+        let v = free.entry(class).or_default();
+        if std::env::var("OMNI_DUP").is_ok() {
+            let p = buf.contents();
+            let dup = v.iter().filter(|b| b.contents() == p).count();
+            if dup > 0 {
+                eprintln!("OMNI_DUP: DOUBLE PUSH ptr={p:?} len={}",
+                    buf.length());
+            }
+        }
+        v.push(buf.clone());
     }
 }
 
@@ -963,8 +980,11 @@ impl MetalCtx {
         bias: &GpuTensor,
         y: &GpuTensor,
     ) -> Result<(), MetalError> {
-        let rows = x.shape[0];
-        let cols = x.shape[1];
+        // Последняя ось = cols (2D (rows,cols) или 3D (B,T,D) — row-major
+        // идентичен (rows,cols)); rows = numel / cols (тот же класс бага,
+        // что layernorm_f32 — 3D обрабатывал только первую строку).
+        let cols = x.shape[x.shape.len() - 1];
+        let rows = x.numel() / cols;
         let grid = MTLSize::new(cols as u64, rows as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run("add_bias_f32", grid, group, |enc| {

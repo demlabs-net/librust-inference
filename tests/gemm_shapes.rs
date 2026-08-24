@@ -183,6 +183,9 @@ fn gemm_nt_i8_shapes() {
     check_i8(&gpu, &cpu, 8, 2048, 8192);
     check_i8(&gpu, &cpu, 8, 8192, 2048);
     check_i8(&gpu, &cpu, 33, 2048, 2048);
+    // Prefill-shaped (TTS fill / STT one-shot frames) — the tiled m>1 path.
+    check_i8(&gpu, &cpu, 64, 2560, 3840);
+    check_i8(&gpu, &cpu, 470, 1536, 384);
     // Edge: m not a multiple of 64 / n not a multiple of 64 (tiled masks).
     check_i8(&gpu, &cpu, 65, 2048, 65);
     check_i8(&gpu, &cpu, 129, 1024, 400);
@@ -283,6 +286,9 @@ fn gemm_nt_half_shapes() {
         (65, 1024, 400),
         (1, 128, 300),
         (4, 1280, 3840),
+        // Prefill-shaped (TTS fill / STT one-shot) — the tiled m>1 path.
+        (64, 2560, 3840),
+        (470, 1536, 384),
     ];
     for &(m, k, n) in &shapes {
         for wf16 in [false, true] {

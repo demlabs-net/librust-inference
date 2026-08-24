@@ -232,11 +232,11 @@ impl CudaBackend {
     }
 
     /// Half-weight (fp16/bf16) GEMM on the own split-k kernels (see the
-    /// DEFINE_HALFW_SPLITK comment). Split factor S: for m=1 (decode) the
-    /// largest divisor of k/32 within a 512-block grid (the split divides
-    /// K — each (column, k-slice) is read once, so S only trades grid
-    /// density against the per-block k-loop length); m>1 reads B once
-    /// (S=1, no re-read). k must be a multiple of 32.
+    /// DEFINE_HALFW_SPLITK comment). Split factor S: m=1 (decode) the
+    /// largest divisor of k/32 within a 512-block grid (latency hiding);
+    /// m>1 (prefill/fill/STT) the largest divisor of k/32 in [8,4,2,1] —
+    /// more blocks than S=1, B re-reads bounded by the L2 (k-multiple
+    /// traffic; measured vs the m=1-shaped fallback). k % 32 == 0.
     fn gemm_halfw_nt<T>(
         &self,
         a: &Tensor,
@@ -252,35 +252,79 @@ impl CudaBackend {
         let m32 = m as i32;
         let c = c.as_cuda_mut();
         let grid_x = (n + 255) / 256;
-        let nblk = k / 32;
-        let s = if m == 1 {
-            [32usize, 16, 8, 4, 2, 1]
-                .into_iter()
-                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
-                .unwrap_or(1)
-        } else {
-            1
-        };
-        let cpart = self.take_pooled(s * m * n)?;
         let act = self.activation_dtype();
-        let (fname, a_arg): (&'static str, KernA) = match (b_suf, act) {
+        let (tiled_name, splitk_name): (&'static str, &'static str) = match (b_suf, act) {
             ("bf16", crate::dtype::Dtype::F16) => {
-                ("gemm_halfw_splitk_f16_bf16", KernA::F16(self.cast_f16(a)?))
+                ("gemm_halfw_tiled_f16_bf16", "gemm_halfw_splitk_f16_bf16")
             }
             ("bf16", crate::dtype::Dtype::BF16) => {
-                ("gemm_halfw_splitk_bf16_bf16", KernA::BF16(self.cast_bf16(a)?))
+                ("gemm_halfw_tiled_bf16_bf16", "gemm_halfw_splitk_bf16_bf16")
             }
-            ("bf16", _) => ("gemm_halfw_splitk_f32_bf16", KernA::F32(a)),
+            ("bf16", _) => ("gemm_halfw_tiled_f32_bf16", "gemm_halfw_splitk_f32_bf16"),
             ("f16", crate::dtype::Dtype::F16) => {
-                ("gemm_halfw_splitk_f16_f16", KernA::F16(self.cast_f16(a)?))
+                ("gemm_halfw_tiled_f16_f16", "gemm_halfw_splitk_f16_f16")
             }
             ("f16", crate::dtype::Dtype::BF16) => {
-                ("gemm_halfw_splitk_bf16_f16", KernA::BF16(self.cast_bf16(a)?))
+                ("gemm_halfw_tiled_bf16_f16", "gemm_halfw_splitk_bf16_f16")
             }
-            ("f16", _) => ("gemm_halfw_splitk_f32_f16", KernA::F32(a)),
+            ("f16", _) => ("gemm_halfw_tiled_f32_f16", "gemm_halfw_splitk_f32_f16"),
             _ => unreachable!("gemm_halfw_nt: unknown weight suffix {b_suf}"),
         };
-        let f = self.function(fname)?;
+        let a_arg: KernA = match act {
+            crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
+            crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
+            _ => KernA::F32(a),
+        };
+        if m > 1 {
+            // Tiled: 32 rows × 256 cols per block, grid.z=4 splits k into
+            // (4·m, n) partials — combined by gemm_i8_reduce. The z-slices
+            // write disjoint (row, col) tiles, so every element is summed
+            // 4× in a fixed order — deterministic.
+            let s4 = 4usize;
+            let cpart = self.take_pooled(s4 * m * n)?;
+            let f = self.function(tiled_name)?;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 4),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            match &a_arg {
+                KernA::F32(t) => la.arg(t.as_cuda()),
+                KernA::F16(sl) => la.arg(sl),
+                KernA::BF16(sl) => la.arg(sl),
+            };
+            la.arg(b);
+            la.arg(&cpart);
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            let f = self.function("gemm_i8_reduce")?;
+            let cfg = LaunchConfig {
+                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(&cpart);
+            la.arg(c);
+            la.arg(&n32);
+            let s4i = 4i32;
+            la.arg(&s4i);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            self.pool.lock().unwrap().entry(s4 * m * n).or_default().push(cpart);
+            self.pool_a_scratch(a_arg);
+            return Ok(());
+        }
+        let nblk = k / 32;
+        let s = [32usize, 16, 8, 4, 2, 1]
+            .into_iter()
+            .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
+            .unwrap_or(1);
+        let cpart = self.take_pooled(s * m * n)?;
+        let f = self.function(splitk_name)?;
         let cfg = LaunchConfig {
             grid_dim: ((grid_x * m) as u32, s as u32, 1),
             block_dim: (256, 1, 1),
@@ -685,42 +729,76 @@ impl Backend for CudaBackend {
             scale: wscale,
         } = &b.inner
         {
-            // Q8_0-style int8 GEMM: per-32-block weight scales, f32
-            // activations (no activation quantization — it added a kernel +
-            // scratch per gemm for nothing). kb-major packed weights feed a
-            // Q4_0-style split-k: coalesced uint4 tile loads, f32 FMA dot
-            // with the per-column scale. The split factor follows the packed
-            // path's policy: for m=1 (decode) the largest S that divides
-            // k/32 within a 512-block grid (latency hiding); m>1 reads B
-            // once (S=1, no re-read).
+            // Q8_0-style int8 GEMM: per-32-block weight scales, the A
+            // operand follows the activation axis (f32 default, fp16/bf16
+            // cast). kb-major packed weights feed the own kernels: m=1
+            // (decode) the split-k (the largest S that divides k/32 within
+            // a 512-block grid — latency hiding); m>1 (prefill/fill/STT)
+            // the tiled kernel (32 rows × 256 cols per block, B staged in
+            // shared once per k-block).
             let k32 = k as i32;
             let n32 = n as i32;
             let m32 = m as i32;
             let c = c.as_cuda_mut();
             let grid_x = (n + 255) / 256;
-            let nblk = k / 32;
-            let s = if m == 1 {
-                [32usize, 16, 8, 4, 2, 1]
-                    .into_iter()
-                    .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
-                    .unwrap_or(1)
-            } else {
-                1
-            };
-            let cpart = self.take_pooled(s * m * n)?;
             let act = self.activation_dtype();
-            let (fname, a_arg) = match act {
-                crate::dtype::Dtype::F16 => {
-                    let a16 = self.cast_f16(a)?;
-                    ("gemm_q8k_splitk_f16", KernA::F16(a16))
-                }
-                crate::dtype::Dtype::BF16 => {
-                    let a16 = self.cast_bf16(a)?;
-                    ("gemm_q8k_splitk_bf16", KernA::BF16(a16))
-                }
-                _ => ("gemm_q8k_splitk_f32", KernA::F32(a)),
+            let (tiled_name, splitk_name): (&'static str, &'static str) = match act {
+                crate::dtype::Dtype::F16 => ("gemm_q8k_tiled_f16", "gemm_q8k_splitk_f16"),
+                crate::dtype::Dtype::BF16 => ("gemm_q8k_tiled_bf16", "gemm_q8k_splitk_bf16"),
+                _ => ("gemm_q8k_tiled_f32", "gemm_q8k_splitk_f32"),
             };
-            let f = self.function(fname)?;
+            let a_arg: KernA = match act {
+                crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
+                crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
+                _ => KernA::F32(a),
+            };
+            if m > 1 {
+                let s4 = 4usize;
+                let cpart = self.take_pooled(s4 * m * n)?;
+                let f = self.function(tiled_name)?;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 4),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                match &a_arg {
+                    KernA::F32(t) => la.arg(t.as_cuda()),
+                    KernA::F16(sl) => la.arg(sl),
+                    KernA::BF16(sl) => la.arg(sl),
+                };
+                la.arg(b8);
+                la.arg(wscale);
+                la.arg(&cpart);
+                la.arg(&m32);
+                la.arg(&k32);
+                la.arg(&n32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                let f = self.function("gemm_i8_reduce")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&cpart);
+                la.arg(c);
+                la.arg(&n32);
+                let s4i = 4i32;
+                la.arg(&s4i);
+                la.arg(&m32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+                self.pool.lock().unwrap().entry(s4 * m * n).or_default().push(cpart);
+                self.pool_a_scratch(a_arg);
+                return Ok(());
+            }
+            let nblk = k / 32;
+            let s = [32usize, 16, 8, 4, 2, 1]
+                .into_iter()
+                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
+                .unwrap_or(1);
+            let cpart = self.take_pooled(s * m * n)?;
+            let f = self.function(splitk_name)?;
             let cfg = LaunchConfig {
                 grid_dim: ((grid_x * m) as u32, s as u32, 1),
                 block_dim: (256, 1, 1),

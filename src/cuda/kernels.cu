@@ -1863,6 +1863,175 @@ DEFINE_HALFW_SPLITK(f32, bf16, float, __nv_bfloat16)
 DEFINE_HALFW_SPLITK(f16, bf16, __half, __nv_bfloat16)
 DEFINE_HALFW_SPLITK(bf16, bf16, __nv_bfloat16, __nv_bfloat16)
 
+// ─────────── Half-weight tiled GEMM (m > 1: prefill/fill/STT) ───────────
+// The split-k kernels are m=1-shaped (one output row per block); for m>1
+// they fall back to S=1 with a long sequential k-loop per row — the prefill
+// qkv measured 11x slower than cuBLAS (646 vs 59 us). The tiled kernel is
+// the Q6_K tiled structure: one block per (32 rows × 256 cols), the B tile
+// staged in shared ONCE per k-block and reused by all 32 rows (B read once
+// total), 32 row-accumulators in registers. Both tiles are TRANSPOSED with
+// a +1 padding column — consecutive threads touch consecutive banks on
+// every access (the unpadded transpose would be 32-way conflicted). A is
+// staged in shared per k-block (one coalesced 128 B row per warp); B rows
+// are 64 B contiguous segments — the strided rows share 128 B L1 lines
+// across adjacent k-blocks (same locality as the split-k direct reads).
+#define DEFINE_HALFW_TILED(ASUF, BSUF, AT, BT)                                \
+extern "C" __global__ void gemm_halfw_tiled_##ASUF##_##BSUF(                  \
+    const AT* __restrict__ A,          /* (m, k) row-major activations */     \
+    const BT* __restrict__ B,          /* (n, k) row-major weights */         \
+    float* __restrict__ Cpart,         /* (S·m, n) — grid.z k-slices */        \
+    int m, int k, int n)                                                      \
+{                                                                             \
+    const int BM = 32;                                                        \
+    const int BN = 256;                                                       \
+    const int BP = BN + 1;                                                    \
+    __shared__ BT Bs[32 * BP];          /* T[j][col] — padded transpose */    \
+    __shared__ AT As[BM * 33];          /* A-tile: 32 rows × 32 cols + pad */ \
+    int tid = threadIdx.x;                                                    \
+    int col0 = blockIdx.x * BN;                                               \
+    int r0 = blockIdx.y * BM;                                                 \
+    int nsup = k >> 5;                                                        \
+    int nkz = (nsup + 3) >> 2;      /* k-split: grid.z=4 quadruples grid */   \
+    int kb0 = blockIdx.z * nkz;                                               \
+    if (kb0 >= nsup) return;                                                  \
+    int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \
+    float acc[BM];                                                            \
+    for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                           \
+    for (int kb = kb0; kb < kb1; ++kb) {                                      \
+        if (col0 + tid < n) {                                                 \
+            const BT* brow = B + (size_t)(col0 + tid) * k + kb * 32;          \
+            const uint4* bv = (const uint4*)brow;                             \
+            _Pragma("unroll")                                                 \
+            for (int v = 0; v < 4; ++v) {                                     \
+                uint4 ub = __ldg(&bv[v]);                                     \
+                const BT* bh = (const BT*)&ub;                                \
+                _Pragma("unroll")                                             \
+                for (int i = 0; i < 8; ++i) {                                 \
+                    Bs[(v * 8 + i) * BP + tid] = bh[i];                       \
+                }                                                             \
+            }                                                                 \
+        } else {                                                              \
+            _Pragma("unroll")                                                 \
+            for (int j = 0; j < 32; ++j) Bs[j * BP + tid] = (BT)0;            \
+        }                                                                     \
+        for (int i = tid; i < BM * 32; i += 256) {                            \
+            int rr = i >> 5;                                                  \
+            int r = r0 + rr;                                                  \
+            As[rr * 33 + (i & 31)] =                                          \
+                r < m ? A[(size_t)r * k + kb * 32 + (i & 31)] : (AT)0;        \
+        }                                                                     \
+        __syncthreads();                                                      \
+        if (col0 + tid < n) {                                                 \
+            _Pragma("unroll")                                                 \
+            for (int rr = 0; rr < BM; ++rr) {                                 \
+                float d = 0.0f;                                               \
+                _Pragma("unroll")                                             \
+                for (int j = 0; j < 32; ++j) {                                \
+                    d += (float)As[rr * 33 + j] * (float)Bs[j * BP + tid];    \
+                }                                                             \
+                acc[rr] += d;                                                 \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (col0 + tid < n) {                                                     \
+        for (int rr = 0; rr < BM; ++rr) {                                     \
+            if (r0 + rr < m) {                                                \
+                Cpart[(blockIdx.z * m + r0 + rr) * n + col0 + tid] = acc[rr]; \
+            }                                                                 \
+        }                                                                     \
+    }                                                                         \
+}
+
+DEFINE_HALFW_TILED(f32, f16, float, __half)
+DEFINE_HALFW_TILED(f16, f16, __half, __half)
+DEFINE_HALFW_TILED(bf16, f16, __nv_bfloat16, __half)
+DEFINE_HALFW_TILED(f32, bf16, float, __nv_bfloat16)
+DEFINE_HALFW_TILED(f16, bf16, __half, __nv_bfloat16)
+DEFINE_HALFW_TILED(bf16, bf16, __nv_bfloat16, __nv_bfloat16)
+
+// ─────────────── Q8_0 tiled GEMM (m > 1), kb-major B ───────────────
+// Same structure as the half-weight tiled: block per (32 rows × 256 cols),
+// B staged in shared once per k-block, 32 row-accumulators. The packed
+// weights are kb-major (block (kb, col) = 32 contiguous i8 at
+// (kb·n + col)·32) — thread t loads its 32 B row (2 uint4, L1-resident
+// across adjacent k-blocks) and the per-block scale wsc(kb, col) directly
+// into a register. The scale is factored out of the j-loop (dot * w).
+#define DEFINE_Q8K_TILED(SUF, AT)                                             \
+extern "C" __global__ void gemm_q8k_tiled_##SUF(                              \
+    const AT* __restrict__ A,          /* (m, k) row-major activations */     \
+    const signed char* __restrict__ B, /* packed (kb·n + col)·32 i8 */        \
+    const float* __restrict__ wsc,     /* (kb·n + col) per-block scales */    \
+    float* __restrict__ Cpart,         /* (S·m, n) — grid.z k-slices */        \
+    int m, int k, int n)                                                      \
+{                                                                             \
+    const int BM = 32;                                                        \
+    const int BN = 256;                                                       \
+    const int BP = BN + 1;                                                    \
+    __shared__ signed char Bs[32 * BP];                                       \
+    __shared__ AT As[BM * 33];                                                \
+    int tid = threadIdx.x;                                                    \
+    int col0 = blockIdx.x * BN;                                               \
+    int r0 = blockIdx.y * BM;                                                 \
+    int nsup = k >> 5;                                                        \
+    int nkz = (nsup + 3) >> 2;      /* k-split: grid.z=4 quadruples grid */   \
+    int kb0 = blockIdx.z * nkz;                                               \
+    if (kb0 >= nsup) return;                                                  \
+    int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \
+    float acc[BM];                                                            \
+    for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                           \
+    for (int kb = kb0; kb < kb1; ++kb) {                                      \
+        float w = 0.0f;                                                       \
+        if (col0 + tid < n) {                                                 \
+            const signed char* brow = B + (size_t)(kb * n + col0 + tid) * 32; \
+            const uint4* bv = (const uint4*)brow;                             \
+            _Pragma("unroll")                                                 \
+            for (int v = 0; v < 2; ++v) {                                     \
+                uint4 ub = __ldg(&bv[v]);                                     \
+                const signed char* bh = (const signed char*)&ub;              \
+                _Pragma("unroll")                                             \
+                for (int i = 0; i < 16; ++i) {                                \
+                    Bs[(v * 16 + i) * BP + tid] = bh[i];                      \
+                }                                                             \
+            }                                                                 \
+            w = wsc[(size_t)kb * n + col0 + tid];                             \
+        } else {                                                              \
+            _Pragma("unroll")                                                 \
+            for (int j = 0; j < 32; ++j) Bs[j * BP + tid] = 0;                \
+        }                                                                     \
+        for (int i = tid; i < BM * 32; i += 256) {                            \
+            int rr = i >> 5;                                                  \
+            int r = r0 + rr;                                                  \
+            As[rr * 33 + (i & 31)] =                                          \
+                r < m ? A[(size_t)r * k + kb * 32 + (i & 31)] : (AT)0;        \
+        }                                                                     \
+        __syncthreads();                                                      \
+        if (col0 + tid < n) {                                                 \
+            _Pragma("unroll")                                                 \
+            for (int rr = 0; rr < BM; ++rr) {                                 \
+                float d = 0.0f;                                               \
+                _Pragma("unroll")                                             \
+                for (int j = 0; j < 32; ++j) {                                \
+                    d += (float)As[rr * 33 + j] * (float)Bs[j * BP + tid];    \
+                }                                                             \
+                acc[rr] += d * w;                                             \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (col0 + tid < n) {                                                     \
+        for (int rr = 0; rr < BM; ++rr) {                                     \
+            if (r0 + rr < m) {                                                \
+                Cpart[(blockIdx.z * m + r0 + rr) * n + col0 + tid] = acc[rr]; \
+            }                                                                 \
+        }                                                                     \
+    }                                                                         \
+}
+
+DEFINE_Q8K_TILED(f32, float)
+DEFINE_Q8K_TILED(f16, __half)
+DEFINE_Q8K_TILED(bf16, __nv_bfloat16)
+
 // ─────────────────── Q6_K GEMM v2 (dequant-amortized) ───────────────────
 // The v1 splitk dequantized inline per FMA: 3 shared byte loads + ~12 ALU
 // per weight, strided 210 B (gcd(210,32)=2 — 2-way bank conflicts) — 49 us

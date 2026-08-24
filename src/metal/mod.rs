@@ -2343,8 +2343,47 @@ impl crate::backend::Backend for MetalBackend {
         b: &crate::backend::Tensor,
         c: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.gemm_nt_f32(a.as_gpu(), b.as_gpu(), c.as_gpu())?;
+        let bg = b.as_gpu();
+        // Квантованные веса — через dequant-in-kernel GEMM/MMV (Ф1.3/1.4).
+        if matches!(
+            bg.dtype,
+            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K
+        ) {
+            if a.as_gpu().shape[0] == 1 {
+                // mv_quantized — MMV-примитив: a 1D [k], c 1D [n] (тот же буфер).
+                let k = a.as_gpu().shape[1];
+                let n = bg.shape[0];
+                let av = a.view(vec![k]);
+                let cv = c.view(vec![n]);
+                self.ctx.mv_quantized(av.as_gpu(), bg, cv.as_gpu())?;
+            } else {
+                self.ctx.gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+            }
+            return Ok(());
+        }
+        self.ctx.gemm_nt_f32(a.as_gpu(), bg, c.as_gpu())?;
         Ok(())
+    }
+
+    fn from_quantized(
+        &self,
+        data: &[u8],
+        shape: Vec<usize>,
+        format: crate::dtype::WeightFormat,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let dtype = match format {
+            crate::dtype::WeightFormat::Q4_0 => GpuDtype::Q4_0,
+            crate::dtype::WeightFormat::Q8_0 => GpuDtype::Q8_0,
+            crate::dtype::WeightFormat::Q4_K => GpuDtype::Q4_K,
+            crate::dtype::WeightFormat::Q6_K => GpuDtype::Q6_K,
+            other => {
+                return Err(crate::error::BackendError::Shape(format!(
+                    "from_quantized: {other:?} is not quantized"
+                )));
+            }
+        };
+        let g = GpuTensor::from_quantized(&self.ctx.device, data, shape.clone(), dtype)?;
+        Ok(crate::backend::Tensor::from_gpu(g))
     }
 
     fn mul(

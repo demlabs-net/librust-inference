@@ -690,6 +690,25 @@ pub trait Backend: Send + Sync {
     /// C (M,N) = A (M,K) · Bᵀ (N,K).
     fn gemm_nt(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError>;
 
+    /// Upload квантованных весов (Q4_0/Q8_0/Q4_K/Q6_K) из сырых GGUF-байтов.
+    /// Default (CPU/CUDA-оракул): деквант → f32; Metal — нативный формат.
+    fn from_quantized(
+        &self,
+        data: &[u8],
+        shape: Vec<usize>,
+        format: crate::dtype::WeightFormat,
+    ) -> Result<Tensor, BackendError> {
+        let tmp = crate::weights_map::WeightTensor {
+            name: "q".into(),
+            shape: shape.iter().map(|&d| d as u64).collect(),
+            format,
+            offset: 0,
+            data,
+        };
+        let f = crate::weights_map::dequant_f32(&tmp);
+        self.from_cpu_f32(&f, shape)
+    }
+
     /// Transpose a 2D tensor (row-major (M,N) → (N,M)). Default: host
     /// round-trip — only the LoRA trainer uses it, on tiny tensors, so the
     /// Metal/CUDA backends inherit this without a kernel.

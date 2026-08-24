@@ -143,6 +143,67 @@ pub struct Qwen3Model {
 
 impl Qwen3Model {
     #[allow(clippy::too_many_arguments)]
+    /// Квант-осведомлённая загрузка веса: Q4_0/Q8_0/Q4_K/Q6_K — нативно
+    /// (dequant-in-kernel GEMM/MMV), иначе dequant→f16 (как раньше).
+    fn upload_q(
+        backend: &dyn Backend,
+        w: &WeightsMap<'_>,
+        name: &str,
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
+        let tensor = w
+            .get(name)
+            .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
+        match tensor.format {
+            crate::dtype::WeightFormat::Q4_0
+            | crate::dtype::WeightFormat::Q8_0
+            | crate::dtype::WeightFormat::Q4_K
+            | crate::dtype::WeightFormat::Q6_K => {
+                backend.from_quantized(tensor.raw(), shape, tensor.format)
+            }
+            _ => upload_w(backend, &crate::weights_map::dequant_f32(tensor), shape),
+        }
+    }
+
+    /// Fused-веса (q/k/v, gate/up) с нативным квантом, если ВСЕ части
+    /// квантованы одинаково (GGUF-модели — всегда); иначе dequant→f16.
+    fn upload_fused(
+        backend: &dyn Backend,
+        w: &WeightsMap<'_>,
+        names: &[&str],
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
+        let tensors: Vec<&crate::weights_map::WeightTensor<'_>> = names
+            .iter()
+            .map(|n| {
+                w.get(n)
+                    .ok_or_else(|| BackendError::Shape(format!("missing tensor {n}")))
+            })
+            .collect::<Result<_, _>>()?;
+        let q = tensors[0].format;
+        let all_q = tensors.iter().all(|t| t.format == q)
+            && matches!(
+                q,
+                crate::dtype::WeightFormat::Q4_0
+                    | crate::dtype::WeightFormat::Q8_0
+                    | crate::dtype::WeightFormat::Q4_K
+                    | crate::dtype::WeightFormat::Q6_K
+            );
+        if all_q {
+            let mut bytes = Vec::new();
+            for t in &tensors {
+                bytes.extend_from_slice(t.raw());
+            }
+            backend.from_quantized(&bytes, shape, q)
+        } else {
+            let mut f = Vec::new();
+            for t in &tensors {
+                f.extend(crate::weights_map::dequant_f32(t));
+            }
+            upload_w(backend, &f, shape)
+        }
+    }
+
     pub fn load(
         backend: &dyn Backend,
         w: &WeightsMap<'_>,
@@ -165,14 +226,19 @@ impl Qwen3Model {
         let mut caches = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}");
-            // fuse q/k/v → [3D, D]
-            let q = t(&p("attn_q.weight"))?;
-            let k = t(&p("attn_k.weight"))?;
-            let v = t(&p("attn_v.weight"))?;
-            let mut wqkv = q;
-            wqkv.extend_from_slice(&k);
-            wqkv.extend_from_slice(&v);
-            let wo = t(&p("attn_output.weight"))?;
+            // fuse q/k/v → [3D, D] (нативный квант, если все Q8_0/Q4_0/...)
+            let qn = p("attn_q.weight");
+            let kn = p("attn_k.weight");
+            let vn = p("attn_v.weight");
+            let wqkv = Self::upload_fused(
+                backend,
+                w,
+                &[&qn, &kn, &vn],
+                vec![
+                    cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
+                    cfg.dim,
+                ],
+            )?;
             // QK-norm опционален (Qwen3 — есть; Qwen2.5-Omni thinker — нет).
             let q_norm = if w.get(&p("attn_q_norm.weight")).is_some() {
                 Some(backend.from_cpu_f32(&t(&p("attn_q_norm.weight"))?, vec![cfg.head_dim])?)
@@ -192,20 +258,15 @@ impl Qwen3Model {
             } else {
                 None
             };
+            let wo = Self::upload_q(
+                backend,
+                w,
+                &p("attn_output.weight"),
+                vec![cfg.dim, cfg.n_heads * cfg.head_dim],
+            )?;
             let attn = Attention {
-                wqkv: upload_w(
-                    backend,
-                    &wqkv,
-                    vec![
-                        cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
-                        cfg.dim,
-                    ],
-                )?,
-                wo: upload_w(
-                    backend,
-                    &wo,
-                    vec![cfg.dim, cfg.n_heads * cfg.head_dim],
-                )?,
+                wqkv,
+                wo,
                 qkv_bias: qkv_bias
                     .map(|b| {
                         backend.from_cpu_f32(
@@ -225,15 +286,22 @@ impl Qwen3Model {
             let attn_norm =
                 RmsNorm::from_weights(backend, t(&p("attn_norm.weight"))?, cfg.norm_eps)?;
             let ffn_norm = RmsNorm::from_weights(backend, t(&p("ffn_norm.weight"))?, cfg.norm_eps)?;
-            // ffn: gate/up [ffn, D], down [D, ffn] — GEMM-веса в f16 (Metal)
-            let gate = t(&p("ffn_gate.weight"))?;
-            let up = t(&p("ffn_up.weight"))?;
-            let down = t(&p("ffn_down.weight"))?;
-            let mut gate_up = gate.clone();
-            gate_up.extend_from_slice(&up);
+            // ffn: gate/up fused [2·ffn, D] (нативный квант), down [D, ffn]
+            let gn = p("ffn_gate.weight");
+            let un = p("ffn_up.weight");
             let ffn = SwiGLU {
-                w13: upload_w(backend, &gate_up, vec![2 * cfg.ffn_dim, cfg.dim])?,
-                w2: upload_w(backend, &down, vec![cfg.dim, cfg.ffn_dim])?,
+                w13: Self::upload_fused(
+                    backend,
+                    w,
+                    &[&gn, &un],
+                    vec![2 * cfg.ffn_dim, cfg.dim],
+                )?,
+                w2: Self::upload_q(
+                    backend,
+                    w,
+                    &p("ffn_down.weight"),
+                    vec![cfg.dim, cfg.ffn_dim],
+                )?,
             };
             layers.push(Qwen3Layer {
                 attn_norm,
@@ -256,7 +324,9 @@ impl Qwen3Model {
             Some(_) if !w.tied_aliases("output.weight").is_empty() => {
                 upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?
             }
-            Some(_) => upload_w(backend, &t("output.weight")?, vec![cfg.vocab_size, cfg.dim])?,
+            Some(_) => {
+                Self::upload_q(backend, w, "output.weight", vec![cfg.vocab_size, cfg.dim])?
+            }
             None => upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?,
         };
 

@@ -3,6 +3,8 @@
 //!
 //! `cargo test --release --features metal --test kv_compact`
 
+#![cfg(feature = "metal")]
+
 use rust_inference::backend::{Backend, Tensor};
 use rust_inference::metal::MetalBackend;
 use rust_inference::nn::{build_causal_mask, KvCache};

@@ -310,6 +310,7 @@ impl Qwen3Model {
                 t,
                 mrope,
             )?;
+            #[cfg(feature = "metal")]
             if std::env::var("Q3_DBG_X20").is_ok() && i == 0 {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static XPTR_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -320,17 +321,20 @@ impl Qwen3Model {
                         h.as_gpu().buffer.contents() as usize);
                 }
             }
+            #[cfg(feature = "metal")]
             if std::env::var("Q3_DBG_X20").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let last = xv.len() - self.cfg.dim;
                 eprintln!("Q3_DBG x20 вход2: {:?}", &xv[last..last + 4]);
             }
+            #[cfg(feature = "metal")]
             if std::env::var("Q3_DBG_X20").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let last = xv.len() - self.cfg.dim;
                 eprintln!("Q3_DBG x20 вход: {:?}", &xv[last..last + 8]);
             }
             x = backend_add(backend, &x, &h)?;
+            #[cfg(feature = "metal")]
             if std::env::var("Q3_DBG_X20").is_ok() && i == 0 {
                 let dv = backend.to_cpu_f32(&x)?;
                 let last = dv.len() - self.cfg.dim;
@@ -367,6 +371,7 @@ impl Qwen3Model {
                     }
                 }
             }
+            #[cfg(feature = "metal")]
             if std::env::var("Q3_DBG_X20").is_ok() && i == 0 {
                 let dv = backend.to_cpu_f32(&x)?;
                 let last = dv.len() - self.cfg.dim;
@@ -397,6 +402,9 @@ impl Qwen3Model {
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
     pub fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
         let x = self.embed.forward(backend, &[id], 1)?;
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             let xv = backend.to_cpu_f32(&x)?;
             eprintln!("Q3_DBG embed_out id={id}: {:?}", &xv[..4]);
@@ -445,6 +453,9 @@ impl Qwen3Model {
                 }
             };
         }
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static H_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -463,9 +474,13 @@ impl Qwen3Model {
         }
         .forward(backend, h)?;
         tlog!("qkv_gemm", t0_qkv);
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() && tq == 1 {
             eprintln!("Q3_DBG ptrs qkv={} h={} w={} ck={}", qkv.as_gpu().buffer.contents() as usize, h.as_gpu().buffer.contents() as usize, attn.wqkv.as_gpu().buffer.contents() as usize, cache.view().as_gpu().buffer.contents() as usize);
         }
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static QKV_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -528,13 +543,17 @@ impl Qwen3Model {
                     backend.rope_mrope(&k, &pos4d, attn.head_dim, cfg.rope_theta, sects)?,
                 )
             } else {
+                #[cfg(feature = "metal")]
                 if std::env::var("Q3_DBG_X20").is_ok() && cfg.mrope_sections.is_some() {
                     eprintln!("Q3_DBG rope_text q_buf={} (before) tq={} pos={}",
                         q.as_gpu().buffer.contents() as usize, t, pos);
                 }
                 let qr = backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?;
                 let kr = backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?;
-                if std::env::var("Q3_DBG_X20").is_ok() {
+                // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
+        if std::env::var("Q3_DBG_X20").is_ok() {
                     eprintln!("Q3_DBG rope_text q_after={} k_after={}",
                         qr.as_gpu().buffer.contents() as usize,
                         kr.as_gpu().buffer.contents() as usize);
@@ -552,6 +571,9 @@ impl Qwen3Model {
         let t0_ck = std::time::Instant::now();
         cache.update(backend, &k, &v)?;
         tlog!("cache_update", t0_ck);
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static Q20_COUNT2: AtomicUsize = AtomicUsize::new(0);
@@ -584,6 +606,9 @@ impl Qwen3Model {
         let ck = cache.view();
         let cv = cache.view_v();
         let attn_out = backend.zeros(vec![b, tq, q_size])?;
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static AOP_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -606,6 +631,9 @@ impl Qwen3Model {
             attn.head_dim,
         )?;
         tlog!("attn_ar", t0_ar);
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static ATTN3_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -627,6 +655,9 @@ impl Qwen3Model {
             b: None,
         }
         .forward(backend, &attn_out)?;
+        // Qwen3 debug scaffold (pointer dumps) — Metal-only (as_gpu); other
+        // backends must still compile (Linux cpu/cuda builds).
+        #[cfg(feature = "metal")]
         if std::env::var("Q3_DBG_X20").is_ok() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static O_COUNT3: AtomicUsize = AtomicUsize::new(0);
@@ -733,6 +764,7 @@ fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor
     if std::env::var("Q3_TIMING").is_ok() {
         eprintln!("TIMING ffn_gemm {:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
     }
+    #[cfg(feature = "metal")]
     if std::env::var("Q3_DBG_X20").is_ok() && t > 1 {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static FFN_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -748,6 +780,7 @@ fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor
         }
     }
     let y = backend.zeros(vec![b * t, d])?;
+    #[cfg(feature = "metal")]
     if std::env::var("Q3_DBG_X20").is_ok() && t > 1 {
         eprintln!("Q3_DBG ptr y={:?} x={:?} gm={:?}",
             y.as_gpu().buffer.contents() as usize,

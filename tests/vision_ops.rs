@@ -4,6 +4,8 @@
 //!
 //! `cargo test --release --features metal --test vision_ops`
 
+#![cfg(feature = "metal")]
+
 use rust_inference::backend::{Backend, Tensor};
 use rust_inference::metal::MetalBackend;
 

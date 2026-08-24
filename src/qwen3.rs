@@ -281,11 +281,16 @@ impl Qwen3Model {
     }
 
     pub fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
-        let t = ids.len();
-        let x = self.embed.forward(backend, ids, t)?;
-        let logits = self.forward_layers(backend, x, t, None)?;
-        self.pos_rope = self.caches[0].pos;
-        Ok(logits)
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let x = self.embed.forward(backend, ids, t)?;
+            let logits = self.forward_layers(backend, x, t, None)?;
+            self.pos_rope = self.caches[0].pos;
+            Ok(logits)
+        })();
+        backend.end_batch()?;
+        r
     }
 
     /// Prefill с vision-эмбеддингами (Ф1.11): токены == `vision_token`
@@ -303,13 +308,18 @@ impl Qwen3Model {
         pos4d: &[u32],
         pos_after: usize,
     ) -> Result<Tensor, BackendError> {
-        let t = ids.len();
-        assert_eq!(pos4d.len(), t * 4, "pos4d: {t} токенов × 4");
-        let x = backend.zeros(vec![1, t, self.cfg.dim])?;
-        backend.embedding_override(ids, &self.embed.table, vision, &x, vision_token)?;
-        let logits = self.forward_layers(backend, x, t, Some(pos4d))?;
-        self.pos_rope = pos_after;
-        Ok(logits)
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            assert_eq!(pos4d.len(), t * 4, "pos4d: {t} токенов × 4");
+            let x = backend.zeros(vec![1, t, self.cfg.dim])?;
+            backend.embedding_override(ids, &self.embed.table, vision, &x, vision_token)?;
+            let logits = self.forward_layers(backend, x, t, Some(pos4d))?;
+            self.pos_rope = pos_after;
+            Ok(logits)
+        })();
+        backend.end_batch()?;
+        r
     }
 
     /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
@@ -376,10 +386,18 @@ impl Qwen3Model {
 
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
     pub fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
-        let x = self.embed.forward(backend, &[id], 1)?;
-        let logits = self.forward_layers(backend, x, 1, None)?;
-        self.pos_rope += 1;
-        Ok(logits)
+        // Все ~290 кернелов шага — в ОДИН command buffer (1 commit+wait
+        // вместо 290 синхронных dispatch — decode был в ~70× медленнее
+        // bandwidth-потолка из-за per-op sync).
+        backend.begin_batch()?;
+        let r = (|| {
+            let x = self.embed.forward(backend, &[id], 1)?;
+            let logits = self.forward_layers(backend, x, 1, None)?;
+            self.pos_rope += 1;
+            Ok(logits)
+        })();
+        backend.end_batch()?;
+        r
     }
 
     /// Сброс KV-кэшей (новый контекст).

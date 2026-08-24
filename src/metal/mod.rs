@@ -18,9 +18,13 @@
 #![allow(clippy::too_many_arguments)]
 
 use metal::*;
+use objc::msg_send;
 use objc::rc::autoreleasepool;
+use objc::sel;
+use objc::sel_impl;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, thiserror::Error)]
@@ -85,7 +89,13 @@ impl BufferPoolState {
     fn acquire(&self, device: &Device, bytes: usize) -> Buffer {
         let class = (bytes + 4095) & !4095;
         let class = class.max(4096);
-        if std::env::var("OMNI_NO_POOL").is_err() {
+        // В batch-режиме пул НЕ используется: его буферы могут быть заняты
+        // НЕВЫПОЛНЕННЫМИ command buffers (в очереди GPU) — CPU-запись в них
+        // (from_cpu_f32/zeros) гоняется с чтением/записью GPU → мусорные
+        // результаты (decode/prefill в batch давали неверные логиты).
+        // Новые буферы безопасны: Metal command buffer удерживает ресурсы
+        // до завершения. После end_batch (wait) пул снова активен.
+        if BATCH_DEPTH.load(Ordering::Relaxed) == 0 && std::env::var("OMNI_NO_POOL").is_err() {
             if let Some(buf) = self.free.lock().unwrap().get_mut(&class).and_then(|v| v.pop()) {
                 return buf;
             }
@@ -106,7 +116,16 @@ impl BufferPoolState {
     }
 
     /// Вернуть буфер в пул (retain — пул держит единственный refcount).
+    /// В batch-режиме буферы НЕ возвращаются в общий пул сразу: их может
+    /// использовать НЕВЫПОЛНЕННЫЙ command buffer (в очереди GPU), а другой
+    /// поток/тест переиспользовал бы буфер с гонкой CPU↔GPU. Откладываются
+    /// в глобальный deferred-список, который возвращается в пул после
+    /// закрытия последнего batch (все command buffers выполнены).
     fn push(&self, buf: &Buffer) {
+        if BATCH_DEPTH.load(Ordering::Relaxed) > 0 {
+            DEFERRED.lock().unwrap().push(buf.clone());
+            return;
+        }
         let class = (buf.length() as usize + 4095) & !4095;
         let class = class.max(4096);
         let mut free = self.free.lock().unwrap();
@@ -124,6 +143,15 @@ impl BufferPoolState {
 }
 
 static POOL: OnceLock<Arc<BufferPoolState>> = OnceLock::new();
+
+/// Глобальная глубина batch-режима (все MetalCtx). Пока > 0 — acquire не
+/// переиспользует буферы пула, а push откладывает их в DEFERRED (они могут
+/// быть заняты невыполненными command buffers; см. BufferPoolState).
+static BATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Буферы, освобождённые внутри batch — возвращаются в пул после закрытия
+/// последнего batch (все command buffers выполнены, wait сделан).
+static DEFERRED: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
 
 fn pool() -> &'static Arc<BufferPoolState> {
     POOL.get_or_init(|| Arc::new(BufferPoolState::new()))
@@ -375,8 +403,7 @@ pub struct MetalCtx {
 
 struct BatchState {
     depth: usize,
-    /// Owned (retained) command buffer — survives the autorelease pool of
-    /// the creating call, unlike `new_command_buffer()`'s borrowed ref.
+    /// Owned (retained) command buffer батча — commit+wait в конце.
     cmd: Option<CommandBuffer>,
     /// Diagnostics: how many times a batch was opened (tests assert the
     /// wake path actually batches — a regression that drops begin_batch
@@ -501,7 +528,11 @@ impl MetalCtx {
         group: MTLSize,
         setup: impl FnOnce(&ComputeCommandEncoderRef),
     ) -> Result<(), MetalError> {
-        // Batch path: accumulate into one command buffer, no per-op sync.
+        // Batch path: накопление в ОДИН command buffer без per-op sync.
+        // dispatch-и в одном command buffer НЕ имеют implicit memory barrier
+        // между собой — после каждого ставим ЛЁГКИЙ memoryBarrierWithScope
+        // (сериализует память внутри CB, без commit/wait). Отдельные CB на
+        // кернел давали ~0.5мс commit-оверхеда × 290 = тот же затык.
         {
             let mut batch = self.batch.lock().unwrap();
             if batch.depth > 0 {
@@ -518,6 +549,10 @@ impl MetalCtx {
                 enc.set_compute_pipeline_state(&pipeline);
                 setup(enc);
                 enc.dispatch_threads(grid, group);
+                // MTLBarrierScopeBuffers = 1 << 0 (msg_send — нет обёртки в metal-rs 0.31).
+                let _: () = unsafe {
+                    msg_send![enc, memoryBarrierWithScope: 1u64]
+                };
                 enc.end_encoding();
                 return Ok(());
             }
@@ -546,6 +581,7 @@ impl MetalCtx {
         let mut batch = self.batch.lock().unwrap();
         batch.depth += 1;
         batch.enters += 1;
+        BATCH_DEPTH.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How many batches were opened since the context was created
@@ -560,11 +596,29 @@ impl MetalCtx {
         let mut batch = self.batch.lock().unwrap();
         if batch.depth > 0 {
             batch.depth -= 1;
+            BATCH_DEPTH.fetch_sub(1, Ordering::Relaxed);
         }
         if batch.depth == 0 {
             if let Some(cmd) = batch.cmd.take() {
                 cmd.commit();
                 cmd.wait_until_completed();
+                let status = cmd.status();
+                if status != metal::MTLCommandBufferStatus::Completed {
+                    tracing::error!(
+                        status = ?status,
+                        "Metal batch command buffer failed — results are garbage"
+                    );
+                }
+            }
+            // Последний batch закрыт — все command buffers выполнены:
+            // возвращаем отложенные буферы в пул (см. BufferPoolState::push).
+            if BATCH_DEPTH.load(Ordering::Relaxed) == 0 {
+                let deferred = std::mem::take(&mut *DEFERRED.lock().unwrap());
+                for buf in deferred {
+                    let class = (buf.length() as usize + 4095) & !4095;
+                    let class = class.max(4096);
+                    pool().free.lock().unwrap().entry(class).or_default().push(buf);
+                }
             }
         }
         Ok(())

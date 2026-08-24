@@ -48,25 +48,96 @@ fn main() -> Result<(), Box<dyn Error>> {
     let t0 = Instant::now();
     let mut model = OmniModel::load(&backend, Path::new(dir))?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    if std::env::var("OMNI_REF").is_ok() {
+        let cw0 = backend.to_cpu_f32(&model.tower.conv1_w)?;
+        eprintln!("OMNI_REF after_load conv1_w[1,5,:3]={:?}", &cw0[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]);
+
+    }
     let tok = omni::tokenizer_from_json(Path::new(dir))?;
     eprintln!("tokenizer: vocab {}", tok.vocab_size());
 
     // аудио → эмбеддинги
     let t1 = Instant::now();
-    let (ids, audio_features, pos4d, pos_after) = model.build_audio_input(&backend, &wav, &question, &tok)?;
+    let (ids, audio_features, pos4d, pos_after) = if std::env::var("AUDIO_CHAT_NO_AUDIO").is_ok() {
+        // text-only: без аудио-части (локализация: префилл vs аудио-энкодер)
+        let ids = tok.encode(&format!(
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+             <|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        let pos4d: Vec<u32> = (0..ids.len() as u32).flat_map(|p| [p, p, p, 0]).collect();
+        let n = ids.len();
+        (ids, backend.zeros(vec![0, 2048])?, pos4d, n)
+    } else {
+        model.build_audio_input(&backend, &wav, &question, &tok)?
+    };
     eprintln!("audio features: {:?} in {:.1}s", audio_features.shape(), t1.elapsed().as_secs_f32());
+    if std::env::var("OMNI_REF").is_ok() {
+        let cw1 = backend.to_cpu_f32(&model.tower.conv1_w)?;
+        eprintln!("OMNI_REF after_tower conv1_w[1,5,:3]={:?}", &cw1[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]);
+        eprintln!("OMNI_REF after_tower conv1_w[0,0,:3]={:?}", &cw1[..3]);
+        eprintln!("OMNI_REF after_tower conv1_w[5,0,:3]={:?}", &cw1[(5 * 128 + 0) * 3..(5 * 128 + 0) * 3 + 3]);
+    }
+    if std::env::var("OMNI_REF").is_ok() && !std::env::var("AUDIO_CHAT_NO_AUDIO").is_ok() {
+        let (mel_c, t_mel) = rust_inference::audio::log_mel_spectrogram(&wav);
+        eprintln!("OMNI_REF our_mel[0,:8]={:?}", &mel_c[..8.min(mel_c.len())]);
+        eprintln!("OMNI_REF our_mel[:,0][:8]={:?}", (0..8).map(|m| mel_c[m * t_mel]).collect::<Vec<_>>());
+        eprintln!("OMNI_REF our_mel[127,0]={}", mel_c[127 * t_mel]);
+    }
+    if std::env::var("OMNI_REF").is_ok() && !std::env::var("AUDIO_CHAT_NO_AUDIO").is_ok() {
+        let cw = backend.to_cpu_f32(&model.tower.conv1_w)?;
+        eprintln!("OMNI_REF our_conv1_w[0,0,:8]={:?}", &cw[..3.min(cw.len())]);
+        let (mel_c, t_c) = rust_inference::audio::log_mel_spectrogram(&wav);
+        let mut tm = vec![0.0f32; t_c * 128];
+        for i in 0..t_c {
+            for m in 0..128 {
+                tm[i * 128 + m] = mel_c[m * t_c + i];
+            }
+        }
+        eprintln!("OMNI_REF our_x[0,:8]={:?}", &tm[..8.min(tm.len())]);
+        let cb = backend.to_cpu_f32(&model.tower.conv1_b)?;
+        eprintln!("OMNI_REF our_conv1_b[:8]={:?}", &cb[..8.min(cb.len())]);
+        let w1: f64 = (0..128).map(|ci| cw[(1 * 128 + ci) * 3..(1 * 128 + ci) * 3 + 3].iter().map(|&v| v as f64).sum::<f64>()).sum();
+        let w7: f64 = (0..128).map(|ci| cw[(7 * 128 + ci) * 3..(7 * 128 + ci) * 3 + 3].iter().map(|&v| v as f64).sum::<f64>()).sum();
+        eprintln!("OMNI_REF our_w1_sum={w1} our_w7_sum={w7}");
+        let m30 = &mel_c[(0) * t_c + 30..(0) * t_c + 36];
+        eprintln!("OMNI_REF mel[0][30..36]={m30:?}");
+        eprintln!("OMNI_REF our_w[5,0,:3]={:?}", &cw[(5 * 128 + 0) * 3..(5 * 128 + 0) * 3 + 3]);
+        eprintln!("OMNI_REF after_prefill conv1_w[0,0,:3]={:?}", &cw[..3]);
+        let af = backend.to_cpu_f32(&audio_features)?;
+        let d = model.cfg.thinker.dim;
+        eprintln!("OMNI_REF our_tower[0,:8]={:?}", &af[..8.min(af.len())]);
+        let last = af.len() - d;
+        eprintln!("OMNI_REF our_tower[99,:8]={:?}", &af[last..last + 8]);
+        let s: f64 = af.iter().map(|&v| v as f64).sum();
+        eprintln!("OMNI_REF our_tower_sum={s}");
+    }
     eprintln!("prompt tokens: {}", ids.len());
+    if std::env::var("AUDIO_CHAT_DUMP_IDS").is_ok() {
+        for (i, &id) in ids.iter().enumerate() {
+            eprintln!("  tok[{i}]={id} {:?}", String::from_utf8_lossy(tok.piece(id)));
+        }
+    }
 
     // prefill (текст + аудио)
     let t2 = Instant::now();
-    let mut logits = model.thinker.prefill_with_vision(
-        &backend,
-        &ids,
-        &audio_features,
-        model.cfg.thinker.audio_token_id,
-        &pos4d,
-        pos_after,
-    )?;
+    if std::env::var("OMNI_REF").is_ok() && std::env::var("AUDIO_CHAT_NO_AUDIO").is_ok() {
+        let e = model.thinker.embed_forward_test(&backend, &ids)?;
+        let ev = backend.to_cpu_f32(&e)?;
+        let last = ev.len() - model.cfg.thinker.dim;
+        eprintln!("OMNI_REF our_emb_out[-1,:8]={:?}", &ev[last..last + 8]);
+    }
+    let mut logits = if std::env::var("AUDIO_CHAT_NO_AUDIO").is_ok() {
+        model.thinker.prefill(&backend, &ids)?
+    } else {
+        model.thinker.prefill_with_vision(
+            &backend,
+            &ids,
+            &audio_features,
+            model.cfg.thinker.audio_token_id,
+            &pos4d,
+            pos_after,
+        )?
+    };
     eprintln!("prefill {} tokens in {:.2}s", ids.len(), t2.elapsed().as_secs_f32());
 
     // топ-5 первого шага

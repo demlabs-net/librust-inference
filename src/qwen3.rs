@@ -338,9 +338,19 @@ impl Qwen3Model {
                 mrope,
             )?;
             x = backend_add(backend, &x, &h)?;
+            if std::env::var("OMNI_REF").is_ok() && i == 0 {
+                let xv = backend.to_cpu_f32(&x)?;
+                let last = xv.len() - self.cfg.dim;
+                eprintln!("OMNI_REF after_attn_layer0[-1,:8]={:?}", &xv[last..last + 8]);
+            }
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
+            if std::env::var("OMNI_REF").is_ok() && i == 0 {
+                let xv = backend.to_cpu_f32(&x)?;
+                let last = xv.len() - self.cfg.dim;
+                eprintln!("OMNI_REF after_ffn_layer0[-1,:8]={:?}", &xv[last..last + 8]);
+            }
             // deepstack: x[t] += embd_in[t + il + 1] — только в vision-пути
             // (llama.cpp: в text-only токен-пути расширенный входной буфер
             // пэддится нулями — вклад нулевой; смещения кладёт mtmd при
@@ -410,14 +420,38 @@ impl Qwen3Model {
         .forward(backend, h)?;
         let qkv = if let Some(bias) = &attn.qkv_bias {
             // Qwen2.5-Omni thinker: q/k/v проекции с bias (fused [3D']).
+            if std::env::var("OMNI_REF").is_ok() {
+                let bv = backend.to_cpu_f32(bias)?;
+                eprintln!("OMNI_REF our_q_bias[:8]={:?}", &bv[..8.min(bv.len())]);
+                let qv = backend.to_cpu_f32(&qkv)?;
+                eprintln!("OMNI_REF qkv_before_bias[:8]={:?}", &qv[..8.min(qv.len())]);
+            }
             backend.add_bias(&qkv, bias, &qkv)?;
+            if std::env::var("OMNI_REF").is_ok() {
+                let qv = backend.to_cpu_f32(&qkv)?;
+                let qs = q_size + 2 * kv_size;
+                let last = qv.len() - qs;
+                eprintln!("OMNI_REF qkv_after[-1,:8]={:?}", &qv[last..last + 8]);
+            }
             qkv
         } else {
+            if std::env::var("OMNI_REF").is_ok() {
+                eprintln!("OMNI_REF qkv_bias=None!!!");
+            }
             qkv
         };
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
+        if std::env::var("OMNI_REF").is_ok() {
+            let qv = backend.to_cpu_f32(&q)?;
+            let kvv = backend.to_cpu_f32(&k)?;
+            let hv = backend.to_cpu_f32(h)?;
+            let t = tq;
+            eprintln!("OMNI_REF our_ln[-1,:8]={:?}", &hv[(t - 1) * q_size..(t - 1) * q_size + 8]);
+            eprintln!("OMNI_REF our_q0[-1,:8]={:?}", &qv[(t - 1) * q_size..(t - 1) * q_size + 8]);
+            eprintln!("OMNI_REF our_k0[-1,:8]={:?}", &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]);
+        }
         let (q, k) = if attn.q_norm.is_some() && attn.k_norm.is_some() {
             (
                 qk_norm(backend, &q, attn.q_norm.as_ref().unwrap(), attn.n_heads)?,

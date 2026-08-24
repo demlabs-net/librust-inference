@@ -184,18 +184,15 @@ impl Tokenizer {
             .unwrap_or(&[])
     }
 
-    /// Encode: tiktoken-претокенизация (пробел→Ġ, перенос→Ċ — словарь Qwen3),
-    /// затем байты → начальные токены → жадный BPE по рангам merges.
-    /// Неизвестные байты пропускаются (v1).
+    /// Encode: GPT-2 byte-level (каждый UTF-8 байт → символ по таблице:
+    /// 0x20→Ġ, 0x0A→Ċ, 0xD0→Ð, 0x82→Ĥ, ...), затем байты → начальные токены
+    /// → жадный BPE по рангам merges. Неизвестные байты пропускаются (v1).
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let mapped: String = text
-            .chars()
-            .map(|c| match c {
-                ' ' => '\u{0120}',
-                '\n' => '\u{010A}',
-                c => c,
-            })
-            .collect();
+        let (btu, _) = unicode_tables();
+        let mut mapped = String::with_capacity(text.len());
+        for &b in text.as_bytes() {
+            mapped.push(btu[b as usize]);
+        }
         // инициализация по СИМВОЛАМ (tiktoken-стиль): каждый символ — токен;
         // неизвестные символы — фоллбэк на байты (byte-fallback токены 0x00-0xFF).
         // Спец-токены (CONTROL/USER_DEFINED) вырезаются едиными кусками ДО BPE.
@@ -256,19 +253,36 @@ impl Tokenizer {
         ids
     }
 
-    /// Decode: конкатенация кусков + обратная tiktoken-маппинг (Ġ→пробел, Ċ→\n).
+    /// Decode: конкатенация кусков + обратный byte-level (Ġ→0x20, Ð→0xD0, ...).
     pub fn decode(&self, ids: &[u32]) -> String {
-        let mut out = Vec::new();
+        let (_, utb) = unicode_tables();
+        let mut bytes = Vec::new();
         for &id in ids {
-            out.extend_from_slice(self.piece(id));
+            for c in String::from_utf8_lossy(self.piece(id)).chars() {
+                if let Some(&b) = utb.get(&c) {
+                    bytes.push(b);
+                } else {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
         }
-        let s = String::from_utf8_lossy(&out).into_owned();
-        unmap_tiktoken(&s)
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Кусок токена как текст (для стриминга): обратная маппинг Ġ/Ċ.
+    /// Кусок токена как текст (для стриминга): обратный byte-level.
     pub fn decode_piece(&self, id: u32) -> String {
-        unmap_tiktoken(&String::from_utf8_lossy(self.piece(id)).into_owned())
+        let (_, utb) = unicode_tables();
+        let mut bytes = Vec::new();
+        for c in String::from_utf8_lossy(self.piece(id)).chars() {
+            if let Some(&b) = utb.get(&c) {
+                bytes.push(b);
+            } else {
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
@@ -320,8 +334,28 @@ impl IncrementalDecoder {
 }
 
 /// Обратная tiktoken-маппинг: Ġ (U+0120)→пробел, Ċ (U+010A)→\n.
-fn unmap_tiktoken(s: &str) -> String {
-    s.replace('\u{0120}', " ").replace('\u{010A}', "\n")
+/// GPT-2 byte-level таблица (как `bytes_to_unicode` в transformers):
+/// байты 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF — сами (latin-1); остальные
+/// (0x00-0x20, 0x7F-0xA0, 0xAD) — U+0100+n в порядке байта. 0x20→Ġ, 0x0A→Ċ.
+fn unicode_tables() -> &'static ([char; 256], std::collections::HashMap<char, u8>) {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static T: OnceLock<([char; 256], HashMap<char, u8>)> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut tbl = [char::from(0u8); 256];
+        let mut n = 0u32;
+        for b in 0u8..=255u8 {
+            let in_bs = (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+            if in_bs {
+                tbl[b as usize] = char::from_u32(b as u32).unwrap();
+            } else {
+                tbl[b as usize] = char::from_u32(0x100 + n).unwrap();
+                n += 1;
+            }
+        }
+        let rev = tbl.iter().enumerate().map(|(i, &c)| (c, i as u8)).collect();
+        (tbl, rev)
+    })
 }
 
 /// Длина UTF-8 символа по первому байту (0 = невалидный старт).
@@ -362,6 +396,7 @@ mod tests {
         vocab.push(ll.clone());
         vocab.push(llo.clone());
         vocab.push(hello.clone());
+        vocab.push("\u{0120}".as_bytes().to_vec()); // Ġ — byte-level пробел
         let ids =
             |p: &[u8]| -> u32 { vocab.iter().position(|v| v.as_slice() == p).unwrap() as u32 };
         let merges = vec![

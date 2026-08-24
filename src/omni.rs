@@ -160,8 +160,8 @@ struct AudioLayer {
 /// 20 голов full attention, GELU, bias во всех проекциях кроме k).
 pub struct OmniAudioTower {
     pub cfg: OmniAudioConfig,
-    conv1_w: Tensor,
-    conv1_b: Tensor,
+    pub conv1_w: Tensor,
+    pub conv1_b: Tensor,
     conv2_w: Tensor,
     conv2_b: Tensor,
     pos_emb: Tensor, // [1, max_source_positions, d_model]
@@ -289,12 +289,22 @@ impl OmniAudioTower {
         // conv1 (stride 1) → GELU
         let h1 = backend.zeros(vec![1, len, d])?;
         backend.conv1d(x, &self.conv1_w, Some(&self.conv1_b), 1, 1, 1, 1, &h1)?;
+        if std::env::var("OMNI_REF").is_ok() {
+            let h1v = backend.to_cpu_f32(&h1)?;
+            eprintln!("OMNI_REF our_conv1_raw[0,:8]={:?}", &h1v[..8.min(h1v.len())]);
+        }
         backend.gelu_erf(&h1, &h1)?;
         // conv2 (stride 2) → GELU; l2 = (len - 1)/2 + 1
         let l2 = (len - 1) / 2 + 1;
         let mut h = backend.zeros(vec![1, l2, d])?;
         backend.conv1d(&h1, &self.conv2_w, Some(&self.conv2_b), 2, 1, 1, 1, &h)?;
         backend.gelu_erf(&h, &h)?;
+        if std::env::var("OMNI_REF").is_ok() {
+            let h1v = backend.to_cpu_f32(&h1)?;
+            let h2v = backend.to_cpu_f32(&h)?;
+            eprintln!("OMNI_REF our_conv1[0,:8]={:?}", &h1v[..8.min(h1v.len())]);
+            eprintln!("OMNI_REF our_conv2[0,:8]={:?}", &h2v[..8.min(h2v.len())]);
+        }
         // + синусоидальные позиции [0..l2)
         let pos = self.pos_emb.view_offset(vec![1, l2, d], 0);
         let mut h = {
@@ -302,8 +312,12 @@ impl OmniAudioTower {
             backend.add(&h, &pos, &mut y)?;
             y
         };
+        if std::env::var("OMNI_REF").is_ok() {
+            let hv = backend.to_cpu_f32(&h)?;
+            eprintln!("OMNI_REF our_pos[0,:8]={:?}", &hv[..8.min(hv.len())]);
+        }
 
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             // self-attn (полный, mask=None)
             let hn = backend.zeros(vec![1, l2, d])?;
             backend.layernorm(&h, &layer.attn_ln_w, &layer.attn_ln_b, &hn, 1e-5)?;
@@ -313,17 +327,32 @@ impl OmniAudioTower {
             let attn_out = backend.zeros(vec![1, l2, d])?;
             backend.attn_ar(&q, &k, &v, None, &attn_out, cfg.n_heads, cfg.n_heads, d / cfg.n_heads)?;
             let o = layer.attn.o.forward(backend, &attn_out)?;
-            let h = {
+            // attn-выход: h = h + o (переприсваивание ВНЕШНЕЙ mut h —
+            // `let h =` в цикле создал бы тень и ПОТЕРЯЛ результат между итерациями)
+            h = {
                 let mut y = backend.zeros(vec![1, l2, d])?;
                 backend.add(&h, &o, &mut y)?;
                 y
             };
+            if std::env::var("OMNI_REF").is_ok() {
+                let hv = backend.to_cpu_f32(&h)?;
+                eprintln!("OMNI_REF t_after_attn[0,:8]={:?}", &hv[..8.min(hv.len())]);
+            }
             // FFN
             let hn2 = backend.zeros(vec![1, l2, d])?;
             backend.layernorm(&h, &layer.ffn_ln_w, &layer.ffn_ln_b, &hn2, 1e-5)?;
+            if std::env::var("OMNI_REF").is_ok() {
+                let hv = backend.to_cpu_f32(&hn2)?;
+                eprintln!("OMNI_REF t_hn2[0,:4]={:?}", &hv[..4.min(hv.len())]);
+            }
             let f = layer.fc1.forward(backend, &hn2)?;
+            backend.gelu_erf(&f, &f)?;
             let f = layer.fc2.forward(backend, &f)?;
-            let h = {
+            if std::env::var("OMNI_REF").is_ok() {
+                let hv = backend.to_cpu_f32(&f)?;
+                eprintln!("OMNI_REF t_after_ffn[0,:8]={:?}", &hv[..8.min(hv.len())]);
+            }
+            h = {
                 let mut y = backend.zeros(vec![1, l2, d])?;
                 backend.add(&h, &f, &mut y)?;
                 y
@@ -333,6 +362,10 @@ impl OmniAudioTower {
         // ln_post → avg-pool парами → proj
         let hp = backend.zeros(vec![1, l2, d])?;
         backend.layernorm(&h, &self.ln_post_w, &self.ln_post_b, &hp, 1e-5)?;
+        if std::env::var("OMNI_REF").is_ok() {
+            let hv = backend.to_cpu_f32(&hp)?;
+            eprintln!("OMNI_REF t_ln_post[0,:8]={:?}", &hv[..8.min(hv.len())]);
+        }
         let n_pool = (l2 - 2) / 2 + 1;
         let hp_cpu = backend.to_cpu_f32(&hp)?;
         let mut pooled = vec![0.0f32; n_pool * d];
@@ -370,22 +403,24 @@ fn map_thinker_name(name: &str) -> Option<String> {
         "lm_head.weight" => "output.weight".to_string(),
         r if r.starts_with("model.layers.") => {
             let parts: Vec<&str> = r.split('.').collect();
-            // model.layers.{i}.{module}.{proj}.{kind}
+            // model.layers.{i}.{module}.{proj}.{kind} (6) ИЛИ
+            // model.layers.{i}.{module}.{kind} (5 — input_layernorm и т.п.)
             let (i, module, proj, kind) = match parts.as_slice() {
-                [_, _, i, module, proj, kind] => (i, *module, *proj, *kind),
+                [_, _, i, module, proj, kind] => (i, *module, Some(*proj), *kind),
+                [_, _, i, module, kind] => (i, *module, None, *kind),
                 _ => return None,
             };
             let key = match (module, proj) {
-                ("self_attn", "q_proj") => "attn_q",
-                ("self_attn", "k_proj") => "attn_k",
-                ("self_attn", "v_proj") => "attn_v",
-                ("self_attn", "o_proj") => "attn_output",
-                ("self_attn", "q_norm") | ("self_attn", "k_norm") => return None,
+                ("self_attn", Some("q_proj")) => "attn_q",
+                ("self_attn", Some("k_proj")) => "attn_k",
+                ("self_attn", Some("v_proj")) => "attn_v",
+                ("self_attn", Some("o_proj")) => "attn_output",
+                ("self_attn", Some("q_norm")) | ("self_attn", Some("k_norm")) => return None,
                 ("input_layernorm", _) => "attn_norm",
                 ("post_attention_layernorm", _) => "ffn_norm",
-                ("mlp", "gate_proj") => "ffn_gate",
-                ("mlp", "up_proj") => "ffn_up",
-                ("mlp", "down_proj") => "ffn_down",
+                ("mlp", Some("gate_proj")) => "ffn_gate",
+                ("mlp", Some("up_proj")) => "ffn_up",
+                ("mlp", Some("down_proj")) => "ffn_down",
                 _ => return None,
             };
             format!("blk.{i}.{key}.{kind}")
@@ -406,8 +441,11 @@ fn load_thinker(
     let mut raw: Vec<(String, Vec<u8>, Vec<u64>)> = Vec::new();
     for (name, (data, shape)) in t {
         if let Some(mapped) = map_thinker_name(name) {
-            // bias-тензоры attention обрабатываются отдельно в Qwen3Model::load
-            if mapped.ends_with(".bias") {
+            // attn_q/k/v.bias обрабатывает Qwen3Model::load (qkv_bias);
+            // остальные bias в Qwen3-архитектуре не используются.
+            let is_attn_bias = mapped.ends_with(".bias")
+                && (mapped.contains("attn_q.") || mapped.contains("attn_k.") || mapped.contains("attn_v."));
+            if mapped.ends_with(".bias") && !is_attn_bias {
                 continue;
             }
             let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -417,14 +455,23 @@ fn load_thinker(
             raw.push((mapped, bytes, shape.iter().map(|&d| d as u64).collect()));
         }
     }
+    // Реальные (накопительные) офсеты: tied_aliases в Qwen3Model::load
+    // сравнивает offset+len — при offset=0 у всех тензоров output.weight
+    // ложно «связывался» с token_embd.weight (одинаковые длины) и выходная
+    // проекция подменялась эмбеддингами (мусорные логиты на спец-токенах).
+    let mut off = 0u64;
     let tensors: Vec<WeightTensor> = raw
         .iter()
-        .map(|(n, bytes, shape)| WeightTensor {
-            name: n.clone(),
-            shape: shape.clone(),
-            format: WeightFormat::Plain(Dtype::F32),
-            offset: 0,
-            data: bytes,
+        .map(|(n, bytes, shape)| {
+            let t = WeightTensor {
+                name: n.clone(),
+                shape: shape.clone(),
+                format: WeightFormat::Plain(Dtype::F32),
+                offset: off,
+                data: bytes,
+            };
+            off += bytes.len() as u64;
+            t
         })
         .collect();
     let wm = WeightsMap {
@@ -491,8 +538,15 @@ impl OmniModel {
         tokenizer: &crate::tokenizer::Tokenizer,
     ) -> Result<(Vec<u32>, Tensor, Vec<u32>, usize), BackendError> {
         let (mel, t) = audio::log_mel_spectrogram(wav);
-        // time-major: [1, T, 128]
-        let mel_t = backend.from_cpu_f32(&mel, vec![1, t, 128])?;
+        // mel — [128, T] row-major (m*T+i); tower ждёт time-major [T, 128] —
+        // транспонируем (перестановка, не reshape!)
+        let mut mel_tm = vec![0.0f32; t * 128];
+        for i in 0..t {
+            for m in 0..128 {
+                mel_tm[i * 128 + m] = mel[m * t + i];
+            }
+        }
+        let mel_t = backend.from_cpu_f32(&mel_tm, vec![1, t, 128])?;
         let audio_tokens = self.tower.forward(backend, &mel_t)?;
         let n = audio_tokens.shape()[0];
         let ids = {
@@ -553,10 +607,27 @@ pub fn tokenizer_from_json(dir: &Path) -> Result<crate::tokenizer::Tokenizer, Ba
     let mut merges = Vec::new();
     if let Some(arr) = model["merges"].as_array() {
         for m in arr {
-            let s = m.as_str().unwrap_or("");
-            let (l, r) = s
-                .split_once(' ')
-                .ok_or_else(|| BackendError::Shape(format!("bad merge {s}")))?;
+            // два формата: строка "a b" ИЛИ массив [a, b]
+            let (l, r) = if let Some(s) = m.as_str() {
+                match s.split_once(' ') {
+                    Some(pair) => pair,
+                    None => {
+                        return Err(BackendError::Shape(format!("bad merge {s}")));
+                    }
+                }
+            } else if let Some(pair) = m.as_array() {
+                let l = pair
+                    .first()
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| BackendError::Shape("merge left not string".into()))?;
+                let r = pair
+                    .get(1)
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| BackendError::Shape("merge right not string".into()))?;
+                (l, r)
+            } else {
+                return Err(BackendError::Shape("merge not string/array".into()));
+            };
             let li = *id_of
                 .get(&norm(l))
                 .ok_or_else(|| BackendError::Shape(format!("merge left {l} missing")))?;
@@ -567,7 +638,7 @@ pub fn tokenizer_from_json(dir: &Path) -> Result<crate::tokenizer::Tokenizer, Ba
             merged.extend_from_slice(&norm(r));
             let mi = *id_of
                 .get(&merged)
-                .ok_or_else(|| BackendError::Shape(format!("merge result {s} missing")))?;
+                .ok_or_else(|| BackendError::Shape(format!("merge result {l}+{r} missing")))?;
             merges.push(((li, ri), mi));
         }
     }
@@ -798,6 +869,108 @@ mod tests {
             max_delta = max_delta.max((a - b).abs());
         }
         assert!(max_delta < 1e-3, "linear+bias max delta {max_delta}");
+    }
+
+    /// conv1d с РЕАЛЬНЫМИ весами (Qwen2.5-Omni conv1: [1280,128,3]) и
+    /// реальным mel-входом (vassista_live.wav) — метал vs CPU.
+    #[test]
+    fn conv1d_real_weights_matches_cpu() {
+        let dir = std::path::Path::new("/Users/dmitriygerasimov/.vassista-models/omni3b");
+        if !dir.join("config.json").exists() {
+            eprintln!("skip: omni3b не скачан");
+            return;
+        }
+        let cfg = config_from_json(dir).unwrap();
+        let mut all: F32Tensors = std::collections::HashMap::new();
+        for i in 1..=3 {
+            let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
+            let t = read_safetensors_f32(&p).unwrap();
+            all.extend(t);
+        }
+        let mb = MetalBackend::new().expect("metal backend");
+        let cpu = CpuBackend;
+        let m_tower = OmniAudioTower::load(&mb, &all, &cfg.audio).unwrap();
+        let c_tower = OmniAudioTower::load(&cpu, &all, &cfg.audio).unwrap();
+
+        let wav = audio::read_wav_pcm16(std::path::Path::new(
+            "/Users/dmitriygerasimov/work/ai/vassista/crates/vs-wake/tests/fixtures/vassista_live.wav",
+        ))
+        .unwrap()
+        .0;
+        let (mel, t) = audio::log_mel_spectrogram(&wav);
+        let n = t.min(20);
+        let mut tm = vec![0.0f32; n * 128];
+        for i in 0..n {
+            for m in 0..128 {
+                tm[i * 128 + m] = mel[m * t + i];
+            }
+        }
+        let m_x = mb.from_cpu_f32(&tm, vec![1, n, 128]).unwrap();
+        let c_x = cpu.from_cpu_f32(&tm, vec![1, n, 128]).unwrap();
+        let cwv = mb.to_cpu_f32(&m_tower.conv1_w).unwrap();
+        eprintln!("conv1d real: w[1,5,:3]={:?}", &cwv[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]);
+        eprintln!("conv1d real: w[0,0,:3]={:?}", &cwv[..3]);
+
+
+        let lnw = mb.to_cpu_f32(&m_tower.layers[0].ffn_ln_w).unwrap();
+        let lnb = mb.to_cpu_f32(&m_tower.layers[0].ffn_ln_b).unwrap();
+        eprintln!("conv1d real: ffn_ln w[:4]={:?} b[:4]={:?}", &lnw[..4], &lnb[..4]);
+        let q1v = mb.to_cpu_f32(&m_tower.layers[1].attn.q.w).unwrap();
+        eprintln!("conv1d real: layer1 q[0,:4]={:?}", &q1v[..4.min(q1v.len())]);
+        // layernorm 3D [1, 20, 1280] метал vs CPU
+        let ln_x: Vec<f32> = (0..20 * 1280).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
+        let ln_w: Vec<f32> = (0..1280).map(|i| ((i * 104729) % 100) as f32 / 1000.0).collect();
+        let ln_b: Vec<f32> = (0..1280).map(|i| ((i * 15485863) % 100) as f32 / 10000.0).collect();
+        let m_lnx = mb.from_cpu_f32(&ln_x, vec![1, 20, 1280]).unwrap();
+        let m_lnw = mb.from_cpu_f32(&ln_w, vec![1280]).unwrap();
+        let m_lnb = mb.from_cpu_f32(&ln_b, vec![1280]).unwrap();
+        let m_lny = mb.zeros(vec![1, 20, 1280]).unwrap();
+        mb.layernorm(&m_lnx, &m_lnw, &m_lnb, &m_lny, 1e-5).unwrap();
+        let c_lnx = cpu.from_cpu_f32(&ln_x, vec![1, 20, 1280]).unwrap();
+        let c_lnw = cpu.from_cpu_f32(&ln_w, vec![1280]).unwrap();
+        let c_lnb = cpu.from_cpu_f32(&ln_b, vec![1280]).unwrap();
+        let c_lny = cpu.zeros(vec![1, 20, 1280]).unwrap();
+        cpu.layernorm(&c_lnx, &c_lnw, &c_lnb, &c_lny, 1e-5).unwrap();
+        let mlv = mb.to_cpu_f32(&m_lny).unwrap();
+        let clv = cpu.to_cpu_f32(&c_lny).unwrap();
+        let mut ln_delta = 0.0f32;
+        for (a, b) in mlv.iter().zip(&clv) {
+            ln_delta = ln_delta.max((a - b).abs());
+        }
+        eprintln!("conv1d real: layernorm3d delta={ln_delta} m[0,:4]={:?} c[0,:4]={:?}",
+            &mlv[..4], &clv[..4]);
+        let fc1v = mb.to_cpu_f32(&m_tower.layers[0].fc1.w).unwrap();
+        eprintln!("conv1d real: fc1[0,:4]={:?}", &fc1v[..4.min(fc1v.len())]);
+        let m_h1 = mb.zeros(vec![1, n, 1280]).unwrap();
+        let c_h1 = cpu.zeros(vec![1, n, 1280]).unwrap();
+        mb.conv1d(&m_x, &m_tower.conv1_w, Some(&m_tower.conv1_b), 1, 1, 1, 1, &m_h1).unwrap();
+        cpu.conv1d(&c_x, &c_tower.conv1_w, Some(&c_tower.conv1_b), 1, 1, 1, 1, &c_h1).unwrap();
+        let m_out = mb.to_cpu_f32(&m_h1).unwrap();
+        eprintln!("conv1d real: out[0,:4]={:?}", &m_out[..4.min(m_out.len())]);
+        // полный forward_window (20 кадров, 2 слоя) vs python-эталон
+        let fw = m_tower.forward_window(&mb, &m_x).unwrap();
+        let fwv = mb.to_cpu_f32(&fw).unwrap();
+        eprintln!("conv1d real: fw[0,:4]={:?}", &fwv[..4.min(fwv.len())]);
+        let cfw = c_tower.forward_window(&cpu, &c_x).unwrap();
+        let cfwv = cpu.to_cpu_f32(&cfw).unwrap();
+        let mut fw_delta = 0.0f32;
+        for (a, b) in fwv.iter().zip(&cfwv) {
+            fw_delta = fw_delta.max((a - b).abs());
+        }
+        eprintln!("conv1d real: fw delta={fw_delta} cfw[0,:4]={:?}", &cfwv[..4.min(cfwv.len())]);
+        let mv = mb.to_cpu_f32(&m_h1).unwrap();
+        let cv = cpu.to_cpu_f32(&c_h1).unwrap();
+        let mut max_delta = 0.0f32;
+        let mut worst = 0usize;
+        for (i, (a, b)) in mv.iter().zip(&cv).enumerate() {
+            let d = (a - b).abs();
+            if d > max_delta {
+                max_delta = d;
+                worst = i;
+            }
+        }
+        eprintln!("conv1d real: delta {max_delta} at {worst} (m {} c {})", mv[worst], cv[worst]);
+        assert!(max_delta < 1e-3, "conv1d real max delta {max_delta}");
     }
 
     /// Локализация расхождения: conv1d напрямую (metal vs cpu), тот же формат.

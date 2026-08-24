@@ -1255,8 +1255,8 @@ impl MetalCtx {
         y: &GpuTensor,
         eps: f32,
     ) -> Result<(), MetalError> {
-        let rows = x.shape[0];
-        let d = x.shape[1];
+        let d = x.shape[x.shape.len() - 1];
+        let rows = x.numel() / d;
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(1, 1, 1);
         self.run("rmsnorm_f32", grid, group, |enc| {
@@ -1278,8 +1278,10 @@ impl MetalCtx {
         y: &GpuTensor,
         eps: f32,
     ) -> Result<(), MetalError> {
-        let rows = x.shape[0];
-        let d = x.shape[1];
+        // Последняя ось = d (2D (rows,d) или 3D (B,T,d) — row-major
+        // идентичен (rows,d)); rows = numel / d.
+        let d = x.shape[x.shape.len() - 1];
+        let rows = x.numel() / d;
         let grid = MTLSize::new(rows as u64, 1, 1);
         let group = MTLSize::new(1, 1, 1);
         self.run("layernorm_f32", grid, group, |enc| {

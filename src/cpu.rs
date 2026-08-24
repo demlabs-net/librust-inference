@@ -232,6 +232,12 @@ impl Backend for CpuBackend {
             0.5 * v * (1.0 + (0.7978845608 * (v + 0.044715 * v * v * v)).tanh())
         })
     }
+    fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        // Точный GELU (erf), A&S 7.1.26 — та же формула, что в Metal-кернеле.
+        elemwise(x, y, |v| {
+            0.5 * v * (1.0 + crate::backend::erf_approx(v / std::f32::consts::SQRT_2))
+        })
+    }
     fn snake(&self, x: &Tensor, a: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // y = x + (1/a)·sin(a·x)² — a PER-CHANNEL (Metal semantics):
         // A (C,), X (…, C) flattened; element i uses A[i % C].

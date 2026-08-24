@@ -52,6 +52,12 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// Добавить спец-токен единым куском (HF added_tokens special=true).
+    /// Поддерживает longest-first порядок.
+    pub fn add_special(&mut self, piece: Vec<u8>, id: u32) {
+        self.special.push((piece, id));
+        self.special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    }
     /// Собрать из готовых частей (для тестов и не-GGUF источников).
     pub fn from_parts(
         vocab: Vec<Vec<u8>>,

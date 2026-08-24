@@ -173,8 +173,25 @@ impl Qwen3Model {
             wqkv.extend_from_slice(&k);
             wqkv.extend_from_slice(&v);
             let wo = t(&p("attn_output.weight"))?;
-            let qn = t(&p("attn_q_norm.weight"))?;
-            let kn = t(&p("attn_k_norm.weight"))?;
+            // QK-norm опционален (Qwen3 — есть; Qwen2.5-Omni thinker — нет).
+            let q_norm = if w.get(&p("attn_q_norm.weight")).is_some() {
+                Some(backend.from_cpu_f32(&t(&p("attn_q_norm.weight"))?, vec![cfg.head_dim])?)
+            } else {
+                None
+            };
+            let k_norm = if w.get(&p("attn_k_norm.weight")).is_some() {
+                Some(backend.from_cpu_f32(&t(&p("attn_k_norm.weight"))?, vec![cfg.head_dim])?)
+            } else {
+                None
+            };
+            let qkv_bias = if w.get(&p("attn_q.bias")).is_some() {
+                let mut b = t(&p("attn_q.bias"))?;
+                b.extend(t(&p("attn_k.bias"))?);
+                b.extend(t(&p("attn_v.bias"))?);
+                Some(b)
+            } else {
+                None
+            };
             let attn = Attention {
                 wqkv: upload_w(
                     backend,
@@ -189,8 +206,18 @@ impl Qwen3Model {
                     &wo,
                     vec![cfg.dim, cfg.n_heads * cfg.head_dim],
                 )?,
-                q_norm: Some(backend.from_cpu_f32(&qn, vec![cfg.head_dim])?),
-                k_norm: Some(backend.from_cpu_f32(&kn, vec![cfg.head_dim])?),
+                qkv_bias: qkv_bias
+                    .map(|b| {
+                        backend.from_cpu_f32(
+                            &b,
+                            vec![
+                                cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
+                            ],
+                        )
+                    })
+                    .transpose()?,
+                q_norm,
+                k_norm,
                 n_heads: cfg.n_heads,
                 n_kv_heads: cfg.n_kv_heads,
                 head_dim: cfg.head_dim,
@@ -381,6 +408,13 @@ impl Qwen3Model {
             b: None,
         }
         .forward(backend, h)?;
+        let qkv = if let Some(bias) = &attn.qkv_bias {
+            // Qwen2.5-Omni thinker: q/k/v проекции с bias (fused [3D']).
+            backend.add_bias(&qkv, bias, &qkv)?;
+            qkv
+        } else {
+            qkv
+        };
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;

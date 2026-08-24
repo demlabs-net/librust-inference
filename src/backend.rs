@@ -722,19 +722,10 @@ pub trait Backend: Send + Sync {
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
     /// Точный GELU (erf): 0.5·x·(1+erf(x/√2)) — vision (clip/Qwen3-VL)
-    /// использует erf-вариант, не tanh-аппроксимацию.
-    fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
-        // Default: CPU-хелпер (erf — аппроксимация A&S 7.1.26, та же, что в
-        // Metal-кернеле); Metal переопределяет кернелом.
-        let xd = self.to_cpu_f32(x)?;
-        let yd: Vec<f32> = xd
-            .iter()
-            .map(|&v| 0.5 * v * (1.0 + erf_approx(v / std::f32::consts::SQRT_2)))
-            .collect();
-        let yt = self.from_cpu_f32(&yd, x.shape().to_vec())?;
-        let _ = &yt;
-        Ok(())
-    }
+    /// и аудио-энкодер (Qwen2.5-Omni) используют erf-вариант, не tanh.
+    /// Обязательный: дефолт не может записать результат в `y` (нет доступа
+    /// к стораджу) — см. историю мёртвого `let _ = &yt`.
+    fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
     fn snake(&self, x: &Tensor, a: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 

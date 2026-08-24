@@ -48,6 +48,10 @@ extern "C" __global__ void elementwise_f32(
             r = 0.5f * a * (1.0f + t);
             break;
         }
+        case 15: {                                    // gelu_erf (точный)
+            r = 0.5f * a * (1.0f + erff(a * 0.70710678118654752440f));
+            break;
+        }
         default: r = a; break;
     }
     out[i] = r;

@@ -58,6 +58,7 @@ enum ElemOp {
     Tanh = 12,
     Silu = 13,
     GeluTanh = 14,
+    GeluErf = 15,
 }
 
 fn map_err(e: impl std::fmt::Display) -> BackendError {
@@ -939,6 +940,9 @@ impl Backend for CudaBackend {
     }
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         self.elementwise(ElemOp::GeluTanh, x, None, y, 0.0)
+    }
+    fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        self.elementwise(ElemOp::GeluErf, x, None, y, 0.0)
     }
     fn snake(&self, x: &Tensor, a: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // Per-channel (Metal semantics): A (C,), X flattened (n·c).

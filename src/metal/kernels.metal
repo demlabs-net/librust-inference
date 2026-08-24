@@ -1069,7 +1069,8 @@ kernel void attn_ar_f32(
     uint KVD = KVH * HD;
     const device float* qrow = Q + (b * Tq + t) * D + h * HD;
     uint kv_lim = Tkv;
-    const float scale = 0.08838834764831845f;
+    // scale = 1/sqrt(HD) — НЕ хардкод: Qwen3 hd=128, аудио-энкодер hd=64.
+    const float scale = 1.0f / sqrt((float)HD);
     float mx = -INFINITY;
     for (uint j = 0u; j < kv_lim; ++j) {
         const device float* krow = K + (b * Tkv + j) * KVD + kvh * HD;

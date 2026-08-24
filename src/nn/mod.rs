@@ -258,6 +258,9 @@ impl ConvTranspose1d {
 pub struct Attention {
     pub wqkv: Tensor,
     pub wo: Tensor,
+    /// Опциональный bias q/k/v (Qwen2.5-Omni thinker: q/k/v_proj.bias,
+    /// [3·D] после fuse). None = классический Qwen3 без bias.
+    pub qkv_bias: Option<Tensor>,
     pub q_norm: Option<Tensor>,
     pub k_norm: Option<Tensor>,
     pub n_heads: usize,
@@ -281,6 +284,7 @@ impl Attention {
         Ok(Self {
             wqkv: backend.from_cpu_f32(&wqkv, vec![3 * dim, dim])?,
             wo: backend.from_cpu_f32(&wo, vec![dim, dim])?,
+            qkv_bias: None,
             q_norm: q_norm
                 .map(|w| backend.from_cpu_f32(&w, vec![dim]))
                 .transpose()?,

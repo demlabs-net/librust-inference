@@ -1270,19 +1270,9 @@ kernel void attn_ar_f32_fused(
     float4 q4 = qrow4[d4];
     const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;
 
-    // проход 1: running max полного score (simd_sum — полный dot broadcast).
-    float mx_local = -INFINITY;
-    for (uint j = 0u; j < Tkv; ++j) {
-        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
-        float4 k4 = krow4[d4];
-        float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
-        float s = simd_sum(acc) * scale;
-        if (maskrow != nullptr) s += maskrow[j];
-        mx_local = max(mx_local, s);
-    }
-    float mx = simd_max(mx_local);
-
-    // проход 2: sum + y4-накопление (KV читается второй раз — V и K).
+    // online-softmax в ОДНОМ проходе: running max m, ssum, y4-накопление.
+    // -inf-маска: skip (continue) ДО exp — нет NaN (exp(-inf - -inf)).
+    float m = -INFINITY;
     float ssum_local = 0.0f;
     float4 y4 = 0.0f;
     for (uint j = 0u; j < Tkv; ++j) {
@@ -1291,7 +1281,14 @@ kernel void attn_ar_f32_fused(
         float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
         float s = simd_sum(acc) * scale;
         if (maskrow != nullptr) s += maskrow[j];
-        float w = exp(s - mx);
+        if (s == -INFINITY) continue;
+        if (s > m) {
+            float e = exp(m - s); // < 1: пересчёт старых вкладов
+            y4 *= e;
+            ssum_local *= e;
+            m = s;
+        }
+        float w = exp(s - m);
         ssum_local += w;
         const device float4* vrow4 = (const device float4*)(V + (b * Tkv + j) * KVD + kvh * HD);
         y4 += w * vrow4[d4];

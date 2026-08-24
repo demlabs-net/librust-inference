@@ -15,6 +15,21 @@
 /// Generic elementwise kernel, one thread per element.
 /// `op` selects the function (see ElemOp in cuda.rs); `c` is the scalar
 /// operand for add_scalar/scale/max_scalar. `y` may alias `out` (in-place).
+// Fused SwiGLU gate: y[i] = silu(x[i]) * x[ffn + i]; x [rows, 2*ffn].
+extern "C" __global__ void silu_mul_fused_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int n,
+    int ffn)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = x[i];
+        float up = x[ffn + i];
+        y[i] = (g / (1.0f + expf(-g))) * up;
+    }
+}
+
 extern "C" __global__ void elementwise_f32(
     const float* __restrict__ x,
     const float* __restrict__ y,

@@ -90,10 +90,10 @@ impl RmsNorm {
     }
 }
 
-/// SwiGLU FFN: y = (silu(x·W1ᵀ) ⊙ (x·W3ᵀ)) · W2ᵀ. All (D,D).
+/// SwiGLU FFN: y = silu_mul_fused(x·W13ᵀ) · W2ᵀ, где W13 = [W1; W3]
+/// (gate|up, слитые в один [2·ffn, dim] GEMM — на 1 кернел меньше на слой).
 pub struct SwiGLU {
-    pub w1: Tensor,
-    pub w3: Tensor,
+    pub w13: Tensor,
     pub w2: Tensor,
 }
 
@@ -105,23 +105,24 @@ impl SwiGLU {
         w2: Vec<f32>,
         dim: usize,
     ) -> Result<Self, BackendError> {
+        let ffn = w1.len() / dim;
+        let mut w13 = Vec::with_capacity(w1.len() + w3.len());
+        w13.extend_from_slice(&w1);
+        w13.extend_from_slice(&w3);
         Ok(Self {
-            w1: backend.from_cpu_f32(&w1, vec![dim, dim])?,
-            w3: backend.from_cpu_f32(&w3, vec![dim, dim])?,
-            w2: backend.from_cpu_f32(&w2, vec![dim, dim])?,
+            w13: backend.from_cpu_f32(&w13, vec![2 * ffn, dim])?,
+            w2: backend.from_cpu_f32(&w2, vec![dim, ffn])?,
         })
     }
 
     pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let x2 = view2(x);
-        let a = backend.zeros(vec![b * t, d])?;
-        let g = backend.zeros(vec![b * t, d])?;
-        let gm = backend.zeros(vec![b * t, d])?;
-        backend.gemm_nt(&x2, &self.w1, &a)?;
-        backend.gemm_nt(&x2, &self.w3, &g)?;
-        backend.silu(&a, &a)?;
-        backend.mul(&a, &g, &gm)?;
+        let ffn = self.w2.shape()[1];
+        let f = backend.zeros(vec![b * t, 2 * ffn])?;
+        let gm = backend.zeros(vec![b * t, ffn])?;
+        backend.gemm_nt(&x2, &self.w13, &f)?;
+        backend.silu_mul_fused(&f, &gm, ffn)?;
         let y = backend.zeros(vec![b * t, d])?;
         backend.gemm_nt(&gm, &self.w2, &y)?;
         Ok(view3(&y, b, t, d))

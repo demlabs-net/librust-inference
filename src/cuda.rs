@@ -234,6 +234,36 @@ impl CudaBackend {
             .unwrap_or(1)
     }
 
+    /// Combine the (S·m, n) partials into C (gemm_i8_reduce — fixed order,
+    /// deterministic) and return the cpart buffer to the pool.
+    fn reduce_and_pool(
+        &self,
+        cpart: CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        n: usize,
+        s: usize,
+    ) -> Result<(), BackendError> {
+        let n32 = n as i32;
+        let m32 = m as i32;
+        let s32 = s as i32;
+        let f = self.function("gemm_i8_reduce")?;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(&cpart);
+        la.arg(c);
+        la.arg(&n32);
+        la.arg(&s32);
+        la.arg(&m32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        Ok(())
+    }
+
     /// Return the activation cast scratch (if any) to its pool.
     fn pool_a_scratch(&self, a_arg: KernA) {
         match a_arg {
@@ -321,21 +351,7 @@ impl CudaBackend {
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            let f = self.function("gemm_i8_reduce")?;
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&cpart);
-            la.arg(c);
-            la.arg(&n32);
-            let s16i = 16i32;
-            la.arg(&s16i);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
+            self.reduce_and_pool(cpart, c, m, n, 16)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -369,20 +385,7 @@ impl CudaBackend {
         la.arg(&m32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // Combine the S partials (stream-ordered after splitk).
-        let f = self.function("gemm_i8_reduce")?;
-        let cfg = LaunchConfig {
-            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut la = self.stream.launch_builder(&f);
-        la.arg(&cpart);
-        la.arg(c);
-        la.arg(&n32);
-        la.arg(&s32);
-        la.arg(&m32);
-        unsafe { la.launch(cfg) }.map_err(map_err)?;
-        self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        self.reduce_and_pool(cpart, c, m, n, s)?;
         self.pool_a_scratch(a_arg);
         Ok(())
     }
@@ -876,21 +879,7 @@ impl Backend for CudaBackend {
                 la.arg(&k32);
                 la.arg(&n32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                let f = self.function("gemm_i8_reduce")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&cpart);
-                la.arg(c);
-                la.arg(&n32);
-                let s16i = 16i32;
-                la.arg(&s16i);
-                la.arg(&m32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
+                self.reduce_and_pool(cpart, c, m, n, 16)?;
                 self.pool_a_scratch(a_arg);
                 return Ok(());
             }
@@ -919,25 +908,7 @@ impl Backend for CudaBackend {
             la.arg(&m32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             // Combine the S partials (stream-ordered after splitk).
-            let f = self.function("gemm_i8_reduce")?;
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&cpart);
-            la.arg(c);
-            la.arg(&n32);
-            la.arg(&s32);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool
-                .lock()
-                .unwrap()
-                .entry(s * m * n)
-                .or_default()
-                .push(cpart);
+            self.reduce_and_pool(cpart, c, m, n, s)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -2236,20 +2207,7 @@ impl CudaBackend {
                 la.arg(&s32);
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                let f = self.function("gemm_i8_reduce")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&cpart);
-                la.arg(c);
-                la.arg(&n32);
-                la.arg(&s32);
-                la.arg(&m32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+                self.reduce_and_pool(cpart, c, m, n, s)?;
             } else {
                 let f = self.function(splitk)?;
                 let cfg = LaunchConfig {
@@ -2285,21 +2243,7 @@ impl CudaBackend {
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            let f = self.function("gemm_i8_reduce")?;
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&cpart);
-            la.arg(c);
-            la.arg(&n32);
-            let s16i = 16i32;
-            la.arg(&s16i);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
+            self.reduce_and_pool(cpart, c, m, n, 16)?;
         }
         let _ = blk_bytes; // layout constant — kept for the kernel contract
         Ok(())

@@ -119,6 +119,38 @@ kernel void gemm_f16(
     C[m * N + n] = acc;
 }
 
+// Decode (m=1) weight-stationary: каждый поток считает 4 выходных столбца
+// (float4 аккумулятор, half4-чтения весов) — в ~4× меньше потоков с
+// векторными операциями; A[k] — broadcast (кэш). Для m=1 заменяет
+// gemm_f16 (grid (1, N/4) вместо (1, N)).
+kernel void mv_f16_f4(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n4 = gid.y;
+    uint n0 = n4 * 4u;
+    if (m >= M || n0 >= N) return;
+    float4 acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        float a = A[m * K + k];
+        device const half4* bp = (device const half4*)(B + k * N + n0);
+        half4 b = *bp;
+        acc.x += a * (float)b.x;
+        acc.y += a * (float)b.y;
+        acc.z += a * (float)b.z;
+        acc.w += a * (float)b.w;
+    }
+    C[m * N + n0] = acc.x;
+    if (n0 + 1u < N) C[m * N + n0 + 1u] = acc.y;
+    if (n0 + 2u < N) C[m * N + n0 + 2u] = acc.z;
+    if (n0 + 3u < N) C[m * N + n0 + 3u] = acc.w;
+}
+
 // C[m,n] = Σ A[m*K+k] · B[k*N+n], B in bf16 (ushort bits).
 kernel void gemm_bf16(
     device const float* A [[buffer(0)]],
@@ -1102,6 +1134,155 @@ kernel void attn_ar_f32(
         float w = exp(s - mx) * inv;
         for (uint d = 0u; d < HD; ++d) yrow[d] += w * vrow[d];
     }
+}
+
+// GQA attention с float4-векторизацией d-цикла (три прохода как в
+// attn_ar_f32, но dot и v-взвешивание — float4). Трёхпроходная версия на
+// decode-шаге читала KV с DRAM-латентностью серийно в 16 потоках — ~1мс на
+// позицию KV (decode деградировал с ростом контекста); float4-чтения дают
+// ~40×. Маска -inf обрабатывается как в оригинале (exp(-inf - mx) = 0).
+kernel void attn_ar_f32_online(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    constant uint& Tq [[buffer(6)]],
+    constant uint& Tkv [[buffer(7)]],
+    constant uint& H [[buffer(8)]],
+    constant uint& KVH [[buffer(9)]],
+    constant uint& HD [[buffer(10)]],
+    constant uint& n_rep [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x, h = gid.y, t = gid.z;
+    if (b >= B || h >= H || t >= Tq) return;
+    uint kvh = h / n_rep;
+    uint D = H * HD;
+    uint KVD = KVH * HD;
+    const float scale = 1.0f / sqrt((float)HD);
+    const uint n4 = HD / 4u;
+    const device float4* qrow4 = (const device float4*)(Q + (b * Tq + t) * D + h * HD);
+    const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;
+
+    float mx = -INFINITY;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float acc = 0.0f;
+        for (uint d4 = 0u; d4 < n4; ++d4) {
+            float4 q4 = qrow4[d4];
+            float4 k4 = krow4[d4];
+            acc += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+        }
+        float maskv = (maskrow != nullptr) ? maskrow[j] : 0.0f;
+        float s = acc * scale + maskv;
+        if (s > mx) mx = s;
+    }
+    float sum = 0.0f;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float acc = 0.0f;
+        for (uint d4 = 0u; d4 < n4; ++d4) {
+            float4 q4 = qrow4[d4];
+            float4 k4 = krow4[d4];
+            acc += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+        }
+        float maskv = (maskrow != nullptr) ? maskrow[j] : 0.0f;
+        float s = acc * scale + maskv;
+        sum += exp(s - mx);
+    }
+    float inv = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+    device float4* yrow4 = (device float4*)(Y + (b * Tq + t) * D + h * HD);
+    for (uint d4 = 0u; d4 < n4; ++d4) yrow4[d4] = 0.0f;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        const device float4* vrow4 = (const device float4*)(V + (b * Tkv + j) * KVD + kvh * HD);
+        float qk = 0.0f;
+        for (uint d4 = 0u; d4 < n4; ++d4) {
+            float4 q4 = qrow4[d4];
+            float4 k4 = krow4[d4];
+            qk += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+        }
+        float maskv = (maskrow != nullptr) ? maskrow[j] : 0.0f;
+        float s = qk * scale + maskv;
+        float w = exp(s - mx) * inv;
+        for (uint d4 = 0u; d4 < n4; ++d4) {
+            yrow4[d4] += w * vrow4[d4];
+        }
+    }
+}
+
+// GQA attention, полностью распараллеленный по (h, d4): grid.y = H*n4 —
+// 512 потоков на (b,t) вместо 16. Каждый поток держит СВОЙ float4 q/k/v;
+// полный score получается simd_sum-редукцией по d4-лейнам (n4=32 = один
+// simdgroup на голову — broadcast без барьеров). KV читается ОДИН раз
+// (не 3 прохода × 16 потоков): ~75× быстрее attn_ar_f32 на decode-шаге.
+kernel void attn_ar_f32_fused(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    constant uint& Tq [[buffer(6)]],
+    constant uint& Tkv [[buffer(7)]],
+    constant uint& H [[buffer(8)]],
+    constant uint& KVH [[buffer(9)]],
+    constant uint& HD [[buffer(10)]],
+    constant uint& n_rep [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x;
+    uint n4 = HD / 4u;
+    // ВСЕГДА 32 лейна на голову: при n4 < 32 (hd=64 → n4=16) неактивные
+    // лейны (lane >= n4) дают нулевой acc — simd_sum по 32 лейнам корректен;
+    // их y4-запись дублирует активную (одинаковые значения — безопасно).
+    uint h = gid.y / 32u;
+    uint lane = gid.y % 32u;
+    uint d4 = lane % n4;
+    uint t = gid.z;
+    if (b >= B || h >= H || t >= Tq) return;
+    uint kvh = h / n_rep;
+    uint D = H * HD;
+    uint KVD = KVH * HD;
+    const float scale = 1.0f / sqrt((float)HD);
+    const bool active = (lane < n4);
+    const device float4* qrow4 = (const device float4*)(Q + (b * Tq + t) * D + h * HD);
+    float4 q4 = qrow4[d4];
+    const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;
+
+    // проход 1: running max полного score (simd_sum — полный dot broadcast).
+    float mx_local = -INFINITY;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float4 k4 = krow4[d4];
+        float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
+        float s = simd_sum(acc) * scale;
+        if (maskrow != nullptr) s += maskrow[j];
+        mx_local = max(mx_local, s);
+    }
+    float mx = simd_max(mx_local);
+
+    // проход 2: sum + y4-накопление (KV читается второй раз — V и K).
+    float ssum_local = 0.0f;
+    float4 y4 = 0.0f;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float4 k4 = krow4[d4];
+        float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
+        float s = simd_sum(acc) * scale;
+        if (maskrow != nullptr) s += maskrow[j];
+        float w = exp(s - mx);
+        ssum_local += w;
+        const device float4* vrow4 = (const device float4*)(V + (b * Tkv + j) * KVD + kvh * HD);
+        y4 += w * vrow4[d4];
+    }
+    // ssum_local у каждого лейна УЖЕ полный (w — broadcast из simd_sum) —
+    // повторная simd_sum утроила бы его в 32 раза.
+    float inv = (ssum_local > 0.0f) ? 1.0f / ssum_local : 0.0f;
+    device float4* yrow4 = (device float4*)(Y + (b * Tq + t) * D + h * HD);
+    yrow4[d4] = y4 * inv;
 }
 
 // ── Deepstack (Qwen3-VL): y[t] = x[t] + embd[t+shift] (сдвиг — вклад входных

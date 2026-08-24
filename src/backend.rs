@@ -364,6 +364,7 @@ impl Tensor {
                         shape: shape.clone(),
                         dtype: g.dtype,
                         offset: g.offset,
+                        pooled: g.pooled.clone(),
                     }),
                     shape,
                     dtype,

@@ -21,7 +21,7 @@ use metal::*;
 use objc::rc::autoreleasepool;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetalError {
@@ -68,6 +68,55 @@ impl GpuDtype {
 
 /// A contiguous tensor living in Metal memory (fp32 activations, or
 /// fp16/bf16 GEMM weights — see [`GpuDtype`]).
+/// Глобальный пул MTLBuffer (free-list по классам размера, 4KB-степени).
+/// Буферы создаются ВНУТРИ autoreleasepool — autorelease-маркер снимается
+/// сразу (refcount 1, Rust-владение), неявные пулы objc больше не могут
+/// освободить живую память (источник недетерминизма промежуточных буферов).
+pub struct BufferPoolState {
+    free: Mutex<HashMap<usize, Vec<Buffer>>>,
+}
+
+impl BufferPoolState {
+    fn new() -> Self {
+        Self { free: Mutex::new(HashMap::new()) }
+    }
+
+    /// Взять буфер размера >= bytes (класс 4KB) или создать (маркер снят).
+    fn acquire(&self, device: &Device, bytes: usize) -> Buffer {
+        let class = (bytes + 4095) & !4095;
+        let class = class.max(4096);
+        if let Some(buf) = self.free.lock().unwrap().get_mut(&class).and_then(|v| v.pop()) {
+            return buf;
+        }
+        let zeroed = vec![0u8; class];
+        autoreleasepool(|| {
+            device.new_buffer_with_data(
+                zeroed.as_ptr().cast(),
+                class as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        })
+    }
+
+    /// Вернуть буфер в пул (retain — пул держит единственный refcount).
+    fn push(&self, buf: &Buffer) {
+        let class = (buf.length() as usize + 4095) & !4095;
+        let class = class.max(4096);
+        self.free.lock().unwrap().entry(class).or_default().push(buf.clone());
+    }
+}
+
+static POOL: OnceLock<Arc<BufferPoolState>> = OnceLock::new();
+
+fn pool() -> &'static Arc<BufferPoolState> {
+    POOL.get_or_init(|| Arc::new(BufferPoolState::new()))
+}
+
+/// Маркер принадлежности буфера пулу: последний клон (все view-клоны
+/// тензора дропнуты) возвращает буфер в пул при Drop.
+#[derive(Debug, Clone)]
+pub(crate) struct PooledToken;
+
 #[derive(Debug, Clone)]
 pub struct GpuTensor {
     pub buffer: Buffer,
@@ -76,6 +125,21 @@ pub struct GpuTensor {
     /// Byte offset into `buffer` (view into a larger allocation — KV
     /// compact / paged-KV read windows without copies).
     pub offset: usize,
+    /// Some(пул) — буфер из пула; возвращается при drop последнего клона.
+    /// pub(crate): view-конструкторы в backend.rs/nn (view_inner, view_metal)
+    /// обязаны распространять маркер — иначе главный тензор дропнется раньше
+    /// живого view, и пул переиспользует буфер под чужие данные.
+    pub(crate) pooled: Option<Arc<PooledToken>>,
+}
+
+impl Drop for GpuTensor {
+    fn drop(&mut self) {
+        if let Some(tok) = self.pooled.as_ref() {
+            if Arc::strong_count(tok) == 1 {
+                pool().push(&self.buffer);
+            }
+        }
+    }
 }
 
 impl GpuTensor {
@@ -101,6 +165,7 @@ impl GpuTensor {
             shape,
             dtype: self.dtype,
             offset: self.offset + elem_offset * self.elem_size(),
+            pooled: self.pooled.clone(),
         }
     }
 
@@ -112,46 +177,38 @@ impl GpuTensor {
     ) -> Result<Self, MetalError> {
         let expected: usize = shape.iter().product();
         assert_eq!(expected, data.len(), "GpuTensor data/shape mismatch");
-        let buffer = device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            (data.len() * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer = pool().acquire(device, data.len() * 4);
         if buffer.contents().is_null() {
-            // OOM: the ObjC call returned a nil buffer — reading it later
-            // would be UB, fail loudly instead.
             return Err(MetalError::BufferAlloc);
         }
-        let buffer = buffer.clone(); // retain (см. zeros)
-        let buffer = buffer.clone(); // второй retain: анти-use-after-free
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.contents().cast(), data.len());
+        }
         Ok(Self {
             buffer,
             shape,
             dtype: GpuDtype::F32,
             offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
         })
     }
 
     /// Zero-filled buffer of the given shape (fp32).
     pub fn zeros(device: &Device, shape: Vec<usize>) -> Result<Self, MetalError> {
         let bytes = shape.iter().product::<usize>() * 4;
-        let zeroed = vec![0u8; bytes];
-        let buffer = device.new_buffer_with_data(
-            zeroed.as_ptr().cast(),
-            bytes as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer = pool().acquire(device, bytes);
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        let buffer = buffer.clone(); // retain (см. zeros)
-        let buffer = buffer.clone(); // второй retain: Metal может вернуть
-        // память autoreleased-буферов при живом тензоре (use-after-free)
+        unsafe {
+            std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, bytes);
+        }
         Ok(Self {
             buffer,
             shape,
             dtype: GpuDtype::F32,
             offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
         })
     }
 
@@ -164,20 +221,19 @@ impl GpuTensor {
     ) -> Result<Self, MetalError> {
         let expected: usize = shape.iter().product();
         assert_eq!(expected, data.len(), "GpuTensor f16 data/shape mismatch");
-        let buffer = device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            (data.len() * 2) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer = pool().acquire(device, data.len() * 2);
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        let buffer = buffer.clone(); // retain (см. zeros)
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.contents().cast(), data.len());
+        }
         Ok(Self {
             buffer,
             shape,
             dtype: GpuDtype::F16,
             offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
         })
     }
 
@@ -189,20 +245,19 @@ impl GpuTensor {
     ) -> Result<Self, MetalError> {
         let expected: usize = shape.iter().product();
         assert_eq!(expected, data.len(), "GpuTensor bf16 data/shape mismatch");
-        let buffer = device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            (data.len() * 2) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer = pool().acquire(device, data.len() * 2);
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        let buffer = buffer.clone(); // retain (см. zeros)
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.contents().cast(), data.len());
+        }
         Ok(Self {
             buffer,
             shape,
             dtype: GpuDtype::BF16,
             offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
         })
     }
 
@@ -234,20 +289,19 @@ impl GpuTensor {
                 data.len()
             )));
         }
-        let buffer = device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            data.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer = pool().acquire(device, data.len());
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
-        let buffer = buffer.clone(); // retain (см. zeros)
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.contents().cast(), data.len());
+        }
         Ok(Self {
             buffer,
             shape,
             dtype,
             offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
         })
     }
 
@@ -1592,23 +1646,25 @@ impl MetalCtx {
                 idx.len()
             )));
         }
-        let bytes = (t * 4) as u64;
-        let idx_buf = self.device.new_buffer_with_data(
-            idx.as_ptr().cast(),
-            bytes,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let idx_buf = idx_buf.clone(); // retain
+        let idx_buf = pool().acquire(&self.device, t * 4);
+        if idx_buf.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(idx.as_ptr(), idx_buf.contents().cast(), t);
+        }
         let grid = MTLSize::new(1, t as u64, d as u64);
         let group = MTLSize::new(1, 4, 8);
-        self.run("embedding_f32", grid, group, |enc| {
+        let res = self.run("embedding_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&idx_buf), 0);
             enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
             enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, n, d].iter().enumerate() {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
-        })
+        });
+        pool().push(&idx_buf);
+        res
     }
 
     /// RoPE with interleaved pairs per head: X (B,T,D=H*HD),
@@ -1684,34 +1740,38 @@ impl MetalCtx {
                 idx.len()
             )));
         }
-        let bytes = (rows * 4) as u64;
-        let idx_buf = self.device.new_buffer_with_data(
-            idx.as_ptr().cast(),
-            bytes,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let idx_buf = idx_buf.clone(); // retain
-        let grid = MTLSize::new(rows as u64, 1, 1);
-        let group = MTLSize::new(256, 1, 1);
-        self.run("codebook_search_f32", grid, group, |enc| {
-            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
-            enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
-            enc.set_buffer(2, Some(&idx_buf), 0);
-            for (i, v) in [rows, n].iter().enumerate() {
-                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
-            }
-        })?;
-        // In batch mode the kernel has NOT executed yet — the host copy
-        // below would read the previous indices. Flush like to_cpu_f32 does.
-        self.flush_batch()?;
-        let ptr = idx_buf.contents();
-        if ptr.is_null() {
+        let idx_buf = pool().acquire(&self.device, rows * 4);
+        if idx_buf.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(ptr as *const u32, idx.as_mut_ptr(), rows);
+            std::ptr::copy_nonoverlapping(idx.as_ptr(), idx_buf.contents().cast(), rows);
         }
-        Ok(())
+        let grid = MTLSize::new(rows as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        let res = (|| -> Result<(), MetalError> {
+            self.run("codebook_search_f32", grid, group, |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
+                enc.set_buffer(2, Some(&idx_buf), 0);
+                for (i, v) in [rows, n].iter().enumerate() {
+                    enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
+                }
+            })?;
+            // In batch mode the kernel has NOT executed yet — the host copy
+            // below would read the previous indices. Flush like to_cpu_f32 does.
+            self.flush_batch()?;
+            let ptr = idx_buf.contents();
+            if ptr.is_null() {
+                return Err(MetalError::BufferAlloc);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr as *const u32, idx.as_mut_ptr(), rows);
+            }
+            Ok(())
+        })();
+        pool().push(&idx_buf);
+        res
     }
 
     /// GQA attention with KV cache: q (B,Tq,H*HD), k/v (B,Tkv,KVH*HD),
@@ -1808,16 +1868,16 @@ impl MetalCtx {
                 idx.len()
             )));
         }
-        let bytes = (t * 4) as u64;
-        let idx_buf = self.device.new_buffer_with_data(
-            idx.as_ptr().cast(),
-            bytes,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let idx_buf = idx_buf.clone(); // retain
+        let idx_buf = pool().acquire(&self.device, t * 4);
+        if idx_buf.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(idx.as_ptr(), idx_buf.contents().cast(), t);
+        }
         let grid = MTLSize::new(1, t as u64, d as u64);
         let group = MTLSize::new(1, 4, 8);
-        self.run("embedding_override_f32", grid, group, |enc| {
+        let res = self.run("embedding_override_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&idx_buf), 0);
             enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
             enc.set_buffer(2, Some(&vision.buffer), vision.offset as u64);
@@ -1825,7 +1885,9 @@ impl MetalCtx {
             for (i, val) in [t, n, d, override_id as usize, v].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (val as *const usize).cast());
             }
-        })
+        });
+        pool().push(&idx_buf);
+        res
     }
 
     /// RMSNorm per head (QK-norm): X (rows, H*HD) → Y, W (HD).
@@ -2052,13 +2114,14 @@ impl crate::backend::Backend for MetalBackend {
         let y = GpuTensor::zeros(&self.ctx.device, vec![1, tq, d])?;
         let grid = MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
         let group = MTLSize::new(1, 1, 8);
-        let pos_buf = self.ctx.device.new_buffer_with_data(
-            pos4d.as_ptr().cast(),
-            (pos4d.len() * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let pos_buf = pos_buf.clone(); // retain
-        self.ctx.run("rope_mrope_f32", grid, group, |enc| {
+        let pos_buf = pool().acquire(&self.ctx.device, pos4d.len() * 4);
+        if pos_buf.contents().is_null() {
+            return Err(MetalError::BufferAlloc.into());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(pos4d.as_ptr(), pos_buf.contents().cast(), pos4d.len());
+        }
+        let res = self.ctx.run("rope_mrope_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&g.buffer), g.offset as u64);
             enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&tq as *const usize).cast());
@@ -2073,7 +2136,9 @@ impl crate::backend::Backend for MetalBackend {
                 sections[3] as u32,
             ];
             enc.set_bytes(7, 16, (sects32.as_ptr() as *const u8).cast());
-        })?;
+        });
+        pool().push(&pos_buf);
+        res?;
         Ok(crate::backend::Tensor::from_gpu(y))
     }
 

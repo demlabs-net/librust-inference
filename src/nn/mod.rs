@@ -593,21 +593,25 @@ impl KvCache {
 
     #[cfg(feature = "metal")]
     pub fn view_metal(&self) -> GpuTensor {
+        let g = self.k.as_gpu();
         GpuTensor {
-            buffer: self.k.as_gpu().buffer.clone(),
+            buffer: g.buffer.clone(),
             shape: vec![1, self.pos, self.k.shape()[2]],
             dtype: crate::metal::GpuDtype::F32,
             offset: 0,
+            pooled: g.pooled.clone(),
         }
     }
 
     #[cfg(feature = "metal")]
     pub fn view_v_metal(&self) -> GpuTensor {
+        let g = self.v.as_gpu();
         GpuTensor {
-            buffer: self.v.as_gpu().buffer.clone(),
+            buffer: g.buffer.clone(),
             shape: vec![1, self.pos, self.v.shape()[2]],
             dtype: crate::metal::GpuDtype::F32,
             offset: 0,
+            pooled: g.pooled.clone(),
         }
     }
 }

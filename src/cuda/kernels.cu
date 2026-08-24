@@ -1705,7 +1705,7 @@ extern "C" __global__ void SUF##_splitk(                                    \
 extern "C" __global__ void SUF##_tiled(                                     \
     const float* __restrict__ A,        /* (m, k) */                        \
     const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
-    float* __restrict__ C,              /* (m, n) */                        \
+    float* __restrict__ Cpart,          /* (S·m, n) — grid.z k-slices */    \
     int m, int k, int n)                                                    \
 {                                                                           \
     const int BM = 32;                                                      \
@@ -1714,11 +1714,15 @@ extern "C" __global__ void SUF##_tiled(                                     \
     int col0 = blockIdx.x * BN;                                             \
     int r0 = blockIdx.y * BM;                                               \
     int nsup = k >> NSUP_SHIFT;                                             \
+    int nkz = (nsup + 15) >> 4;     /* k-split: grid.z=16 multiplies grid */\
+    int kb0 = blockIdx.z * nkz;                                             \
+    if (kb0 >= nsup) return;                                                \
+    int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                          \
     float acc[BM];                                                          \
     for (int rr = 0; rr < BM; ++rr) acc[rr] = 0.0f;                         \
     const int tile_bytes = BN * BLK_BYTES;                                  \
     const int tile_v4 = tile_bytes >> 4;                                    \
-    for (int kb = 0; kb < nsup; ++kb) {                                     \
+    for (int kb = kb0; kb < kb1; ++kb) {                                    \
         const unsigned char* src = B + (size_t)(kb * n + col0) * BLK_BYTES; \
         if (col0 + BN <= n && (n & 7) == 0) {                               \
             for (int i = tid; i < tile_v4; i += 256) {                      \
@@ -1748,9 +1752,8 @@ extern "C" __global__ void SUF##_tiled(                                     \
         __syncthreads();                                                    \
     }                                                                       \
     if (col0 + tid >= n || tid >= BN) return;                               \
-    float* c0 = C + (size_t)r0 * n + col0 + tid;                            \
     for (int rr = 0; rr < BM; ++rr) {                                       \
-        if (r0 + rr < m) c0[rr * n] = acc[rr];                              \
+        if (r0 + rr < m) Cpart[(blockIdx.z * m + r0 + rr) * n + col0 + tid] = acc[rr]; \
     }                                                                       \
 }
 
@@ -2143,7 +2146,7 @@ extern "C" __global__ void gemm_q6k_splitk_v2(
 extern "C" __global__ void gemm_q6k_tiled_v3(
     const float* __restrict__ A,        // (m, k)
     const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
-    float* __restrict__ C,              // (m, n)
+    float* __restrict__ Cpart,          // (S·m, n) — grid.z k-slices
     int m,
     int k,
     int n)
@@ -2155,11 +2158,15 @@ extern "C" __global__ void gemm_q6k_tiled_v3(
     int col0 = blockIdx.x * BN;
     int r0 = blockIdx.y * BM;
     int nsup = k >> 8;
+    int nkz = (nsup + 15) >> 4;     /* k-split: grid.z=16 multiplies grid */
+    int kb0 = blockIdx.z * nkz;
+    if (kb0 >= nsup) return;
+    int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;
     int col = tid & 63;
     int rq = tid >> 6;      // 0..3 — eight rows per thread
     float acc[8];
     for (int q = 0; q < 8; ++q) acc[q] = 0.0f;
-    for (int kb = 0; kb < nsup; ++kb) {
+    for (int kb = kb0; kb < kb1; ++kb) {
         const unsigned char* src = B + (size_t)(kb * n + col0) * 210;
         if (col0 + BN <= n && (n & 7) == 0) {
             for (int i = tid; i < (BN * 210) / 16; i += 256) {
@@ -2197,10 +2204,9 @@ extern "C" __global__ void gemm_q6k_tiled_v3(
         __syncthreads();
     }
     if (col0 + col >= n) return;
-    float* c0 = C + (size_t)r0 * n + col0 + col;
     for (int q = 0; q < 8; ++q) {
         int rr = rq + 4 * (q & 3) + 16 * (q >> 2);
-        if (r0 + rr < m) c0[rr * n] = acc[q];
+        if (r0 + rr < m) Cpart[(blockIdx.z * m + r0 + rr) * n + col0 + col] = acc[q];
     }
 }
 

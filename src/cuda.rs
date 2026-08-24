@@ -2213,11 +2213,7 @@ impl CudaBackend {
         // re-dequants — measured 3-7× slower for prefill). S=1 writes
         // straight into C — no reduce pass.
         let s = if m == 1 {
-            [32usize, 16, 8, 4, 2]
-                .iter()
-                .copied()
-                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
-                .unwrap_or(1)
+            self.pick_split(nblk, m, n, grid_x)
         } else {
             1
         };
@@ -2273,20 +2269,37 @@ impl CudaBackend {
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
         } else {
+            let s16 = 16usize;
+            let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 1),
+                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
             let mut la = self.stream.launch_builder(&f);
             la.arg(a.as_cuda());
             la.arg(bpack);
-            la.arg(c);
+            la.arg(&cpart);
             la.arg(&m32);
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
+            let f = self.function("gemm_i8_reduce")?;
+            let cfg = LaunchConfig {
+                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(&cpart);
+            la.arg(c);
+            la.arg(&n32);
+            let s16i = 16i32;
+            la.arg(&s16i);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
         }
         let _ = blk_bytes; // layout constant — kept for the kernel contract
         Ok(())

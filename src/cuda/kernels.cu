@@ -1795,9 +1795,14 @@ extern "C" __global__ void gemm_q8k_splitk_##SUF(                           \
             for (int v = 0; v < 2; ++v) {                                   \
                 uint4 ub = __ldg(&bv[v]);                                   \
                 const signed char* bh = (const signed char*)&ub;            \
-                _Pragma("unroll 8")                                         \
-                for (int j = 0; j < 16; ++j) {                              \
-                    dot += (float)aseg[v * 16 + j] * (float)bh[j];          \
+                _Pragma("unroll")                                           \
+                for (int u = 0; u < (int)sizeof(AT); ++u) {                 \
+                    uint4 ua = __ldg((const uint4*)(aseg + v * 16) + u);    \
+                    const AT* ah = (const AT*)&ua;                          \
+                    _Pragma("unroll")                                       \
+                    for (int j = 0; j < 16 / (int)sizeof(AT); ++j) {        \
+                        dot += (float)ah[j] * (float)bh[u * (16 / (int)sizeof(AT)) + j]; \
+                    }                                                       \
                 }                                                           \
             }                                                               \
             acc += dot * w;                                                 \
@@ -1846,9 +1851,16 @@ extern "C" __global__ void gemm_halfw_splitk_##ASUF##_##BSUF(                 \
             for (int v = 0; v < 4; ++v) {                                     \
                 uint4 ub = __ldg(&bv[v]);                                     \
                 const BT* bh = (const BT*)&ub;                                \
-                _Pragma("unroll 8")                                           \
-                for (int j = 0; j < 8; ++j) {                                 \
-                    acc += (float)aseg[v * 8 + j] * (float)bh[j];             \
+                /* A: 8 elements per v — vectorized uint4 loads (broadcast,  \
+                   same address for all lanes): 2 uint4 for f32, 1 for half */\
+                _Pragma("unroll")                                             \
+                for (int u = 0; u < (int)sizeof(AT) / 2; ++u) {               \
+                    uint4 ua = __ldg((const uint4*)(aseg + v * 8) + u);       \
+                    const AT* ah = (const AT*)&ua;                            \
+                    _Pragma("unroll")                                         \
+                    for (int j = 0; j < 16 / (int)sizeof(AT); ++j) {          \
+                        acc += (float)ah[j] * (float)bh[u * (16 / (int)sizeof(AT)) + j]; \
+                    }                                                         \
                 }                                                             \
             }                                                                 \
         }                                                                     \

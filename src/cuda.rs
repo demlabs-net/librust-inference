@@ -263,6 +263,11 @@ impl CudaBackend {
         n: usize,
         b_suf: &'static str,
     ) -> Result<(), BackendError> {
+        if k % 32 != 0 {
+            return Err(BackendError::Shape(format!(
+                "half-weight gemm_nt: k={k} not a multiple of 32"
+            )));
+        }
         let k32 = k as i32;
         let n32 = n as i32;
         let m32 = m as i32;
@@ -821,6 +826,11 @@ impl Backend for CudaBackend {
             scale: wscale,
         } = &b.inner
         {
+            if k % 32 != 0 {
+                return Err(BackendError::Shape(format!(
+                    "int8 gemm_nt: k={k} not a multiple of 32"
+                )));
+            }
             // Q8_0-style int8 GEMM: per-32-block weight scales, the A
             // operand follows the activation axis (f32 default, fp16/bf16
             // cast). kb-major packed weights feed the own kernels: m=1

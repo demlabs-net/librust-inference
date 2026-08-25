@@ -234,6 +234,36 @@ impl CudaBackend {
             .unwrap_or(1)
     }
 
+    /// Combine the (S·m, n) partials into C (gemm_i8_reduce — fixed order,
+    /// deterministic) and return the cpart buffer to the pool.
+    fn reduce_and_pool(
+        &self,
+        cpart: CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        n: usize,
+        s: usize,
+    ) -> Result<(), BackendError> {
+        let n32 = n as i32;
+        let m32 = m as i32;
+        let s32 = s as i32;
+        let f = self.function("gemm_i8_reduce")?;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(&cpart);
+        la.arg(c);
+        la.arg(&n32);
+        la.arg(&s32);
+        la.arg(&m32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        Ok(())
+    }
+
     /// Return the activation cast scratch (if any) to its pool.
     fn pool_a_scratch(&self, a_arg: KernA) {
         match a_arg {
@@ -264,9 +294,30 @@ impl CudaBackend {
         b_suf: &'static str,
     ) -> Result<(), BackendError> {
         if k % 32 != 0 {
-            return Err(BackendError::Shape(format!(
-                "half-weight gemm_nt: k={k} not a multiple of 32"
-            )));
+            // Shapes like the DAC codec's (1, 8, 1024) carry raw row-major
+            // half weights (k%32!=0 tensors are not kb-major packed) — the
+            // naive elementwise kernel covers any k (the split-k/tiled paths
+            // require k ≡ 0 mod 32; before this fallback they computed a
+            // silent zero for k<32).
+            let fname: &'static str = match b_suf {
+                "bf16" => "gemm_halfw_naive_bf16",
+                "f16" => "gemm_halfw_naive_f16",
+                _ => unreachable!(),
+            };
+            let f = self.function(fname)?;
+            let cfg = LaunchConfig::for_num_elems((m * n) as u32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(b);
+            la.arg(c.as_cuda_mut());
+            let m32 = m as i32;
+            let k32 = k as i32;
+            let n32 = n as i32;
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            return Ok(());
         }
         let k32 = k as i32;
         let n32 = n as i32;
@@ -275,20 +326,30 @@ impl CudaBackend {
         let grid_x = (n + 255) / 256;
         let act = self.activation_dtype();
         let (tiled_name, splitk_name): (&'static str, &'static str) = match (b_suf, act) {
-            ("bf16", crate::dtype::Dtype::F16) => {
-                ("gemm_halfw_tiled_f16_bf16", "gemm_halfw_splitk_f16_bf16")
-            }
-            ("bf16", crate::dtype::Dtype::BF16) => {
-                ("gemm_halfw_tiled_bf16_bf16", "gemm_halfw_splitk_bf16_bf16")
-            }
-            ("bf16", _) => ("gemm_halfw_tiled_f32_bf16", "gemm_halfw_splitk_f32_bf16"),
-            ("f16", crate::dtype::Dtype::F16) => {
-                ("gemm_halfw_tiled_f16_f16", "gemm_halfw_splitk_f16_f16")
-            }
-            ("f16", crate::dtype::Dtype::BF16) => {
-                ("gemm_halfw_tiled_bf16_f16", "gemm_halfw_splitk_bf16_f16")
-            }
-            ("f16", _) => ("gemm_halfw_tiled_f32_f16", "gemm_halfw_splitk_f32_f16"),
+            ("bf16", crate::dtype::Dtype::F16) => (
+                "gemm_halfw_tiled_f16_bf16",
+                "gemm_halfw_splitk_f16_bf16",
+            ),
+            ("bf16", crate::dtype::Dtype::BF16) => (
+                "gemm_halfw_tiled_bf16_bf16",
+                "gemm_halfw_splitk_bf16_bf16",
+            ),
+            ("bf16", _) => (
+                "gemm_halfw_tiled_f32_bf16",
+                "gemm_halfw_splitk_f32_bf16",
+            ),
+            ("f16", crate::dtype::Dtype::F16) => (
+                "gemm_halfw_tiled_f16_f16",
+                "gemm_halfw_splitk_f16_f16",
+            ),
+            ("f16", crate::dtype::Dtype::BF16) => (
+                "gemm_halfw_tiled_bf16_f16",
+                "gemm_halfw_splitk_bf16_f16",
+            ),
+            ("f16", _) => (
+                "gemm_halfw_tiled_f32_f16",
+                "gemm_halfw_splitk_f32_f16",
+            ),
             _ => unreachable!("gemm_halfw_nt: unknown weight suffix {b_suf}"),
         };
         let a_arg: KernA = match act {
@@ -297,10 +358,16 @@ impl CudaBackend {
             _ => KernA::F32(a),
         };
         if m > 1 {
-            // Tiled: 32 rows × 256 cols per block, grid.z=8 splits k into
-            // (8·m, n) partials — combined by gemm_i8_reduce. The z-slices
-            // write disjoint (row, col) tiles, so every element is summed
-            // 8× in a fixed order — deterministic.
+            // m>1: the tiled kernel — one block per (32 rows × 256 cols),
+            // grid.z=16 splits k into (16·m, n) partials combined by
+            // gemm_i8_reduce (deterministic fixed-order reduction).
+            // NOTE: the mma.sync tensor-core path was removed after the
+            // sm_120 investigation (2026-08-25): the ptxas miscompiles the
+            // fragment loads (SASS: LDS.U16 at 0x4040 with 0x800 shared —
+            // out-of-bounds reads), the wmma API is gone from CUDA 13, and
+            // tcgen05 is datacenter-only (sm_100a). The f32-accumulating
+            // tiled kernel is the production path — it beats cuBLAS on all
+            // measured shapes (1.06–3.4×).
             let s16 = 16usize;
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled_name)?;
@@ -321,21 +388,7 @@ impl CudaBackend {
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            let f = self.function("gemm_i8_reduce")?;
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&cpart);
-            la.arg(c);
-            la.arg(&n32);
-            let s16i = 16i32;
-            la.arg(&s16i);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
+            self.reduce_and_pool(cpart, c, m, n, 16)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -369,20 +422,7 @@ impl CudaBackend {
         la.arg(&m32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // Combine the S partials (stream-ordered after splitk).
-        let f = self.function("gemm_i8_reduce")?;
-        let cfg = LaunchConfig {
-            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut la = self.stream.launch_builder(&f);
-        la.arg(&cpart);
-        la.arg(c);
-        la.arg(&n32);
-        la.arg(&s32);
-        la.arg(&m32);
-        unsafe { la.launch(cfg) }.map_err(map_err)?;
-        self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        self.reduce_and_pool(cpart, c, m, n, s)?;
         self.pool_a_scratch(a_arg);
         Ok(())
     }
@@ -876,21 +916,7 @@ impl Backend for CudaBackend {
                 la.arg(&k32);
                 la.arg(&n32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                let f = self.function("gemm_i8_reduce")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&cpart);
-                la.arg(c);
-                la.arg(&n32);
-                let s16i = 16i32;
-                la.arg(&s16i);
-                la.arg(&m32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s16 * m * n).or_default().push(cpart);
+                self.reduce_and_pool(cpart, c, m, n, 16)?;
                 self.pool_a_scratch(a_arg);
                 return Ok(());
             }
@@ -919,25 +945,7 @@ impl Backend for CudaBackend {
             la.arg(&m32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             // Combine the S partials (stream-ordered after splitk).
-            let f = self.function("gemm_i8_reduce")?;
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(&cpart);
-            la.arg(c);
-            la.arg(&n32);
-            la.arg(&s32);
-            la.arg(&m32);
-            unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.pool
-                .lock()
-                .unwrap()
-                .entry(s * m * n)
-                .or_default()
-                .push(cpart);
+            self.reduce_and_pool(cpart, c, m, n, s)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -2266,13 +2274,32 @@ impl CudaBackend {
         // re-dequants — measured 3-7× slower for prefill). S=1 writes
         // straight into C — no reduce pass.
         let s = if m == 1 {
-            [32usize, 16, 8, 4, 2]
-                .iter()
-                .copied()
-                .find(|&s| nblk % s == 0 && grid_x * m * s <= 512)
-                .unwrap_or(1)
+            self.pick_split(nblk, m, n, grid_x)
         } else {
             1
+        };
+        // The m=1 split-k follows the activation axis (f16/bf16 cast the A
+        // rows — half-width A shared tile and traffic); the m>1 tiled
+        // kernel keeps the f32 activation tile (A is amortized in shared
+        // there — the axis would buy nothing).
+        let act = self.activation_dtype();
+        let a_arg: KernA = if m == 1 {
+            match act {
+                crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
+                crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
+                _ => KernA::F32(a),
+            }
+        } else {
+            KernA::F32(a)
+        };
+        let (splitk, tiled): (&'static str, &'static str) = match (&a_arg, name) {
+            (KernA::F16(_), "gemm_q6k") => ("gemm_q6k_splitk_v2_f16", "gemm_q6k_tiled_v3"),
+            (KernA::BF16(_), "gemm_q6k") => ("gemm_q6k_splitk_v2_bf16", "gemm_q6k_tiled_v3"),
+            (KernA::F16(_), "gemm_q4k") => ("gemm_q4k_f16_splitk", "gemm_q4k_f16_tiled"),
+            (KernA::BF16(_), "gemm_q4k") => ("gemm_q4k_bf16_splitk", "gemm_q4k_bf16_tiled"),
+            (_, "gemm_q6k") => ("gemm_q6k_splitk_v2_f32", "gemm_q6k_tiled_v3"),
+            (_, "gemm_q4k") => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
+            _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };
         if m == 1 {
             if s > 1 {
@@ -2284,7 +2311,11 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
+                match &a_arg {
+                    KernA::F32(t) => la.arg(t.as_cuda()),
+                    KernA::F16(sl) => la.arg(sl),
+                    KernA::BF16(sl) => la.arg(sl),
+                };
                 la.arg(bpack);
                 la.arg(&cpart);
                 la.arg(&k32);
@@ -2293,20 +2324,7 @@ impl CudaBackend {
                 la.arg(&s32);
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                let f = self.function("gemm_i8_reduce")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(&cpart);
-                la.arg(c);
-                la.arg(&n32);
-                la.arg(&s32);
-                la.arg(&m32);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+                self.reduce_and_pool(cpart, c, m, n, s)?;
             } else {
                 let f = self.function(splitk)?;
                 let cfg = LaunchConfig {
@@ -2315,7 +2333,11 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
+                match &a_arg {
+                    KernA::F32(t) => la.arg(t.as_cuda()),
+                    KernA::F16(sl) => la.arg(sl),
+                    KernA::BF16(sl) => la.arg(sl),
+                };
                 la.arg(bpack);
                 la.arg(c);
                 la.arg(&k32);
@@ -2326,21 +2348,29 @@ impl CudaBackend {
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
         } else {
+            let s16 = 16usize;
+            let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 1),
+                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
             let mut la = self.stream.launch_builder(&f);
-            la.arg(a.as_cuda());
+            match &a_arg {
+                KernA::F32(t) => la.arg(t.as_cuda()),
+                KernA::F16(sl) => la.arg(sl),
+                KernA::BF16(sl) => la.arg(sl),
+            };
             la.arg(bpack);
-            la.arg(c);
+            la.arg(&cpart);
             la.arg(&m32);
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
+            self.reduce_and_pool(cpart, c, m, n, 16)?;
         }
+        self.pool_a_scratch(a_arg);
         let _ = blk_bytes; // layout constant — kept for the kernel contract
         Ok(())
     }

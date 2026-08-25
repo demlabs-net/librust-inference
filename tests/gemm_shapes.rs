@@ -208,7 +208,7 @@ fn check_half(
     wf16: bool,
     act: rust_inference::dtype::Dtype,
 ) {
-    assert_eq!(k % 32, 0, "k must be a multiple of 32");
+    // k < 32 shapes (e.g. the DAC codec's 1×8×1024) run the naive fallback.
     let seed = (m * 7919 + k * 104729 + n) as u64;
     let a = {
         let mut d = vec![0.0f32; m * k];
@@ -258,7 +258,7 @@ fn check_half(
         }
         assert!(
             ok,
-            "half gemm_nt [{m}x{k}x{n}] w={} act={:?} [{i}]: gpu {} cpu {}",
+            "half gemm_nt [{m}x{k}x{n}] w={} act={:?} [{i}]: gpu {} cpu {} (tol {tol})",
             if wf16 { "f16" } else { "bf16" },
             act,
             g[i],
@@ -289,6 +289,8 @@ fn gemm_nt_half_shapes() {
         // Prefill-shaped (TTS fill / STT one-shot) — the tiled m>1 path.
         (64, 2560, 3840),
         (470, 1536, 384),
+        // DAC codec k<32 (raw row-major half weights — the naive fallback).
+        (1, 8, 1024),
     ];
     for &(m, k, n) in &shapes {
         for wf16 in [false, true] {

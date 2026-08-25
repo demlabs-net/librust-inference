@@ -30,6 +30,7 @@ fn view3(x: &Tensor, b: usize, t: usize, d: usize) -> Tensor {
 }
 
 /// Linear: y = x @ Wᵀ + b. W (out, in), x (B,T,in) → y (B,T,out).
+#[derive(Debug, Clone)]
 pub struct Linear {
     pub w: Tensor,
     pub b: Option<Tensor>,
@@ -64,6 +65,7 @@ impl Linear {
 }
 
 /// RMSNorm over the last dim. W (D).
+#[derive(Debug, Clone)]
 pub struct RmsNorm {
     pub w: Tensor,
     pub eps: f32,
@@ -92,6 +94,7 @@ impl RmsNorm {
 
 /// SwiGLU FFN: y = silu_mul_fused(x·W13ᵀ) · W2ᵀ, где W13 = [W1; W3]
 /// (gate|up, слитые в один [2·ffn, dim] GEMM — на 1 кернел меньше на слой).
+#[derive(Debug, Clone)]
 pub struct SwiGLU {
     pub w13: Tensor,
     pub w2: Tensor,
@@ -150,6 +153,7 @@ impl Snake {
 }
 
 /// Embedding lookup (batch fixed to 1 in the kernel). Table (N,D).
+#[derive(Debug, Clone)]
 pub struct Embedding {
     pub table: Tensor,
 }
@@ -256,6 +260,7 @@ impl ConvTranspose1d {
 
 /// GQA attention + KV cache for the slow/fast AR paths.
 /// wqkv (3D, D), wo (D, D), optional QK-norms (D).
+#[derive(Debug, Clone)]
 pub struct Attention {
     pub wqkv: Tensor,
     pub wo: Tensor,
@@ -518,6 +523,12 @@ impl KvCache {
 
     pub fn reset(&mut self) {
         self.pos = 0;
+    }
+
+    /// Откат к позиции `pos` (спекулятивный decode: непринятые draft-токены).
+    /// Данные остаются — следующий kv_update перезапишет хвост.
+    pub fn truncate(&mut self, pos: usize) {
+        self.pos = self.pos.min(pos);
     }
 
     /// Drop the grown capacity — called when an engine returns to the pool:

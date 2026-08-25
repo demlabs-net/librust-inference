@@ -119,11 +119,12 @@ impl Qwen3Config {
     }
 }
 
-struct Qwen3Layer {
-    attn_norm: RmsNorm,
-    attn: Attention,
-    ffn_norm: RmsNorm,
-    ffn: SwiGLU,
+#[derive(Debug, Clone)]
+pub struct Qwen3Layer {
+    pub attn_norm: RmsNorm,
+    pub attn: Attention,
+    pub ffn_norm: RmsNorm,
+    pub ffn: SwiGLU,
 }
 
 /// Qwen3-модель (decode-состояние: KV-кэши в слоях).
@@ -141,8 +142,77 @@ pub struct Qwen3Model {
     pos_rope: usize,
 }
 
+/// Результат спекулятивного шага (Ф2.1).
+pub struct SpecOutcome {
+    /// Принятые токены (первый — гарантированно; остальные — draft).
+    pub accepted: Vec<u32>,
+    /// Логиты последней позиции (продолжение, если приняты все draft).
+    pub logits: Tensor,
+}
+
 impl Qwen3Model {
     #[allow(clippy::too_many_arguments)]
+    /// Квант-осведомлённая загрузка веса: Q4_0/Q8_0/Q4_K/Q6_K — нативно
+    /// (dequant-in-kernel GEMM/MMV), иначе dequant→f16 (как раньше).
+    fn upload_q(
+        backend: &dyn Backend,
+        w: &WeightsMap<'_>,
+        name: &str,
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
+        let tensor = w
+            .get(name)
+            .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
+        match tensor.format {
+            crate::dtype::WeightFormat::Q4_0
+            | crate::dtype::WeightFormat::Q8_0
+            | crate::dtype::WeightFormat::Q4_K
+            | crate::dtype::WeightFormat::Q6_K => {
+                backend.from_quantized(tensor.raw(), shape, tensor.format)
+            }
+            _ => upload_w(backend, &crate::weights_map::dequant_f32(tensor), shape),
+        }
+    }
+
+    /// Fused-веса (q/k/v, gate/up) с нативным квантом, если ВСЕ части
+    /// квантованы одинаково (GGUF-модели — всегда); иначе dequant→f16.
+    fn upload_fused(
+        backend: &dyn Backend,
+        w: &WeightsMap<'_>,
+        names: &[&str],
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
+        let tensors: Vec<&crate::weights_map::WeightTensor<'_>> = names
+            .iter()
+            .map(|n| {
+                w.get(n)
+                    .ok_or_else(|| BackendError::Shape(format!("missing tensor {n}")))
+            })
+            .collect::<Result<_, _>>()?;
+        let q = tensors[0].format;
+        let all_q = tensors.iter().all(|t| t.format == q)
+            && matches!(
+                q,
+                crate::dtype::WeightFormat::Q4_0
+                    | crate::dtype::WeightFormat::Q8_0
+                    | crate::dtype::WeightFormat::Q4_K
+                    | crate::dtype::WeightFormat::Q6_K
+            );
+        if all_q {
+            let mut bytes = Vec::new();
+            for t in &tensors {
+                bytes.extend_from_slice(t.raw());
+            }
+            backend.from_quantized(&bytes, shape, q)
+        } else {
+            let mut f = Vec::new();
+            for t in &tensors {
+                f.extend(crate::weights_map::dequant_f32(t));
+            }
+            upload_w(backend, &f, shape)
+        }
+    }
+
     pub fn load(
         backend: &dyn Backend,
         w: &WeightsMap<'_>,
@@ -165,14 +235,19 @@ impl Qwen3Model {
         let mut caches = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}");
-            // fuse q/k/v → [3D, D]
-            let q = t(&p("attn_q.weight"))?;
-            let k = t(&p("attn_k.weight"))?;
-            let v = t(&p("attn_v.weight"))?;
-            let mut wqkv = q;
-            wqkv.extend_from_slice(&k);
-            wqkv.extend_from_slice(&v);
-            let wo = t(&p("attn_output.weight"))?;
+            // fuse q/k/v → [3D, D] (нативный квант, если все Q8_0/Q4_0/...)
+            let qn = p("attn_q.weight");
+            let kn = p("attn_k.weight");
+            let vn = p("attn_v.weight");
+            let wqkv = Self::upload_fused(
+                backend,
+                w,
+                &[&qn, &kn, &vn],
+                vec![
+                    cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
+                    cfg.dim,
+                ],
+            )?;
             // QK-norm опционален (Qwen3 — есть; Qwen2.5-Omni thinker — нет).
             let q_norm = if w.get(&p("attn_q_norm.weight")).is_some() {
                 Some(backend.from_cpu_f32(&t(&p("attn_q_norm.weight"))?, vec![cfg.head_dim])?)
@@ -192,20 +267,15 @@ impl Qwen3Model {
             } else {
                 None
             };
+            let wo = Self::upload_q(
+                backend,
+                w,
+                &p("attn_output.weight"),
+                vec![cfg.dim, cfg.n_heads * cfg.head_dim],
+            )?;
             let attn = Attention {
-                wqkv: upload_w(
-                    backend,
-                    &wqkv,
-                    vec![
-                        cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
-                        cfg.dim,
-                    ],
-                )?,
-                wo: upload_w(
-                    backend,
-                    &wo,
-                    vec![cfg.dim, cfg.n_heads * cfg.head_dim],
-                )?,
+                wqkv,
+                wo,
                 qkv_bias: qkv_bias
                     .map(|b| {
                         backend.from_cpu_f32(
@@ -225,15 +295,22 @@ impl Qwen3Model {
             let attn_norm =
                 RmsNorm::from_weights(backend, t(&p("attn_norm.weight"))?, cfg.norm_eps)?;
             let ffn_norm = RmsNorm::from_weights(backend, t(&p("ffn_norm.weight"))?, cfg.norm_eps)?;
-            // ffn: gate/up [ffn, D], down [D, ffn] — GEMM-веса в f16 (Metal)
-            let gate = t(&p("ffn_gate.weight"))?;
-            let up = t(&p("ffn_up.weight"))?;
-            let down = t(&p("ffn_down.weight"))?;
-            let mut gate_up = gate.clone();
-            gate_up.extend_from_slice(&up);
+            // ffn: gate/up fused [2·ffn, D] (нативный квант), down [D, ffn]
+            let gn = p("ffn_gate.weight");
+            let un = p("ffn_up.weight");
             let ffn = SwiGLU {
-                w13: upload_w(backend, &gate_up, vec![2 * cfg.ffn_dim, cfg.dim])?,
-                w2: upload_w(backend, &down, vec![cfg.dim, cfg.ffn_dim])?,
+                w13: Self::upload_fused(
+                    backend,
+                    w,
+                    &[&gn, &un],
+                    vec![2 * cfg.ffn_dim, cfg.dim],
+                )?,
+                w2: Self::upload_q(
+                    backend,
+                    w,
+                    &p("ffn_down.weight"),
+                    vec![cfg.dim, cfg.ffn_dim],
+                )?,
             };
             layers.push(Qwen3Layer {
                 attn_norm,
@@ -256,7 +333,9 @@ impl Qwen3Model {
             Some(_) if !w.tied_aliases("output.weight").is_empty() => {
                 upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?
             }
-            Some(_) => upload_w(backend, &t("output.weight")?, vec![cfg.vocab_size, cfg.dim])?,
+            Some(_) => {
+                Self::upload_q(backend, w, "output.weight", vec![cfg.vocab_size, cfg.dim])?
+            }
             None => upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?,
         };
 
@@ -323,13 +402,16 @@ impl Qwen3Model {
         r
     }
 
-    /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
-    fn forward_layers(
+    /// Скрытые состояния после `upto` слоёв (None — все) + out_norm.
+    /// Для DFlash-драфтеров (conditioning на hidden states) и сверки
+    /// DraftModel-среза с полной моделью.
+    fn forward_layers_hidden(
         &mut self,
         backend: &dyn Backend,
         mut x: Tensor,
         t: usize,
         mrope: Option<&[u32]>,
+        upto: Option<usize>,
     ) -> Result<Tensor, BackendError> {
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
         // текстовый deepstack (Qwen3-VL): к слоям 0..N-1 добавляются входные
@@ -340,6 +422,11 @@ impl Qwen3Model {
         let mut prof_ffn = 0.0f64;
         let prof = std::env::var("LLM_BENCH").is_ok() && t == 1;
         for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(u) = upto {
+                if i >= u {
+                    break;
+                }
+            }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
             let h = Self::rope_and_attn(
@@ -385,19 +472,144 @@ impl Qwen3Model {
             }
         }
         let h = self.out_norm.forward(backend, &x)?;
-        let (b, tq, d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
+        Ok(h)
+    }
+
+    /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
+    fn forward_layers(
+        &mut self,
+        backend: &dyn Backend,
+        x: Tensor,
+        t: usize,
+        mrope: Option<&[u32]>,
+    ) -> Result<Tensor, BackendError> {
+        let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let h = self.forward_layers_hidden(backend, x, t, mrope, None)?;
         let h2 = h.view(vec![b * tq, d]);
-        let t2 = std::time::Instant::now();
         let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;
-        if prof {
-            eprintln!("prof step: attn {:.1}ms ffn {:.1}ms lm_head {:.1}ms",
-                prof_attn * 1e3, prof_ffn * 1e3, t2.elapsed().as_secs_f64() * 1e3);
-        }
         Ok(logits.view(vec![b, tq, self.cfg.vocab_size]))
     }
 
+    /// Скрытые состояния после всех слоёв (без lm_head) — для драфтеров.
+    pub fn forward_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let x = self.embed.forward(backend, ids, t)?;
+            let h = self.forward_layers_hidden(backend, x, t, None, None)?;
+            Ok(h)
+        })();
+        backend.end_batch()?;
+        r
+    }
+
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
+    /// Вероятность токена в softmax-распределении строки.
+    fn softmax_prob(row: &[f32], tok: u32) -> f32 {
+        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for &l in row {
+            sum += (l - max).exp();
+        }
+        ((row[tok as usize] - max).exp()) / sum
+    }
+
+    /// Честное rejection-sampling (Leviathan et al.): сэмпл из (p − q)+,
+    /// где q — масса драфтера на draft-токене.
+    fn sample_modified(row: &[f32], draft_tok: u32, q: f32, rng: &mut Option<u64>) -> u32 {
+        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+        let sum_exp: f32 = w.iter().sum();
+        // вычесть q-массу (в exp-масштабе) с draft-позиции; p' = (p − q)+
+        w[draft_tok as usize] -= q * sum_exp;
+        let mut total = 0.0f32;
+        for v in w.iter_mut() {
+            *v = v.max(0.0);
+            total += *v;
+        }
+        if total <= 0.0 {
+            return draft_tok; // вырожденный случай — масса целиком в draft
+        }
+        // LCG как в inference::sampling::top_p_sample_vec.
+        let r = match rng {
+            Some(state) => {
+                *state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*state >> 33) as f32 / (1u64 << 33) as f32
+            }
+            None => {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos();
+                let mut st = nanos as u64;
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *rng = Some(st);
+                (st >> 33) as f32 / (1u64 << 33) as f32
+            }
+        };
+        let mut r = r * total;
+        for (i, &v) in w.iter().enumerate() {
+            r -= v;
+            if r <= 0.0 {
+                return i as u32;
+            }
+        }
+        (w.len() - 1) as u32
+    }
+
+    /// Спекулятивный decode (Ф2.1 каркас): батч-верификация draft одним
+    /// forward на [id, draft...], честное rejection-sampling, KV-откат
+    /// непринятого хвоста. `draft_probs` — вероятности драфтера q_i.
+    pub fn decode_spec(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        rng: &mut Option<u64>,
+    ) -> Result<SpecOutcome, BackendError> {
+        assert_eq!(draft.len(), draft_probs.len());
+        let mut ids = Vec::with_capacity(1 + draft.len());
+        ids.push(id);
+        ids.extend_from_slice(draft);
+        // 1. ОДИН forward: кэш пополняется всеми (1+γ) токенами.
+        let logits = self.prefill(backend, &ids)?; // [1, T, V]
+        let v = logits.shape()[2];
+        let ld = backend.to_cpu_f32(&logits)?;
+        // 2. Rejection-sampling по позициям.
+        let mut accepted: Vec<u32> = Vec::new();
+        let mut accepted_len = 1usize;
+        for i in 0..draft.len() {
+            let row = &ld[(i + 1) * v..(i + 2) * v];
+            let p = Self::softmax_prob(row, draft[i]);
+            if draft_probs[i] <= p {
+                accepted.push(draft[i]);
+                accepted_len += 1;
+            } else {
+                accepted.push(Self::sample_modified(row, draft[i], draft_probs[i], rng));
+                break;
+            }
+        }
+        // 3. KV-откат непринятого хвоста: остаются prefill-база + id + принятые.
+        if accepted_len < ids.len() {
+            let base = self.caches[0].pos - ids.len();
+            for c in &mut self.caches {
+                c.truncate(base + accepted_len);
+            }
+            self.pos_rope = base + accepted_len;
+        }
+        Ok(SpecOutcome { accepted, logits })
+    }
+
     pub fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
         // Все ~290 кернелов шага — в ОДИН command buffer (1 commit+wait
         // вместо 290 синхронных dispatch — decode был в ~70× медленнее
@@ -608,7 +820,7 @@ fn upload_w(
 
 /// Стандартный rotate-half RoPE (HF/Qwen3) через backend-оп
 /// (Metal — кернел rope_std_f32; CPU — референс-вычисление).
-fn rope_standard(
+pub fn rope_standard(
     backend: &dyn Backend,
     x: &Tensor,
     pos: usize,
@@ -689,6 +901,12 @@ mod tests {
     fn mini_model() -> (MetalBackend, Qwen3Model) {
         let backend = MetalBackend::new().expect("metal backend");
         let c = cfg();
+        mini_model_with_cfg(c)
+    }
+
+    fn mini_model_with_cfg(c: Qwen3Config) -> (MetalBackend, Qwen3Model) {
+        let backend = MetalBackend::new().expect("metal backend");
+        let cfg = c.clone(); // входной конфиг (n_layers среза!) — не переопределять cfg()
         let mut rng = rng_u64(0xC0FFEE);
         let mut storage: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
         storage.push((
@@ -750,6 +968,81 @@ mod tests {
     }
 
     /// Ключевой инвариант decode: лог-проблема декод-шага на позиции k
+    /// Ф2.1: spec с пустым draft (γ=0) == обычный decode (бит-в-бит).
+    #[test]
+    fn decode_spec_empty_matches_decode() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        model.prefill(&backend, &ids).unwrap();
+        let d1 = model.decode(&backend, 5).unwrap();
+
+        model.reset_cache(&backend).unwrap();
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = None;
+        let out = model.decode_spec(&backend, 5, &[], &[], &mut rng).unwrap();
+        assert!(out.accepted.is_empty(), "γ=0: draft-токенов нет");
+        let a = backend.to_cpu_f32(&d1).unwrap();
+        let b = backend.to_cpu_f32(&out.logits).unwrap();
+        assert_eq!(a, b, "spec(γ=0) должен совпадать с decode");
+    }
+
+    /// Ф2.1: draft отклоняется (q=1 > p), KV откатывается — следующий
+    /// decode совпадает с обычным decode после того же prefill.
+    #[test]
+    fn decode_spec_rejects_and_rolls_back() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        model.prefill(&backend, &ids).unwrap();
+        let l1 = model.decode(&backend, 5).unwrap();
+        let l2 = model.decode(&backend, 6).unwrap();
+
+        model.reset_cache(&backend).unwrap();
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = None;
+        let out = model
+            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng)
+            .unwrap();
+        assert_eq!(out.accepted.len(), 1, "мусорный draft отклонён");
+        assert_ne!(out.accepted[0], 3, "q=1 > p — токен 3 не принимается");
+        // KV откачен (остался id=5) — decode(6) даёт обычный результат.
+        let l2s = model.decode(&backend, 6).unwrap();
+        let a = backend.to_cpu_f32(&l2).unwrap();
+        let b = backend.to_cpu_f32(&l2s).unwrap();
+        assert_eq!(a, b, "после отката decode должен совпадать с обычным");
+        let _ = l1;
+    }
+
+    /// Ф2.2: DraftModel = Qwen3Model с n_layers=k — его forward_hidden
+    /// бит-в-бит совпадает со скрытыми полной модели после k слоёв.
+    #[test]
+    fn draft_slice_matches_full_hidden() {
+        let (backend, full) = mini_model();
+        let k = 2usize; // срез первых k слоёв (cfg() даёт 2 слоя)
+        let mut cfg = full.cfg.clone();
+        cfg.n_layers = k;
+        let (_, mut draft) = mini_model_with_cfg(cfg);
+        let ids = [1u32, 2, 3, 4];
+        // полная модель — скрытые после k слоёв (кэш пуст — как у DraftModel;
+        // через batch-путь, как forward_hidden — исключить sync-vs-batch)
+        let h_full = {
+            let mut m = full;
+            let x = m.embed_forward_test(&backend, &ids).unwrap();
+            let t = ids.len();
+            backend.begin_batch().unwrap();
+            let r = m.forward_layers_hidden(&backend, x, t, None, Some(k)).unwrap();
+            backend.end_batch().unwrap();
+            r
+        };
+        // DraftModel(k) — скрытые после k слоёв
+        let h_draft = {
+            let mut m = draft;
+            m.forward_hidden(&backend, &ids).unwrap()
+        };
+        let a = backend.to_cpu_f32(&h_full).unwrap();
+        let b = backend.to_cpu_f32(&h_draft).unwrap();
+        assert_eq!(a, b, "срез k слоёв должен совпадать с полной моделью");
+    }
+
     /// совпадает с prefill-логитами на позиции k (при том же состоянии KV).
     #[test]
     fn decode_matches_prefill_last_logits() {

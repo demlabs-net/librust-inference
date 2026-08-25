@@ -294,9 +294,30 @@ impl CudaBackend {
         b_suf: &'static str,
     ) -> Result<(), BackendError> {
         if k % 32 != 0 {
-            return Err(BackendError::Shape(format!(
-                "half-weight gemm_nt: k={k} not a multiple of 32"
-            )));
+            // Shapes like the DAC codec's (1, 8, 1024) carry raw row-major
+            // half weights (k%32!=0 tensors are not kb-major packed) — the
+            // naive elementwise kernel covers any k (the split-k/tiled paths
+            // require k ≡ 0 mod 32; before this fallback they computed a
+            // silent zero for k<32).
+            let fname: &'static str = match b_suf {
+                "bf16" => "gemm_halfw_naive_bf16",
+                "f16" => "gemm_halfw_naive_f16",
+                _ => unreachable!(),
+            };
+            let f = self.function(fname)?;
+            let cfg = LaunchConfig::for_num_elems((m * n) as u32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(b);
+            la.arg(c.as_cuda_mut());
+            let m32 = m as i32;
+            let k32 = k as i32;
+            let n32 = n as i32;
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            return Ok(());
         }
         let k32 = k as i32;
         let n32 = n as i32;
@@ -329,11 +350,14 @@ impl CudaBackend {
         if m > 1 {
             // m>1: the AT-variant tiled kernel (32 rows × 256 cols, grid.z=16
             // splits k into (16·m, n) partials — combined by gemm_i8_reduce
-            // in a fixed order — deterministic). NOTE: a wmma tensor-core
-            // variant (gemm_halfw_tiled_mma_*) was implemented and removed —
+            // in a fixed order — deterministic). NOTE: tensor-core variants
+            // (wmma AND raw mma.sync m16n8k16) were implemented and removed:
             // wmma traps on the sm_120 JIT of the compute_86 PTX (invalid
-            // shared access in the wmma emulation) — the raw mma.sync path
-            // is the documented follow-up.
+            // shared access in the wmma emulation), and raw mma.sync shows a
+            // non-doc C-fragment layout (rows r0+rt·16 carry ~8% errors) —
+            // the compute_86 PTX → sm_120 JIT path is incompatible with
+            // tensor cores; a direct sm_120 cubin build is the recorded
+            // follow-up. prefill/STT beat cuBLAS without tensor cores.
             let s16 = 16usize;
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled_name)?;

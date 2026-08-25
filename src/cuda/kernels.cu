@@ -1896,6 +1896,33 @@ DEFINE_HALFW_SPLITK(f32, bf16, float, __nv_bfloat16)
 DEFINE_HALFW_SPLITK(f16, bf16, __half, __nv_bfloat16)
 DEFINE_HALFW_SPLITK(bf16, bf16, __nv_bfloat16, __nv_bfloat16)
 
+// ─────────── Half-weight naive GEMM (k % 32 != 0 fallback) ───────────
+// The split-k/tiled kernels require k ≡ 0 (mod 32) (kb-major 32-blocks).
+// Shapes like the DAC codec's (1, 8, 1024) — raw row-major weights, k<32 —
+// used to compute a SILENT ZERO in the half path (ks>>5 = 0 iterations);
+// the k%32 fail-fast guard exposed it. This elementary kernel covers any
+// k: one thread per output element, row-major B (n, k).
+#define DEFINE_HALFW_NAIVE(SUF, BT)                                            \
+extern "C" __global__ void gemm_halfw_naive_##SUF(                             \
+    const float* __restrict__ A,        /* (m, k) f32 */                      \
+    const BT* __restrict__ B,           /* (n, k) row-major raw */            \
+    float* __restrict__ C,              /* (m, n) */                          \
+    int m, int k, int n)                                                       \
+{                                                                              \
+    int i = blockIdx.x * blockDim.x + threadIdx.x;                             \
+    if (i >= m * n) return;                                                    \
+    int r = i / n;                                                             \
+    int c = i % n;                                                             \
+    const float* a = A + (size_t)r * k;                                        \
+    const BT* b = B + (size_t)c * k;                                           \
+    float acc = 0.0f;                                                          \
+    for (int j = 0; j < k; ++j) acc += a[j] * (float)b[j];                     \
+    C[i] = acc;                                                                \
+}
+
+DEFINE_HALFW_NAIVE(f16, __half)
+DEFINE_HALFW_NAIVE(bf16, __nv_bfloat16)
+
 // ─────────── Half-weight tiled GEMM (m > 1: prefill/fill/STT) ───────────
 // The split-k kernels are m=1-shaped (one output row per block); for m>1
 // they fall back to S=1 with a long sequential k-loop per row — the prefill

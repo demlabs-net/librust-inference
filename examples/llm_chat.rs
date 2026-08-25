@@ -203,10 +203,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    // greedy decode (+ спекулятивный режим LLM_SPEC=1: NGramDrafter + rejection)
-    let spec_mode = std::env::var("LLM_SPEC").is_ok();
+    // greedy decode (+ спекулятивные режимы: LLM_SPEC=1 — NGramDrafter;
+    // LLM_SPEC_DFLASH=<draft.gguf> — DFlash v1/v2 с инжектом фич таргета)
+    let spec_mode = std::env::var("LLM_SPEC").is_ok() || std::env::var("LLM_SPEC_DFLASH").is_ok();
+    let spec_dflash_path = std::env::var("LLM_SPEC_DFLASH").ok();
+    let mut dflash_drafter: Option<rust_inference::dflash::DFlashDrafter> = match &spec_dflash_path {
+        Some(p) => {
+            use rust_inference::dflash::{DFlashDrafter, DFlashModel};
+            let dfile = File::open(p)?;
+            let dmmap = unsafe { memmap2::Mmap::map(&dfile)? };
+            let dgf = gguf::parse(&dmmap)?;
+            let dwm = WeightsMap::from_gguf(&dgf)?;
+            let dmodel =
+                DFlashModel::load_gguf(backend.as_ref(), &dgf, &dwm, cfg.vocab_size)?;
+            // общие эмбеддинги и lm_head таргета
+            let ew = rust_inference::weights_map::dequant_f32(
+                wm.get("token_embd.weight").ok_or("token_embd.weight missing")?,
+            );
+            let embed_t = backend.from_cpu_f32(&ew, vec![cfg.vocab_size, cfg.dim])?;
+            let ow = rust_inference::weights_map::dequant_f32(
+                wm.get("output.weight").unwrap_or(wm.get("token_embd.weight").unwrap()),
+            );
+            let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let lm_head = backend.from_cpu_f16(&f16, vec![cfg.vocab_size, cfg.dim])?;
+            eprintln!(
+                "dflash: layers={} dim={} block={} extract={:?} conv={}/{} mask={}",
+                dmodel.cfg.n_layers,
+                dmodel.cfg.dim,
+                dmodel.block_size,
+                dmodel.extract_layers,
+                dmodel.conv_kernel,
+                dmodel.conv_group,
+                dmodel.mask_token
+            );
+            Some(DFlashDrafter::new(dmodel, embed_t, lm_head))
+        }
+        None => None,
+    };
     let mut drafter = NGramDrafter::new(4);
     let mut history: Vec<u32> = ids.clone();
+    // extract-скрытые принятых токенов для DFlash-инжекта (Ф2.4): кольцо
+    // [n_layers × dim] на токен, последние block_size токенов.
+    let mut extract_ring: std::collections::VecDeque<Vec<Vec<f32>>> =
+        std::collections::VecDeque::new();
     let mut rng: Option<u64> = None;
     let mut spec_drafts = 0usize;
     let mut spec_accepted = 0usize;
@@ -271,15 +310,75 @@ fn main() -> Result<(), Box<dyn Error>> {
         let t_dec = Instant::now();
         if spec_mode {
             history.push(next);
-            let (draft, probs) = drafter.draft(&history, 4);
+            let (draft, probs) = if let Some(d) = &mut dflash_drafter {
+                // DFlash: инжект из extract-кольца ПРИНЯТЫХ токенов (каждый
+                // токен инжектится один раз при принятии; кольцо — последние
+                // block_size). Пусто на первом шаге. LLM_NO_INJECT — отладка.
+                if !extract_ring.is_empty() && std::env::var("LLM_NO_INJECT").is_err() {
+                    let bs = d.model.block_size;
+                    let n = extract_ring.len().min(bs);
+                    let nl = d.model.extract_layers.len();
+                    let dd = d.model.cfg.dim;
+                    let mut flat = vec![0f32; n * nl * dd];
+                    for (k, rows) in extract_ring.iter().rev().take(n).enumerate() {
+                        for li in 0..nl {
+                            flat[(n - 1 - k) * nl * dd + li * dd..(n - 1 - k) * nl * dd
+                                + (li + 1) * dd]
+                                .copy_from_slice(&rows[li]);
+                        }
+                    }
+                    let ft = backend.from_cpu_f32(&flat, vec![n, nl * dd])?;
+                    d.model.inject_features(&*backend, &ft, history.len() - n)?;
+                }
+                d.draft(&*backend, &history, d.model.block_size - 1)
+            } else {
+                drafter.draft(&*backend, &history, 4)
+            };
             spec_drafts += 1;
-            let spec = model.decode_spec(&*backend, next, &draft, &probs, &mut rng)?;
+            let spec = model.decode_spec(
+                &*backend,
+                next,
+                &draft,
+                &probs,
+                &mut rng,
+                dflash_drafter
+                    .as_ref()
+                    .map(|d| d.model.extract_layers.clone())
+                    .unwrap_or_default()
+                    .as_slice(),
+            )?;
+            // принятые токены → extract-кольцо: позиция 0 (next) + принятые
+            // draft (их фичи в extract корректны). Пересэмпл (последний
+            // accepted при частичном принятии) НЕ добавляется — его фичи
+            // соответствуют draft-токену, а не пересэмплу.
+            if let Some(d) = &dflash_drafter {
+                let dd = d.model.cfg.dim;
+                let nl = d.model.extract_layers.len();
+                let n_rows = 1 + spec.n_draft_accepted;
+                for i in 0..n_rows.min(spec.extract[0].shape()[1]) {
+                    let mut rows = Vec::with_capacity(nl);
+                    for h in &spec.extract {
+                        let hv = backend.to_cpu_f32(h)?;
+                        rows.push(hv[i * dd..(i + 1) * dd].to_vec());
+                    }
+                    extract_ring.push_back(rows);
+                }
+                while extract_ring.len() > d.model.block_size {
+                    extract_ring.pop_front();
+                }
+            }
             let n_acc = 1 + spec.accepted.len();
             spec_accepted += n_acc;
             if std::env::var("LLM_BENCH").is_ok() && generated % 10 == 0 {
                 eprintln!("spec step {generated}: draft {} accepted {} ({:.0}%)",
                     draft.len(), spec.accepted.len(),
                     100.0 * n_acc as f32 / (1 + draft.len()) as f32);
+                if std::env::var("LLM_DBG_SPEC").is_ok() {
+                    let d0: Vec<u32> = draft.iter().take(3).copied().collect();
+                    let q0: Vec<f32> = probs.iter().take(3).copied().collect();
+                    let a0: Vec<u32> = spec.accepted.iter().take(3).copied().collect();
+                    eprintln!("  draft={d0:?} q={q0:?} accepted={a0:?}");
+                }
             }
             for t in &spec.accepted {
                 history.push(*t);
@@ -289,7 +388,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 std::io::stdout().flush()?;
                 generated += 1;
             }
-            logits = spec.logits;
+            // Следующий токен: при ПОЛНОМ принятии — логиты после последнего
+            // draft (кэш им соответствует). При частичном — последний accepted
+            // это ПЕРЕСЭМПЛ: его логиты от spec-контекста (с draft-мусором)
+            // неверны — честный AR-decode по кэшу с пересэмплом.
+            if spec.n_draft_accepted < draft.len() {
+                let x = *spec.accepted.last().ok_or("spec: пустой accepted")?;
+                logits = model.decode(&*backend, x)?;
+            } else {
+                logits = spec.logits;
+            }
         } else {
             logits = model.decode(&*backend, next)?;
             if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {

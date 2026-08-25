@@ -1895,9 +1895,10 @@ kernel void concat4_f32(
 
 
 // ── DFlash2 two-tap dynamic conv (Ф2.3, спека PR #27342) ────────────────────
-// X [n_tokens, n_embd] (скрытые), BASE [n_embd, kernel, 2],
-// DYN [n_groups·kernel·2, n_tokens] (проекция шума), Y [n_tokens, n_embd].
-// y[t,i] = Σ_tap (DYN[(g·k+tap)·2+side, t] + BASE[i·k·2 + tap·2 + side]) · x[t−tap]
+// X [n_tokens, n_embd] (скрытые), BASE [2, kernel, n_embd] (ggml-порядок:
+// side·k·D + tap·D + i), DYN [n_tokens, n_groups·kernel·2] (row-major:
+// t·proj + r, r = g + n_groups·(tap + k·side)), Y [n_tokens, n_embd].
+// y[t,i] = Σ_tap (DYN[t, r(g,tap,side)] + BASE[side,tap,i]) · x[t−tap]
 // сдвиг — ВНУТРИ блока (block_size): pos−tap < 0 → 0.
 kernel void dflash2_conv_f32(
     device const float* X [[buffer(0)]],
@@ -1918,6 +1919,7 @@ kernel void dflash2_conv_f32(
     uint blk = t / block_size;
     uint pos = t % block_size;
     uint g = i / group_size;
+    uint proj = n_groups * kern * 2u;
     float acc = 0.0f;
     for (uint tap = 0u; tap < kern; ++tap) {
         float v = 0.0f;
@@ -1925,8 +1927,11 @@ kernel void dflash2_conv_f32(
             uint src = blk * block_size + (pos - tap);
             v = X[src * n_embd + i];
         }
-        float coeff = DYN[((g * kern + tap) * 2u + side) * n_tokens + t];
-        float b = BASE[i * kern * 2u + tap * 2u + side];
+        // ggml coeffs [n_groups, kern, 2, T] в row-major DYN [T, proj]:
+        // r = g + n_groups·(tap + kern·side)
+        uint r = g + n_groups * (tap + kern * side);
+        float coeff = DYN[t * proj + r];
+        float b = BASE[side * kern * n_embd + tap * n_embd + i];
         acc += (coeff + b) * v;
     }
     Y[t * n_embd + i] = acc;

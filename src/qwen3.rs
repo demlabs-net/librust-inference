@@ -47,14 +47,9 @@ pub struct Qwen3Config {
 
 impl Qwen3Config {
     pub fn from_gguf(file: &GgufFile<'_>, vocab_size: usize) -> Result<Self, BackendError> {
-        // Qwen3 и Qwen3-VL (MROPE-текст = обычный rope с их freq_base).
-        let p = |s: &str| -> String {
-            if file.get("qwen3vl.block_count").is_some() {
-                format!("qwen3vl.{s}")
-            } else {
-                format!("qwen3.{s}")
-            }
-        };
+        // Архитектура из метаданных: qwen3 / qwen3vl / qwen35 (M-RoPE) и т.п.
+        let arch = file.architecture().unwrap_or("qwen3").to_string();
+        let p = |s: &str| -> String { format!("{arch}.{s}") };
         let u = |k: &str| -> Result<usize, BackendError> {
             file.get(k)
                 .and_then(GgufValue::as_u32)
@@ -148,6 +143,13 @@ pub struct SpecOutcome {
     pub accepted: Vec<u32>,
     /// Логиты последней позиции (продолжение, если приняты все draft).
     pub logits: Tensor,
+    /// Скрытые extract-слоёв таргета (по ВСЕМ позициям forward'а, без
+    /// out_norm) — для DFlash-инжекта следующего шага (Ф2.4).
+    pub extract: Vec<Tensor>,
+    /// Сколько draft-токенов принято подряд (0..=draft.len()); если
+    /// < draft.len() — последний элемент accepted — ПЕРЕСЭМПЛ (его фич
+    /// в extract нет: строка соответствует draft, а не токену).
+    pub n_draft_accepted: usize,
 }
 
 impl Qwen3Model {
@@ -373,6 +375,58 @@ impl Qwen3Model {
         r
     }
 
+    /// Prefill + скрытые extract-слоёв (для DFlash-инжекта, Ф2.4): h_i —
+    /// выход слоя i (attn+ffn+residual, без out_norm), по порядку `layers`.
+    /// Один проход: кэши и логиты как в prefill, скрытые — побочный сбор.
+    pub fn prefill_extract(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>), BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let mut x = self.embed.forward(backend, ids, t)?;
+            let mut out = Vec::with_capacity(layers.len());
+            let mut li = 0usize;
+            for (i, layer) in self.layers.iter().enumerate() {
+                // фичи для DFlash-инжекта = ВХОД extract-слоя (llama.cpp
+                // llama_get_embeddings_layer_inp: выход предыдущего слоя)
+                if li < layers.len() && layers[li] == i {
+                    out.push(x.clone());
+                    li += 1;
+                }
+                let h = layer.attn_norm.forward(backend, &x)?;
+                let h = Self::rope_and_attn(
+                    &self.cfg,
+                    backend,
+                    &h,
+                    &layer.attn,
+                    &mut self.caches[i],
+                    self.pos_rope,
+                    t,
+                    None,
+                    true,
+                    None,
+                )?;
+                x = backend_add(backend, &x, &h)?;
+                let h = layer.ffn_norm.forward(backend, &x)?;
+                let f = ffn_forward(backend, &h, &layer.ffn)?;
+                x = backend_add(backend, &x, &f)?;
+            }
+            let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+            let h = self.out_norm.forward(backend, &x)?;
+            let h2 = h.view(vec![b * tq, d]);
+            let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
+            backend.gemm_nt(&h2, &self.output, &logits)?;
+            self.pos_rope = self.caches[0].pos;
+            Ok((logits.view(vec![b, tq, self.cfg.vocab_size]), out))
+        })();
+        backend.end_batch()?;
+        r
+    }
+
     /// Prefill с vision-эмбеддингами (Ф1.11): токены == `vision_token`
     /// заменяются строками vision-энкодера (по порядку появления) — всё на
     /// GPU (embedding_override). `pos4d` — M-RoPE позиции (t,h,w,e) на токен
@@ -439,6 +493,7 @@ impl Qwen3Model {
                 t,
                 mrope,
                 true,
+                None,
             )?;
             x = backend_add(backend, &x, &h)?;
             if prof { prof_attn += t0.elapsed().as_secs_f64(); }
@@ -509,6 +564,52 @@ impl Qwen3Model {
         r
     }
 
+    /// Скрытые после указанных слоёв (для DFlash-инжекта, Ф2.4): h_i — выход
+    /// слоя i (attn+ffn+residual, БЕЗ out_norm), по порядку `layers`.
+    /// Кэши пополняются как при обычном префилле.
+    pub fn forward_extract(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<Vec<Tensor>, BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let mut x = self.embed.forward(backend, ids, t)?;
+            let mut out = Vec::with_capacity(layers.len());
+            let mut li = 0usize;
+            for (i, layer) in self.layers.iter().enumerate() {
+                // фичи для DFlash-инжекта = ВХОД extract-слоя (llama.cpp
+                // llama_get_embeddings_layer_inp: выход предыдущего слоя)
+                if li < layers.len() && layers[li] == i {
+                    out.push(x.clone());
+                    li += 1;
+                }
+                let h = layer.attn_norm.forward(backend, &x)?;
+                let h = Self::rope_and_attn(
+                    &self.cfg,
+                    backend,
+                    &h,
+                    &layer.attn,
+                    &mut self.caches[i],
+                    self.pos_rope,
+                    t,
+                    None,
+                    true,
+                    None,
+                )?;
+                x = backend_add(backend, &x, &h)?;
+                let h = layer.ffn_norm.forward(backend, &x)?;
+                let f = ffn_forward(backend, &h, &layer.ffn)?;
+                x = backend_add(backend, &x, &f)?;
+            }
+            Ok(out)
+        })();
+        backend.end_batch()?;
+        r
+    }
+
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
     /// Вероятность токена в softmax-распределении строки.
     fn softmax_prob(row: &[f32], tok: u32) -> f32 {
@@ -570,6 +671,8 @@ impl Qwen3Model {
     /// Спекулятивный decode (Ф2.1 каркас): батч-верификация draft одним
     /// forward на [id, draft...], честное rejection-sampling, KV-откат
     /// непринятого хвоста. `draft_probs` — вероятности драфтера q_i.
+    /// `extract_layers` — собрать скрытые этих слоёв (DFlash-инжект Ф2.4;
+    /// пустой — без сбора).
     pub fn decode_spec(
         &mut self,
         backend: &dyn Backend,
@@ -577,13 +680,14 @@ impl Qwen3Model {
         draft: &[u32],
         draft_probs: &[f32],
         rng: &mut Option<u64>,
+        extract_layers: &[usize],
     ) -> Result<SpecOutcome, BackendError> {
         assert_eq!(draft.len(), draft_probs.len());
         let mut ids = Vec::with_capacity(1 + draft.len());
         ids.push(id);
         ids.extend_from_slice(draft);
         // 1. ОДИН forward: кэш пополняется всеми (1+γ) токенами.
-        let logits = self.prefill(backend, &ids)?; // [1, T, V]
+        let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?; // [1, T, V]
         let v = logits.shape()[2];
         let ld = backend.to_cpu_f32(&logits)?;
         // 2. Rejection-sampling по позициям.
@@ -608,7 +712,23 @@ impl Qwen3Model {
             }
             self.pos_rope = base + accepted_len;
         }
-        Ok(SpecOutcome { accepted, logits })
+        // Логиты позиции accepted_len (первой после принятой части) — они
+        // СООТВЕТСТВУЮТ откаченному кэшу. При полном принятии это последняя
+        // строка (продолжение после всех draft) — как раньше.
+        let row_idx = if accepted_len == ids.len() {
+            ids.len() - 1
+        } else {
+            accepted_len
+        };
+        let row = &ld[row_idx * v..(row_idx + 1) * v];
+        let logits = backend.from_cpu_f32(row, vec![1, 1, v])?;
+        let n_draft_accepted = accepted_len.saturating_sub(1);
+        Ok(SpecOutcome {
+            accepted,
+            logits,
+            extract,
+            n_draft_accepted,
+        })
     }
 
     pub fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
@@ -641,6 +761,8 @@ impl Qwen3Model {
     /// токен, len = t*4): картинка Qwen3-VL видит ВСЮ себя (все t равны),
     /// текст после картинки — каузально по t. `causal` — false для диффузии
     /// DFlash (кэш и draft-токены видят друг друга, маски нет).
+    /// `cache_at` — запись k/v в кэш на АБСОЛЮТНУЮ позицию (DFlash: кэш
+    /// индексирован позициями токенов); None — append (cache.pos).
     pub fn rope_and_attn(
         cfg: &Qwen3Config,
         backend: &dyn Backend,
@@ -651,6 +773,7 @@ impl Qwen3Model {
         t: usize,
         mrope: Option<&[u32]>,
         causal: bool,
+        cache_at: Option<usize>,
     ) -> Result<Tensor, BackendError> {
         // q/k из h через Attention — но Attention применяет interleaved-RoPE
         // сам. Делаем pre-rotation стандартным RoPE и передаём identity-таблицы:
@@ -726,7 +849,10 @@ impl Qwen3Model {
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
         let t_upd = std::time::Instant::now();
-        cache.update(backend, &k, &v)?;
+        match cache_at {
+            Some(at) => cache.update_at(backend, &k, &v, at)?,
+            None => cache.update(backend, &k, &v)?,
+        }
         let t_upd_d = t_upd.elapsed().as_secs_f64();
         let mask = if let Some(mrope) = mrope {
             if t > 1 {
@@ -982,7 +1108,7 @@ mod tests {
         model.reset_cache(&backend).unwrap();
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
-        let out = model.decode_spec(&backend, 5, &[], &[], &mut rng).unwrap();
+        let out = model.decode_spec(&backend, 5, &[], &[], &mut rng, &[]).unwrap();
         assert!(out.accepted.is_empty(), "γ=0: draft-токенов нет");
         let a = backend.to_cpu_f32(&d1).unwrap();
         let b = backend.to_cpu_f32(&out.logits).unwrap();
@@ -1003,7 +1129,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let out = model
-            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng)
+            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[])
             .unwrap();
         assert_eq!(out.accepted.len(), 1, "мусорный draft отклонён");
         assert_ne!(out.accepted[0], 3, "q=1 > p — токен 3 не принимается");

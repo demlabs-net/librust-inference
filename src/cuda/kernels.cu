@@ -2285,6 +2285,8 @@ extern "C" __global__ void im2col_t1d_f32(
 }
 
 // DFlash2 two-tap dynamic conv (Ф2.3, спека PR #27342). Grid (t, i).
+// ggml-порядок: BASE [2, k, D] (side·k·D + tap·D + i),
+// DYN [T, proj] row-major: coeff = dyn[t·proj + r], r = g + n_groups·(tap + k·side).
 extern "C" __global__ void dflash2_conv_f32(
     const float* __restrict__ x,
     const float* __restrict__ base,
@@ -2299,6 +2301,7 @@ extern "C" __global__ void dflash2_conv_f32(
     int blk = t / block_size;
     int pos = t % block_size;
     int g = i / group_size;
+    int proj = n_groups * kernel * 2;
     float acc = 0.0f;
     for (int tap = 0; tap < kernel; ++tap) {
         float v = 0.0f;
@@ -2306,8 +2309,9 @@ extern "C" __global__ void dflash2_conv_f32(
             int src = blk * block_size + (pos - tap);
             v = x[src * n_embd + i];
         }
-        float coeff = dyn[((g * kernel + tap) * 2 + side) * n_tokens + t];
-        float b = base[i * kernel * 2 + tap * 2 + side];
+        int r = g + n_groups * (tap + kernel * side);
+        float coeff = dyn[t * proj + r];
+        float b = base[side * kernel * n_embd + tap * n_embd + i];
         acc += (coeff + b) * v;
     }
     y[t * n_embd + i] = acc;

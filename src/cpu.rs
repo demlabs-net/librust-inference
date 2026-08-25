@@ -250,14 +250,18 @@ impl Backend for CpuBackend {
         block_size: usize,
         side: usize,
     ) -> Result<(), BackendError> {
-        // CPU-референс спеки PR #27342: y[t,i] = Σ_tap (coeff + base)·x[t−tap],
-        // coeff = DYN[(g·k+tap)·2+side, t], g = i/group_size, сдвиг в блоке.
+        // CPU-референс спеки PR #27342 (ggml-порядок тензоров):
+        // y[t,i] = Σ_tap (coeff[r, t] + BASE[side,tap,i])·x[t−tap],
+        // r = g + n_groups·(tap + kernel·side), g = i/group_size,
+        // DYN [n_tokens, n_groups·kernel·2] (row-major: t·proj + r),
+        // BASE [2, kernel, n_embd] (side·k·D + tap·D + i), сдвиг в блоке.
         let (n_tokens, n_embd) = (y.shape()[0], y.shape()[1]);
         let xr = x.cpu_read();
         let br = base.cpu_read();
         let dr = dynamic.cpu_read();
         let mut yr = y.cpu_write();
         let n_groups = n_embd / group_size;
+        let proj = n_groups * kernel * 2;
         for t in 0..n_tokens {
             let blk = t / block_size;
             let pos = t % block_size;
@@ -270,8 +274,9 @@ impl Backend for CpuBackend {
                     } else {
                         0.0
                     };
-                    let coeff = dr[((g * kernel + tap) * 2 + side) * n_tokens + t];
-                    let b = br[i * kernel * 2 + tap * 2 + side];
+                    let r = g + n_groups * (tap + kernel * side);
+                    let coeff = dr[t * proj + r];
+                    let b = br[side * kernel * n_embd + tap * n_embd + i];
                     acc += (coeff + b) * v;
                 }
                 yr[t * n_embd + i] = acc;

@@ -531,6 +531,25 @@ impl KvCache {
         self.pos = self.pos.min(pos);
     }
 
+    /// Запись k/v на АБСОЛЮТНУЮ позицию (DFlash: кэш индексирован позициями
+    /// токенов, как в llama.cpp — инжект и диффузия пишут на pos..pos+tq;
+    /// pos == self.pos — обычный append). view() читает [0..pos) — дыры
+    /// между записанными диапазонами не попадают в attention.
+    pub fn update_at(
+        &mut self,
+        backend: &dyn Backend,
+        k: &Tensor,
+        v: &Tensor,
+        pos: usize,
+    ) -> Result<(), BackendError> {
+        let tq = k.shape()[1];
+        self.ensure(backend, pos + tq)?;
+        backend.kv_update(&self.k, k, pos)?;
+        backend.kv_update(&self.v, v, pos)?;
+        self.pos = self.pos.max(pos + tq);
+        Ok(())
+    }
+
     /// Drop the grown capacity — called when an engine returns to the pool:
     /// a long utterance's KV buffers stay at their peak size otherwise
     /// (~1.2 GB per engine at cap 4096) and accumulate across calls/engines.

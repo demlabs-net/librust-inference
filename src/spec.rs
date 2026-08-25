@@ -55,10 +55,12 @@ impl DrafterManifest {
     }
 }
 
-/// Генератор draft-токенов.
+/// Генератор draft-токенов. `backend` нужен графическим драфтерам
+/// (DFlash — диффузия на GPU); n-граммовый его игнорирует.
 pub trait Drafter {
     /// Следующие `gamma` токенов и их вероятности q_i (для rejection).
-    fn draft(&mut self, history: &[u32], gamma: usize) -> (Vec<u32>, Vec<f32>);
+    fn draft(&mut self, backend: &dyn crate::backend::Backend, history: &[u32], gamma: usize)
+        -> (Vec<u32>, Vec<f32>);
 }
 
 /// Суффиксный n-граммовый драфтер: самый длинный суффикс истории с
@@ -78,7 +80,12 @@ impl NGramDrafter {
 }
 
 impl Drafter for NGramDrafter {
-    fn draft(&mut self, history: &[u32], gamma: usize) -> (Vec<u32>, Vec<f32>) {
+    fn draft(
+        &mut self,
+        _backend: &dyn crate::backend::Backend,
+        history: &[u32],
+        gamma: usize,
+    ) -> (Vec<u32>, Vec<f32>) {
         let mut drafts: Vec<u32> = Vec::new();
         let mut hist: Vec<u32> = history.to_vec();
         for _ in 0..gamma {
@@ -118,7 +125,7 @@ mod tests {
         let mut d = NGramDrafter::new(4);
         // история ... 7 8 9 — суффикс [7,8,9] встречался ранее → продолжение 10
         let history: Vec<u32> = vec![1, 2, 3, 7, 8, 9, 4, 5, 6, 7, 8, 9];
-        let (drafts, probs) = d.draft(&history, 3);
+        let (drafts, probs) = d.draft(&crate::cpu::CpuBackend::default(), &history, 3);
         assert_eq!(drafts[0], 4, "продолжение [7,8,9] → 4");
         assert_eq!(probs.len(), drafts.len());
     }
@@ -140,7 +147,7 @@ mod tests {
     #[test]
     fn ngram_short_history() {
         let mut d = NGramDrafter::new(4);
-        let (drafts, _) = d.draft(&[1, 2], 4);
+        let (drafts, _) = d.draft(&crate::cpu::CpuBackend::default(), &[1, 2], 4);
         assert!(drafts.is_empty(), "нет повторений — пустой draft");
     }
 }

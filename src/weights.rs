@@ -94,7 +94,7 @@ pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<F32Tensors> {
             anyhow::anyhow!("tensor {name}: byte range {start}..{end} out of bounds")
         })?;
         let n = match dtype {
-            "F32" => data.len() / 4,
+            "F32" | "U32" => data.len() / 4,
             "F16" | "BF16" => data.len() / 2,
             other => {
                 return Err(anyhow::anyhow!(
@@ -106,6 +106,11 @@ pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<F32Tensors> {
         if dtype == "F32" {
             for chunk in data.chunks_exact(4) {
                 vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        } else if dtype == "U32" {
+            // U32 → f32 как числа (индексы/кванты; widening для совместимости)
+            for chunk in data.chunks_exact(4) {
+                vec.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32);
             }
         } else if dtype == "F16" {
             for chunk in data.chunks_exact(2) {

@@ -401,13 +401,16 @@ impl Qwen3Model {
         r
     }
 
-    /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
-    fn forward_layers(
+    /// Скрытые состояния после `upto` слоёв (None — все) + out_norm.
+    /// Для DFlash-драфтеров (conditioning на hidden states) и сверки
+    /// DraftModel-среза с полной моделью.
+    fn forward_layers_hidden(
         &mut self,
         backend: &dyn Backend,
         mut x: Tensor,
         t: usize,
         mrope: Option<&[u32]>,
+        upto: Option<usize>,
     ) -> Result<Tensor, BackendError> {
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
         // текстовый deepstack (Qwen3-VL): к слоям 0..N-1 добавляются входные
@@ -418,6 +421,11 @@ impl Qwen3Model {
         let mut prof_ffn = 0.0f64;
         let prof = std::env::var("LLM_BENCH").is_ok() && t == 1;
         for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(u) = upto {
+                if i >= u {
+                    break;
+                }
+            }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
             let h = Self::rope_and_attn(
@@ -463,16 +471,40 @@ impl Qwen3Model {
             }
         }
         let h = self.out_norm.forward(backend, &x)?;
-        let (b, tq, d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
+        Ok(h)
+    }
+
+    /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
+    fn forward_layers(
+        &mut self,
+        backend: &dyn Backend,
+        x: Tensor,
+        t: usize,
+        mrope: Option<&[u32]>,
+    ) -> Result<Tensor, BackendError> {
+        let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let h = self.forward_layers_hidden(backend, x, t, mrope, None)?;
         let h2 = h.view(vec![b * tq, d]);
-        let t2 = std::time::Instant::now();
         let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;
-        if prof {
-            eprintln!("prof step: attn {:.1}ms ffn {:.1}ms lm_head {:.1}ms",
-                prof_attn * 1e3, prof_ffn * 1e3, t2.elapsed().as_secs_f64() * 1e3);
-        }
         Ok(logits.view(vec![b, tq, self.cfg.vocab_size]))
+    }
+
+    /// Скрытые состояния после всех слоёв (без lm_head) — для драфтеров.
+    pub fn forward_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let x = self.embed.forward(backend, ids, t)?;
+            let h = self.forward_layers_hidden(backend, x, t, None, None)?;
+            Ok(h)
+        })();
+        backend.end_batch()?;
+        r
     }
 
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
@@ -868,6 +900,12 @@ mod tests {
     fn mini_model() -> (MetalBackend, Qwen3Model) {
         let backend = MetalBackend::new().expect("metal backend");
         let c = cfg();
+        mini_model_with_cfg(c)
+    }
+
+    fn mini_model_with_cfg(c: Qwen3Config) -> (MetalBackend, Qwen3Model) {
+        let backend = MetalBackend::new().expect("metal backend");
+        let cfg = c.clone(); // входной конфиг (n_layers среза!) — не переопределять cfg()
         let mut rng = rng_u64(0xC0FFEE);
         let mut storage: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
         storage.push((
@@ -971,6 +1009,37 @@ mod tests {
         let b = backend.to_cpu_f32(&l2s).unwrap();
         assert_eq!(a, b, "после отката decode должен совпадать с обычным");
         let _ = l1;
+    }
+
+    /// Ф2.2: DraftModel = Qwen3Model с n_layers=k — его forward_hidden
+    /// бит-в-бит совпадает со скрытыми полной модели после k слоёв.
+    #[test]
+    fn draft_slice_matches_full_hidden() {
+        let (backend, full) = mini_model();
+        let k = 2usize; // срез первых k слоёв (cfg() даёт 2 слоя)
+        let mut cfg = full.cfg.clone();
+        cfg.n_layers = k;
+        let (_, mut draft) = mini_model_with_cfg(cfg);
+        let ids = [1u32, 2, 3, 4];
+        // полная модель — скрытые после k слоёв (кэш пуст — как у DraftModel;
+        // через batch-путь, как forward_hidden — исключить sync-vs-batch)
+        let h_full = {
+            let mut m = full;
+            let x = m.embed_forward_test(&backend, &ids).unwrap();
+            let t = ids.len();
+            backend.begin_batch().unwrap();
+            let r = m.forward_layers_hidden(&backend, x, t, None, Some(k)).unwrap();
+            backend.end_batch().unwrap();
+            r
+        };
+        // DraftModel(k) — скрытые после k слоёв
+        let h_draft = {
+            let mut m = draft;
+            m.forward_hidden(&backend, &ids).unwrap()
+        };
+        let a = backend.to_cpu_f32(&h_full).unwrap();
+        let b = backend.to_cpu_f32(&h_draft).unwrap();
+        assert_eq!(a, b, "срез k слоёв должен совпадать с полной моделью");
     }
 
     /// совпадает с prefill-логитами на позиции k (при том же состоянии KV).

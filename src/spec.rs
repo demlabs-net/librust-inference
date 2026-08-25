@@ -6,6 +6,55 @@
 //! неточных q). [`NGramDrafter`] — суффиксный lookup по истории (n-граммы),
 //! q=0.5 консервативно.
 
+/// Версия драфтера (Ф2.5 профили: v1 — AR-блок 16, 5 слоёв; v2 — блок 8,
+/// 7 draft-токенов + selector/conv).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrafterVersion {
+    V1,
+    V2,
+}
+
+/// Манифест драфтера (Ф2.2): версия, таргет (версионная сверка!), топология.
+#[derive(Debug, Clone)]
+pub struct DrafterManifest {
+    pub version: DrafterVersion,
+    /// Идентификатор таргета (например "qwen3-8b") — драфтеры
+    /// версио-чувствительны: несовпадение → отказ от загрузки.
+    pub target: String,
+    /// Число слоёв драфтера (v1: 5, Qwen3-Coder: 8).
+    pub n_layers: usize,
+    /// Размер блока AR (v1: 16).
+    pub block: usize,
+    /// Top-K кандидатов селектора.
+    pub top_k: usize,
+    /// Число draft-токенов на шаг (v2: 7).
+    pub n_draft: usize,
+}
+
+impl DrafterManifest {
+    pub fn v1(target: &str, block: usize, top_k: usize) -> Self {
+        Self {
+            version: DrafterVersion::V1,
+            target: target.into(),
+            n_layers: 5,
+            block,
+            top_k,
+            n_draft: block,
+        }
+    }
+
+    pub fn v2(target: &str) -> Self {
+        Self {
+            version: DrafterVersion::V2,
+            target: target.into(),
+            n_layers: 8,
+            block: 8,
+            top_k: 10,
+            n_draft: 7,
+        }
+    }
+}
+
 /// Генератор draft-токенов.
 pub trait Drafter {
     /// Следующие `gamma` токенов и их вероятности q_i (для rejection).
@@ -72,6 +121,20 @@ mod tests {
         let (drafts, probs) = d.draft(&history, 3);
         assert_eq!(drafts[0], 4, "продолжение [7,8,9] → 4");
         assert_eq!(probs.len(), drafts.len());
+    }
+
+    #[test]
+    fn manifests_v1_v2() {
+        let v1 = DrafterManifest::v1("qwen3-8b", 16, 8);
+        assert_eq!(v1.version, DrafterVersion::V1);
+        assert_eq!(v1.n_layers, 5);
+        assert_eq!(v1.block, 16);
+        assert_eq!(v1.n_draft, 16);
+        let v2 = DrafterManifest::v2("qwen3-8b");
+        assert_eq!(v2.version, DrafterVersion::V2);
+        assert_eq!(v2.n_layers, 8);
+        assert_eq!(v2.block, 8);
+        assert_eq!(v2.n_draft, 7);
     }
 
     #[test]

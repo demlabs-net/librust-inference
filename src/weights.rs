@@ -96,6 +96,8 @@ pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<F32Tensors> {
         let n = match dtype {
             "F32" | "U32" => data.len() / 4,
             "F16" | "BF16" => data.len() / 2,
+            // I64 — константы (position_ids и т.п.); widening до f32
+            "I64" => data.len() / 8,
             other => {
                 return Err(anyhow::anyhow!(
                     "tensor {name}: unsupported dtype {other} (F32/F16/BF16 only)"
@@ -111,6 +113,13 @@ pub fn read_safetensors_f32(path: &Path) -> anyhow::Result<F32Tensors> {
             // U32 → f32 как числа (индексы/кванты; widening для совместимости)
             for chunk in data.chunks_exact(4) {
                 vec.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32);
+            }
+        } else if dtype == "I64" {
+            // I64 → f32 (position_ids и др. целые константы; widening)
+            for chunk in data.chunks_exact(8) {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(chunk);
+                vec.push(i64::from_le_bytes(b) as f32);
             }
         } else if dtype == "F16" {
             for chunk in data.chunks_exact(2) {

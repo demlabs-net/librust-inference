@@ -19,6 +19,7 @@
 
 pub mod backend;
 pub mod audio;
+pub mod bert;
 pub mod chat_template;
 pub mod concurrency;
 #[cfg(feature = "cpu")]

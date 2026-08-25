@@ -520,6 +520,12 @@ impl KvCache {
         self.pos = 0;
     }
 
+    /// Откат к позиции `pos` (спекулятивный decode: непринятые draft-токены).
+    /// Данные остаются — следующий kv_update перезапишет хвост.
+    pub fn truncate(&mut self, pos: usize) {
+        self.pos = self.pos.min(pos);
+    }
+
     /// Drop the grown capacity — called when an engine returns to the pool:
     /// a long utterance's KV buffers stay at their peak size otherwise
     /// (~1.2 GB per engine at cap 4096) and accumulate across calls/engines.

@@ -141,6 +141,14 @@ pub struct Qwen3Model {
     pos_rope: usize,
 }
 
+/// Результат спекулятивного шага (Ф2.1).
+pub struct SpecOutcome {
+    /// Принятые токены (первый — гарантированно; остальные — draft).
+    pub accepted: Vec<u32>,
+    /// Логиты последней позиции (продолжение, если приняты все draft).
+    pub logits: Tensor,
+}
+
 impl Qwen3Model {
     #[allow(clippy::too_many_arguments)]
     /// Квант-осведомлённая загрузка веса: Q4_0/Q8_0/Q4_K/Q6_K — нативно
@@ -468,6 +476,107 @@ impl Qwen3Model {
     }
 
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
+    /// Вероятность токена в softmax-распределении строки.
+    fn softmax_prob(row: &[f32], tok: u32) -> f32 {
+        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for &l in row {
+            sum += (l - max).exp();
+        }
+        ((row[tok as usize] - max).exp()) / sum
+    }
+
+    /// Честное rejection-sampling (Leviathan et al.): сэмпл из (p − q)+,
+    /// где q — масса драфтера на draft-токене.
+    fn sample_modified(row: &[f32], draft_tok: u32, q: f32, rng: &mut Option<u64>) -> u32 {
+        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+        let sum_exp: f32 = w.iter().sum();
+        // вычесть q-массу (в exp-масштабе) с draft-позиции; p' = (p − q)+
+        w[draft_tok as usize] -= q * sum_exp;
+        let mut total = 0.0f32;
+        for v in w.iter_mut() {
+            *v = v.max(0.0);
+            total += *v;
+        }
+        if total <= 0.0 {
+            return draft_tok; // вырожденный случай — масса целиком в draft
+        }
+        // LCG как в inference::sampling::top_p_sample_vec.
+        let r = match rng {
+            Some(state) => {
+                *state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*state >> 33) as f32 / (1u64 << 33) as f32
+            }
+            None => {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos();
+                let mut st = nanos as u64;
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *rng = Some(st);
+                (st >> 33) as f32 / (1u64 << 33) as f32
+            }
+        };
+        let mut r = r * total;
+        for (i, &v) in w.iter().enumerate() {
+            r -= v;
+            if r <= 0.0 {
+                return i as u32;
+            }
+        }
+        (w.len() - 1) as u32
+    }
+
+    /// Спекулятивный decode (Ф2.1 каркас): батч-верификация draft одним
+    /// forward на [id, draft...], честное rejection-sampling, KV-откат
+    /// непринятого хвоста. `draft_probs` — вероятности драфтера q_i.
+    pub fn decode_spec(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        rng: &mut Option<u64>,
+    ) -> Result<SpecOutcome, BackendError> {
+        assert_eq!(draft.len(), draft_probs.len());
+        let mut ids = Vec::with_capacity(1 + draft.len());
+        ids.push(id);
+        ids.extend_from_slice(draft);
+        // 1. ОДИН forward: кэш пополняется всеми (1+γ) токенами.
+        let logits = self.prefill(backend, &ids)?; // [1, T, V]
+        let v = logits.shape()[2];
+        let ld = backend.to_cpu_f32(&logits)?;
+        // 2. Rejection-sampling по позициям.
+        let mut accepted: Vec<u32> = Vec::new();
+        let mut accepted_len = 1usize;
+        for i in 0..draft.len() {
+            let row = &ld[(i + 1) * v..(i + 2) * v];
+            let p = Self::softmax_prob(row, draft[i]);
+            if draft_probs[i] <= p {
+                accepted.push(draft[i]);
+                accepted_len += 1;
+            } else {
+                accepted.push(Self::sample_modified(row, draft[i], draft_probs[i], rng));
+                break;
+            }
+        }
+        // 3. KV-откат непринятого хвоста: остаются prefill-база + id + принятые.
+        if accepted_len < ids.len() {
+            let base = self.caches[0].pos - ids.len();
+            for c in &mut self.caches {
+                c.truncate(base + accepted_len);
+            }
+            self.pos_rope = base + accepted_len;
+        }
+        Ok(SpecOutcome { accepted, logits })
+    }
+
     pub fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
         // Все ~290 кернелов шага — в ОДИН command buffer (1 commit+wait
         // вместо 290 синхронных dispatch — decode был в ~70× медленнее
@@ -820,6 +929,50 @@ mod tests {
     }
 
     /// Ключевой инвариант decode: лог-проблема декод-шага на позиции k
+    /// Ф2.1: spec с пустым draft (γ=0) == обычный decode (бит-в-бит).
+    #[test]
+    fn decode_spec_empty_matches_decode() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        model.prefill(&backend, &ids).unwrap();
+        let d1 = model.decode(&backend, 5).unwrap();
+
+        model.reset_cache(&backend).unwrap();
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = None;
+        let out = model.decode_spec(&backend, 5, &[], &[], &mut rng).unwrap();
+        assert!(out.accepted.is_empty(), "γ=0: draft-токенов нет");
+        let a = backend.to_cpu_f32(&d1).unwrap();
+        let b = backend.to_cpu_f32(&out.logits).unwrap();
+        assert_eq!(a, b, "spec(γ=0) должен совпадать с decode");
+    }
+
+    /// Ф2.1: draft отклоняется (q=1 > p), KV откатывается — следующий
+    /// decode совпадает с обычным decode после того же prefill.
+    #[test]
+    fn decode_spec_rejects_and_rolls_back() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        model.prefill(&backend, &ids).unwrap();
+        let l1 = model.decode(&backend, 5).unwrap();
+        let l2 = model.decode(&backend, 6).unwrap();
+
+        model.reset_cache(&backend).unwrap();
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = None;
+        let out = model
+            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng)
+            .unwrap();
+        assert_eq!(out.accepted.len(), 1, "мусорный draft отклонён");
+        assert_ne!(out.accepted[0], 3, "q=1 > p — токен 3 не принимается");
+        // KV откачен (остался id=5) — decode(6) даёт обычный результат.
+        let l2s = model.decode(&backend, 6).unwrap();
+        let a = backend.to_cpu_f32(&l2).unwrap();
+        let b = backend.to_cpu_f32(&l2s).unwrap();
+        assert_eq!(a, b, "после отката decode должен совпадать с обычным");
+        let _ = l1;
+    }
+
     /// совпадает с prefill-логитами на позиции k (при том же состоянии KV).
     #[test]
     fn decode_matches_prefill_last_logits() {

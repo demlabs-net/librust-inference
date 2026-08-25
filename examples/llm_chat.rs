@@ -210,12 +210,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut dflash_drafter: Option<rust_inference::dflash::DFlashDrafter> = match &spec_dflash_path {
         Some(p) => {
             use rust_inference::dflash::{DFlashDrafter, DFlashModel};
-            let dfile = File::open(p)?;
-            let dmmap = unsafe { memmap2::Mmap::map(&dfile)? };
-            let dgf = gguf::parse(&dmmap)?;
-            let dwm = WeightsMap::from_gguf(&dgf)?;
-            let dmodel =
-                DFlashModel::load_gguf(backend.as_ref(), &dgf, &dwm, cfg.vocab_size)?;
+            let dmodel = if p.ends_with(".safetensors") {
+                DFlashModel::load_safetensors(backend.as_ref(), std::path::Path::new(p), cfg.vocab_size)?
+            } else {
+                let dfile = File::open(p)?;
+                let dmmap = unsafe { memmap2::Mmap::map(&dfile)? };
+                let dgf = gguf::parse(&dmmap)?;
+                let dwm = WeightsMap::from_gguf(&dgf)?;
+                DFlashModel::load_gguf(backend.as_ref(), &dgf, &dwm, cfg.vocab_size)?
+            };
             // общие эмбеддинги и lm_head таргета
             let ew = rust_inference::weights_map::dequant_f32(
                 wm.get("token_embd.weight").ok_or("token_embd.weight missing")?,
@@ -242,10 +245,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut drafter = NGramDrafter::new(4);
     let mut history: Vec<u32> = ids.clone();
-    // extract-скрытые принятых токенов для DFlash-инжекта (Ф2.4): кольцо
-    // [n_layers × dim] на токен, последние block_size токенов.
-    let mut extract_ring: std::collections::VecDeque<Vec<Vec<f32>>> =
-        std::collections::VecDeque::new();
+    // extract-фичи для прямой инъекции (z-lab): (число принятых, фичи).
+    // Первый шаг — фичи ВСЕГО префилла (z-lab: target_hidden = extract
+    // префилл-форварда); далее — последние принятые.
+    let mut last_extract: Option<(usize, Vec<rust_inference::backend::Tensor>)> = None;
+    if dflash_drafter.is_some() {
+        let tl = dflash_drafter
+            .as_ref()
+            .unwrap()
+            .model
+            .extract_layers
+            .clone();
+        let feats = model.forward_extract(&*backend, &ids, &tl)?;
+        last_extract = Some((ids.len().saturating_sub(1), feats));
+    }
     let mut rng: Option<u64> = None;
     let mut spec_drafts = 0usize;
     let mut spec_accepted = 0usize;
@@ -311,61 +324,107 @@ fn main() -> Result<(), Box<dyn Error>> {
         if spec_mode {
             history.push(next);
             let (draft, probs) = if let Some(d) = &mut dflash_drafter {
-                // DFlash: инжект из extract-кольца ПРИНЯТЫХ токенов (каждый
-                // токен инжектится один раз при принятии; кольцо — последние
-                // block_size). Пусто на первом шаге. LLM_NO_INJECT — отладка.
-                if !extract_ring.is_empty() && std::env::var("LLM_NO_INJECT").is_err() {
-                    let bs = d.model.block_size;
-                    let n = extract_ring.len().min(bs);
-                    let nl = d.model.extract_layers.len();
-                    let dd = d.model.cfg.dim;
-                    let mut flat = vec![0f32; n * nl * dd];
-                    for (k, rows) in extract_ring.iter().rev().take(n).enumerate() {
-                        for li in 0..nl {
-                            flat[(n - 1 - k) * nl * dd + li * dd..(n - 1 - k) * nl * dd
-                                + (li + 1) * dd]
-                                .copy_from_slice(&rows[li]);
+                // DFlash: прямая инъекция фич (z-lab: k_ctx = wkv(hidden_norm(
+                // fc(features)))) — фичи ПРИНЯТЫХ из последнего форварда
+                // (первые n_draft_accepted+1 строк). LLM_NO_INJECT — отладка.
+                if let Some((acc_len, ref extract)) = last_extract {
+                    if std::env::var("LLM_NO_INJECT").is_err() {
+                        let t = extract[0].shape()[1].min(acc_len + 1);
+                        let nl = d.model.extract_layers.len();
+                        let dd = d.model.cfg.dim;
+                        let mut flat = vec![0f32; t * nl * dd];
+                        for (li, h) in extract.iter().enumerate() {
+                            let hv = backend.to_cpu_f32(h)?;
+                            for tok in 0..t {
+                                flat[tok * nl * dd + li * dd..tok * nl * dd + (li + 1) * dd]
+                                    .copy_from_slice(&hv[tok * dd..(tok + 1) * dd]);
+                            }
                         }
+                        let ft = backend.from_cpu_f32(&flat, vec![t, nl * dd])?;
+                        d.features = Some(ft);
+                    } else {
+                        d.features = None;
                     }
-                    let ft = backend.from_cpu_f32(&flat, vec![n, nl * dd])?;
-                    d.model.inject_features(&*backend, &ft, history.len() - n)?;
+                } else {
+                    d.features = None;
                 }
                 d.draft(&*backend, &history, d.model.block_size - 1)
             } else {
                 drafter.draft(&*backend, &history, 4)
             };
             spec_drafts += 1;
-            let spec = model.decode_spec(
-                &*backend,
-                next,
-                &draft,
-                &probs,
-                &mut rng,
-                dflash_drafter
-                    .as_ref()
-                    .map(|d| d.model.extract_layers.clone())
-                    .unwrap_or_default()
-                    .as_slice(),
-            )?;
-            // принятые токены → extract-кольцо: позиция 0 (next) + принятые
-            // draft (их фичи в extract корректны). Пересэмпл (последний
-            // accepted при частичном принятии) НЕ добавляется — его фичи
-            // соответствуют draft-токену, а не пересэмплу.
-            if let Some(d) = &dflash_drafter {
-                let dd = d.model.cfg.dim;
-                let nl = d.model.extract_layers.len();
-                let n_rows = 1 + spec.n_draft_accepted;
-                for i in 0..n_rows.min(spec.extract[0].shape()[1]) {
-                    let mut rows = Vec::with_capacity(nl);
-                    for h in &spec.extract {
-                        let hv = backend.to_cpu_f32(h)?;
-                        rows.push(hv[i * dd..(i + 1) * dd].to_vec());
+            let spec = if std::env::var("LLM_ZLAB_VERIFY").is_ok() && dflash_drafter.is_some() {
+                // z-lab верификация: таргет на [anchor, MASK×15]; posterior =
+                // argmax по каждой позиции; принятие = совпадение draft.
+                let d = dflash_drafter.as_ref().unwrap();
+                let mask = d.model.mask_token;
+                let mut mid = vec![next];
+                mid.resize(1 + draft.len(), mask);
+                let (lg, ext) = model.prefill_extract(
+                    &*backend,
+                    &mid,
+                    &d.model.extract_layers.clone(),
+                )?;
+                let v = backend.to_cpu_f32(&lg)?;
+                let vv = cfg.vocab_size;
+                let mut accepted: Vec<u32> = Vec::new();
+                let mut acc_len = 1usize;
+                for i in 0..draft.len() {
+                    let row = &v[(i + 1) * vv..(i + 2) * vv];
+                    // posterior — СЭМПЛ из softmax (z-lab: sample(logits, temp))
+                    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+                    let total: f32 = w.iter().sum();
+                    rng = Some(rng.unwrap_or(0x9e3779b97f4a7c15).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+                    let mut r = (rng.unwrap() >> 33) as f32 / (1u64 << 33) as f32 * total;
+                    let mut post = (w.len() - 1) as u32;
+                    for (ti, wv) in w.iter().enumerate() {
+                        r -= *wv;
+                        if r <= 0.0 {
+                            post = ti as u32;
+                            break;
+                        }
                     }
-                    extract_ring.push_back(rows);
+                    if post == draft[i] {
+                        accepted.push(draft[i]);
+                        acc_len += 1;
+                    } else {
+                        accepted.push(post);
+                        break;
+                    }
                 }
-                while extract_ring.len() > d.model.block_size {
-                    extract_ring.pop_front();
+                let base = model.caches[0].pos - mid.len();
+                for c in &mut model.caches {
+                    c.truncate(base + acc_len);
                 }
+                let row_idx = if acc_len == mid.len() { mid.len() - 1 } else { acc_len };
+                let logits = backend.from_cpu_f32(
+                    &v[row_idx * vv..(row_idx + 1) * vv],
+                    vec![1, 1, vv],
+                )?;
+                rust_inference::qwen3::SpecOutcome {
+                    accepted,
+                    logits,
+                    extract: ext,
+                    n_draft_accepted: acc_len.saturating_sub(1),
+                }
+            } else {
+                model.decode_spec(
+                    &*backend,
+                    next,
+                    &draft,
+                    &probs,
+                    &mut rng,
+                    dflash_drafter
+                        .as_ref()
+                        .map(|d| d.model.extract_layers.clone())
+                        .unwrap_or_default()
+                        .as_slice(),
+                )?
+            };
+            // фичи принятых (первый шаг — префилл, заполняется ниже)
+            if dflash_drafter.is_some() {
+                last_extract = Some((spec.n_draft_accepted, spec.extract.clone()));
             }
             let n_acc = 1 + spec.accepted.len();
             spec_accepted += n_acc;

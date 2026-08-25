@@ -895,6 +895,21 @@ impl Qwen3Model {
 }
 
 /// QK-norm: per-head RMSNorm (w [dim], применяется по hd каждой головы).
+pub fn qk_norm_pub(
+    backend: &dyn Backend,
+    x: &Tensor,
+    w: Option<&Tensor>,
+    heads: usize,
+    eps: f32,
+) -> Result<Tensor, BackendError> {
+    let y = backend.zeros(x.shape().to_vec())?;
+    match w {
+        Some(w) => backend.rmsnorm_head(x, w, &y, heads, eps)?,
+        None => return Ok(x.clone()),
+    }
+    Ok(y)
+}
+
 fn qk_norm(
     backend: &dyn Backend,
     x: &Tensor,

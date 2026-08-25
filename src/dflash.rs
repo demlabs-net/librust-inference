@@ -311,6 +311,154 @@ impl DFlashModel {
         )
     }
 
+    /// Загрузка драфтера из safetensors z-lab (+ config.json рядом):
+    /// BF16-веса (HF-порядок [out, in] — как наш row-major), имена
+    /// layers.K.* → blk.K.*, hidden_norm = инжект-норм (enc.output_norm).
+    /// Параметры диффузии — из config.json (dflash_config: mask_token_id,
+    /// target_layer_ids; block_size; rope_theta; rms_norm_eps).
+    pub fn load_safetensors(
+        backend: &dyn Backend,
+        model_path: &std::path::Path,
+        vocab_size: usize,
+    ) -> Result<Self, BackendError> {
+        let dir = model_path.parent().unwrap_or(std::path::Path::new("."));
+        let cfg_path = dir.join("config.json");
+        let cfgj: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cfg_path)
+                .map_err(|e| BackendError::Shape(format!("config.json: {e}")))?,
+        )
+        .map_err(|e| BackendError::Shape(format!("config.json: {e}")))?;
+        let g = |k: &str| -> Result<usize, BackendError> {
+            cfgj.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .ok_or_else(|| BackendError::Shape(format!("config: missing {k}")))
+        };
+        let f = |k: &str, d: f32| -> f32 {
+            cfgj.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+        };
+        let dflash = cfgj.get("dflash_config").cloned().unwrap_or(serde_json::Value::Null);
+        let mask_token = dflash
+            .get("mask_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(151669);
+        let target_layers = dflash
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dim = g("hidden_size")?;
+        let n_layers = g("num_hidden_layers")?;
+        let head_dim = g("head_dim").unwrap_or(dim / g("num_attention_heads")?);
+        let cfg = Qwen3Config {
+            dim,
+            n_layers,
+            n_heads: g("num_attention_heads")?,
+            n_kv_heads: g("num_key_value_heads")?,
+            head_dim,
+            ffn_dim: g("intermediate_size")?,
+            vocab_size,
+            rope_theta: f("rope_theta", 1e6),
+            rope_max_seq: g("max_position_embeddings").unwrap_or(8192),
+            norm_eps: f("rms_norm_eps", 1e-6),
+            swa_window: None,
+            mrope_sections: None,
+            n_deepstack: None,
+        };
+        let block_size = g("block_size")?;
+        // safetensors → WeightsMap (f32, имена blk.*)
+        let st = crate::weights::read_safetensors_f32(model_path)
+            .map_err(|e| BackendError::Shape(format!("safetensors: {e}")))?;
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let mut meta: Vec<(String, Vec<u64>, usize)> = Vec::new();
+        let map = |name: &str| -> Option<String> {
+            if name == "fc.weight" {
+                return Some("fc.weight".into());
+            }
+            if name == "norm.weight" {
+                return Some("output_norm.weight".into());
+            }
+            if name == "hidden_norm.weight" {
+                return Some("enc.output_norm.weight".into());
+            }
+            let parts: Vec<&str> = name.split('.').collect();
+            if parts.len() >= 4 && parts[0] == "layers" {
+                let k = parts[1];
+                let rest = parts[2..].join(".");
+                let mapped = match rest.as_str() {
+                    "input_layernorm.weight" => "attn_norm.weight",
+                    "post_attention_layernorm.weight" => "ffn_norm.weight",
+                    "self_attn.q_proj.weight" => "attn_q.weight",
+                    "self_attn.k_proj.weight" => "attn_k.weight",
+                    "self_attn.v_proj.weight" => "attn_v.weight",
+                    "self_attn.o_proj.weight" => "attn_output.weight",
+                    "self_attn.q_norm.weight" => "attn_q_norm.weight",
+                    "self_attn.k_norm.weight" => "attn_k_norm.weight",
+                    "mlp.gate_proj.weight" => "ffn_gate.weight",
+                    "mlp.up_proj.weight" => "ffn_up.weight",
+                    "mlp.down_proj.weight" => "ffn_down.weight",
+                    _ => return None,
+                };
+                return Some(format!("blk.{k}.{mapped}"));
+            }
+            None
+        };
+        for (name, (data, shape)) in &st {
+            let mapped = map(name).ok_or_else(|| {
+                BackendError::Shape(format!("safetensors: незнакомый тензор {name}"))
+            })?;
+            let mut b = Vec::with_capacity(data.len() * 4);
+            for v in data {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            meta.push((mapped, shape.iter().map(|&d| d as u64).collect(), b.len()));
+            blobs.push(b);
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(blobs.iter().map(|b| b.len()).sum());
+        let mut offs = Vec::with_capacity(blobs.len());
+        for b in &blobs {
+            offs.push(buf.len());
+            buf.extend_from_slice(b);
+        }
+        let tensors = meta
+            .into_iter()
+            .zip(offs)
+            .map(|((name, shape, len), off)| crate::weights_map::WeightTensor {
+                name,
+                shape,
+                format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
+                offset: off as u64,
+                data: &buf[off..off + len],
+            })
+            .collect::<Vec<_>>();
+        let wm = crate::weights_map::WeightsMap {
+            arch: "dflash".into(),
+            tensors,
+            storage: vec![crate::weights_map::Storage {
+                offset: 0,
+                data: &buf,
+            }],
+        };
+        Self::load_with_selector(
+            backend,
+            &wm,
+            cfg,
+            block_size,
+            0,
+            1,
+            target_layers,
+            mask_token,
+            None,
+            None,
+        )
+    }
+
     /// Диагностическая загрузка с транспонированием 2D-весов (гипотеза
     /// «конвертер не транспонировал»): каждый 2D .weight деквантуется и
     /// читается как [out, in] вместо ggml [in, out]. Для сравнения
@@ -491,12 +639,22 @@ impl DFlashModel {
     /// в последовательности таргета; спека: inp_pos = позиции токенов).
     /// ВНИМАНИЕ: мутирует кэши (пишет k/v draft-токенов) — после шага
     /// вызывающий должен откатить кэши до инжектной длины.
+    /// Диффузия token-режима (ОРИГИНАЛЬНЫЙ протокол z-lab modeling_dflash.py):
+    /// mask-патч `ids` ([anchor, MASK...]) → dense-слои. Внимание — прямая
+    /// инъекция фич (НЕ через кэш!): k_ctx/v_ctx = wkv(hidden_norm(fc(фичи)))
+    /// поворачиваются ПОЗИЦИЯМИ НАЧАЛА БЛОКА [pos..pos+ctx) и дописываются в
+    /// кэш ПОСЛЕ noise-строк (порядок k-строк не влияет — маски нет).
+    /// Кэш: только noise-копии принятых токенов (как z-lab DynamicCache).
+    /// `features` — фичи таргета [ctx, D] (конкат входов extract-слоёв
+    /// последних ПРИНЯТЫХ токенов); None — без инъекции.
+    /// Логиты — через lm_head ТАРГЕТА (общий), скрытые — свой out_norm.
     pub fn diffuse(
         &mut self,
         backend: &dyn Backend,
         ids: &[u32],
         lm_head: &Tensor,
         pos: usize,
+        features: Option<&Tensor>,
     ) -> Result<DiffusionResult, BackendError> {
         backend.begin_batch()?;
         let r = (|| {
@@ -510,8 +668,24 @@ impl DFlashModel {
                 .clone();
             let mut x = backend.zeros(vec![1, t, self.cfg.dim])?;
             backend.embedding(ids, &embed, &mut x)?;
+            // фичи → fc → hidden_norm (z-lab: target_hidden = hidden_norm(fc(...)))
+            let enc = match (features, &self.fc, &self.enc_norm) {
+                (Some(f), Some(fc), Some(norm)) => {
+                    let d = fc.shape()[0];
+                    let y = backend.zeros(vec![f.shape()[0], d])?;
+                    backend.gemm_nt(f, fc, &y)?;
+                    Some(norm.forward(backend, &y.view(vec![1, f.shape()[0], d]))?)
+                }
+                _ => None,
+            };
+            let ctx = enc.as_ref().map(|e| e.shape()[1]).unwrap_or(0);
+            // кэш-индексы — непрерывно от past_len (длина кэша ДО диффузии;
+            // z-lab: cache_position = position_ids от get_seq_length()); на
+            // первом шаге past_len=0 — запись с нуля, БЕЗ дыр.
+            let past_len = self.caches[0].pos;
+            let kctx_pos = pos;
             for (i, layer) in self.layers.iter().enumerate() {
-                // ── attn-часть ──
+                // ── attn-часть (свой путь: прямая инъекция k_ctx) ──
                 let mut h = layer.dense.attn_norm.forward(backend, &x)?;
                 let attn_dyn = match (&layer.attn_conv.proj, &layer.attn_conv.base) {
                     (Some(p), Some(_)) => Some(conv_dynamic(backend, p, &h)?),
@@ -520,20 +694,67 @@ impl DFlashModel {
                 if let (Some(d), Some(b)) = (&attn_dyn, &layer.attn_conv.base) {
                     h = conv_side(backend, &h, b, d, 0, self.block_size)?;
                 }
-                // абсолютная rope-позиция anchor (позиция в таргете; спека:
-                // inp_pos = позиции токенов батча) — не cache.pos!
-                let mut cur = crate::qwen3::Qwen3Model::rope_and_attn(
-                    &self.cfg,
-                    backend,
-                    &h,
-                    &layer.dense.attn,
-                    &mut self.caches[i],
-                    pos,
-                    t,
-                    None,
-                    false,
-                    Some(pos),
+                let attn = &layer.dense.attn;
+                let q_size = attn.n_heads * attn.head_dim;
+                let kv_size = attn.n_kv_heads * attn.head_dim;
+                let qkv = crate::nn::Linear {
+                    w: attn.wqkv.clone(),
+                    b: None,
+                }
+                .forward(backend, &h)?;
+                let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
+                let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
+                let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
+                // qk_norm + rope: noise-токены на [pos..pos+t)
+                let q = crate::qwen3::qk_norm_pub(
+                    backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6,
                 )?;
+                let k = crate::qwen3::qk_norm_pub(
+                    backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6,
+                )?;
+                let q = crate::qwen3::rope_standard(
+                    backend, &q, pos, t, attn.head_dim, self.cfg.rope_theta,
+                )?;
+                let k = crate::qwen3::rope_standard(
+                    backend, &k, pos, t, attn.head_dim, self.cfg.rope_theta,
+                )?;
+                // прямая инъекция фич (z-lab: concat([k_ctx, k_noise])) —
+                // k_ctx на [pos..pos+ctx), noise следом — кэш непрерывен
+                if let Some(e) = &enc {
+                    let qkv2 = crate::nn::Linear {
+                        w: attn.wqkv.clone(),
+                        b: None,
+                    }
+                    .forward(backend, e)?;
+                    let kc = crate::nn::slice_last(backend, &qkv2, kv_size, q_size)?;
+                    let vc = crate::nn::slice_last(backend, &qkv2, kv_size, q_size + kv_size)?;
+                    let kc = crate::qwen3::qk_norm_pub(
+                        backend, &kc, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6,
+                    )?;
+                    let kc = crate::qwen3::rope_standard(
+                        backend, &kc, kctx_pos, ctx, attn.head_dim, self.cfg.rope_theta,
+                    )?;
+                    self.caches[i].update_at(backend, &kc, &vc, past_len)?;
+                }
+                self.caches[i].update_at(backend, &k, &v, past_len + ctx)?;
+                let ck = self.caches[i].view();
+                let cv = self.caches[i].view_v();
+                let attn_out = backend.zeros(vec![1, t, q_size])?;
+                backend.attn_ar(
+                    &q,
+                    &ck,
+                    &cv,
+                    None,
+                    &attn_out,
+                    attn.n_heads,
+                    attn.n_kv_heads,
+                    attn.head_dim,
+                )?;
+                let mut cur = crate::nn::Linear {
+                    w: attn.wo.clone(),
+                    b: None,
+                }
+                .forward(backend, &attn_out)?;
                 if let (Some(d), Some(b)) = (&attn_dyn, &layer.attn_conv.base) {
                     cur = conv_side(backend, &cur, b, d, 1, self.block_size)?;
                 }
@@ -671,6 +892,9 @@ pub struct DFlashDrafter {
     pub model: DFlashModel,
     pub target_embed: Tensor,
     pub lm_head: Tensor,
+    /// Фичи таргета для прямой инъекции (z-lab: k_ctx = wkv(hidden_norm(fc(features)))).
+    /// Ставятся вызывающим перед draft (последние ПРИНЯТЫЕ токены).
+    pub features: Option<Tensor>,
     /// Кольцо принятых токенов (последние block_size).
     pub committed: std::collections::VecDeque<u32>,
     /// Сид сэмплинга (v1-диффузия: позиции блока симметричны без conv —
@@ -685,6 +909,7 @@ impl DFlashDrafter {
             model,
             target_embed,
             lm_head,
+            features: None,
             committed: std::collections::VecDeque::new(),
             rng: 0x85ebca6b,
         }
@@ -747,13 +972,16 @@ impl crate::spec::Drafter for DFlashDrafter {
         let pos = history.len();
         let mut ids = vec![anchor];
         ids.resize(block, self.model.mask_token);
-        let inject_len = self.model.caches[0].pos; // инжект остаётся в кэше
+        // кэш содержит только noise-копии [0..pos); после диффузии —
+        // откат до pos (z-lab: past_key_values_draft.crop(start))
         if std::env::var("LLM_DBG_SPEC").is_ok() {
             eprintln!(
-                "DFlashDrafter: inject_len={inject_len} pos={pos} block={block}"
+                "DFlashDrafter: cache={} pos={pos} block={block} ctx={:?}",
+                self.model.caches[0].pos,
+                self.features.as_ref().map(|f| f.shape()[0])
             );
         }
-        let res = match self.model.diffuse(backend, &ids, &self.lm_head, pos) {
+        let res = match self.model.diffuse(backend, &ids, &self.lm_head, pos, self.features.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("DFlashDrafter: диффузия не удалась: {e}");
@@ -789,9 +1017,8 @@ impl crate::spec::Drafter for DFlashDrafter {
             }
             (tokens, probs)
         };
-        // кэш после диффузии содержит k/v блока — откат до инжектной длины
-        // (инжект остаётся; новый инжект пересоздаётся вызывающим)
-        self.model.truncate_caches(inject_len);
+        // кэш после диффузии содержит k/v блока — откат до pos (crop)
+        self.model.truncate_caches(pos);
         self.commit(&tokens);
         (
             tokens.into_iter().take(gamma).collect(),
@@ -1040,6 +1267,24 @@ mod tests {
             vec![4, c.dim],
         ));
         st.push((
+            "fc.weight".into(),
+            {
+                let mut v = vec![0f32; c.dim * c.dim];
+                rng.fill(&mut v);
+                v
+            },
+            vec![c.dim, c.dim],
+        ));
+        st.push((
+            "enc.output_norm.weight".into(),
+            {
+                let mut v = vec![0f32; c.dim];
+                rng.fill(&mut v);
+                v
+            },
+            vec![c.dim],
+        ));
+        st.push((
             "output_norm.weight".into(),
             {
                 let mut v = vec![0f32; c.dim];
@@ -1240,7 +1485,7 @@ mod tests {
         // t=1: каузальная маска не строится ни в одном пути — пути тождественны
         let ids = [3u32];
         let h = qwen.forward_hidden(&backend, &ids).unwrap();
-        let d = dflash.diffuse(&backend, &ids, &lm_head, 0).unwrap();
+        let d = dflash.diffuse(&backend, &ids, &lm_head, 0, None).unwrap();
         crate::harness::assert_close(
             &backend.to_cpu_f32(&d.hidden).unwrap(),
             &backend.to_cpu_f32(&h).unwrap(),
@@ -1264,7 +1509,7 @@ mod tests {
 
         // t=2: non-causal диффузия (взаимный attn) — только проверка конечности
         let ids2 = [3u32, 5];
-        let d2 = dflash.diffuse(&backend, &ids2, &lm_head, 0).unwrap();
+        let d2 = dflash.diffuse(&backend, &ids2, &lm_head, 0, None).unwrap();
         let lg = backend.to_cpu_f32(&d2.logits).unwrap();
         assert!(lg.iter().all(|v| v.is_finite()));
         dflash.truncate_caches(0);
@@ -1485,16 +1730,15 @@ mod tests {
         let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
         let ids = [3u32, 5, 5, 5];
         // без инжекта
-        let r0 = m.diffuse(&backend, &ids, &lm_head, 3).unwrap();
+        let r0 = m.diffuse(&backend, &ids, &lm_head, 3, None).unwrap();
         let lg0 = backend.to_cpu_f32(&r0.logits).unwrap();
         // с инжектом: случайные фичи [2, 20480→dim·2] — у мини-модели fc нет,
         // фичи идут напрямую в wkv (размерность dim)
         let mut rng = Lcg::new(11);
         let mut fd = vec![0f32; 2 * c.dim];
         rng.fill(&mut fd);
-        let ft = backend.from_cpu_f32(&fd, vec![1, 2, c.dim]).unwrap();
-        m.inject_features(&backend, &ft, 1).unwrap();
-        let r1 = m.diffuse(&backend, &ids, &lm_head, 3).unwrap();
+        let ft = backend.from_cpu_f32(&fd, vec![2, c.dim]).unwrap();
+        let r1 = m.diffuse(&backend, &ids, &lm_head, 3, Some(&ft)).unwrap();
         let lg1 = backend.to_cpu_f32(&r1.logits).unwrap();
         assert_ne!(lg0, lg1, "инжект не влияет на логиты диффузии");
         m.truncate_caches(0);
@@ -1548,7 +1792,7 @@ mod tests {
         let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
         let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
         let ids = [3u32, 5, 5, 5];
-        let r = m.diffuse(&backend, &ids, &lm_head, 0).unwrap();
+        let r = m.diffuse(&backend, &ids, &lm_head, 0, None).unwrap();
         let lg = backend.to_cpu_f32(&r.logits).unwrap();
         let v = c.vocab_size;
         let mut tops = Vec::new();
@@ -1597,7 +1841,7 @@ mod tests {
             tops_q.push(best);
         }
         eprintln!("qwen-prefill tops: {tops_q:?}");
-        let rc = mc.diffuse(&cpu, &ids, &lm_c, 0).unwrap();
+        let rc = mc.diffuse(&cpu, &ids, &lm_c, 0, None).unwrap();
         let lgc = cpu.to_cpu_f32(&rc.logits).unwrap();
         let mut tops_c = Vec::new();
         for pos in 0..4 {

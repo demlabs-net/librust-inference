@@ -1228,7 +1228,7 @@ impl MetalCtx {
         // B читается 1 раз на 8 строк; F16 — half4-чтения.
         if m > 1 {
             let (kname, is_f16) = match b.dtype {
-                GpuDtype::Q8_0 => ("gemm_nt_q8_0_m8", false),
+                GpuDtype::Q8_0 => ("gemm_nt_q8_0_m8f4", false),
                 GpuDtype::F16 => ("gemm_nt_f16_m8", true),
                 _ => ("", false),
             };

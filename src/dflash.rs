@@ -916,9 +916,24 @@ impl DFlashDrafter {
     }
 
     /// Сэмпл из softmax-распределения строки (LCG, как sample_modified).
+    /// Сэмпл из softmax-распределения строки (LCG, как sample_modified).
+    /// LLM_TOP_K=N — сэмпл только из топ-N (эксперимент: совпадение с
+    /// posterior чаще, если распределения совпадают на топах).
     fn sample_row(&mut self, row: &[f32]) -> u32 {
+        let top_k = std::env::var("LLM_TOP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+        if top_k > 0 && top_k < w.len() {
+            // оставить топ-N по весу, остальные — 0
+            let mut idx: Vec<usize> = (0..w.len()).collect();
+            idx.sort_by(|&a, &b| w[b].partial_cmp(&w[a]).unwrap());
+            for &i in &idx[top_k..] {
+                w[i] = 0.0;
+            }
+        }
         let total: f32 = w.iter().sum();
         self.rng = self
             .rng

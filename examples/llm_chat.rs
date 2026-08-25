@@ -375,7 +375,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut acc_len = 1usize;
                 for i in 0..draft.len() {
                     let row = &v[(i + 1) * vv..(i + 2) * vv];
-                    // posterior — СЭМПЛ из softmax (z-lab: sample(logits, temp))
+                    // posterior — СЭМПЛ из ПОЛНОГО softmax (z-lab: sample);
+                    // top-k для posterior НЕ применяем: усечение обеих сторон
+                    // завышает совпадение и портит текст (эксперимент)
                     let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
                     let total: f32 = w.iter().sum();

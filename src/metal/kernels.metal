@@ -2174,3 +2174,57 @@ kernel void gemm_nt_f16_m8(
     if (ok6) C[(mb + 6) * N + n] = acc6;
     if (ok7) C[(mb + 7) * N + n] = acc7;
 }
+
+// ── Q8_0 GEMM m>1: m8 + float4 (Ф2.5, w13/w2 доминируют в prefill) ────────
+// Поток (n, 8 m-строк): B-столбец 1 раз на 8 строк; float4 по k:
+// acc0..acc7 — float4-аккумуляторы (32 регистра), A-чтения float4.
+kernel void gemm_nt_q8_0_m8f4(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint n = gid.x;
+    uint mb = gid.y * 8u;
+    if (n >= N || mb >= M) return;
+    const uint blocks = K / 32;
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float4 acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    const bool ok0 = mb + 0 < M, ok1 = mb + 1 < M, ok2 = mb + 2 < M, ok3 = mb + 3 < M;
+    const bool ok4 = mb + 4 < M, ok5 = mb + 5 < M, ok6 = mb + 6 < M, ok7 = mb + 7 < M;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 34;
+        float d = (float)load_half_unaligned(blk);
+        device const int8_t* q = (device const int8_t*)(blk + 2);
+        uint k0 = b * 32;
+        for (uint j4 = 0; j4 < 8; ++j4) {
+            float4 b4;
+            b4.x = (float)q[j4 * 4 + 0] * d;
+            b4.y = (float)q[j4 * 4 + 1] * d;
+            b4.z = (float)q[j4 * 4 + 2] * d;
+            b4.w = (float)q[j4 * 4 + 3] * d;
+            uint kk = k0 + j4 * 4;
+            float4 a0 = ok0 ? *(device const float4*)(A + (mb + 0) * K + kk) : (float4)0.0f;
+            float4 a1 = ok1 ? *(device const float4*)(A + (mb + 1) * K + kk) : (float4)0.0f;
+            float4 a2 = ok2 ? *(device const float4*)(A + (mb + 2) * K + kk) : (float4)0.0f;
+            float4 a3 = ok3 ? *(device const float4*)(A + (mb + 3) * K + kk) : (float4)0.0f;
+            float4 a4 = ok4 ? *(device const float4*)(A + (mb + 4) * K + kk) : (float4)0.0f;
+            float4 a5 = ok5 ? *(device const float4*)(A + (mb + 5) * K + kk) : (float4)0.0f;
+            float4 a6 = ok6 ? *(device const float4*)(A + (mb + 6) * K + kk) : (float4)0.0f;
+            float4 a7 = ok7 ? *(device const float4*)(A + (mb + 7) * K + kk) : (float4)0.0f;
+            acc0 += a0 * b4; acc1 += a1 * b4; acc2 += a2 * b4; acc3 += a3 * b4;
+            acc4 += a4 * b4; acc5 += a5 * b4; acc6 += a6 * b4; acc7 += a7 * b4;
+        }
+    }
+    if (ok0) { float4 v = acc0; C[(mb + 0) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok1) { float4 v = acc1; C[(mb + 1) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok2) { float4 v = acc2; C[(mb + 2) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok3) { float4 v = acc3; C[(mb + 3) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok4) { float4 v = acc4; C[(mb + 4) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok5) { float4 v = acc5; C[(mb + 5) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok6) { float4 v = acc6; C[(mb + 6) * N + n] = v.x + v.y + v.z + v.w; }
+    if (ok7) { float4 v = acc7; C[(mb + 7) * N + n] = v.x + v.y + v.z + v.w; }
+}

@@ -1648,14 +1648,15 @@ __device__ inline float q4k_weight(const unsigned char* blk, int j) {
 // BN: 128 for Q6_K (26.9 KB tile — 48 KB static-shared limit), 256 for
 // Q4_0 (4.6 KB). No activation staging: A is re-read per k-block and
 // broadcasts across the block's threads (L2-resident).
-#define DEFINE_Q_GEMMS(SUF, WREAD, NSUP_SHIFT, WPB, BLK_BYTES, BN)          \
+#define DEFINE_Q_GEMMS(SUF, WREAD, NSUP_SHIFT, WPB, BLK_BYTES, BN, AT)      \
 /* m ≤ 64 (TTS fill/decode): split-k over k-slices. Grid                  \
    (ceil(n/BN)·m, S); each block: one output row × BN columns, per         \
    k-block a cooperative tile load + full WPB-weight dot from shared.      \
    S=1 needs no shared A window (activations read from global) — one       \
-   kernel covers every k. `gemm_i8_reduce` combines the partials. */       \
+   kernel covers every k. `gemm_i8_reduce` combines the partials. The A    \
+   operand follows the activation axis (AT = f32/f16/bf16). */             \
 extern "C" __global__ void SUF##_splitk(                                    \
-    const float* __restrict__ A,        /* (m, k) */                        \
+    const AT* __restrict__ A,        /* (m, k) */                           \
     const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
     float* __restrict__ Cpart,          /* (S·m, n) */                      \
     int k, int n, int S, int m)                                             \
@@ -1670,7 +1671,7 @@ extern "C" __global__ void SUF##_splitk(                                    \
     int nblk_s = ks >> NSUP_SHIFT;                                          \
     int nsup = k >> NSUP_SHIFT;                                             \
     int kb0 = blockIdx.y * nblk_s;                                          \
-    const float* arow = A + (size_t)row * k;                                \
+    const AT* arow = A + (size_t)row * k;                                    \
     float acc = 0.0f;                                                       \
     const int tile_bytes = BN * BLK_BYTES;                                  \
     const int tile_v4 = tile_bytes >> 4;                                    \
@@ -1705,7 +1706,7 @@ extern "C" __global__ void SUF##_splitk(                                    \
                hidden without pressure. */                                  \
             _Pragma("unroll 8")                                             \
             for (int j = 0; j < WPB; ++j) {                                 \
-                acc += arow[kb * WPB + j] * WREAD(blk, j);                  \
+                acc += (float)arow[kb * WPB + j] * WREAD(blk, j);           \
             }                                                               \
         }                                                                   \
         __syncthreads();                                                    \
@@ -1718,7 +1719,7 @@ extern "C" __global__ void SUF##_splitk(                                    \
    accumulators in registers; B staged once per k-block, reused by all     \
    32 rows — B read once per row-chunk, not per row. */                    \
 extern "C" __global__ void SUF##_tiled(                                     \
-    const float* __restrict__ A,        /* (m, k) */                        \
+    const AT* __restrict__ A,        /* (m, k) */                           \
     const unsigned char* __restrict__ B,/* (k/WPB, n) blocks, kb-major */   \
     float* __restrict__ Cpart,          /* (S·m, n) — grid.z k-slices */    \
     int m, int k, int n)                                                    \
@@ -1758,9 +1759,9 @@ extern "C" __global__ void SUF##_tiled(                                     \
             const unsigned char* blk = Bs + tid * BLK_BYTES;                \
             for (int j = 0; j < WPB; ++j) {                                 \
                 float w = WREAD(blk, j);                                    \
-                const float* a0 = A + (size_t)r0 * k + kb * WPB + j;        \
+                const AT* a0 = A + (size_t)r0 * k + kb * WPB + j;           \
                 for (int rr = 0; rr < BM; ++rr) {                           \
-                    if (r0 + rr < m) acc[rr] += a0[rr * k] * w;             \
+                    if (r0 + rr < m) acc[rr] += (float)a0[rr * k] * w;      \
                 }                                                           \
             }                                                               \
         }                                                                   \
@@ -1772,7 +1773,9 @@ extern "C" __global__ void SUF##_tiled(                                     \
     }                                                                       \
 }
 
-DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18, 256)
+DEFINE_Q_GEMMS(gemm_q4k, q4k_weight, 5, 32, 18, 256, float)
+DEFINE_Q_GEMMS(gemm_q4k_f16, q4k_weight, 5, 32, 18, 256, __half)
+DEFINE_Q_GEMMS(gemm_q4k_bf16, q4k_weight, 5, 32, 18, 256, __nv_bfloat16)
 
 // ─────────────────── Q8_0 GEMM splitk (kb-major, configurable A) ────────
 // Q8_0 (per-32-block i8 + f32 scale) — the q8_0 m=1 decode was 47-176 us
@@ -2069,88 +2072,95 @@ DEFINE_Q8K_TILED(bf16, __nv_bfloat16)
 // cooperatively dequantize the 32-column tile ONCE into a TRANSPOSED f32
 // tile (TILE[j][col] — consecutive threads read consecutive columns, bank
 // conflict-free), then the compute is pure FMA. BN=32: Bs 6.7 KB + f32
-// tile 32 KB fits the 48 KB static-shared budget.
-extern "C" __global__ void gemm_q6k_splitk_v2(
-    const float* __restrict__ A,        // (m, k)
-    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·210
-    float* __restrict__ Cpart,          // (S·m, n)
-    int k,
-    int n,
-    int S,
-    int m)
-{
-    const int BN = 32;
-    __shared__ unsigned char Bs[BN * 210];
-    __shared__ float T[256][BN];
-    __shared__ float As[256];
-    int tid = threadIdx.x;
-    int bx = blockIdx.x;
-    int row = bx % m;
-    int nb = bx / m;
-    int col0 = nb * BN;
-    int nsup = k >> 8;
-    int nblk_s = (k / S) >> 8;
-    int kb0 = blockIdx.y * nblk_s;
-    const float* arow = A + (size_t)row * k;
-    float acc = 0.0f;
-    for (int t = 0; t < nblk_s; ++t) {
-        int kb = kb0 + t;
-        // Activation k-block (shared — the compute's 32 threads would not
-        // hide 256 global loads per thread otherwise).
-        As[tid] = arow[kb * 256 + tid];
-        const unsigned char* src = B + (size_t)(kb * n + col0) * 210;
-        // Flat coalesced tile load (interior: 6720 B contiguous; edge:
-        // per-column byte copy, garbage columns zeroed — masked later).
-        if (col0 + BN <= n && (n & 7) == 0) {
-            for (int i = tid; i < (BN * 210) / 16; i += 256) {
-                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);
-            }
-        } else if (tid < BN) {
-            int c = col0 + tid;
-            if (c < n) {
-                const unsigned char* s = src + (size_t)tid * 210;
-                unsigned char* d = Bs + tid * 210;
-                for (int i = 0; i < 210; ++i) d[i] = s[i];
-            } else {
-                for (int i = 0; i < 210; ++i) Bs[tid * 210 + i] = 0;
-            }
-        }
-        __syncthreads();
-        // Dequant pass: thread (col, jg) → TILE[j][col] (transposed —
-        // conflict-free writes and reads).
-        int col = tid & 31;
-        int jg = tid >> 5;
-        {
-            const unsigned char* blk = Bs + col * 210;
-            float d = __half2float(*(const __half*)(blk + 208));
-            for (int r = 0; r < 32; ++r) {
-                int j = jg * 32 + r;
-                // For j = jg·32+r: lane = r, q = jg&3 (r < 32 → lane = r).
-                int nchunk = j >> 7;
-                int lane = r;
-                int q = jg & 3;
-                int qlb = nchunk * 64 + lane + ((q & 1) << 5);
-                int qhb = nchunk * 32 + lane;
-                int scb = nchunk * 8 + (lane >> 4) + (q << 1);
-                int low = ((q >> 1) & 1) ? (blk[qlb] >> 4) : (blk[qlb] & 0xF);
-                int high = (blk[128 + qhb] >> (q << 1)) & 3;
-                int qv = (low | (high << 4)) - 32;
-                T[j][col] = d * (float)(signed char)blk[192 + scb] * (float)qv;
-            }
-        }
-        __syncthreads();
-        // Compute: 32 threads (one per column), pure FMA over the f32 tile.
-        if (tid < BN && col0 + tid < n) {
-            for (int j = 0; j < 256; ++j) {
-                acc += As[j] * T[j][tid];
-            }
-        }
-        __syncthreads();
-    }
-    if (tid < BN && col0 + tid < n) {
-        Cpart[(blockIdx.y * m + row) * n + col0 + tid] = acc;
-    }
+// tile 32 KB fits the 48 KB static-shared budget. The A operand follows
+// the activation axis: the activation tile As is stored AT (f32/f16/bf16 —
+// the half widths halve the shared traffic and the (float) conversions).
+#define DEFINE_Q6K_SPLITK(SUF, AT)                                            \
+extern "C" __global__ void gemm_q6k_splitk_v2_##SUF(                          \
+    const AT* __restrict__ A,        /* (m, k) — activation axis */          \
+    const unsigned char* __restrict__ B,/* packed blocks, (col·nsuper + kb)·210 */ \
+    float* __restrict__ Cpart,          /* (S·m, n) */                       \
+    int k,                                                                   \
+    int n,                                                                   \
+    int S,                                                                   \
+    int m)                                                                   \
+{                                                                             \
+    const int BN = 32;                                                        \
+    __shared__ unsigned char Bs[BN * 210];                                    \
+    __shared__ float T[256][BN];                                              \
+    __shared__ AT As[256];                                                    \
+    int tid = threadIdx.x;                                                    \
+    int bx = blockIdx.x;                                                      \
+    int row = bx % m;                                                         \
+    int nb = bx / m;                                                          \
+    int col0 = nb * BN;                                                        \
+    int nsup = k >> 8;                                                        \
+    int nblk_s = (k / S) >> 8;                                                \
+    int kb0 = blockIdx.y * nblk_s;                                            \
+    const AT* arow = A + (size_t)row * k;                                     \
+    float acc = 0.0f;                                                         \
+    for (int t = 0; t < nblk_s; ++t) {                                        \
+        int kb = kb0 + t;                                                     \
+        /* Activation k-block (shared — the compute's 32 threads would not   \
+           hide 256 global loads per thread otherwise). */                    \
+        As[tid] = arow[kb * 256 + tid];                                       \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * 210;         \
+        /* Flat coalesced tile load (interior: 6720 B contiguous; edge:      \
+           per-column byte copy, garbage columns zeroed — masked later). */  \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * 210) / 16; i += 256) {                \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+            }                                                                 \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * 210;             \
+                unsigned char* d = Bs + tid * 210;                            \
+                for (int i = 0; i < 210; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < 210; ++i) Bs[tid * 210 + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        /* Dequant pass: thread (col, jg) → TILE[j][col] (transposed —       \
+           conflict-free writes and reads). */                                \
+        int col = tid & 31;                                                   \
+        int jg = tid >> 5;                                                    \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * 210;                        \
+            float d = __half2float(*(const __half*)(blk + 208));              \
+            for (int r = 0; r < 32; ++r) {                                    \
+                int j = jg * 32 + r;                                          \
+                /* For j = jg·32+r: lane = r, q = jg&3 (r < 32 → lane = r). */\
+                int nchunk = j >> 7;                                          \
+                int lane = r;                                                 \
+                int q = jg & 3;                                               \
+                int qlb = nchunk * 64 + lane + ((q & 1) << 5);                \
+                int qhb = nchunk * 32 + lane;                                 \
+                int scb = nchunk * 8 + (lane >> 4) + (q << 1);                \
+                int low = ((q >> 1) & 1) ? (blk[qlb] >> 4) : (blk[qlb] & 0xF);\
+                int high = (blk[128 + qhb] >> (q << 1)) & 3;                  \
+                int qv = (low | (high << 4)) - 32;                            \
+                T[j][col] = d * (float)(signed char)blk[192 + scb] * (float)qv;\
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        /* Compute: 32 threads (one per column), pure FMA over the f32 tile.*/\
+        if (tid < BN && col0 + tid < n) {                                     \
+            for (int j = 0; j < 256; ++j) {                                   \
+                acc += (float)As[j] * T[j][tid];                              \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (tid < BN && col0 + tid < n) {                                         \
+        Cpart[(blockIdx.y * m + row) * n + col0 + tid] = acc;                 \
+    }                                                                         \
 }
+
+DEFINE_Q6K_SPLITK(f32, float)
+DEFINE_Q6K_SPLITK(f16, __half)
+DEFINE_Q6K_SPLITK(bf16, __nv_bfloat16)
 
 /// Q6_K GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
 /// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The

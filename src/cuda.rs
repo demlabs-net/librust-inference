@@ -327,10 +327,13 @@ impl CudaBackend {
             _ => KernA::F32(a),
         };
         if m > 1 {
-            // Tiled: 32 rows × 256 cols per block, grid.z=8 splits k into
-            // (8·m, n) partials — combined by gemm_i8_reduce. The z-slices
-            // write disjoint (row, col) tiles, so every element is summed
-            // 8× in a fixed order — deterministic.
+            // m>1: the AT-variant tiled kernel (32 rows × 256 cols, grid.z=16
+            // splits k into (16·m, n) partials — combined by gemm_i8_reduce
+            // in a fixed order — deterministic). NOTE: a wmma tensor-core
+            // variant (gemm_halfw_tiled_mma_*) was implemented and removed —
+            // wmma traps on the sm_120 JIT of the compute_86 PTX (invalid
+            // shared access in the wmma emulation) — the raw mma.sync path
+            // is the documented follow-up.
             let s16 = 16usize;
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled_name)?;
@@ -2203,6 +2206,29 @@ impl CudaBackend {
         } else {
             1
         };
+        // The m=1 split-k follows the activation axis (f16/bf16 cast the A
+        // rows — half-width A shared tile and traffic); the m>1 tiled
+        // kernel keeps the f32 activation tile (A is amortized in shared
+        // there — the axis would buy nothing).
+        let act = self.activation_dtype();
+        let a_arg: KernA = if m == 1 {
+            match act {
+                crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
+                crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
+                _ => KernA::F32(a),
+            }
+        } else {
+            KernA::F32(a)
+        };
+        let (splitk, tiled): (&'static str, &'static str) = match (&a_arg, name) {
+            (KernA::F16(_), "gemm_q6k") => ("gemm_q6k_splitk_v2_f16", "gemm_q6k_tiled_v3"),
+            (KernA::BF16(_), "gemm_q6k") => ("gemm_q6k_splitk_v2_bf16", "gemm_q6k_tiled_v3"),
+            (KernA::F16(_), "gemm_q4k") => ("gemm_q4k_f16_splitk", "gemm_q4k_f16_tiled"),
+            (KernA::BF16(_), "gemm_q4k") => ("gemm_q4k_bf16_splitk", "gemm_q4k_bf16_tiled"),
+            (_, "gemm_q6k") => ("gemm_q6k_splitk_v2_f32", "gemm_q6k_tiled_v3"),
+            (_, "gemm_q4k") => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
+            _ => unreachable!("gemm_packed_nt: name/activation combo"),
+        };
         if m == 1 {
             if s > 1 {
                 let cpart = self.take_pooled(s * m * n)?;
@@ -2213,7 +2239,11 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
+                match &a_arg {
+                    KernA::F32(t) => la.arg(t.as_cuda()),
+                    KernA::F16(sl) => la.arg(sl),
+                    KernA::BF16(sl) => la.arg(sl),
+                };
                 la.arg(bpack);
                 la.arg(&cpart);
                 la.arg(&k32);
@@ -2231,7 +2261,11 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 };
                 let mut la = self.stream.launch_builder(&f);
-                la.arg(a.as_cuda());
+                match &a_arg {
+                    KernA::F32(t) => la.arg(t.as_cuda()),
+                    KernA::F16(sl) => la.arg(sl),
+                    KernA::BF16(sl) => la.arg(sl),
+                };
                 la.arg(bpack);
                 la.arg(c);
                 la.arg(&k32);
@@ -2251,7 +2285,11 @@ impl CudaBackend {
                 shared_mem_bytes: 0,
             };
             let mut la = self.stream.launch_builder(&f);
-            la.arg(a.as_cuda());
+            match &a_arg {
+                KernA::F32(t) => la.arg(t.as_cuda()),
+                KernA::F16(sl) => la.arg(sl),
+                KernA::BF16(sl) => la.arg(sl),
+            };
             la.arg(bpack);
             la.arg(&cpart);
             la.arg(&m32);
@@ -2260,6 +2298,7 @@ impl CudaBackend {
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             self.reduce_and_pool(cpart, c, m, n, 16)?;
         }
+        self.pool_a_scratch(a_arg);
         let _ = blk_bytes; // layout constant — kept for the kernel contract
         Ok(())
     }

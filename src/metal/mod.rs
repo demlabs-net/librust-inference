@@ -3403,6 +3403,42 @@ mod batch_debug {
         }
         ctx.gemm_nt_quantized(&a, &b, &c).unwrap();
         let cv = c.to_cpu_f32(&ctx).unwrap();
+        // микро-бенч: attn_ar 9 токенов × 36 кэш × 32 головы
+        {
+            let q9 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.1f32; 1 * 9 * 4096], vec![1, 9, 4096]).unwrap();
+            let k36 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.2f32; 1 * 36 * 1024], vec![1, 36, 1024]).unwrap();
+            let v36 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.3f32; 1 * 36 * 1024], vec![1, 36, 1024]).unwrap();
+            let y9 = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                ctx.attn_ar_f32(&q9, &k36, &v36, None, &y9, 32, 8, 128).unwrap();
+            }
+            eprintln!("micro: attn_ar 9x36x32 = {:.2}ms", t0.elapsed().as_secs_f64() * 1e3 / 10.0);
+            // rmsnorm_head 9 токенов
+            let w128 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.5f32; 128], vec![128]).unwrap();
+            let yn = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
+            let t1 = std::time::Instant::now();
+            for _ in 0..10 {
+                ctx.rmsnorm_head_f32(&q9, &w128, &yn, 32, 1e-6).unwrap();
+            }
+            eprintln!("micro: rmsnorm_head 9t = {:.2}ms", t1.elapsed().as_secs_f64() * 1e3 / 10.0);
+            // rope 9 токенов (напрямую через run)
+            let yr = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
+            let t2 = std::time::Instant::now();
+            for _ in 0..10 {
+                let grid = metal::MTLSize::new(9, 32, 64);
+                let group = metal::MTLSize::new(1, 4, 4);
+                ctx.run("rope_std_f32", grid, group, |enc| {
+                    enc.set_buffer(0, Some(&q9.buffer), q9.offset as u64);
+                    enc.set_buffer(1, Some(&yr.buffer), yr.offset as u64);
+                    for (i, v) in [9usize, 4096, 128, 0usize].iter().enumerate() {
+                        enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
+                    }
+                    enc.set_bytes(6, 4, (&1e6f32 as *const f32).cast());
+                }).unwrap();
+            }
+            eprintln!("micro: rope 9t = {:.2}ms", t2.elapsed().as_secs_f64() * 1e3 / 10.0);
+        }
         // микро-бенч: gemm 16×4096×4096 Q8_0 (как prefill-верификация)
         {
             let m16 = 16usize;

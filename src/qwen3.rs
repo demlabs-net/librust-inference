@@ -390,6 +390,8 @@ impl Qwen3Model {
             let mut x = self.embed.forward(backend, ids, t)?;
             let mut out = Vec::with_capacity(layers.len());
             let mut li = 0usize;
+            let (mut p_attn, mut p_ffn) = (0.0f64, 0.0f64);
+            let prof = std::env::var("LLM_BENCH").is_ok();
             for (i, layer) in self.layers.iter().enumerate() {
                 // фичи для DFlash-инжекта = ВХОД extract-слоя (llama.cpp
                 // llama_get_embeddings_layer_inp: выход предыдущего слоя)
@@ -397,6 +399,8 @@ impl Qwen3Model {
                     out.push(x.clone());
                     li += 1;
                 }
+                let t0 = std::time::Instant::now();
+                if prof { backend.end_batch()?; backend.begin_batch()?; }
                 let h = layer.attn_norm.forward(backend, &x)?;
                 let h = Self::rope_and_attn(
                     &self.cfg,
@@ -411,9 +415,21 @@ impl Qwen3Model {
                     None,
                 )?;
                 x = backend_add(backend, &x, &h)?;
+                if prof { backend.end_batch()?; backend.begin_batch()?; }
+                if prof { p_attn += t0.elapsed().as_secs_f64(); }
+                let t1 = std::time::Instant::now();
                 let h = layer.ffn_norm.forward(backend, &x)?;
                 let f = ffn_forward(backend, &h, &layer.ffn)?;
                 x = backend_add(backend, &x, &f)?;
+                if prof { backend.end_batch()?; backend.begin_batch()?; }
+                if prof { p_ffn += t1.elapsed().as_secs_f64(); }
+            }
+            if prof {
+                eprintln!(
+                    "PROF prefill_extract t={}: attn {:.1}ms ({:.2}/layer) ffn {:.1}ms ({:.2}/layer)",
+                    t, p_attn * 1e3, p_attn * 1e3 / self.layers.len() as f64,
+                    p_ffn * 1e3, p_ffn * 1e3 / self.layers.len() as f64
+                );
             }
             let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
             let h = self.out_norm.forward(backend, &x)?;
@@ -474,7 +490,7 @@ impl Qwen3Model {
         let embd_in = x.clone();
         let mut prof_attn = 0.0f64;
         let mut prof_ffn = 0.0f64;
-        let prof = std::env::var("LLM_BENCH").is_ok() && t == 1;
+        let prof = std::env::var("LLM_BENCH").is_ok();
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(u) = upto {
                 if i >= u {
@@ -526,6 +542,17 @@ impl Qwen3Model {
                     }
                 }
             }
+        }
+        if prof && t > 1 {
+            eprintln!(
+                "PROF layers={} t={}: attn {:.1}ms ffn {:.1}ms (per-layer {:.2}/{:.2}ms)",
+                self.layers.len(),
+                t,
+                prof_attn * 1e3,
+                prof_ffn * 1e3,
+                prof_attn * 1e3 / self.layers.len() as f64,
+                prof_ffn * 1e3 / self.layers.len() as f64
+            );
         }
         let h = self.out_norm.forward(backend, &x)?;
         Ok(h)

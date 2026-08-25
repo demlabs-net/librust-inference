@@ -685,9 +685,18 @@ impl MetalCtx {
             })?;
             return Ok(());
         }
-        // gemm_nt_q8_0_f4 (float4) отключён: 3.5мс vs 2.6мс скалярного —
-        // узкое место — инструкции (каст q + mul d), не чтения; кернел
-        // оставлен заделом в kernels.metal.
+        if b.dtype == GpuDtype::Q8_0 && m > 1 {
+            let grid = MTLSize::new(n as u64, m.div_ceil(8) as u64, 1);
+            let group = MTLSize::new(256, 1, 1);
+            return self.run("gemm_nt_q8_0_m8", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 8, (&m as *const usize).cast());
+                enc.set_bytes(4, 8, (&k as *const usize).cast());
+                enc.set_bytes(5, 8, (&n as *const usize).cast());
+            });
+        }
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -1214,6 +1223,27 @@ impl MetalCtx {
                 "gemm_nt_quantized: K={k} not a multiple of block {block} ({:?})",
                 b.dtype
             )));
+        }
+        // m>1: m8-кернелы (n-столбец × 8 m-строк, явные аккумуляторы) —
+        // B читается 1 раз на 8 строк; F16 — half4-чтения.
+        if m > 1 {
+            let (kname, is_f16) = match b.dtype {
+                GpuDtype::Q8_0 => ("gemm_nt_q8_0_m8", false),
+                GpuDtype::F16 => ("gemm_nt_f16_m8", true),
+                _ => ("", false),
+            };
+            if !kname.is_empty() {
+                let grid = MTLSize::new(n as u64, m.div_ceil(8) as u64, 1);
+                let group = MTLSize::new(256, 1, 1);
+                return self.run(kname, grid, group, |enc| {
+                    enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                    enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                    enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                    enc.set_bytes(3, 8, (&m as *const usize).cast());
+                    enc.set_bytes(4, 8, (&k as *const usize).cast());
+                    enc.set_bytes(5, 8, (&n as *const usize).cast());
+                });
+            }
         }
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);

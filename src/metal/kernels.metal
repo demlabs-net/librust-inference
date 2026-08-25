@@ -2049,3 +2049,128 @@ kernel void gemm_nt_q8_0_f4(
     }
     C[m * N + n] = acc;
 }
+
+// ── Q8_0 GEMM m>1: n-столбец × 8 m-строк, явные аккумуляторы (Ф2.5) ───────
+// Поток (n, m-чанк 8): B-столбец читается 1 раз на 8 строк (было на 1),
+// A-строка — 1 чтение на 8 m (av в регистре). acc0..acc7 — ЯВНЫЕ регистры
+// (массив acc[8] с runtime-индексом уходит в локальную память!). guard
+// для хвостовых m-строк (M не кратно 8).
+kernel void gemm_nt_q8_0_m8(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint n = gid.x;
+    uint mb = gid.y * 8u;
+    if (n >= N || mb >= M) return;
+    const uint blocks = K / 32;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    const bool ok0 = mb + 0 < M, ok1 = mb + 1 < M, ok2 = mb + 2 < M, ok3 = mb + 3 < M;
+    const bool ok4 = mb + 4 < M, ok5 = mb + 5 < M, ok6 = mb + 6 < M, ok7 = mb + 7 < M;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 34;
+        float d = (float)load_half_unaligned(blk);
+        device const int8_t* q = (device const int8_t*)(blk + 2);
+        uint k0 = b * 32;
+        for (uint j = 0; j < 32; ++j) {
+            float qv = (float)q[j] * d;
+            float a0 = ok0 ? A[(mb + 0) * K + k0 + j] : 0.0f;
+            float a1 = ok1 ? A[(mb + 1) * K + k0 + j] : 0.0f;
+            float a2 = ok2 ? A[(mb + 2) * K + k0 + j] : 0.0f;
+            float a3 = ok3 ? A[(mb + 3) * K + k0 + j] : 0.0f;
+            float a4 = ok4 ? A[(mb + 4) * K + k0 + j] : 0.0f;
+            float a5 = ok5 ? A[(mb + 5) * K + k0 + j] : 0.0f;
+            float a6 = ok6 ? A[(mb + 6) * K + k0 + j] : 0.0f;
+            float a7 = ok7 ? A[(mb + 7) * K + k0 + j] : 0.0f;
+            acc0 += a0 * qv; acc1 += a1 * qv; acc2 += a2 * qv; acc3 += a3 * qv;
+            acc4 += a4 * qv; acc5 += a5 * qv; acc6 += a6 * qv; acc7 += a7 * qv;
+        }
+    }
+    if (ok0) C[(mb + 0) * N + n] = acc0;
+    if (ok1) C[(mb + 1) * N + n] = acc1;
+    if (ok2) C[(mb + 2) * N + n] = acc2;
+    if (ok3) C[(mb + 3) * N + n] = acc3;
+    if (ok4) C[(mb + 4) * N + n] = acc4;
+    if (ok5) C[(mb + 5) * N + n] = acc5;
+    if (ok6) C[(mb + 6) * N + n] = acc6;
+    if (ok7) C[(mb + 7) * N + n] = acc7;
+}
+
+// ── F16 GEMM m>1: n-столбец × 8 m-строк (Ф2.5, диффузия драфтера) ─────────
+// B-столбец (f16) читается 1 раз на 8 строк; half4-чтения; acc0..acc7 —
+// явные регистры (массив с runtime-индексом уходит в локальную память).
+kernel void gemm_nt_f16_m8(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint n = gid.x;
+    uint mb = gid.y * 8u;
+    if (n >= N || mb >= M) return;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    const bool ok0 = mb + 0 < M, ok1 = mb + 1 < M, ok2 = mb + 2 < M, ok3 = mb + 3 < M;
+    const bool ok4 = mb + 4 < M, ok5 = mb + 5 < M, ok6 = mb + 6 < M, ok7 = mb + 7 < M;
+    device const half* brow = B + n * K;
+    for (uint k4 = 0; k4 < K / 4; ++k4) {
+        half4 b4 = *(device const half4*)(brow + k4 * 4);
+        float b0 = (float)b4.x, b1 = (float)b4.y, b2 = (float)b4.z, b3 = (float)b4.w;
+        float a0_0 = ok0 ? A[(mb + 0) * K + k4 * 4 + 0] : 0.0f;
+        float a0_1 = ok0 ? A[(mb + 0) * K + k4 * 4 + 1] : 0.0f;
+        float a0_2 = ok0 ? A[(mb + 0) * K + k4 * 4 + 2] : 0.0f;
+        float a0_3 = ok0 ? A[(mb + 0) * K + k4 * 4 + 3] : 0.0f;
+        float a1_0 = ok1 ? A[(mb + 1) * K + k4 * 4 + 0] : 0.0f;
+        float a1_1 = ok1 ? A[(mb + 1) * K + k4 * 4 + 1] : 0.0f;
+        float a1_2 = ok1 ? A[(mb + 1) * K + k4 * 4 + 2] : 0.0f;
+        float a1_3 = ok1 ? A[(mb + 1) * K + k4 * 4 + 3] : 0.0f;
+        float a2_0 = ok2 ? A[(mb + 2) * K + k4 * 4 + 0] : 0.0f;
+        float a2_1 = ok2 ? A[(mb + 2) * K + k4 * 4 + 1] : 0.0f;
+        float a2_2 = ok2 ? A[(mb + 2) * K + k4 * 4 + 2] : 0.0f;
+        float a2_3 = ok2 ? A[(mb + 2) * K + k4 * 4 + 3] : 0.0f;
+        float a3_0 = ok3 ? A[(mb + 3) * K + k4 * 4 + 0] : 0.0f;
+        float a3_1 = ok3 ? A[(mb + 3) * K + k4 * 4 + 1] : 0.0f;
+        float a3_2 = ok3 ? A[(mb + 3) * K + k4 * 4 + 2] : 0.0f;
+        float a3_3 = ok3 ? A[(mb + 3) * K + k4 * 4 + 3] : 0.0f;
+        float a4_0 = ok4 ? A[(mb + 4) * K + k4 * 4 + 0] : 0.0f;
+        float a4_1 = ok4 ? A[(mb + 4) * K + k4 * 4 + 1] : 0.0f;
+        float a4_2 = ok4 ? A[(mb + 4) * K + k4 * 4 + 2] : 0.0f;
+        float a4_3 = ok4 ? A[(mb + 4) * K + k4 * 4 + 3] : 0.0f;
+        float a5_0 = ok5 ? A[(mb + 5) * K + k4 * 4 + 0] : 0.0f;
+        float a5_1 = ok5 ? A[(mb + 5) * K + k4 * 4 + 1] : 0.0f;
+        float a5_2 = ok5 ? A[(mb + 5) * K + k4 * 4 + 2] : 0.0f;
+        float a5_3 = ok5 ? A[(mb + 5) * K + k4 * 4 + 3] : 0.0f;
+        float a6_0 = ok6 ? A[(mb + 6) * K + k4 * 4 + 0] : 0.0f;
+        float a6_1 = ok6 ? A[(mb + 6) * K + k4 * 4 + 1] : 0.0f;
+        float a6_2 = ok6 ? A[(mb + 6) * K + k4 * 4 + 2] : 0.0f;
+        float a6_3 = ok6 ? A[(mb + 6) * K + k4 * 4 + 3] : 0.0f;
+        float a7_0 = ok7 ? A[(mb + 7) * K + k4 * 4 + 0] : 0.0f;
+        float a7_1 = ok7 ? A[(mb + 7) * K + k4 * 4 + 1] : 0.0f;
+        float a7_2 = ok7 ? A[(mb + 7) * K + k4 * 4 + 2] : 0.0f;
+        float a7_3 = ok7 ? A[(mb + 7) * K + k4 * 4 + 3] : 0.0f;
+        acc0 += a0_0 * b0 + a0_1 * b1 + a0_2 * b2 + a0_3 * b3;
+        acc1 += a1_0 * b0 + a1_1 * b1 + a1_2 * b2 + a1_3 * b3;
+        acc2 += a2_0 * b0 + a2_1 * b1 + a2_2 * b2 + a2_3 * b3;
+        acc3 += a3_0 * b0 + a3_1 * b1 + a3_2 * b2 + a3_3 * b3;
+        acc4 += a4_0 * b0 + a4_1 * b1 + a4_2 * b2 + a4_3 * b3;
+        acc5 += a5_0 * b0 + a5_1 * b1 + a5_2 * b2 + a5_3 * b3;
+        acc6 += a6_0 * b0 + a6_1 * b1 + a6_2 * b2 + a6_3 * b3;
+        acc7 += a7_0 * b0 + a7_1 * b1 + a7_2 * b2 + a7_3 * b3;
+    }
+    if (ok0) C[(mb + 0) * N + n] = acc0;
+    if (ok1) C[(mb + 1) * N + n] = acc1;
+    if (ok2) C[(mb + 2) * N + n] = acc2;
+    if (ok3) C[(mb + 3) * N + n] = acc3;
+    if (ok4) C[(mb + 4) * N + n] = acc4;
+    if (ok5) C[(mb + 5) * N + n] = acc5;
+    if (ok6) C[(mb + 6) * N + n] = acc6;
+    if (ok7) C[(mb + 7) * N + n] = acc7;
+}

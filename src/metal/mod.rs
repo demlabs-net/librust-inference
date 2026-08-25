@@ -685,10 +685,6 @@ impl MetalCtx {
             })?;
             return Ok(());
         }
-        // Batch-путь (prefill m>1) ОТКЛЮЧЁН: shared-кернел на m=16 медленнее
-        // поточечного (barrier-overhead; веса и так в L2 — 8.5GB×16 в DRAM
-        // не упирается). Поточечный — 337мс/16 токенов; оставлен заделом
-        // для больших батчей (L2 не вмещает).
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -1166,10 +1162,6 @@ impl MetalCtx {
                 ));
             }
         };
-        // Batch-путь (prefill m>1) ОТКЛЮЧЁН: shared-кернел на m=16 медленнее
-        // поточечного (barrier-overhead; веса и так в L2 — 8.5GB×16 в DRAM
-        // не упирается). Поточечный — 337мс/16 токенов; оставлен заделом
-        // для больших батчей (L2 не вмещает).
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -1220,10 +1212,6 @@ impl MetalCtx {
                 b.dtype
             )));
         }
-        // Batch-путь (prefill m>1) ОТКЛЮЧЁН: shared-кернел на m=16 медленнее
-        // поточечного (barrier-overhead; веса и так в L2 — 8.5GB×16 в DRAM
-        // не упирается). Поточечный — 337мс/16 токенов; оставлен заделом
-        // для больших батчей (L2 не вмещает).
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {

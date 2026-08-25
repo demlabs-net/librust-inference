@@ -2011,6 +2011,3 @@ kernel void tg_barrier_test(
     C[tid] = v[0];
 }
 
-    }
-    C[m * N + n] = acc4.x + acc4.y + acc4.z + acc4.w;
-}

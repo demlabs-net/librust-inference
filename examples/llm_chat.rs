@@ -353,9 +353,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 drafter.draft(&*backend, &history, 4)
             };
             spec_drafts += 1;
+            let t_step0 = Instant::now();
+            let t_draft0 = Instant::now();
             let spec = if std::env::var("LLM_ZLAB_VERIFY").is_ok() && dflash_drafter.is_some() {
-                // z-lab верификация: таргет на [anchor, MASK×15]; posterior =
-                // argmax по каждой позиции; принятие = совпадение draft.
+                // z-lab верификация: таргет на [anchor, MASK×15] (эмпирика:
+                // на draft-контексте acceptance 12%, на масках 19-31%);
+                // posterior = сэмпл; принятие = совпадение draft.
                 let d = dflash_drafter.as_ref().unwrap();
                 let mask = d.model.mask_token;
                 let mut mid = vec![next];
@@ -428,6 +431,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let n_acc = 1 + spec.accepted.len();
             spec_accepted += n_acc;
+            if std::env::var("LLM_BENCH").is_ok() {
+                eprintln!("  step {generated}: {:.1}ms (draft {:.1}ms)",
+                    t_step0.elapsed().as_secs_f64() * 1e3,
+                    t_draft0.elapsed().as_secs_f64() * 1e3);
+            }
             if std::env::var("LLM_BENCH").is_ok() && generated % 10 == 0 {
                 eprintln!("spec step {generated}: draft {} accepted {} ({:.0}%)",
                     draft.len(), spec.accepted.len(),

@@ -1936,3 +1936,77 @@ kernel void dflash2_conv_f32(
     }
     Y[t * n_embd + i] = acc;
 }
+
+// ── Q8_0 batch-GEMM (Ф2.5, prefill m>1) ────────────────────────────────────
+// Threadgroup-вариант: BM=8 m-строк × BN=64 n-столбцов на группу; Q8_0-
+// блоки загружаются в shared ОДИН раз на 8 строк (bandwidth ×8 против
+// поточечного); 512 потоков/группа — 65536 потоков на m=16,n=4096.
+// ВАЖНО: размеры shared-массивов — ЛИТЕРАЛЫ (runtime const ломает их).
+kernel void gemm_nt_q8_0_batch(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint n0 = gid.x * 64u;
+    uint m0 = gid.y * 8u;
+    if (n0 >= N) return;
+    const uint blocks = K / 32;
+    threadgroup float sa[8][32];
+    threadgroup float sb[64][32];
+    const uint tid = gid.z; // 0..511
+    uint i = tid / 64u;     // 0..7 (m-строка в группе)
+    uint j = tid % 64u;     // 0..63 (n-столбец в группе)
+    float acc = 0.0f;
+    for (uint kb = 0; kb < blocks; ++kb) {
+        if (tid < 256u) {
+            uint ai = tid / 32u, al = tid % 32u;
+            uint row = m0 + ai;
+            sa[ai][al] = (row < M) ? A[row * K + kb * 32u + al] : 0.0f;
+        }
+        {
+            uint bj = tid % 64u;
+            uint col = n0 + bj;
+            uint lo = (tid / 64u) * 4u; // 0..28
+            if (col < N) {
+                device const uchar* blk = B + (col * blocks + kb) * 34;
+                float d = (float)load_half_unaligned(blk);
+                device const int8_t* q = (device const int8_t*)(blk + 2);
+                for (uint t = 0u; t < 4u; ++t) {
+                    sb[bj][lo + t] = (float)q[lo + t] * d;
+                }
+            } else {
+                for (uint t = 0u; t < 4u; ++t) { sb[bj][lo + t] = 0.0f; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s = 0.0f;
+        for (uint l = 0u; l < 32u; ++l) {
+            s += sa[i][l] * sb[j][l];
+        }
+        acc += s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint row = m0 + i;
+    uint col = n0 + j;
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
+
+
+// debug: barrier-проверка: поток 0 пишет в shared, все читают
+kernel void tg_barrier_test(
+    device float* C [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    threadgroup float v[32];
+    uint tid = gid.z;
+    if (tid == 0) { v[0] = 42.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    C[tid] = v[0];
+}

@@ -685,6 +685,10 @@ impl MetalCtx {
             })?;
             return Ok(());
         }
+        // Batch-путь (prefill m>1) ОТКЛЮЧЁН: shared-кернел на m=16 медленнее
+        // поточечного (barrier-overhead; веса и так в L2 — 8.5GB×16 в DRAM
+        // не упирается). Поточечный — 337мс/16 токенов; оставлен заделом
+        // для больших батчей (L2 не вмещает).
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -1162,6 +1166,10 @@ impl MetalCtx {
                 ));
             }
         };
+        // Batch-путь (prefill m>1) ОТКЛЮЧЁН: shared-кернел на m=16 медленнее
+        // поточечного (barrier-overhead; веса и так в L2 — 8.5GB×16 в DRAM
+        // не упирается). Поточечный — 337мс/16 токенов; оставлен заделом
+        // для больших батчей (L2 не вмещает).
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -1212,6 +1220,10 @@ impl MetalCtx {
                 b.dtype
             )));
         }
+        // Batch-путь (prefill m>1) ОТКЛЮЧЁН: shared-кернел на m=16 медленнее
+        // поточечного (barrier-overhead; веса и так в L2 — 8.5GB×16 в DRAM
+        // не упирается). Поточечный — 337мс/16 токенов; оставлен заделом
+        // для больших батчей (L2 не вмещает).
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {
@@ -3326,5 +3338,80 @@ mod quant_gemm_tests {
             let diff = max_diff(&got, &c_ref);
             assert!(diff <= bound, "{dtype:?} mv: |Δ| max {diff} > {bound}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod batch_debug {
+    use super::*;
+    fn bytes_rep(n: usize, k: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        let half_one = 0x3C00u16.to_le_bytes();
+        for _ in 0..n * (k / 32) {
+            b.extend_from_slice(&half_one);
+            for i in 0..32 { b.push((i % 64) as u8); }
+        }
+        b
+    }
+    #[test]
+    fn q8_batch_vs_naive() {
+        let ctx = MetalCtx::new().unwrap();
+        // Q8_0: n=2, k=32: scale=1.0 (f16-le), q = [0..31], [31..0]
+        let mut bytes = Vec::new();
+        let half_one = 0x3C00u16.to_le_bytes();
+        bytes.extend_from_slice(&half_one);
+        for i in 0..32 { bytes.push(i as u8); }
+        bytes.extend_from_slice(&half_one);
+        for i in 0..32 { bytes.push((31 - i) as u8); }
+        let b = GpuTensor::from_quantized(&ctx.device, &bytes, vec![2, 32], GpuDtype::Q8_0).unwrap();
+        // A: m=2, k=32: a0 = [1,0,0,...], a1 = [0..31]
+        let mut ad = vec![0f32; 2 * 32];
+        ad[0] = 1.0;
+        for i in 0..32 { ad[32 + i] = i as f32; }
+        let a = GpuTensor::from_cpu_f32(&ctx.device, &ad, vec![2, 32]).unwrap();
+        let c = GpuTensor::zeros(&ctx.device, vec![2, 2]).unwrap();
+        // barrier-проверка
+        {
+            let c4 = GpuTensor::zeros(&ctx.device, vec![32]).unwrap();
+            ctx.run("tg_barrier_test", metal::MTLSize::new(1, 1, 32), metal::MTLSize::new(1, 1, 32), |enc| {
+                enc.set_buffer(0, Some(&c4.buffer), c4.offset as u64);
+            }).unwrap();
+            let v4 = c4.to_cpu_f32(&ctx).unwrap();
+            assert!(v4.iter().all(|&x| x == 42.0), "barrier сломан: {v4:?}");
+        }
+        ctx.gemm_nt_quantized(&a, &b, &c).unwrap();
+        let cv = c.to_cpu_f32(&ctx).unwrap();
+        // микро-бенч: gemm 16×4096×4096 Q8_0 (как prefill-верификация)
+        {
+            let m16 = 16usize;
+            let k16 = 4096usize;
+            let n16 = 4096usize;
+            let b16 = GpuTensor::from_quantized(&ctx.device, &bytes_rep(n16, k16), vec![n16, k16], GpuDtype::Q8_0).unwrap();
+            let a16 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.5f32; m16 * k16], vec![m16, k16]).unwrap();
+            let c16 = GpuTensor::zeros(&ctx.device, vec![m16, n16]).unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..3 {
+                ctx.gemm_nt_quantized(&a16, &b16, &c16).unwrap();
+            }
+            eprintln!("micro: gemm 16x4096x4096 Q8_0 = {:.1}ms", t0.elapsed().as_secs_f64() * 1e3 / 3.0);
+        }
+        // CPU: C[0][0] = 0 (a0·q0: 1*0=0); C[0][1] = 31; C[1][0] = Σi*i = 9455
+        let exp = vec![0.0, 31.0, 10416.0, (0..32).map(|i| (i * (31 - i)) as f32).sum()];
+        assert_eq!(cv, exp, "batch Q8_0 m=2: got {cv:?} expected {exp:?}");
+        // m=1: только строка 0
+        let a1 = GpuTensor::from_cpu_f32(&ctx.device, &ad[..32], vec![1, 32]).unwrap();
+        let c1 = GpuTensor::zeros(&ctx.device, vec![1, 2]).unwrap();
+        ctx.gemm_nt_quantized(&a1, &b, &c1).unwrap();
+        let cv1 = c1.to_cpu_f32(&ctx).unwrap();
+        assert_eq!(cv1, vec![0.0, 31.0], "batch Q8_0 m=1: got {cv1:?}");
+        // единица на j=31 в строке 1 (лишний член?)
+        let mut ad2 = vec![0f32; 2 * 32];
+        ad2[32 + 31] = 1.0;
+        let a2 = GpuTensor::from_cpu_f32(&ctx.device, &ad2, vec![2, 32]).unwrap();
+        let c2 = GpuTensor::zeros(&ctx.device, vec![2, 2]).unwrap();
+        ctx.gemm_nt_quantized(&a2, &b, &c2).unwrap();
+        let cv2 = c2.to_cpu_f32(&ctx).unwrap();
+        assert_eq!(cv2, vec![0.0, 0.0, 31.0, 0.0], "единица j=31: got {cv2:?}");
     }
 }

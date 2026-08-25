@@ -119,11 +119,12 @@ impl Qwen3Config {
     }
 }
 
-struct Qwen3Layer {
-    attn_norm: RmsNorm,
-    attn: Attention,
-    ffn_norm: RmsNorm,
-    ffn: SwiGLU,
+#[derive(Debug, Clone)]
+pub struct Qwen3Layer {
+    pub attn_norm: RmsNorm,
+    pub attn: Attention,
+    pub ffn_norm: RmsNorm,
+    pub ffn: SwiGLU,
 }
 
 /// Qwen3-модель (decode-состояние: KV-кэши в слоях).
@@ -819,7 +820,7 @@ fn upload_w(
 
 /// Стандартный rotate-half RoPE (HF/Qwen3) через backend-оп
 /// (Metal — кернел rope_std_f32; CPU — референс-вычисление).
-fn rope_standard(
+pub fn rope_standard(
     backend: &dyn Backend,
     x: &Tensor,
     pos: usize,

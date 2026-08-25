@@ -25,6 +25,7 @@ pub mod concurrency;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod dflash;
 pub mod dtype;
 pub mod error;
 pub mod gguf;

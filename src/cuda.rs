@@ -130,17 +130,35 @@ pub struct CudaBackend {
     /// Activation compute dtype for GEMM A-operands (the plan's activation
     /// axis — `set_activation_dtype`; 0=f32, 1=f16, 2=bf16).
     activation: std::sync::atomic::AtomicU8,
+    /// True when the native sm_120 CUBIN was loaded — the mma.sync tensor-
+    /// core kernels keep the documented fragment layouts only there (the
+    /// compute_86 PTX → sm_120 JIT miscompiles the C fragment order).
+    has_cubin: bool,
 }
 
 impl CudaBackend {
     pub fn new(ordinal: usize) -> Result<Self, BackendError> {
         let dev = CudaContext::new(ordinal).map_err(map_err)?;
         let stream = dev.default_stream();
-        // The PTX is embedded at compile time (include_str!): reading it from
-        // the OUT_DIR path at runtime would break on any other machine — the
-        // container has no such path (CUDA_ERROR_FILE_NOT_FOUND).
-        let ptx = Ptx::from_src(include_str!(concat!(env!("OUT_DIR"), "/kernels.ptx")));
-        let module = dev.load_module(ptx).map_err(map_err)?;
+        // The CUBIN (sm_120, Blackwell) is embedded at compile time
+        // (include_bytes!): loading it first keeps the tensor-core fragment
+        // layouts intact; the compute_86 PTX (JIT) is the fallback for the
+        // older architectures and hosts without a regenerated CUBIN.
+        let (module, has_cubin) = {
+            let cubin =
+                include_bytes!(concat!(env!("OUT_DIR"), "/kernels.sm120.cubin")).to_vec();
+            match dev.load_module(Ptx::from_binary(cubin)) {
+                Ok(m) => (m, true),
+                Err(e) => {
+                    eprintln!("cubin load failed ({e}) — falling back to PTX JIT");
+                    let ptx = Ptx::from_src(include_str!(concat!(
+                        env!("OUT_DIR"),
+                        "/kernels.ptx"
+                    )));
+                    (dev.load_module(ptx).map_err(map_err)?, false)
+                }
+            }
+        };
         Ok(Self {
             dev,
             stream,
@@ -151,6 +169,7 @@ impl CudaBackend {
             pool_f16: Arc::new(Mutex::new(HashMap::new())),
             pool_bf16: Arc::new(Mutex::new(HashMap::new())),
             activation: std::sync::atomic::AtomicU8::new(0),
+            has_cubin,
         })
     }
 
@@ -264,6 +283,20 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Tensor-core GEMM toggle (`CUDA_GEMM_MMA=1`): the raw mma.sync
+    /// m16n8k16 kernels cast the A rows to f16 — faster, but HMMA on sm_120
+    /// accumulates with ~0.5·sqrt(k)% error (2.6% at k=8192), so the path
+    /// is opt-in; the default f32-accumulating kernels stay the production
+    /// path.
+    fn mma_enabled(&self) -> bool {
+        static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MMA.get_or_init(|| {
+            std::env::var("CUDA_GEMM_MMA")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
     /// Return the activation cast scratch (if any) to its pool.
     fn pool_a_scratch(&self, a_arg: KernA) {
         match a_arg {
@@ -325,48 +358,70 @@ impl CudaBackend {
         let c = c.as_cuda_mut();
         let grid_x = (n + 255) / 256;
         let act = self.activation_dtype();
-        let (tiled_name, splitk_name): (&'static str, &'static str) = match (b_suf, act) {
-            ("bf16", crate::dtype::Dtype::F16) => {
-                ("gemm_halfw_tiled_f16_bf16", "gemm_halfw_splitk_f16_bf16")
-            }
-            ("bf16", crate::dtype::Dtype::BF16) => {
-                ("gemm_halfw_tiled_bf16_bf16", "gemm_halfw_splitk_bf16_bf16")
-            }
-            ("bf16", _) => ("gemm_halfw_tiled_f32_bf16", "gemm_halfw_splitk_f32_bf16"),
-            ("f16", crate::dtype::Dtype::F16) => {
-                ("gemm_halfw_tiled_f16_f16", "gemm_halfw_splitk_f16_f16")
-            }
-            ("f16", crate::dtype::Dtype::BF16) => {
-                ("gemm_halfw_tiled_bf16_f16", "gemm_halfw_splitk_bf16_f16")
-            }
-            ("f16", _) => ("gemm_halfw_tiled_f32_f16", "gemm_halfw_splitk_f32_f16"),
-            _ => unreachable!("gemm_halfw_nt: unknown weight suffix {b_suf}"),
-        };
+        let (tiled_name, mma_name, splitk_name): (&'static str, &'static str, &'static str) =
+            match (b_suf, act) {
+                ("bf16", crate::dtype::Dtype::F16) => (
+                    "gemm_halfw_tiled_f16_bf16",
+                    "gemm_halfw_tiled_mma_bf16",
+                    "gemm_halfw_splitk_f16_bf16",
+                ),
+                ("bf16", crate::dtype::Dtype::BF16) => (
+                    "gemm_halfw_tiled_bf16_bf16",
+                    "gemm_halfw_tiled_mma_bf16",
+                    "gemm_halfw_splitk_bf16_bf16",
+                ),
+                ("bf16", _) => (
+                    "gemm_halfw_tiled_f32_bf16",
+                    "gemm_halfw_tiled_mma_bf16",
+                    "gemm_halfw_splitk_f32_bf16",
+                ),
+                ("f16", crate::dtype::Dtype::F16) => (
+                    "gemm_halfw_tiled_f16_f16",
+                    "gemm_halfw_tiled_mma_f16",
+                    "gemm_halfw_splitk_f16_f16",
+                ),
+                ("f16", crate::dtype::Dtype::BF16) => (
+                    "gemm_halfw_tiled_bf16_f16",
+                    "gemm_halfw_tiled_mma_f16",
+                    "gemm_halfw_splitk_bf16_f16",
+                ),
+                ("f16", _) => (
+                    "gemm_halfw_tiled_f32_f16",
+                    "gemm_halfw_tiled_mma_f16",
+                    "gemm_halfw_splitk_f32_f16",
+                ),
+                _ => unreachable!("gemm_halfw_nt: unknown weight suffix {b_suf}"),
+            };
         let a_arg: KernA = match act {
             crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
             crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
             _ => KernA::F32(a),
         };
         if m > 1 {
-            // m>1: the AT-variant tiled kernel (32 rows × 256 cols, grid.z=16
-            // splits k into (16·m, n) partials — combined by gemm_i8_reduce
-            // in a fixed order — deterministic). NOTE: tensor-core variants
-            // (wmma AND raw mma.sync m16n8k16) were implemented and removed:
-            // wmma traps on the sm_120 JIT of the compute_86 PTX (invalid
-            // shared access in the wmma emulation), and raw mma.sync shows a
-            // non-doc C-fragment layout (rows r0+rt·16 carry ~8% errors) —
-            // the compute_86 PTX → sm_120 JIT path is incompatible with
-            // tensor cores; a direct sm_120 cubin build is the recorded
-            // follow-up. prefill/STT beat cuBLAS without tensor cores.
+            // m>1: the TENSOR-CORE kernel (raw mma.sync m16n8k16) — opt-in
+            // via CUDA_GEMM_MMA=1 and requires the native sm_120 CUBIN (the
+            // compute_86 PTX → sm_120 JIT miscompiles the C-fragment order).
+            // NOTE on accuracy: HMMA on sm_120 accumulates with ~0.5·sqrt(k)%
+            // error (2.6% measured at k=8192 — the f16 inputs alone give
+            // 1.5e-5), so the tensor-core path stays opt-in; the default
+            // f32-accumulating tiled kernel is the production path. The
+            // f16/bf16 activation axis keeps the AT-variant tiled kernel.
+            let use_mma = self.mma_enabled()
+                && self.has_cubin
+                && matches!(a_arg, KernA::F32(_));
+            let fname = if use_mma { mma_name } else { tiled_name };
             let s16 = 16usize;
             let cpart = self.take_pooled(s16 * m * n)?;
-            let f = self.function(tiled_name)?;
+            let f = self.function(fname)?;
+            // MMA kernel: 32-col blocks (8 warps × 16×8); tiled: 256-col.
+            let gx = if use_mma { (n + 31) / 32 } else { grid_x };
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                grid_dim: (gx as u32, ((m + 31) / 32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
             let mut la = self.stream.launch_builder(&f);
+            let a_arg = if use_mma { KernA::F32(a) } else { a_arg };
             match &a_arg {
                 KernA::F32(t) => la.arg(t.as_cuda()),
                 KernA::F16(sl) => la.arg(sl),
@@ -379,7 +434,9 @@ impl CudaBackend {
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             self.reduce_and_pool(cpart, c, m, n, 16)?;
-            self.pool_a_scratch(a_arg);
+            if !use_mma {
+                self.pool_a_scratch(a_arg);
+            }
             return Ok(());
         }
         let nblk = k / 32;

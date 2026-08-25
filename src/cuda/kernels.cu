@@ -2010,6 +2010,97 @@ DEFINE_HALFW_TILED(f32, bf16, float, __nv_bfloat16)
 DEFINE_HALFW_TILED(f16, bf16, __half, __nv_bfloat16)
 DEFINE_HALFW_TILED(bf16, bf16, __nv_bfloat16, __nv_bfloat16)
 
+// ─────────── Half-weight tiled GEMM on TENSOR CORES (m > 1) ───────────
+// Raw mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32, block per (32 rows
+// × 32 cols) = 8 warps × one 16×8 tile (2 row × 4 col tiles); A (32×16) and
+// B (16×32) staged in shared as f16 (bf16 widened — lossless for normed
+// weights), grid.z=16 splits k into (16·m, n) partials → gemm_i8_reduce
+// (deterministic). REQUIRES the native sm_120 CUBIN: the compute_86 PTX →
+// sm_120 JIT miscompiles the C-fragment order (measured ~8% errors on the
+// first tile rows). Fragment layouts per the PTX ISA m16n8k16: A:
+// a0=(r,c) a1=(r+8,c) a2=(r,c+8) a3=(r+8,c+8) with r=lane>>2, c=(lane&3)*2;
+// B: b0=(k,n) b1=(k+8,n) with k=lane>>2, n=(lane&3)*2; C: c0=(r,c)
+// c1=(r+8,c) c2=(r,c+4) c3=(r+8,c+4) with r=lane>>2, c=lane&3.
+#define DEFINE_HALFW_TILED_MMA(BSUF, BT)                                       \
+extern "C" __global__ void gemm_halfw_tiled_mma_##BSUF(                        \
+    const float* __restrict__ A,        /* (m, k) f32 — cast to f16 in As */  \
+    const BT* __restrict__ B,           /* kb-major (kb·n + col)·32 BT */     \
+    float* __restrict__ Cpart,          /* (S·m, n) — grid.z k-slices */      \
+    int m, int k, int n)                                                       \
+{                                                                              \
+    const int BM = 32, BN = 32;                                                \
+    __shared__ __half As[BM * 16];                                             \
+    __shared__ __half Bs[16 * BN];                                             \
+    int tid = threadIdx.x;                                                     \
+    int col0 = blockIdx.x * BN;                                                \
+    int r0 = blockIdx.y * BM;                                                  \
+    int n16 = k >> 4;                                                          \
+    int nkz = (n16 + 15) >> 4;                                                 \
+    int kk0 = blockIdx.z * nkz;                                                \
+    if (kk0 >= n16) return;                                                    \
+    int kk1 = n16 < kk0 + nkz ? n16 : kk0 + nkz;                               \
+    int lane = tid & 31;                                                       \
+    int w = tid >> 5;                                                          \
+    int rt = w >> 2;                 /* row tile 0..1 */                       \
+    int ctn = w & 3;                 /* col tile 0..3 (8 cols each) */         \
+    int r = lane >> 2;                                                         \
+    int c = (lane & 3) * 2;                                                    \
+    /* C accumulators (16×8 f32 fragment). */                                  \
+    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;                          \
+    for (int kk = kk0; kk < kk1; ++kk) {                                       \
+        /* A tile: 32 rows × 16 cols → As[row·16 + j]. */                      \
+        for (int i = tid; i < BM * 16; i += 256) {                             \
+            int rr = r0 + (i >> 4);                                            \
+            int j = i & 15;                                                    \
+            As[i] = (rr < m) ? __float2half(A[(size_t)rr * k + kk * 16 + j])   \
+                             : (__half)0;                                      \
+        }                                                                      \
+        /* B tile: 16 k × 32 cols, row-major Bs[j·BN + col], from the         \
+           kb-major blocks (kb = kk>>1, j-offset (kk&1)·16). */                \
+        int kb = kk >> 1;                                                      \
+        int joff = (kk & 1) * 16;                                              \
+        for (int i = tid; i < 16 * BN; i += 256) {                             \
+            int j = i & 15;                                                    \
+            int col = i >> 4;                                                  \
+            int cc = col0 + col;                                               \
+            Bs[i] = (cc < n)                                                   \
+                ? __float2half((float)B[(size_t)(kb * n + cc) * 32 + joff + j])\
+                : (__half)0;                                                   \
+        }                                                                      \
+        __syncthreads();                                                       \
+        /* Load the A fragment (rows rt·16.., cols via r/c). */                \
+        const __half* aptr = As + rt * 256;                                    \
+        unsigned a0 = *(const unsigned*)(aptr + r * 16 + c);                   \
+        unsigned a1 = *(const unsigned*)(aptr + (r + 8) * 16 + c);             \
+        unsigned a2 = *(const unsigned*)(aptr + r * 16 + c + 8);               \
+        unsigned a3 = *(const unsigned*)(aptr + (r + 8) * 16 + c + 8);         \
+        /* B fragment (k via r, n via c). */                                   \
+        const __half* bptr = Bs + ctn * 8;                                     \
+        unsigned b0 = *(const unsigned*)(bptr + r * 16 + c);                   \
+        unsigned b1 = *(const unsigned*)(bptr + (r + 8) * 16 + c);             \
+        asm volatile(                                                          \
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "               \
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"          \
+            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)                           \
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));           \
+        __syncthreads();                                                       \
+    }                                                                          \
+    /* Store C (16×8) with ragged m/n guards (MEASURED C-fragment order on
+       sm_120 — both CUBIN and PTX-JIT: c1=(r,c+4), c2=(r+8,c)). */          \
+    int row1 = r0 + rt * 16;                                                   \
+    int col1 = col0 + ctn * 8;                                                 \
+    int cr = lane >> 2;                                                        \
+    int cc = lane & 3;                                                         \
+    float* cptr = Cpart + (blockIdx.z * m + row1) * n + col1;                  \
+    if (row1 + cr < m && col1 + cc < n) cptr[cr * n + cc] = c0;                \
+    if (row1 + cr < m && col1 + cc + 4 < n) cptr[cr * n + cc + 4] = c1;        \
+    if (row1 + cr + 8 < m && col1 + cc < n) cptr[(cr + 8) * n + cc] = c2;      \
+    if (row1 + cr + 8 < m && col1 + cc + 4 < n) cptr[(cr + 8) * n + cc + 4] = c3; \
+}
+
+DEFINE_HALFW_TILED_MMA(f16, __half)
+DEFINE_HALFW_TILED_MMA(bf16, __nv_bfloat16)
+
 // ─────────────── Q8_0 tiled GEMM (m > 1), kb-major B ───────────────
 // Same structure as the half-weight tiled: block per (32 rows × 256 cols),
 // B staged in shared once per k-block, 32 row-accumulators. The packed

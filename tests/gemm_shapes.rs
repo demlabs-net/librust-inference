@@ -258,7 +258,7 @@ fn check_half(
         }
         assert!(
             ok,
-            "half gemm_nt [{m}x{k}x{n}] w={} act={:?} [{i}]: gpu {} cpu {}",
+            "half gemm_nt [{m}x{k}x{n}] w={} act={:?} [{i}]: gpu {} cpu {} (tol {tol})",
             if wf16 { "f16" } else { "bf16" },
             act,
             g[i],

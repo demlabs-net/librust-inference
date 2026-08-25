@@ -2011,3 +2011,41 @@ kernel void tg_barrier_test(
     C[tid] = v[0];
 }
 
+
+// ── Q8_0 поточечный GEMM, float4 (Ф2.5, prefill m>1) ───────────────────────
+// A-чтения float4 (4 FMA на чтение — узкое место было L2-чтения 2:1 к FMA);
+// аккумулятор per-block float4 + скалярная сумма по блокам (порядок ближе
+// к последовательному). A-буферы свежие (offset 0, MTLBuffer выровнен 16).
+kernel void gemm_nt_q8_0_f4(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + (n * blocks + b) * 34;
+        float d = (float)load_half_unaligned(blk);
+        device const int8_t* q = (device const int8_t*)(blk + 2);
+        uint k0 = b * 32;
+        device const float* arow = A + m * K + k0;
+        float4 acc4 = 0.0f;
+        for (uint j4 = 0; j4 < 8; ++j4) {
+            float4 a4 = *(device const float4*)(arow + j4 * 4);
+            float4 q4;
+            q4.x = (float)q[j4 * 4 + 0];
+            q4.y = (float)q[j4 * 4 + 1];
+            q4.z = (float)q[j4 * 4 + 2];
+            q4.w = (float)q[j4 * 4 + 3];
+            acc4 += a4 * (q4 * d);
+        }
+        acc += acc4.x + acc4.y + acc4.z + acc4.w;
+    }
+    C[m * N + n] = acc;
+}

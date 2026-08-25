@@ -685,6 +685,9 @@ impl MetalCtx {
             })?;
             return Ok(());
         }
+        // gemm_nt_q8_0_f4 (float4) отключён: 3.5мс vs 2.6мс скалярного —
+        // узкое место — инструкции (каст q + mul d), не чтения; кернел
+        // оставлен заделом в kernels.metal.
         let grid = MTLSize::new(m as u64, n as u64, 1);
         let group = MTLSize::new(8, 8, 1);
         self.run(name, grid, group, |enc| {

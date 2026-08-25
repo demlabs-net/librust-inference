@@ -46,6 +46,8 @@ pub struct DFlashModel {
     /// Эмбеддинги — ОБЩИЕ с таргетом (драфтер их не имеет — берутся у таргета).
     pub target_embed: Option<Tensor>,
     pub layers: Vec<DFlashLayer>,
+    /// Финальная нормализация драфтера (result_norm; своя, не таргета).
+    pub out_norm: RmsNorm,
     pub selector: Option<Selector>,
     pub caches: Vec<KvCache>,
     pub block_size: usize,
@@ -143,10 +145,19 @@ impl DFlashModel {
             None
         };
         let _ = up;
+        let out_norm = RmsNorm::from_weights(
+            backend,
+            dequant_f32(
+                w.get("output_norm.weight")
+                    .ok_or_else(|| BackendError::Shape("missing tensor output_norm.weight".into()))?,
+            ),
+            cfg.norm_eps,
+        )?;
         Ok(Self {
             cfg,
             target_embed: None,
             layers,
+            out_norm,
             selector,
             caches,
             block_size,
@@ -191,6 +202,145 @@ impl DFlashModel {
         backend.end_batch()?;
         r
     }
+
+    /// Диффузия token-режима (dflash.cpp build_graph): mask-патч `ids`
+    /// ([committed..., MASK...]) → dense+conv слои. Порядок слоя:
+    /// attn_norm → conv_in(noise) → qkv/rope/attn (non-causal, по кэшу) →
+    /// conv_out → +inpL → ffn_norm → conv_in → swiglu → conv_out → +ffn_inp.
+    /// Логиты — через lm_head ТАРГЕТА (общий; спека: "lm_head from the target
+    /// model"), скрытые — свой out_norm (t_embd, для селектора v2).
+    /// ВНИМАНИЕ: мутирует кэши (пишет k/v draft-токенов) — после шага
+    /// вызывающий должен откатить кэши до инжектной длины.
+    pub fn diffuse(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        lm_head: &Tensor,
+    ) -> Result<DiffusionResult, BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let embed = self
+                .target_embed
+                .as_ref()
+                .ok_or_else(|| {
+                    BackendError::Shape("diffuse: не установлен target_embed — драфтер без общих эмбеддингов".into())
+                })?
+                .clone();
+            let mut x = backend.zeros(vec![1, t, self.cfg.dim])?;
+            backend.embedding(ids, &embed, &mut x)?;
+            for (i, layer) in self.layers.iter().enumerate() {
+                // ── attn-часть ──
+                let mut h = layer.dense.attn_norm.forward(backend, &x)?;
+                let attn_dyn = match &layer.attn_conv.proj {
+                    Some(p) => Some(conv_dynamic(backend, p, &h)?),
+                    None => None,
+                };
+                if let Some(d) = &attn_dyn {
+                    h = conv_side(backend, &h, &layer.attn_conv.base, d, 0, self.block_size)?;
+                }
+                let pos = self.caches[i].pos;
+                let mut cur = crate::qwen3::Qwen3Model::rope_and_attn(
+                    &self.cfg,
+                    backend,
+                    &h,
+                    &layer.dense.attn,
+                    &mut self.caches[i],
+                    pos,
+                    t,
+                    None,
+                    false,
+                )?;
+                if let Some(d) = &attn_dyn {
+                    cur = conv_side(backend, &cur, &layer.attn_conv.base, d, 1, self.block_size)?;
+                }
+                let ffn_inp = add(backend, &cur, &x)?;
+                // ── ffn-часть ──
+                let mut h = layer.dense.ffn_norm.forward(backend, &ffn_inp)?;
+                let ffn_dyn = match &layer.ffn_conv.proj {
+                    Some(p) => Some(conv_dynamic(backend, p, &h)?),
+                    None => None,
+                };
+                if let Some(d) = &ffn_dyn {
+                    h = conv_side(backend, &h, &layer.ffn_conv.base, d, 0, self.block_size)?;
+                }
+                let mut f = crate::qwen3::ffn_forward(backend, &h, &layer.dense.ffn)?;
+                if let Some(d) = &ffn_dyn {
+                    f = conv_side(backend, &f, &layer.ffn_conv.base, d, 1, self.block_size)?;
+                }
+                x = add(backend, &f, &ffn_inp)?;
+            }
+            let hidden = self.out_norm.forward(backend, &x)?;
+            let logits = crate::nn::Linear {
+                w: lm_head.clone(),
+                b: None,
+            }
+            .forward(backend, &hidden)?;
+            Ok(DiffusionResult { logits, hidden })
+        })();
+        backend.end_batch()?;
+        r
+    }
+
+    /// Сброс кэшей до инжектной длины (после диффузии; spec-decode
+    /// сохраняет только принятые токены).
+    pub fn truncate_caches(&mut self, inject_len: usize) {
+        for c in &mut self.caches {
+            c.pos = inject_len;
+        }
+    }
+}
+
+/// Результат диффузии: логиты (lm_head таргета) + скрытые (свой out_norm).
+pub struct DiffusionResult {
+    pub logits: Tensor, // [1, T, V]
+    pub hidden: Tensor, // [1, T, D]
+}
+
+/// conv-проекция шума: dynamic = proj(x) — [n_groups·k·2, T].
+fn conv_dynamic(
+    backend: &dyn Backend,
+    proj: &Tensor,
+    x: &Tensor,
+) -> Result<Tensor, BackendError> {
+    let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+    let x2 = x.view(vec![b * t, d]);
+    let y = backend.zeros(vec![proj.shape()[0], b * t])?;
+    backend.gemm_nt(&x2, proj, &y)?;
+    Ok(y)
+}
+
+/// Один tap-конв (side: 0 = вход, 1 = выход) по формуле спеки.
+fn conv_side(
+    backend: &dyn Backend,
+    x: &Tensor,
+    base: &Tensor,
+    dynamic: &Tensor,
+    side: usize,
+    block_size: usize,
+) -> Result<Tensor, BackendError> {
+    let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+    let kernel = base.shape()[1];
+    let n_groups = dynamic.shape()[0] / (kernel * 2);
+    let group = d / n_groups;
+    let y = backend.zeros(x.shape().to_vec())?;
+    backend.dflash2_conv(
+        &x.view(vec![b * t, d]),
+        base,
+        dynamic,
+        &y.view(vec![b * t, d]),
+        kernel,
+        group,
+        block_size,
+        side,
+    )?;
+    Ok(y)
+}
+
+fn add(backend: &dyn Backend, a: &Tensor, b: &Tensor) -> Result<Tensor, BackendError> {
+    let y = backend.zeros(a.shape().to_vec())?;
+    backend.add(a, b, &y)?;
+    Ok(y)
 }
 
 fn load_dense_layer(
@@ -368,6 +518,24 @@ mod tests {
             },
             vec![c.dim, 40],
         ));
+        st.push((
+            "output_norm.weight".into(),
+            {
+                let mut v = vec![0f32; c.dim];
+                rng.fill(&mut v);
+                v
+            },
+            vec![c.dim],
+        ));
+        st.push((
+            "output.weight".into(),
+            {
+                let mut v = vec![0f32; c.vocab_size * c.dim];
+                rng.fill(&mut v);
+                v
+            },
+            vec![c.vocab_size, c.dim],
+        ));
         st
     }
 
@@ -419,5 +587,156 @@ mod tests {
         assert_eq!(m.layers[0].attn_conv.base.shape(), &[16, 3, 2]);
         assert_eq!(m.layers[0].attn_conv.proj.as_ref().unwrap().shape(), &[24, 16]);
         let _ = m;
+    }
+
+    #[test]
+    fn dflash2_conv_metal_matches_cpu() {
+        // Спека PR #27342: y[t,i] = Σ_tap (coeff + base)·x_block[t−tap,i],
+        // сдвиг ВНУТРИ блока (паддинг нулями на границах), coeff по группам.
+        use crate::harness::Lcg;
+        let backend = MetalBackend::new().unwrap();
+        let cpu = crate::cpu::CpuBackend::default();
+        let (tokens, dim, kernel, group, block) = (9usize, 16usize, 3usize, 4usize, 4usize);
+        let n_groups = dim / group; // 4
+        let mut rng = Lcg::new(7);
+        let mut xd = vec![0f32; tokens * dim];
+        let mut bd = vec![0f32; dim * kernel * 2];
+        let mut dd = vec![0f32; n_groups * kernel * 2 * tokens];
+        rng.fill(&mut xd);
+        rng.fill(&mut bd);
+        rng.fill(&mut dd);
+        let xt = backend.from_cpu_f32(&xd, vec![tokens, dim]).unwrap();
+        let bt = backend.from_cpu_f32(&bd, vec![dim, kernel, 2]).unwrap();
+        let dt = backend
+            .from_cpu_f32(&dd, vec![n_groups * kernel * 2, tokens])
+            .unwrap();
+        let (xc, bc, dc) = (
+            cpu.from_cpu_f32(&xd, vec![tokens, dim]).unwrap(),
+            cpu.from_cpu_f32(&bd, vec![dim, kernel, 2]).unwrap(),
+            cpu.from_cpu_f32(&dd, vec![n_groups * kernel * 2, tokens]).unwrap(),
+        );
+        for side in [0usize, 1] {
+            let ym = backend
+                .from_cpu_f32(&vec![0f32; tokens * dim], vec![tokens, dim])
+                .unwrap();
+            let yc = cpu
+                .from_cpu_f32(&vec![0f32; tokens * dim], vec![tokens, dim])
+                .unwrap();
+            backend
+                .dflash2_conv(&xt, &bt, &dt, &ym, kernel, group, block, side)
+                .unwrap();
+            cpu.dflash2_conv(&xc, &bc, &dc, &yc, kernel, group, block, side)
+                .unwrap();
+            let md = backend.to_cpu_f32(&ym).unwrap();
+            let cd = cpu.to_cpu_f32(&yc).unwrap();
+            crate::harness::assert_close(
+                &md,
+                &cd,
+                crate::harness::standard_tolerance().0,
+                crate::harness::standard_tolerance().1,
+            )
+            .unwrap_or_else(|e| panic!("side={side}: {e}"));
+        }
+        // Краевой случай: вход 0 → выход 0 при любых весах (паддинг нулями
+        // на границах блоков не вносит мусора).
+        let xz = vec![0f32; tokens * dim];
+        let xzt = backend.from_cpu_f32(&xz, vec![tokens, dim]).unwrap();
+        let yz = backend
+            .from_cpu_f32(&vec![0f32; tokens * dim], vec![tokens, dim])
+            .unwrap();
+        backend
+            .dflash2_conv(&xzt, &bt, &dt, &yz, kernel, group, block, 0)
+            .unwrap();
+        let zd_out = backend.to_cpu_f32(&yz).unwrap();
+        assert!(zd_out.iter().all(|&v| v == 0.0));
+    }
+
+    /// Диффузия = чистый qwen3-forward, когда conv-модули выключены
+    /// (proj=None в storage): те же эмбеддинги, dense-слои, out_norm,
+    /// lm_head таргета. При t=1 non-causal attn тождествен causal.
+    #[test]
+    fn diffuse_matches_qwen3_forward_without_conv() {
+        use crate::nn::{Embedding, Linear};
+        let backend = MetalBackend::new().unwrap();
+        let c = cfg();
+        let st = storage(&c);
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut layout: Vec<(String, Vec<u64>, u64, usize)> = Vec::new();
+        for (name, data, shape) in &st {
+            if name.ends_with("_conv_proj") {
+                continue; // conv-модули выключены
+            }
+            let off = bytes.len();
+            for v in data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            layout.push((
+                name.clone(),
+                shape.iter().map(|&d| d as u64).collect(),
+                off as u64,
+                data.len() * 4,
+            ));
+        }
+        let tensors = layout
+            .into_iter()
+            .map(|(name, shape, off, len)| crate::weights_map::WeightTensor {
+                name,
+                shape,
+                format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
+                offset: off,
+                data: &bytes[off as usize..off as usize + len],
+            })
+            .collect();
+        let wm = crate::weights_map::WeightsMap {
+            arch: "dflash".into(),
+            tensors,
+            storage: vec![crate::weights_map::Storage {
+                offset: 0,
+                data: &bytes,
+            }],
+        };
+        let mut qwen = crate::qwen3::Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
+        let mut dflash = DFlashModel::load(&backend, &wm, c.clone(), 16, 3, 4, vec![0]).unwrap();
+        assert!(dflash.layers[0].attn_conv.proj.is_none());
+        // общие эмбеддинги (те же данные, что у qwen)
+        let ew = dequant_f32(wm.get("token_embd.weight").unwrap());
+        let embed = Embedding::from_weights(&backend, ew, vec![c.vocab_size, c.dim]).unwrap();
+        dflash.set_target_embed(embed.table.clone());
+        // lm_head таргета (f16, как Qwen3Model::load)
+        let ow = dequant_f32(wm.get("output.weight").unwrap());
+        let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
+        let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
+
+        // t=1: каузальная маска не строится ни в одном пути — пути тождественны
+        let ids = [3u32];
+        let h = qwen.forward_hidden(&backend, &ids).unwrap();
+        let d = dflash.diffuse(&backend, &ids, &lm_head).unwrap();
+        crate::harness::assert_close(
+            &backend.to_cpu_f32(&d.hidden).unwrap(),
+            &backend.to_cpu_f32(&h).unwrap(),
+            1e-3,
+            1e-4,
+        )
+        .unwrap();
+        let lq = Linear {
+            w: lm_head.clone(),
+            b: None,
+        }
+        .forward(&backend, &h)
+        .unwrap();
+        crate::harness::assert_close(
+            &backend.to_cpu_f32(&d.logits).unwrap(),
+            &backend.to_cpu_f32(&lq).unwrap(),
+            2e-3,
+            1e-4,
+        )
+        .unwrap();
+
+        // t=2: non-causal диффузия (взаимный attn) — только проверка конечности
+        let ids2 = [3u32, 5];
+        let d2 = dflash.diffuse(&backend, &ids2, &lm_head).unwrap();
+        let lg = backend.to_cpu_f32(&d2.logits).unwrap();
+        assert!(lg.iter().all(|v| v.is_finite()));
+        dflash.truncate_caches(0);
     }
 }

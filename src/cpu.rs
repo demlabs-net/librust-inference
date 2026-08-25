@@ -239,6 +239,46 @@ impl Backend for CpuBackend {
         let _ = ffn;
         Ok(())
     }
+    fn dflash2_conv(
+        &self,
+        x: &Tensor,
+        base: &Tensor,
+        dynamic: &Tensor,
+        y: &Tensor,
+        kernel: usize,
+        group_size: usize,
+        block_size: usize,
+        side: usize,
+    ) -> Result<(), BackendError> {
+        // CPU-референс спеки PR #27342: y[t,i] = Σ_tap (coeff + base)·x[t−tap],
+        // coeff = DYN[(g·k+tap)·2+side, t], g = i/group_size, сдвиг в блоке.
+        let (n_tokens, n_embd) = (y.shape()[0], y.shape()[1]);
+        let xr = x.cpu_read();
+        let br = base.cpu_read();
+        let dr = dynamic.cpu_read();
+        let mut yr = y.cpu_write();
+        let n_groups = n_embd / group_size;
+        for t in 0..n_tokens {
+            let blk = t / block_size;
+            let pos = t % block_size;
+            for i in 0..n_embd {
+                let g = i / group_size;
+                let mut acc = 0.0f32;
+                for tap in 0..kernel {
+                    let v = if pos >= tap {
+                        xr[(blk * block_size + (pos - tap)) * n_embd + i]
+                    } else {
+                        0.0
+                    };
+                    let coeff = dr[((g * kernel + tap) * 2 + side) * n_tokens + t];
+                    let b = br[i * kernel * 2 + tap * 2 + side];
+                    acc += (coeff + b) * v;
+                }
+                yr[t * n_embd + i] = acc;
+            }
+        }
+        Ok(())
+    }
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // tanh approximation (GPT-2 style), f32 compute.
         elemwise(x, y, |v| {

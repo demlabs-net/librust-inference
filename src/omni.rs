@@ -920,7 +920,7 @@ mod tests {
         // layernorm 3D [1, 20, 1280] метал vs CPU
         let ln_x: Vec<f32> = (0..20 * 1280).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
         let ln_w: Vec<f32> = (0..1280).map(|i| ((i * 104729) % 100) as f32 / 1000.0).collect();
-        let ln_b: Vec<f32> = (0..1280).map(|i| ((i * 15485863) % 100) as f32 / 10000.0).collect();
+        let ln_b: Vec<f32> = (0..1280).map(|i| (((i as u64 * 15485863) % 100) as f32) / 10000.0).collect();
         let m_lnx = mb.from_cpu_f32(&ln_x, vec![1, 20, 1280]).unwrap();
         let m_lnw = mb.from_cpu_f32(&ln_w, vec![1280]).unwrap();
         let m_lnb = mb.from_cpu_f32(&ln_b, vec![1280]).unwrap();

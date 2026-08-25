@@ -852,6 +852,38 @@ impl MetalCtx {
         })
     }
 
+    /// DFlash2 two-tap dynamic conv (спека PR #27342): см. backend.rs.
+    /// Grid (t, i) — каждый поток считает свой выходной элемент.
+    pub fn dflash2_conv_f32(
+        &self,
+        x: &GpuTensor,
+        base: &GpuTensor,
+        dynamic: &GpuTensor,
+        y: &GpuTensor,
+        kernel: usize,
+        group_size: usize,
+        block_size: usize,
+        side: usize,
+    ) -> Result<(), MetalError> {
+        let (n_tokens, n_embd) = (y.shape[0], y.shape[1]);
+        let n_groups = n_embd / group_size;
+        let grid = MTLSize::new(n_tokens as u64, n_embd as u64, 1);
+        let group = MTLSize::new(1, 256, 1);
+        self.run("dflash2_conv_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&base.buffer), base.offset as u64);
+            enc.set_buffer(2, Some(&dynamic.buffer), dynamic.offset as u64);
+            enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(4, 8, (&n_tokens as *const usize).cast());
+            enc.set_bytes(5, 8, (&n_embd as *const usize).cast());
+            enc.set_bytes(6, 8, (&kernel as *const usize).cast());
+            enc.set_bytes(7, 8, (&group_size as *const usize).cast());
+            enc.set_bytes(8, 8, (&block_size as *const usize).cast());
+            enc.set_bytes(9, 8, (&n_groups as *const usize).cast());
+            enc.set_bytes(10, 8, (&side as *const usize).cast());
+        })
+    }
+
     /// ReLU: y[i] = max(x[i], 0) (same shape, may alias).
     pub fn relu_f32(&self, x: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
         let n = x.numel();
@@ -2537,6 +2569,30 @@ impl crate::backend::Backend for MetalBackend {
         ffn: usize,
     ) -> Result<(), crate::error::BackendError> {
         self.ctx.silu_mul_fused_f32(x.as_gpu(), y.as_gpu(), ffn)?;
+        Ok(())
+    }
+
+    fn dflash2_conv(
+        &self,
+        x: &crate::backend::Tensor,
+        base: &crate::backend::Tensor,
+        dynamic: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+        kernel: usize,
+        group_size: usize,
+        block_size: usize,
+        side: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.dflash2_conv_f32(
+            x.as_gpu(),
+            base.as_gpu(),
+            dynamic.as_gpu(),
+            y.as_gpu(),
+            kernel,
+            group_size,
+            block_size,
+            side,
+        )?;
         Ok(())
     }
 

@@ -438,6 +438,7 @@ impl Qwen3Model {
                 pos,
                 t,
                 mrope,
+                true,
             )?;
             x = backend_add(backend, &x, &h)?;
             if prof { prof_attn += t0.elapsed().as_secs_f64(); }
@@ -638,8 +639,9 @@ impl Qwen3Model {
     /// Стандартный rotate-half RoPE (HF) на CPU-хелпере + Attention с
     /// identity-таблицами. `mrope` — per-token M-RoPE позиции (t,h,w,e на
     /// токен, len = t*4): картинка Qwen3-VL видит ВСЮ себя (все t равны),
-    /// текст после картинки — каузально по t.
-    fn rope_and_attn(
+    /// текст после картинки — каузально по t. `causal` — false для диффузии
+    /// DFlash (кэш и draft-токены видят друг друга, маски нет).
+    pub fn rope_and_attn(
         cfg: &Qwen3Config,
         backend: &dyn Backend,
         h: &Tensor,
@@ -648,6 +650,7 @@ impl Qwen3Model {
         pos: usize,
         t: usize,
         mrope: Option<&[u32]>,
+        causal: bool,
     ) -> Result<Tensor, BackendError> {
         // q/k из h через Attention — но Attention применяет interleaved-RoPE
         // сам. Делаем pre-rotation стандартным RoPE и передаём identity-таблицы:
@@ -731,7 +734,7 @@ impl Qwen3Model {
             } else {
                 None
             }
-        } else if t > 1 {
+        } else if causal && t > 1 {
             Some(crate::nn::build_causal_mask(backend, t, cache.pos, pos, cfg.swa_window)?)
         } else {
             None
@@ -832,12 +835,12 @@ pub fn rope_standard(
     backend.rope_standard(x, pos, hd, theta)
 }
 
-fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor, BackendError> {
-    // Qwen3-VL FFN (llama.cpp build_ffn, LLM_FFN_SILU + LLM_FFN_PAR):
-    // silu применяется к GATE-проекции, up остаётся линейным:
-    //   gm = silu(x @ ffn_gate) * (x @ ffn_up) → down.
-    // В GGUF Qwen3-VL ffn_gate/ffn_up лежат именно в этом порядке
-    // (проверено: python-эталон совпал с llama.cpp при silu(gate)*up, corr 1.0).
+/// FFN (Qwen3-VL llama.cpp build_ffn, LLM_FFN_SILU + LLM_FFN_PAR):
+/// silu применяется к GATE-проекции, up остаётся линейным:
+///   gm = silu(x @ ffn_gate) * (x @ ffn_up) → down.
+/// В GGUF Qwen3-VL ffn_gate/ffn_up лежат именно в этом порядке
+/// (проверено: python-эталон совпал с llama.cpp при silu(gate)*up, corr 1.0).
+pub fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor, BackendError> {
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let x2 = x.view(vec![b * t, d]);
     let ffn_dim = ffn.w2.shape()[1];

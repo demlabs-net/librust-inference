@@ -1055,6 +1055,44 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg).map_err(map_err)? };
         Ok(())
     }
+    fn dflash2_conv(
+        &self,
+        x: &Tensor,
+        base: &Tensor,
+        dynamic: &Tensor,
+        y: &Tensor,
+        kernel: usize,
+        group_size: usize,
+        block_size: usize,
+        side: usize,
+    ) -> Result<(), BackendError> {
+        let (n_tokens, n_embd) = (y.shape()[0] as i32, y.shape()[1] as i32);
+        let n_groups = n_embd / group_size as i32;
+        let f = self.function("dflash2_conv_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n_tokens as u32).div_ceil(32),
+                (n_embd as u32).div_ceil(8),
+                1,
+            ),
+            block_dim: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(base.as_cuda());
+        la.arg(dynamic.as_cuda());
+        la.arg(y.as_cuda());
+        la.arg(&n_tokens);
+        la.arg(&n_embd);
+        la.arg(&(kernel as i32));
+        la.arg(&(group_size as i32));
+        la.arg(&(block_size as i32));
+        la.arg(&n_groups);
+        la.arg(&(side as i32));
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        Ok(())
+    }
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         self.elementwise(ElemOp::GeluTanh, x, None, y, 0.0)
     }

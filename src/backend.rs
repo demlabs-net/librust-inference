@@ -747,6 +747,22 @@ pub trait Backend: Send + Sync {
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     /// Fused SwiGLU gate: Y[i] = silu(X[i]) * X[ffn + i]; X [rows, 2*ffn].
     fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError>;
+
+    /// DFlash2 two-tap dynamic conv (спека PR #27342):
+    /// Y[t,i] = Σ_tap (DYN[(g·k+tap)·2+side, t] + BASE[i·k·2 + tap·2 + side]) · X[t−tap, i]
+    /// где g = i/group_size, сдвиг ВНУТРИ блока (t−tap < 0 в блоке → 0).
+    /// X/Y [n_tokens, n_embd], BASE [n_embd, kernel, 2], DYN [n_groups·kernel·2, n_tokens].
+    fn dflash2_conv(
+        &self,
+        x: &Tensor,
+        base: &Tensor,
+        dynamic: &Tensor,
+        y: &Tensor,
+        kernel: usize,
+        group_size: usize,
+        block_size: usize,
+        side: usize,
+    ) -> Result<(), BackendError>;
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
     /// Точный GELU (erf): 0.5·x·(1+erf(x/√2)) — vision (clip/Qwen3-VL)

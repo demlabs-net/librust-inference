@@ -2283,3 +2283,32 @@ extern "C" __global__ void im2col_t1d_f32(
     }
     xc[i] = v;
 }
+
+// DFlash2 two-tap dynamic conv (Ф2.3, спека PR #27342). Grid (t, i).
+extern "C" __global__ void dflash2_conv_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ base,
+    const float* __restrict__ dyn,
+    float* __restrict__ y,
+    int n_tokens, int n_embd, int kernel,
+    int group_size, int block_size, int n_groups, int side)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (t >= n_tokens || i >= n_embd) return;
+    int blk = t / block_size;
+    int pos = t % block_size;
+    int g = i / group_size;
+    float acc = 0.0f;
+    for (int tap = 0; tap < kernel; ++tap) {
+        float v = 0.0f;
+        if (pos >= tap) {
+            int src = blk * block_size + (pos - tap);
+            v = x[src * n_embd + i];
+        }
+        float coeff = dyn[((g * kernel + tap) * 2 + side) * n_tokens + t];
+        float b = base[i * kernel * 2 + tap * 2 + side];
+        acc += (coeff + b) * v;
+    }
+    y[t * n_embd + i] = acc;
+}

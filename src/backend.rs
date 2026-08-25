@@ -1052,6 +1052,24 @@ pub trait Backend: Send + Sync {
         h: usize,
         eps: f32,
     ) -> Result<(), BackendError>;
+    /// Fused per-head RMSNorm + rotate-half RoPE (Ф8): Y = rope(rmsnorm_head(X)).
+    /// X (1, T, h·hd), w [hd], позиции токенов pos..pos+T.
+    /// Default — два шага (rmsnorm_head + rope_standard); Metal — fused-кернел
+    /// (qk_norm+rope в attn — 4 кернела на слой → 2).
+    fn rmsnorm_head_rope(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        h: usize,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let tmp = self.zeros(x.shape().to_vec())?;
+        self.rmsnorm_head(x, w, &tmp, h, eps)?;
+        self.rope_standard(&tmp, pos, hd, theta)
+    }
     /// LayerNorm applied per head: X (rows, h·hd), w/b per head-dim (hd).
     fn layernorm_head(
         &self,

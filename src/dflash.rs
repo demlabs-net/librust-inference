@@ -705,19 +705,23 @@ impl DFlashModel {
                 let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
                 let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
                 let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
-                // qk_norm + rope: noise-токены на [pos..pos+t)
-                let q = crate::qwen3::qk_norm_pub(
-                    backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6,
-                )?;
-                let k = crate::qwen3::qk_norm_pub(
-                    backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6,
-                )?;
-                let q = crate::qwen3::rope_standard(
-                    backend, &q, pos, t, attn.head_dim, self.cfg.rope_theta,
-                )?;
-                let k = crate::qwen3::rope_standard(
-                    backend, &k, pos, t, attn.head_dim, self.cfg.rope_theta,
-                )?;
+                // fused qk_norm+rope (Ф8): noise-токены на [pos..pos+t)
+                let q = match &attn.q_norm {
+                    Some(w) => backend.rmsnorm_head_rope(
+                        &q, w, pos, attn.head_dim, self.cfg.rope_theta, attn.n_heads, 1e-6,
+                    )?,
+                    None => crate::qwen3::rope_standard(
+                        backend, &q, pos, t, attn.head_dim, self.cfg.rope_theta,
+                    )?,
+                };
+                let k = match &attn.k_norm {
+                    Some(w) => backend.rmsnorm_head_rope(
+                        &k, w, pos, attn.head_dim, self.cfg.rope_theta, attn.n_kv_heads, 1e-6,
+                    )?,
+                    None => crate::qwen3::rope_standard(
+                        backend, &k, pos, t, attn.head_dim, self.cfg.rope_theta,
+                    )?,
+                };
                 // прямая инъекция фич (z-lab: concat([k_ctx, k_noise])) —
                 // k_ctx на [pos..pos+ctx), noise следом — кэш непрерывен
                 if let Some(e) = &enc {
@@ -728,12 +732,15 @@ impl DFlashModel {
                     .forward(backend, e)?;
                     let kc = crate::nn::slice_last(backend, &qkv2, kv_size, q_size)?;
                     let vc = crate::nn::slice_last(backend, &qkv2, kv_size, q_size + kv_size)?;
-                    let kc = crate::qwen3::qk_norm_pub(
-                        backend, &kc, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6,
-                    )?;
-                    let kc = crate::qwen3::rope_standard(
-                        backend, &kc, kctx_pos, ctx, attn.head_dim, self.cfg.rope_theta,
-                    )?;
+                    let kc = match &attn.k_norm {
+                        Some(w) => backend.rmsnorm_head_rope(
+                            &kc, w, kctx_pos, attn.head_dim, self.cfg.rope_theta,
+                            attn.n_kv_heads, 1e-6,
+                        )?,
+                        None => crate::qwen3::rope_standard(
+                            backend, &kc, kctx_pos, ctx, attn.head_dim, self.cfg.rope_theta,
+                        )?,
+                    };
                     self.caches[i].update_at(backend, &kc, &vc, past_len)?;
                 }
                 self.caches[i].update_at(backend, &k, &v, past_len + ctx)?;

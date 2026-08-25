@@ -2228,3 +2228,35 @@ kernel void gemm_nt_q8_0_m8f4(
     if (ok6) { float4 v = acc6; C[(mb + 6) * N + n] = v.x + v.y + v.z + v.w; }
     if (ok7) { float4 v = acc7; C[(mb + 7) * N + n] = v.x + v.y + v.z + v.w; }
 }
+
+// ── Fused per-head RMSNorm + rotate-half RoPE (Ф8) ─────────────────────────
+// Y = rope(rmsnorm_head(X)): 4 кернела на слой (qk_norm×2 + rope×2) → 2.
+// X (1, T, H·HD), W [HD]; поток (t, h, i) — пара (i, i+HD/2); позиция pos+t.
+kernel void rmsnorm_head_rope_f32(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& H [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    constant uint& pos [[buffer(7)]],
+    constant float& theta [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, h = gid.y, i = gid.z;
+    if (t >= T || h >= H || i >= HD / 2) return;
+    const device float* row = X + t * (H * HD) + h * HD;
+    float sum = 0.0f;
+    for (uint dd = 0u; dd < HD; ++dd) sum += row[dd] * row[dd];
+    float inv = rsqrt(sum / (float)HD + eps);
+    float p = (float)(pos + t);
+    float fr = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
+    float c = cos(p * fr);
+    float s = sin(p * fr);
+    uint base = t * (H * HD) + h * HD + i;
+    float x0 = row[i] * inv * W[i];
+    float x1 = row[i + HD / 2] * inv * W[i + HD / 2];
+    Y[base] = x0 * c - x1 * s;
+    Y[base + HD / 2] = x1 * c + x0 * s;
+}

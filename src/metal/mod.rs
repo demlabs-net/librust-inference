@@ -2238,6 +2238,37 @@ impl crate::backend::Backend for MetalBackend {
         Ok(y)
     }
 
+    fn rmsnorm_head_rope(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        h: usize,
+        eps: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let y = self.zeros(vec![1, tq, d])?;
+        let xg = x.inner_metal();
+        let wg = w.inner_metal();
+        let yg = y.inner_metal();
+        let grid = metal::MTLSize::new(tq as u64, h as u64, (hd / 2) as u64);
+        let group = metal::MTLSize::new(1, 4, 4);
+        self.ctx.run("rmsnorm_head_rope_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+            enc.set_buffer(1, Some(&wg.buffer), wg.offset as u64);
+            enc.set_buffer(2, Some(&yg.buffer), yg.offset as u64);
+            for (i, v) in [tq, h, hd].iter().enumerate() {
+                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
+            }
+            enc.set_bytes(6, 4, (&eps as *const f32).cast());
+            enc.set_bytes(7, 8, (&pos as *const usize).cast());
+            enc.set_bytes(8, 4, (&theta as *const f32).cast());
+        })?;
+        Ok(y)
+    }
+
     fn rope_mrope_text(
         &self,
         x: &crate::backend::Tensor,

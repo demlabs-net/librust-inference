@@ -857,21 +857,36 @@ impl Qwen3Model {
             (q, k)
         };
         let (q, k) = if let Some(mrope) = mrope {
+            let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
+            let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
             let sects = cfg.mrope_sections.expect("mrope без sections");
             (
                 backend.rope_mrope(&q, mrope, attn.head_dim, cfg.rope_theta, sects)?,
                 backend.rope_mrope(&k, mrope, attn.head_dim, cfg.rope_theta, sects)?,
             )
         } else if let Some(sects) = cfg.mrope_sections {
+            let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
+            let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
             (
                 backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?,
                 backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?,
             )
         } else {
-            (
-                rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
-                rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
-            )
+            // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4; дефолт
+            // (CPU/CUDA) — два шага
+            let q = match &attn.q_norm {
+                Some(w) => backend.rmsnorm_head_rope(
+                    &q, w, pos, attn.head_dim, cfg.rope_theta, attn.n_heads, 1e-6,
+                )?,
+                None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
+            };
+            let k = match &attn.k_norm {
+                Some(w) => backend.rmsnorm_head_rope(
+                    &k, w, pos, attn.head_dim, cfg.rope_theta, attn.n_kv_heads, 1e-6,
+                )?,
+                None => rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
+            };
+            (q, k)
         };
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам

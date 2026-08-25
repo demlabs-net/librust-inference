@@ -19,6 +19,7 @@ use rust_inference::chat_template::{Template, TemplateContext};
 use rust_inference::gguf;
 use rust_inference::metal::MetalBackend;
 use rust_inference::qwen3::{Qwen3Config, Qwen3Model};
+use rust_inference::spec::{Drafter as _, NGramDrafter};
 use rust_inference::tokenizer::{IncrementalDecoder, Tokenizer};
 use rust_inference::weights_map::WeightsMap;
 
@@ -202,7 +203,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    // greedy decode
+    // greedy decode (+ спекулятивный режим LLM_SPEC=1: NGramDrafter + rejection)
+    let spec_mode = std::env::var("LLM_SPEC").is_ok();
+    let mut drafter = NGramDrafter::new(4);
+    let mut history: Vec<u32> = ids.clone();
+    let mut rng: Option<u64> = None;
+    let mut spec_drafts = 0usize;
+    let mut spec_accepted = 0usize;
     let mut decoder = IncrementalDecoder::new();
     let mut generated: usize = 0;
     let d0 = Instant::now();
@@ -262,10 +269,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         print!("{text}");
         std::io::stdout().flush()?;
         let t_dec = Instant::now();
-        logits = model.decode(&*backend, next)?;
-        if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {
-            eprintln!("bench decode step {generated}: {:.2}ms",
-                t_dec.elapsed().as_secs_f64() * 1e3);
+        if spec_mode {
+            history.push(next);
+            let (draft, probs) = drafter.draft(&history, 4);
+            spec_drafts += 1;
+            let spec = model.decode_spec(&*backend, next, &draft, &probs, &mut rng)?;
+            let n_acc = 1 + spec.accepted.len();
+            spec_accepted += n_acc;
+            if std::env::var("LLM_BENCH").is_ok() && generated % 10 == 0 {
+                eprintln!("spec step {generated}: draft {} accepted {} ({:.0}%)",
+                    draft.len(), spec.accepted.len(),
+                    100.0 * n_acc as f32 / (1 + draft.len()) as f32);
+            }
+            for t in &spec.accepted {
+                history.push(*t);
+                let text = decoder.push(tok.decode_piece(*t).as_bytes());
+                out.push_str(&text);
+                print!("{text}");
+                std::io::stdout().flush()?;
+                generated += 1;
+            }
+            logits = spec.logits;
+        } else {
+            logits = model.decode(&*backend, next)?;
+            if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {
+                eprintln!("bench decode step {generated}: {:.2}ms",
+                    t_dec.elapsed().as_secs_f64() * 1e3);
+            }
         }
         generated += 1;
     }
@@ -274,6 +304,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::io::stdout().flush()?;
     let dt = d0.elapsed();
     eprintln!();
+    if spec_mode && spec_drafts > 0 {
+        eprintln!("spec: {} шагов, средний acceptance-length {:.2} (γ≤4)",
+            spec_drafts, spec_accepted as f32 / spec_drafts as f32);
+    }
     eprintln!(
         "generated {generated} tokens in {:.2}s → {:.1} tok/s (decode)",
         dt.as_secs_f32(),

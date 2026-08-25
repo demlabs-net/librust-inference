@@ -36,6 +36,7 @@ pub mod metal;
 pub mod nn;
 pub mod omni;
 pub mod qwen3;
+pub mod spec;
 pub mod vision;
 pub mod vision_qwen3vl;
 pub mod tokenizer;

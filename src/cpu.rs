@@ -828,6 +828,16 @@ impl Backend for CpuBackend {
         // Halved RoPE: X (T, head_dim), pairs (i, i + rope_dim/2).
         let (t, hd) = (x.shape()[0], x.shape()[1]);
         check_len(x, y.numel())?;
+        // F16: cos/sin are indexed [ti·half + i] — a short table (generation
+        // past max_seq_len) read OOB; fail loudly instead.
+        let half = rope_dim / 2;
+        if cos.numel() < t * half || sin.numel() < t * half {
+            return Err(BackendError::Shape(format!(
+                "rope: cos/sin {} elements < t·half {} (t={t}, rope_dim={rope_dim})",
+                cos.numel().min(sin.numel()),
+                t * half
+            )));
+        }
         let half = rope_dim / 2;
         let (xd, cd, sd) = (data(x).to_vec(), data(cos).to_vec(), data(sin).to_vec());
         let mut yd = data_mut(y);
@@ -860,6 +870,15 @@ impl Backend for CpuBackend {
         let h = d / hd;
         check_len(x, y.numel())?;
         let half = hd / 2;
+        // F16: cos/sin are indexed at ABSOLUTE position (start + ti) — the
+        // table must cover (start + t) positions or the read goes OOB.
+        if cos.numel() < (start + t) * half || sin.numel() < (start + t) * half {
+            return Err(BackendError::Shape(format!(
+                "rope_interleaved: cos/sin {} < (start+t)·half {} (start={start}, t={t})",
+                cos.numel().min(sin.numel()),
+                (start + t) * half
+            )));
+        }
         let (xd, cd, sd) = (data(x).to_vec(), data(cos).to_vec(), data(sin).to_vec());
         let mut yd = data_mut(y);
         yd.copy_from_slice(&xd);
@@ -894,6 +913,14 @@ impl Backend for CpuBackend {
         check_len(x, y.numel())?;
         let hd = d / h;
         let half = rope_dim / 2;
+        // F16: cos/sin are indexed [ti·half + i] — same OOB guard as rope.
+        if cos.numel() < t * half || sin.numel() < t * half {
+            return Err(BackendError::Shape(format!(
+                "rope_head: cos/sin {} elements < t·half {} (t={t}, rope_dim={rope_dim})",
+                cos.numel().min(sin.numel()),
+                t * half
+            )));
+        }
         let (xd, cd, sd) = (data(x).to_vec(), data(cos).to_vec(), data(sin).to_vec());
         let mut yd = data_mut(y);
         yd.copy_from_slice(&xd);

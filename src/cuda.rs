@@ -1582,6 +1582,15 @@ impl Backend for CudaBackend {
     fn embedding(&self, idx: &[u32], table: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         let n = idx.len();
         let d = table.shape()[1] as i32;
+        // The CPU oracle rejects out-of-range indices (Err); the GPU kernels
+        // read table[idx·d .. ] — guard BEFORE launch so a bad codebook/token
+        // index cannot silently read OOB memory.
+        let rows = table.shape()[0];
+        if let Some(&bad) = idx.iter().find(|&&i| i as usize >= rows) {
+            return Err(BackendError::Shape(format!(
+                "embedding: index {bad} >= rows {rows}"
+            )));
+        }
         let idx_dev = self.stream.clone_htod(idx).map_err(map_err)?;
         let cfg = LaunchConfig::for_num_elems((n * d as usize) as u32);
         let n32 = n as i32;
@@ -1616,6 +1625,16 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         let (t, hd) = (x.shape()[0], x.shape()[1]);
         let n = t * hd;
+        // F16: cos/sin indexed [ti·half + i] — short tables (past max_seq_len)
+        // read OOB on the GPU; fail loudly like the CPU oracle.
+        let half = rope_dim / 2;
+        if cos.numel() < t * half || sin.numel() < t * half {
+            return Err(BackendError::Shape(format!(
+                "rope: cos/sin {} elements < t·half {} (t={t}, rope_dim={rope_dim})",
+                cos.numel().min(sin.numel()),
+                t * half
+            )));
+        }
         let f = self.function("rope_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);
@@ -1643,6 +1662,16 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let n = b * t * d;
+        // F16: cos/sin indexed at absolute position (start + ti) — the table
+        // must cover (start + t) positions.
+        let half = rope_dim / 2;
+        if cos.numel() < (start + t) * half || sin.numel() < (start + t) * half {
+            return Err(BackendError::Shape(format!(
+                "rope_interleaved: cos/sin {} < (start+t)·half {} (start={start}, t={t})",
+                cos.numel().min(sin.numel()),
+                (start + t) * half
+            )));
+        }
         let f = self.function("rope_interleaved_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);
@@ -1675,6 +1704,14 @@ impl Backend for CudaBackend {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let hd = d / h;
         let n = b * t * d;
+        let half = rope_dim / 2;
+        if cos.numel() < t * half || sin.numel() < t * half {
+            return Err(BackendError::Shape(format!(
+                "rope_head: cos/sin {} elements < t·half {} (t={t}, rope_dim={rope_dim})",
+                cos.numel().min(sin.numel()),
+                t * half
+            )));
+        }
         let f = self.function("rope_head_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);

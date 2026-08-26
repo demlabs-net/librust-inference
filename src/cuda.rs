@@ -2133,6 +2133,15 @@ impl Backend for CudaBackend {
 
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError> {
         let (b, tq, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
+        // K44: the q8_0 KV format stores one f32 scale per 32-element
+        // block — a head_dim not divisible by 32 would silently drop the
+        // tail elements in kv_update_q8 (the make_kv_tensor q8_0 branch
+        // already rejects this; the update path must too).
+        if matches!(dst.inner, crate::backend::TensorInner::CudaI8 { .. }) && d % 32 != 0 {
+            return Err(BackendError::Shape(format!(
+                "kv_update q8_0: head_dim {d} not a multiple of 32"
+            )));
+        }
         let cap = dst.shape()[1];
         let n = b * tq * d;
         let cfg = LaunchConfig::for_num_elems(n as u32);

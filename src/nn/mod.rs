@@ -405,9 +405,9 @@ fn make_kv_tensor(
             let sc = vec![1.0f32; cap * (d / 32)];
             backend.from_cpu_i8(&z, &sc, vec![1, cap, d])
         }
-        crate::dtype::KvFormat::Q4_0 => Err(BackendError::Shape(
-            "KV q4_0 not implemented yet — use fp32/fp16/q8_0".into(),
-        )),
+        // K49: KvFormat::Q4_0 was declared but never implemented (this arm
+        // returned Err) — removed from the enum; KV quantization is
+        // fp16/q8_0 only.
     }
 }
 

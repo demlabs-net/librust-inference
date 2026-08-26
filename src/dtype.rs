@@ -105,7 +105,6 @@ pub enum KvFormat {
     F32,
     F16,
     Q8_0,
-    Q4_0,
 }
 
 impl KvFormat {
@@ -114,19 +113,20 @@ impl KvFormat {
         match self {
             KvFormat::F32 => 4.0,
             KvFormat::F16 => 2.0,
-            KvFormat::Q8_0 => 34.0 / 32.0, // 32-elem block: 32×i8 + f32 scale
-            KvFormat::Q4_0 => 18.0 / 32.0, // 32-elem block: 32×4bit + f32 scale
+            // K48: our Q8_0 KV uses an f32 scale per 32-elem block (36
+            // bytes/block); the old comment said 34/32 — that would be a
+            // llama.cpp-style f16 scale, which this backend does not store.
+            KvFormat::Q8_0 => 36.0 / 32.0,
         }
     }
     pub fn is_quantized(self) -> bool {
-        matches!(self, KvFormat::Q8_0 | KvFormat::Q4_0)
+        matches!(self, KvFormat::Q8_0)
     }
     pub fn name(self) -> &'static str {
         match self {
             KvFormat::F32 => "f32",
             KvFormat::F16 => "f16",
             KvFormat::Q8_0 => "q8_0",
-            KvFormat::Q4_0 => "q4_0",
         }
     }
 }
@@ -216,8 +216,9 @@ mod tests {
     fn kv_bytes_per_elem() {
         assert_eq!(KvFormat::F32.bytes_per_elem(), 4.0);
         assert_eq!(KvFormat::F16.bytes_per_elem(), 2.0);
-        assert!((KvFormat::Q8_0.bytes_per_elem() - 1.0625).abs() < 1e-6);
-        assert!(KvFormat::Q4_0.is_quantized());
+        // K48: f32 scale per 32-elem block → 36/32 = 1.125.
+        assert!((KvFormat::Q8_0.bytes_per_elem() - 1.125).abs() < 1e-6);
+        assert!(KvFormat::Q8_0.is_quantized());
     }
 
     #[test]
@@ -245,7 +246,7 @@ mod tests {
         validate(QuantConfig {
             activation: Dtype::F16,
             weights: WeightFormat::Plain(Dtype::F16),
-            kv: KvFormat::Q4_0,
+            kv: KvFormat::Q8_0,
         })
         .unwrap();
     }

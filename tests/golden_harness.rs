@@ -1,8 +1,9 @@
 //! Golden-vector harness (Phase 2.2): every op of the contract runs on the
 //! CPU reference backend against committed golden fixtures.
 //!
-//! Run with `REGEN_GOLDEN=1` to (re)generate `tests/golden/*.json` from the
-//! CPU oracle; the normal run compares. Once GPU backends land, they reuse
+//! Run with `REGEN_GOLDEN=1` to generate `tests/golden/*.json` from the
+//! CPU oracle (existing files are overwritten only with `REGEN_GOLDEN_FORCE=1`);
+//! the normal run compares. Once GPU backends land, they reuse
 //! the same committed inputs/outputs (tolerance-based comparison).
 #![cfg(feature = "cpu")]
 

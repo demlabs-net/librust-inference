@@ -18,7 +18,7 @@ fn genr(seed: u64, n: usize) -> Vec<f32> {
 #[test]
 fn gemm_f16_m21_k2048_n4096_row20() {
     let bk = MetalBackend::new().unwrap();
-    let (m, k, n) = (1usize, 2048usize, 4096usize);
+    let (m, k, n) = (21usize, 2048usize, 4096usize);
     let a = genr(1, m * k);
     let b = genr(2, n * k);
     let bf16: Vec<f32> = b.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
@@ -34,7 +34,9 @@ fn gemm_f16_m21_k2048_n4096_row20() {
     let ct = bk.zeros(vec![m, n]).unwrap();
     bk.gemm_nt(&at, &bt, &ct).unwrap();
     let got = bk.to_cpu_f32(&ct).unwrap();
-    for row in [0usize] {
+    // K32: m=1 проверял только строку 0 — теперь m=21 и эталон сверяется
+    // по строкам 0/10/20 (первая, середина, последняя), как обещает шапка.
+    for row in [0usize, 10, 20] {
         for col in [0usize, 7, 2048, 4095] {
             let want: f32 = (0..k).map(|kk| a[row * k + kk] * bf16[col * k + kk]).sum();
             let g = got[row * n + col];

@@ -82,8 +82,25 @@ pub fn regen_enabled() -> bool {
 pub fn save_golden(case: &GoldenCase) -> std::io::Result<()> {
     let dir = golden_dir();
     std::fs::create_dir_all(&dir)?;
+    let path = golden_path(&case.op);
+    // K34: не перезаписываем существующий оракул молча — сбитый REGEN_GOLDEN=1
+    // в окружении (CI/шелл) замаскировал бы регрессию. Поверх существующего
+    // файла пишем только с явным REGEN_GOLDEN_FORCE=1.
+    let force = std::env::var("REGEN_GOLDEN_FORCE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if path.exists() && !force {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists — refusing to silently overwrite; \
+                 delete it or rerun with REGEN_GOLDEN_FORCE=1",
+                path.display()
+            ),
+        ));
+    }
     let json = serde_json::to_string_pretty(case).expect("serialize golden");
-    std::fs::write(golden_path(&case.op), json)
+    std::fs::write(path, json)
 }
 
 pub fn load_golden(op: &str) -> std::io::Result<GoldenCase> {

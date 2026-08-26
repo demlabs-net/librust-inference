@@ -18,6 +18,7 @@ cudarc = { version = "0.19.9", default-features = false, optional = true }
 half = "2"
 memmap2 = "0.9"
 rustfft = "6"
+rand = "0.8"
 
 # Backend selection is explicit per build (no silent CPU fallback — GPU-only
 # rule). `metal` (macOS) is implemented; `cuda` lands with the CudaBackend

@@ -148,7 +148,7 @@ pub fn log_mel_spectrogram(wav: &[f32]) -> (Vec<f32>, usize) {
     (mel, t)
 }
 
-/// Синусоидальные позиционные эмбеддинги (Whisper-стиль): 
+/// Синусоидальные позиционные эмбеддинги (Whisper-стиль):
 /// `cat([sin, cos], dim=1)`, max_timescale=10000 — бит-в-бит
 /// `SinusoidsPositionEmbedding` из modeling_qwen2_5_omni.py.
 pub fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Vec<f32> {
@@ -234,7 +234,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .flat_map(|row| row.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32))
+            .flat_map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap() as f32)
+            })
             .collect();
         let (mel, t) = log_mel_spectrogram(&wav);
         assert_eq!(t, 100);

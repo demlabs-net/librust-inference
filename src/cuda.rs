@@ -257,9 +257,7 @@ impl CudaBackend {
         let cap_grid = 8192;
         (1..=nblk / 2)
             .rev()
-            .find(|&s| {
-                nblk % s == 0 && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid
-            })
+            .find(|&s| nblk % s == 0 && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid)
             .unwrap_or(1)
     }
 
@@ -289,6 +287,8 @@ impl CudaBackend {
         la.arg(&s32);
         la.arg(&m32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // J7: poison-resilient pool lock (a panic while the pool mutex was
+        // held must not abort the next take()).
         lock_poison_resilient(&self.pool).entry(s * m * n).or_default().push(cpart);
         Ok(())
     }
@@ -357,30 +357,20 @@ impl CudaBackend {
         let grid_x = (n + 255) / 256;
         let act = self.activation_dtype();
         let (tiled_name, splitk_name): (&'static str, &'static str) = match (b_suf, act) {
-            ("bf16", crate::dtype::Dtype::F16) => (
-                "gemm_halfw_tiled_f16_bf16",
-                "gemm_halfw_splitk_f16_bf16",
-            ),
-            ("bf16", crate::dtype::Dtype::BF16) => (
-                "gemm_halfw_tiled_bf16_bf16",
-                "gemm_halfw_splitk_bf16_bf16",
-            ),
-            ("bf16", _) => (
-                "gemm_halfw_tiled_f32_bf16",
-                "gemm_halfw_splitk_f32_bf16",
-            ),
-            ("f16", crate::dtype::Dtype::F16) => (
-                "gemm_halfw_tiled_f16_f16",
-                "gemm_halfw_splitk_f16_f16",
-            ),
-            ("f16", crate::dtype::Dtype::BF16) => (
-                "gemm_halfw_tiled_bf16_f16",
-                "gemm_halfw_splitk_bf16_f16",
-            ),
-            ("f16", _) => (
-                "gemm_halfw_tiled_f32_f16",
-                "gemm_halfw_splitk_f32_f16",
-            ),
+            ("bf16", crate::dtype::Dtype::F16) => {
+                ("gemm_halfw_tiled_f16_bf16", "gemm_halfw_splitk_f16_bf16")
+            }
+            ("bf16", crate::dtype::Dtype::BF16) => {
+                ("gemm_halfw_tiled_bf16_bf16", "gemm_halfw_splitk_bf16_bf16")
+            }
+            ("bf16", _) => ("gemm_halfw_tiled_f32_bf16", "gemm_halfw_splitk_f32_bf16"),
+            ("f16", crate::dtype::Dtype::F16) => {
+                ("gemm_halfw_tiled_f16_f16", "gemm_halfw_splitk_f16_f16")
+            }
+            ("f16", crate::dtype::Dtype::BF16) => {
+                ("gemm_halfw_tiled_bf16_f16", "gemm_halfw_splitk_bf16_f16")
+            }
+            ("f16", _) => ("gemm_halfw_tiled_f32_f16", "gemm_halfw_splitk_f32_f16"),
             _ => unreachable!("gemm_halfw_nt: unknown weight suffix {b_suf}"),
         };
         let a_arg: KernA = match act {
@@ -623,7 +613,9 @@ impl Backend for CudaBackend {
                 std::borrow::Cow::Borrowed(data)
             };
         let mut s = unsafe { self.stream.alloc::<half::f16>(n) }.map_err(map_err)?;
-        self.stream.memcpy_htod(packed.as_ref(), &mut s).map_err(map_err)?;
+        self.stream
+            .memcpy_htod(packed.as_ref(), &mut s)
+            .map_err(map_err)?;
         Ok(Tensor::from_cuda_f16(s, shape))
     }
 
@@ -656,7 +648,9 @@ impl Backend for CudaBackend {
                 std::borrow::Cow::Borrowed(data)
             };
         let mut s = unsafe { self.stream.alloc::<half::bf16>(n) }.map_err(map_err)?;
-        self.stream.memcpy_htod(packed.as_ref(), &mut s).map_err(map_err)?;
+        self.stream
+            .memcpy_htod(packed.as_ref(), &mut s)
+            .map_err(map_err)?;
         Ok(Tensor::from_cuda_bf16(s, shape))
     }
 
@@ -735,8 +729,7 @@ impl Backend for CudaBackend {
                     for r in 0..rows {
                         for b in 0..nblk {
                             for j in 0..32 {
-                                out[r * per + b * 32 + j] =
-                                    f32::from(raw[(b * rows + r) * 32 + j]);
+                                out[r * per + b * 32 + j] = f32::from(raw[(b * rows + r) * 32 + j]);
                             }
                         }
                     }
@@ -755,8 +748,7 @@ impl Backend for CudaBackend {
                     for r in 0..rows {
                         for b in 0..nblk {
                             for j in 0..32 {
-                                out[r * per + b * 32 + j] =
-                                    f32::from(raw[(b * rows + r) * 32 + j]);
+                                out[r * per + b * 32 + j] = f32::from(raw[(b * rows + r) * 32 + j]);
                             }
                         }
                     }
@@ -795,9 +787,9 @@ impl Backend for CudaBackend {
                     for sb in 0..nsuper {
                         // kb-major: block (sb, r) at (sb·rows + r)·210.
                         let blk = &raw[(sb * rows + r) * 210..(sb * rows + r + 1) * 210];
-                        let d = f32::from(half::f16::from_bits(
-                            u16::from_le_bytes([blk[208], blk[209]]),
-                        ));
+                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([
+                            blk[208], blk[209],
+                        ])));
                         for nchunk in 0..2 {
                             for lane in 0..32 {
                                 let ql0 = blk[nchunk * 64 + lane];
@@ -808,10 +800,14 @@ impl Backend for CudaBackend {
                                 let sc1 = blk[192 + nchunk * 8 + (lane >> 4) + 2] as i8 as f32;
                                 let sc2 = blk[192 + nchunk * 8 + (lane >> 4) + 4] as i8 as f32;
                                 let sc3 = blk[192 + nchunk * 8 + (lane >> 4) + 6] as i8 as f32;
-                                let q1 = (((ql0 & 0xF) | (((qh >> 0) & 3) << 4)) as i32 - 32) as f32;
-                                let q2 = (((ql1 & 0xF) | (((qh >> 2) & 3) << 4)) as i32 - 32) as f32;
-                                let q3 = ((((ql0 >> 4) & 0xF) | (((qh >> 4) & 3) << 4)) as i32 - 32) as f32;
-                                let q4 = ((((ql1 >> 4) & 0xF) | (((qh >> 6) & 3) << 4)) as i32 - 32) as f32;
+                                let q1 =
+                                    (((ql0 & 0xF) | (((qh >> 0) & 3) << 4)) as i32 - 32) as f32;
+                                let q2 =
+                                    (((ql1 & 0xF) | (((qh >> 2) & 3) << 4)) as i32 - 32) as f32;
+                                let q3 = ((((ql0 >> 4) & 0xF) | (((qh >> 4) & 3) << 4)) as i32 - 32)
+                                    as f32;
+                                let q4 = ((((ql1 >> 4) & 0xF) | (((qh >> 6) & 3) << 4)) as i32 - 32)
+                                    as f32;
                                 out[base + 0] = d * sc0 * q1;
                                 out[base + 32] = d * sc1 * q2;
                                 out[base + 64] = d * sc2 * q3;
@@ -832,7 +828,8 @@ impl Backend for CudaBackend {
                     for sb in 0..nsup {
                         // kb-major: block (sb, r) at (sb·rows + r)·18.
                         let blk = &raw[(sb * rows + r) * 18..(sb * rows + r + 1) * 18];
-                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+                        let d =
+                            f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
                         for j in 0..32 {
                             let nib = blk[2 + (j >> 1)];
                             let q = if j & 1 == 1 { nib >> 4 } else { nib & 0xF };
@@ -1902,17 +1899,33 @@ impl Backend for CudaBackend {
         let mut la = self.stream.launch_builder(&f);
         la.arg(q.as_cuda());
         match &k.inner {
-            crate::backend::TensorInner::Cuda(_) => { la.arg(k.as_cuda()); }
-            crate::backend::TensorInner::CudaF16(b) => { la.arg(b); }
-            crate::backend::TensorInner::CudaBF16(b) => { la.arg(b); }
-            crate::backend::TensorInner::CudaI8 { data, .. } => { la.arg(data); }
+            crate::backend::TensorInner::Cuda(_) => {
+                la.arg(k.as_cuda());
+            }
+            crate::backend::TensorInner::CudaF16(b) => {
+                la.arg(b);
+            }
+            crate::backend::TensorInner::CudaBF16(b) => {
+                la.arg(b);
+            }
+            crate::backend::TensorInner::CudaI8 { data, .. } => {
+                la.arg(data);
+            }
             _ => unreachable!(),
         }
         match &v.inner {
-            crate::backend::TensorInner::Cuda(_) => { la.arg(v.as_cuda()); }
-            crate::backend::TensorInner::CudaF16(b) => { la.arg(b); }
-            crate::backend::TensorInner::CudaBF16(b) => { la.arg(b); }
-            crate::backend::TensorInner::CudaI8 { data, .. } => { la.arg(data); }
+            crate::backend::TensorInner::Cuda(_) => {
+                la.arg(v.as_cuda());
+            }
+            crate::backend::TensorInner::CudaF16(b) => {
+                la.arg(b);
+            }
+            crate::backend::TensorInner::CudaBF16(b) => {
+                la.arg(b);
+            }
+            crate::backend::TensorInner::CudaI8 { data, .. } => {
+                la.arg(data);
+            }
             _ => unreachable!(),
         }
         if let Some(m) = mask {
@@ -1946,12 +1959,20 @@ impl Backend for CudaBackend {
         let dummy = self.take_pooled(1)?;
         let dummy2 = dummy.clone();
         match &k.inner {
-            crate::backend::TensorInner::CudaI8 { scale, .. } => { la.arg(scale); }
-            _ => { la.arg(&dummy); }
+            crate::backend::TensorInner::CudaI8 { scale, .. } => {
+                la.arg(scale);
+            }
+            _ => {
+                la.arg(&dummy);
+            }
         }
         match &v.inner {
-            crate::backend::TensorInner::CudaI8 { scale, .. } => { la.arg(scale); }
-            _ => { la.arg(&dummy2); }
+            crate::backend::TensorInner::CudaI8 { scale, .. } => {
+                la.arg(scale);
+            }
+            _ => {
+                la.arg(&dummy2);
+            }
         }
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // C6: return the dummy scales to the pool — they leaked per call.
@@ -2034,12 +2055,20 @@ impl Backend for CudaBackend {
         let dummy = self.take_pooled(1)?;
         let dummy2 = dummy.clone();
         match &k.inner {
-            crate::backend::TensorInner::CudaI8 { scale, .. } => { la.arg(scale); }
-            _ => { la.arg(&dummy); }
+            crate::backend::TensorInner::CudaI8 { scale, .. } => {
+                la.arg(scale);
+            }
+            _ => {
+                la.arg(&dummy);
+            }
         }
         match &v.inner {
-            crate::backend::TensorInner::CudaI8 { scale, .. } => { la.arg(scale); }
-            _ => { la.arg(&dummy2); }
+            crate::backend::TensorInner::CudaI8 { scale, .. } => {
+                la.arg(scale);
+            }
+            _ => {
+                la.arg(&dummy2);
+            }
         }
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
         // C6: return the dummy scales to the pool (they leaked per call).
@@ -2200,7 +2229,10 @@ impl Backend for CudaBackend {
                 la.arg(&c32);
                 unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
             }
-            (crate::backend::TensorInner::Cuda(_), crate::backend::TensorInner::CudaI8 { data, scale }) => {
+            (
+                crate::backend::TensorInner::Cuda(_),
+                crate::backend::TensorInner::CudaI8 { data, scale },
+            ) => {
                 let f = self.function("kv_update_q8")?;
                 let mut la = self.stream.launch_builder(&f);
                 la.arg(src.as_cuda());
@@ -2250,8 +2282,14 @@ impl Backend for CudaBackend {
                 unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
             }
             (
-                crate::backend::TensorInner::CudaI8 { data: sa, scale: ss },
-                crate::backend::TensorInner::CudaI8 { data: da, scale: ds },
+                crate::backend::TensorInner::CudaI8 {
+                    data: sa,
+                    scale: ss,
+                },
+                crate::backend::TensorInner::CudaI8 {
+                    data: da,
+                    scale: ds,
+                },
             ) => {
                 let f = self.function("kv_update_q8_q8")?;
                 let mut la = self.stream.launch_builder(&f);
@@ -2446,5 +2484,4 @@ impl CudaBackend {
         let _ = blk_bytes; // layout constant — kept for the kernel contract
         Ok(())
     }
-
 }

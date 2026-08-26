@@ -27,8 +27,12 @@ const VISION_NX: usize = 24; // (768/16)/2 — токенов по x после 
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let model_path = args.get(1).ok_or("usage: vision_chat <model.gguf> <mmproj.gguf>")?;
-    let mmproj_path = args.get(2).ok_or("usage: vision_chat <model.gguf> <mmproj.gguf>")?;
+    let model_path = args
+        .get(1)
+        .ok_or("usage: vision_chat <model.gguf> <mmproj.gguf>")?;
+    let mmproj_path = args
+        .get(2)
+        .ok_or("usage: vision_chat <model.gguf> <mmproj.gguf>")?;
     let prompt = args
         .get(3)
         .cloned()
@@ -46,7 +50,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tok = Tokenizer::from_gguf(&gf)?;
     eprintln!(
         "cfg: dim={} layers={} heads={}/{} ffn={} vocab={} mrope={:?}",
-        cfg.dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size,
+        cfg.dim,
+        cfg.n_layers,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.ffn_dim,
+        cfg.vocab_size,
         cfg.mrope_sections
     );
 
@@ -114,7 +123,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "<|vision_end|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         )));
     }
-    eprintln!("prompt tokens: {} (image: {n_img} at {img_start})", ids.len());
+    eprintln!(
+        "prompt tokens: {} (image: {n_img} at {img_start})",
+        ids.len()
+    );
     if std::env::var("VISION_CHAT_DUMP_IDS").is_ok() {
         for id in &ids {
             println!("ID {id}");
@@ -122,7 +134,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if std::env::var("VISION_CHAT_DBG_TOKENS").is_ok() {
         for (i, &id) in ids.iter().enumerate() {
-            eprintln!("  tok[{i}]={id} {:?}", String::from_utf8_lossy(tok.piece(id)));
+            eprintln!(
+                "  tok[{i}]={id} {:?}",
+                String::from_utf8_lossy(tok.piece(id))
+            );
         }
     }
 
@@ -162,17 +177,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         model.prefill(&backend, &ids)?
     };
-    eprintln!("prefill {} tokens in {:.2}s (TTFT)", ids.len(), t0.elapsed().as_secs_f32());
+    eprintln!(
+        "prefill {} tokens in {:.2}s (TTFT)",
+        ids.len(),
+        t0.elapsed().as_secs_f32()
+    );
 
     // топ-20 первого шага
     let v0 = backend.to_cpu_f32(&logits)?;
     let n = cfg.vocab_size;
     let last = &v0[v0.len() - n..];
-    let mut top: Vec<(u32, f32)> = last.iter().enumerate().map(|(i, &x)| (i as u32, x)).collect();
+    let mut top: Vec<(u32, f32)> = last
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i as u32, x))
+        .collect();
     top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     eprintln!("top-20 first step:");
     for (id, s) in top.iter().take(20) {
-        eprintln!("  {:>6} {:.4} {:?}", id, s, String::from_utf8_lossy(tok.piece(*id)));
+        eprintln!(
+            "  {:>6} {:.4} {:?}",
+            id,
+            s,
+            String::from_utf8_lossy(tok.piece(*id))
+        );
     }
     if std::env::var("VISION_CHAT_DUMP_LOGITS").is_ok() {
         for (i, s) in last.iter().enumerate() {

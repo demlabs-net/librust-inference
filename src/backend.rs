@@ -129,7 +129,12 @@ impl Tensor {
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("cpu_read() on a non-CPU tensor"),
             #[cfg(feature = "cuda")]
-            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) | TensorInner::CudaQ4K(_) => panic!("cpu_read() on a non-CPU tensor"),
+            TensorInner::Cuda(_)
+            | TensorInner::CudaF16(_)
+            | TensorInner::CudaBF16(_)
+            | TensorInner::CudaI8 { .. }
+            | TensorInner::CudaQ6K(_)
+            | TensorInner::CudaQ4K(_) => panic!("cpu_read() on a non-CPU tensor"),
         }
     }
 
@@ -141,7 +146,12 @@ impl Tensor {
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("cpu_write() on a non-CPU tensor"),
             #[cfg(feature = "cuda")]
-            TensorInner::Cuda(_) | TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) | TensorInner::CudaQ4K(_) => panic!("cpu_write() on a non-CPU tensor"),
+            TensorInner::Cuda(_)
+            | TensorInner::CudaF16(_)
+            | TensorInner::CudaBF16(_)
+            | TensorInner::CudaI8 { .. }
+            | TensorInner::CudaQ6K(_)
+            | TensorInner::CudaQ4K(_) => panic!("cpu_write() on a non-CPU tensor"),
         }
     }
 
@@ -221,7 +231,11 @@ impl Tensor {
     /// Q6_K packed-weight tensor (canonical 210 B / 256-weight blocks).
     #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda_q6k(data: cudarc::driver::CudaSlice<u8>, shape: Vec<usize>) -> Self {
-        Self { inner: TensorInner::CudaQ6K(data), shape, dtype: Dtype::I8 }
+        Self {
+            inner: TensorInner::CudaQ6K(data),
+            shape,
+            dtype: Dtype::I8,
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -235,7 +249,11 @@ impl Tensor {
     /// Q4_0 packed-weight tensor (canonical 18 B / 32-weight blocks).
     #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda_q4k(data: cudarc::driver::CudaSlice<u8>, shape: Vec<usize>) -> Self {
-        Self { inner: TensorInner::CudaQ4K(data), shape, dtype: Dtype::I8 }
+        Self {
+            inner: TensorInner::CudaQ4K(data),
+            shape,
+            dtype: Dtype::I8,
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -250,7 +268,11 @@ impl Tensor {
     pub(crate) fn as_cuda(&self) -> &cudarc::driver::CudaSlice<f32> {
         match &self.inner {
             TensorInner::Cuda(b) => b.as_slice(),
-            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) | TensorInner::CudaQ4K(_) => panic!("as_cuda() on a half/int8/Q6K tensor"),
+            TensorInner::CudaF16(_)
+            | TensorInner::CudaBF16(_)
+            | TensorInner::CudaI8 { .. }
+            | TensorInner::CudaQ6K(_)
+            | TensorInner::CudaQ4K(_) => panic!("as_cuda() on a half/int8/Q6K tensor"),
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda() on a non-CUDA tensor"),
             #[cfg(feature = "cpu")]
@@ -282,7 +304,11 @@ impl Tensor {
             TensorInner::Cuda(b) => unsafe {
                 &mut *Arc::as_ptr(b).cast_mut().as_mut().unwrap().as_slice_mut()
             },
-            TensorInner::CudaF16(_) | TensorInner::CudaBF16(_) | TensorInner::CudaI8 { .. } | TensorInner::CudaQ6K(_) | TensorInner::CudaQ4K(_) => panic!("as_cuda_mut() on a half/int8/Q6K tensor"),
+            TensorInner::CudaF16(_)
+            | TensorInner::CudaBF16(_)
+            | TensorInner::CudaI8 { .. }
+            | TensorInner::CudaQ6K(_)
+            | TensorInner::CudaQ4K(_) => panic!("as_cuda_mut() on a half/int8/Q6K tensor"),
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda_mut() on a non-CUDA tensor"),
             #[cfg(feature = "cpu")]
@@ -483,8 +509,7 @@ pub trait Backend: Send + Sync {
             for b in 0..nblk {
                 let s = scale[b * rows + r];
                 for j in 0..32 {
-                    f32s[r * per + b * 32 + j] =
-                        data[(b * rows + r) * 32 + j] as f32 * s;
+                    f32s[r * per + b * 32 + j] = data[(b * rows + r) * 32 + j] as f32 * s;
                 }
             }
         }
@@ -613,7 +638,11 @@ pub trait Backend: Send + Sync {
         let sect_dims = sections.iter().sum::<usize>().max(1);
         let (s0, s1, s2) = (sections[0], sections[1], sections[2]);
         for tt in 0..tq {
-            let (pt, ph, pw) = (pos4d[tt * 4] as f32, pos4d[tt * 4 + 1] as f32, pos4d[tt * 4 + 2] as f32);
+            let (pt, ph, pw) = (
+                pos4d[tt * 4] as f32,
+                pos4d[tt * 4 + 1] as f32,
+                pos4d[tt * 4 + 2] as f32,
+            );
             for h in 0..d / hd {
                 for i in 0..half {
                     let sector = i % sect_dims;
@@ -1061,6 +1090,24 @@ pub trait Backend: Send + Sync {
         h: usize,
         eps: f32,
     ) -> Result<(), BackendError>;
+    /// Fused per-head RMSNorm + rotate-half RoPE (Ф8): Y = rope(rmsnorm_head(X)).
+    /// X (1, T, h·hd), w [hd], позиции токенов pos..pos+T.
+    /// Default — два шага (rmsnorm_head + rope_standard); Metal — fused-кернел
+    /// (qk_norm+rope в attn — 4 кернела на слой → 2).
+    fn rmsnorm_head_rope(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        h: usize,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let tmp = self.zeros(x.shape().to_vec())?;
+        self.rmsnorm_head(x, w, &tmp, h, eps)?;
+        self.rope_standard(&tmp, pos, hd, theta)
+    }
     /// LayerNorm applied per head: X (rows, h·hd), w/b per head-dim (hd).
     fn layernorm_head(
         &self,

@@ -19,8 +19,13 @@ fn add_big_matches_cpu() {
     for i in 0..n {
         let want = a[i] + b[i];
         let d = (got[i] - want).abs();
-        if d > maxd { maxd = d; }
-        if d > 1e-4 && bad < 5 { bad += 1; eprintln!("add[{i}]: got {} want {}", got[i], want); }
+        if d > maxd {
+            maxd = d;
+        }
+        if d > 1e-4 && bad < 5 {
+            bad += 1;
+            eprintln!("add[{i}]: got {} want {}", got[i], want);
+        }
     }
     assert!(maxd < 1e-3, "add max diff {maxd}");
 }

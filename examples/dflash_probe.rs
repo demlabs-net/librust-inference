@@ -1,14 +1,14 @@
 //! Диагностика DFlash: диффузия t=1 (AR-шаг драфтера) vs таргет-декод.
 //! Использование: dflash_probe <target.gguf> <draft.gguf|.safetensors>
 #![cfg(feature = "metal")]
-use std::error::Error;
-use std::fs::File;
 use rust_inference::backend::Backend as _;
 use rust_inference::dflash::DFlashModel;
 use rust_inference::gguf;
 use rust_inference::metal::MetalBackend;
 use rust_inference::qwen3::{Qwen3Config, Qwen3Model};
-use rust_inference::weights_map::{dequant_f32, WeightsMap};
+use rust_inference::weights_map::{WeightsMap, dequant_f32};
+use std::error::Error;
+use std::fs::File;
 
 fn top5(row: &[f32]) -> Vec<(usize, f32)> {
     let mut v: Vec<(usize, f32)> = row.iter().enumerate().map(|(i, &x)| (i, x)).collect();
@@ -42,7 +42,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let ew = dequant_f32(wm_t.get("token_embd.weight").unwrap());
     let embed_t = backend.from_cpu_f32(&ew, vec![vocab, cfg_t.dim])?;
-    let ow = dequant_f32(wm_t.get("output.weight").unwrap_or(wm_t.get("token_embd.weight").unwrap()));
+    let ow = dequant_f32(
+        wm_t.get("output.weight")
+            .unwrap_or(wm_t.get("token_embd.weight").unwrap()),
+    );
     let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
     let lm_head = backend.from_cpu_f16(&f16, vec![vocab, cfg_t.dim])?;
     dmod.set_target_embed(embed_t);

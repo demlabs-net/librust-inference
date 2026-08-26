@@ -62,7 +62,8 @@ impl ToolCallParser {
             self.call_body = None;
             self.pending.clear();
         } else if !self.pending.is_empty() {
-            self.out.push(ToolEvent::Text(std::mem::take(&mut self.pending)));
+            self.out
+                .push(ToolEvent::Text(std::mem::take(&mut self.pending)));
         }
         std::mem::take(&mut self.out)
     }
@@ -110,7 +111,8 @@ impl ToolCallParser {
                 return;
             }
             if !self.pending.is_empty() {
-                self.out.push(ToolEvent::Text(std::mem::take(&mut self.pending)));
+                self.out
+                    .push(ToolEvent::Text(std::mem::take(&mut self.pending)));
             }
             return;
         }
@@ -138,9 +140,11 @@ mod tests {
     #[test]
     fn full_call_in_one_chunk() {
         let mut p = ToolCallParser::new();
-        let ev = p.feed(r#"Sure!<tool_call>
+        let ev = p.feed(
+            r#"Sure!<tool_call>
 {"name": "get_weather", "arguments": {"city": "Moscow"}}
-</tool_call>Done"#);
+</tool_call>Done"#,
+        );
         assert_eq!(
             ev,
             vec![
@@ -222,6 +226,12 @@ mod tests {
         events.extend(p.feed(" world"));
         events.extend(p.finish());
         // Стрим отдаёт куски как приходят (склейка — на стороне потребителя).
-        assert_eq!(events, vec![ToolEvent::Text("Hello".into()), ToolEvent::Text(" world".into())]);
+        assert_eq!(
+            events,
+            vec![
+                ToolEvent::Text("Hello".into()),
+                ToolEvent::Text(" world".into())
+            ]
+        );
     }
 }

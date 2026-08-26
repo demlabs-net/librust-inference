@@ -201,7 +201,9 @@ impl VisionQwen3Vl {
                     let std = self.image_std[c].max(1e-6);
                     for ph in 0..p {
                         for pw in 0..p {
-                            let v = image_rgb[((py * p + ph) * self.image_size + px * p + pw) * 3 + c] / 255.0;
+                            let v = image_rgb
+                                [((py * p + ph) * self.image_size + px * p + pw) * 3 + c]
+                                / 255.0;
                             patches[dst + c * p * p + ph * p + pw] = (v - mean) / std;
                         }
                     }

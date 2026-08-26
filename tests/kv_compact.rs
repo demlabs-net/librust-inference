@@ -7,7 +7,7 @@
 
 use rust_inference::backend::{Backend, Tensor};
 use rust_inference::metal::MetalBackend;
-use rust_inference::nn::{build_causal_mask, KvCache};
+use rust_inference::nn::{KvCache, build_causal_mask};
 
 fn backend() -> MetalBackend {
     MetalBackend::new().expect("metal backend")
@@ -21,8 +21,14 @@ fn fill(bk: &dyn Backend, base: f32, n: usize, d: usize) -> Tensor {
 #[test]
 fn compact_drops_oldest_half_on_overflow() {
     let bk = backend();
-    let mut cache = KvCache::new(&bk, 2, 4, rust_inference::dtype::KvFormat::F32, rust_inference::dtype::KvFormat::F32)
-        .expect("cache");
+    let mut cache = KvCache::new(
+        &bk,
+        2,
+        4,
+        rust_inference::dtype::KvFormat::F32,
+        rust_inference::dtype::KvFormat::F32,
+    )
+    .expect("cache");
     cache.set_max_cap(Some(8));
     let d = 8usize;
     // 10 single-token updates; max_cap 8 → compact fires at the 9th write
@@ -56,12 +62,22 @@ fn compact_drops_oldest_half_on_overflow() {
 #[test]
 fn no_compact_below_max_cap() {
     let bk = backend();
-    let mut cache = KvCache::new(&bk, 1, 4, rust_inference::dtype::KvFormat::F32, rust_inference::dtype::KvFormat::F32)
-        .expect("cache");
+    let mut cache = KvCache::new(
+        &bk,
+        1,
+        4,
+        rust_inference::dtype::KvFormat::F32,
+        rust_inference::dtype::KvFormat::F32,
+    )
+    .expect("cache");
     cache.set_max_cap(Some(16));
     for i in 0..10 {
         cache
-            .update(&bk, &fill(&bk, i as f32, 1, 4), &fill(&bk, i as f32 * 2.0, 1, 4))
+            .update(
+                &bk,
+                &fill(&bk, i as f32, 1, 4),
+                &fill(&bk, i as f32 * 2.0, 1, 4),
+            )
             .unwrap();
     }
     assert_eq!(cache.pos, 10, "no roll below max_cap");

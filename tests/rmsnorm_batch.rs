@@ -34,7 +34,9 @@ fn rmsnorm_rows21_matches_rows1() {
     let mut maxd = 0.0f32;
     for i in 0..d {
         let diff = (got21[20 * d + i] - got1[i]).abs();
-        if diff > maxd { maxd = diff; }
+        if diff > maxd {
+            maxd = diff;
+        }
     }
     assert!(maxd < 1e-4, "rmsnorm rows21 vs rows1: max diff {maxd}");
 }

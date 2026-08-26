@@ -345,7 +345,9 @@ fn unicode_tables() -> &'static ([char; 256], std::collections::HashMap<char, u8
         let mut tbl = [char::from(0u8); 256];
         let mut n = 0u32;
         for b in 0u8..=255u8 {
-            let in_bs = (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+            let in_bs = (0x21..=0x7E).contains(&b)
+                || (0xA1..=0xAC).contains(&b)
+                || (0xAE..=0xFF).contains(&b);
             if in_bs {
                 tbl[b as usize] = char::from_u32(b as u32).unwrap();
             } else {

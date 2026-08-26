@@ -16,12 +16,12 @@ use std::path::Path;
 
 use crate::audio;
 use crate::backend::{Backend, Tensor};
+use crate::dtype::{Dtype, WeightFormat};
 use crate::error::BackendError;
 use crate::nn::Linear;
 use crate::qwen3::{Qwen3Config, Qwen3Model};
-use crate::weights::{read_safetensors_f32, F32Tensors};
+use crate::weights::{F32Tensors, read_safetensors_f32};
 use crate::weights_map::{WeightTensor, WeightsMap};
-use crate::dtype::{Dtype, WeightFormat};
 
 // ─────────────────────────── конфиг ───────────────────────────
 
@@ -88,8 +88,8 @@ fn get_f64(v: &serde_json::Value, path: &[&str]) -> Result<f32, BackendError> {
 pub fn config_from_json(dir: &Path) -> Result<OmniConfig, BackendError> {
     let raw = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|e| BackendError::Shape(format!("config.json: {e}")))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| BackendError::Shape(format!("config.json: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| BackendError::Shape(format!("config.json: {e}")))?;
     let thinker = get(&v, &["thinker_config"])
         .ok_or_else(|| BackendError::Shape("no thinker_config".into()))?;
     let text = get(thinker, &["text_config"])
@@ -122,7 +122,8 @@ pub fn config_from_json(dir: &Path) -> Result<OmniConfig, BackendError> {
         n_heads: get_u64(text, &["num_attention_heads"])?,
         n_kv_heads: get_u64(text, &["num_key_value_heads"])?,
         head_dim: get_u64(text, &["head_dim"]).unwrap_or_else(|_| {
-            get_u64(text, &["hidden_size"]).unwrap() / get_u64(text, &["num_attention_heads"]).unwrap()
+            get_u64(text, &["hidden_size"]).unwrap()
+                / get_u64(text, &["num_attention_heads"]).unwrap()
         }),
         ffn_dim: get_u64(text, &["intermediate_size"])?,
         vocab_size: get_u64(text, &["vocab_size"])?,
@@ -187,7 +188,10 @@ impl OmniAudioTower {
                   data: &[f32],
                   shape: Vec<usize>|
          -> Result<Tensor, BackendError> { backend.from_cpu_f32(data, shape) };
-        let ln = |backend: &dyn Backend, name: &str, d: usize| -> Result<(Tensor, Tensor), BackendError> {
+        let ln = |backend: &dyn Backend,
+                  name: &str,
+                  d: usize|
+         -> Result<(Tensor, Tensor), BackendError> {
             Ok((
                 up(backend, &g(&format!("{name}.weight"))?, vec![d])?,
                 up(backend, &g(&format!("{name}.bias"))?, vec![d])?,
@@ -256,7 +260,10 @@ impl OmniAudioTower {
         let cfg = &self.cfg;
         let (_, t, n_mel) = (mel.shape()[0], mel.shape()[1], mel.shape()[2]);
         if n_mel != cfg.n_mel {
-            return Err(BackendError::Shape(format!("mel bins {n_mel} != {}", cfg.n_mel)));
+            return Err(BackendError::Shape(format!(
+                "mel bins {n_mel} != {}",
+                cfg.n_mel
+            )));
         }
         let mel_cpu = backend.to_cpu_f32(mel)?;
         let win = cfg.n_window * 2;
@@ -276,12 +283,19 @@ impl OmniAudioTower {
             out_rows.extend(backend.to_cpu_f32(&tokens)?);
             start += len;
         }
-        backend.from_cpu_f32(&out_rows, vec![out_rows.len() / cfg.output_dim, cfg.output_dim])
+        backend.from_cpu_f32(
+            &out_rows,
+            vec![out_rows.len() / cfg.output_dim, cfg.output_dim],
+        )
     }
 
     /// Одно окно (≤ 200 кадров): conv → pos → слои → ln_post → avg-pool → proj.
     /// x — time-major [1, T, n_mel] (как conv1d).
-    pub(crate) fn forward_window(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
+    pub(crate) fn forward_window(
+        &self,
+        backend: &dyn Backend,
+        x: &Tensor,
+    ) -> Result<Tensor, BackendError> {
         let cfg = &self.cfg;
         let d = cfg.d_model;
         let len = x.shape()[1];
@@ -291,7 +305,10 @@ impl OmniAudioTower {
         backend.conv1d(x, &self.conv1_w, Some(&self.conv1_b), 1, 1, 1, 1, &h1)?;
         if std::env::var("OMNI_REF").is_ok() {
             let h1v = backend.to_cpu_f32(&h1)?;
-            eprintln!("OMNI_REF our_conv1_raw[0,:8]={:?}", &h1v[..8.min(h1v.len())]);
+            eprintln!(
+                "OMNI_REF our_conv1_raw[0,:8]={:?}",
+                &h1v[..8.min(h1v.len())]
+            );
         }
         backend.gelu_erf(&h1, &h1)?;
         // conv2 (stride 2) → GELU; l2 = (len - 1)/2 + 1
@@ -325,7 +342,16 @@ impl OmniAudioTower {
             let k = layer.attn.k.forward(backend, &hn)?;
             let v = layer.attn.v.forward(backend, &hn)?;
             let attn_out = backend.zeros(vec![1, l2, d])?;
-            backend.attn_ar(&q, &k, &v, None, &attn_out, cfg.n_heads, cfg.n_heads, d / cfg.n_heads)?;
+            backend.attn_ar(
+                &q,
+                &k,
+                &v,
+                None,
+                &attn_out,
+                cfg.n_heads,
+                cfg.n_heads,
+                d / cfg.n_heads,
+            )?;
             let o = layer.attn.o.forward(backend, &attn_out)?;
             // attn-выход: h = h + o (переприсваивание ВНЕШНЕЙ mut h —
             // `let h =` в цикле создал бы тень и ПОТЕРЯЛ результат между итерациями)
@@ -444,7 +470,9 @@ fn load_thinker(
             // attn_q/k/v.bias обрабатывает Qwen3Model::load (qkv_bias);
             // остальные bias в Qwen3-архитектуре не используются.
             let is_attn_bias = mapped.ends_with(".bias")
-                && (mapped.contains("attn_q.") || mapped.contains("attn_k.") || mapped.contains("attn_v."));
+                && (mapped.contains("attn_q.")
+                    || mapped.contains("attn_k.")
+                    || mapped.contains("attn_v."));
             if mapped.ends_with(".bias") && !is_attn_bias {
                 continue;
             }
@@ -524,7 +552,11 @@ impl OmniModel {
         }
         let tower = OmniAudioTower::load(backend, &all, &cfg.audio)?;
         let thinker = load_thinker(backend, &all, &cfg.thinker)?;
-        Ok(Self { cfg, tower, thinker })
+        Ok(Self {
+            cfg,
+            tower,
+            thinker,
+        })
     }
 
     /// Собрать вход: ids с audio_bos + N×audio_token + audio_eos,
@@ -557,9 +589,9 @@ impl OmniModel {
             ids.push(self.cfg.thinker.audio_bos_id);
             ids.extend(std::iter::repeat(self.cfg.thinker.audio_token_id).take(n));
             ids.push(self.cfg.thinker.audio_eos_id);
-            ids.extend(tokenizer.encode(&format!(
-                "{text_after}<|im_end|>\n<|im_start|>assistant\n"
-            )));
+            ids.extend(
+                tokenizer.encode(&format!("{text_after}<|im_end|>\n<|im_start|>assistant\n")),
+            );
             ids
         };
         let pos4d: Vec<u32> = (0..ids.len() as u32).flat_map(|p| [p, p, p, 0]).collect();
@@ -706,7 +738,10 @@ mod tests {
                     put(&format!("{p}{proj}.bias"), vec![cfg.d_model]);
                 }
             }
-            put(&format!("{p}self_attn_layer_norm.weight"), vec![cfg.d_model]);
+            put(
+                &format!("{p}self_attn_layer_norm.weight"),
+                vec![cfg.d_model],
+            );
             put(&format!("{p}self_attn_layer_norm.bias"), vec![cfg.d_model]);
             put(&format!("{p}fc1.weight"), vec![cfg.ffn_dim, cfg.d_model]);
             put(&format!("{p}fc1.bias"), vec![cfg.ffn_dim]);
@@ -737,12 +772,10 @@ mod tests {
         };
         let t = mini_weights(&cfg);
 
-
         let mb = MetalBackend::new().expect("metal backend");
         let m_tower = OmniAudioTower::load(&mb, &t, &cfg).unwrap();
         let cpu = CpuBackend;
         let c_tower = OmniAudioTower::load(&cpu, &t, &cfg).unwrap();
-
 
         // синтетический mel: 100 кадров (log-mel диапазон ~[-1, 1])
         let mut rng = rng_u64(7);
@@ -796,13 +829,15 @@ mod tests {
         let m_k = mb.from_cpu_f32(&k, vec![1, tq, d]).unwrap();
         let m_v = mb.from_cpu_f32(&v, vec![1, tq, d]).unwrap();
         let m_y = mb.zeros(vec![1, tq, d]).unwrap();
-        mb.attn_ar(&m_q, &m_k, &m_v, None, &m_y, heads, heads, hd).unwrap();
+        mb.attn_ar(&m_q, &m_k, &m_v, None, &m_y, heads, heads, hd)
+            .unwrap();
 
         let c_q = cpu.from_cpu_f32(&q, vec![1, tq, d]).unwrap();
         let c_k = cpu.from_cpu_f32(&k, vec![1, tq, d]).unwrap();
         let c_v = cpu.from_cpu_f32(&v, vec![1, tq, d]).unwrap();
         let c_y = cpu.zeros(vec![1, tq, d]).unwrap();
-        cpu.attn_ar(&c_q, &c_k, &c_v, None, &c_y, heads, heads, hd).unwrap();
+        cpu.attn_ar(&c_q, &c_k, &c_v, None, &c_y, heads, heads, hd)
+            .unwrap();
 
         let mv = mb.to_cpu_f32(&m_y).unwrap();
         let cv = cpu.to_cpu_f32(&c_y).unwrap();
@@ -810,7 +845,10 @@ mod tests {
         for (a, b) in mv.iter().zip(&cv) {
             max_delta = max_delta.max((a - b).abs());
         }
-        assert!(max_delta < 1e-4, "attn_ar nomask hd64 max delta {max_delta}");
+        assert!(
+            max_delta < 1e-4,
+            "attn_ar nomask hd64 max delta {max_delta}"
+        );
     }
 
     /// layernorm (w/b/eps) — метал vs cpu.
@@ -856,7 +894,8 @@ mod tests {
 
         let mb = MetalBackend::new().expect("metal backend");
         let cpu = CpuBackend;
-        let m_lin = crate::nn::Linear::from_weights(&mb, w.clone(), vec![out, d], Some(b.clone())).unwrap();
+        let m_lin =
+            crate::nn::Linear::from_weights(&mb, w.clone(), vec![out, d], Some(b.clone())).unwrap();
         let c_lin = crate::nn::Linear::from_weights(&cpu, w, vec![out, d], Some(b)).unwrap();
         let m_x = mb.from_cpu_f32(&x, vec![1, rows, d]).unwrap();
         let c_x = cpu.from_cpu_f32(&x, vec![1, rows, d]).unwrap();
@@ -908,19 +947,31 @@ mod tests {
         let m_x = mb.from_cpu_f32(&tm, vec![1, n, 128]).unwrap();
         let c_x = cpu.from_cpu_f32(&tm, vec![1, n, 128]).unwrap();
         let cwv = mb.to_cpu_f32(&m_tower.conv1_w).unwrap();
-        eprintln!("conv1d real: w[1,5,:3]={:?}", &cwv[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]);
+        eprintln!(
+            "conv1d real: w[1,5,:3]={:?}",
+            &cwv[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]
+        );
         eprintln!("conv1d real: w[0,0,:3]={:?}", &cwv[..3]);
-
 
         let lnw = mb.to_cpu_f32(&m_tower.layers[0].ffn_ln_w).unwrap();
         let lnb = mb.to_cpu_f32(&m_tower.layers[0].ffn_ln_b).unwrap();
-        eprintln!("conv1d real: ffn_ln w[:4]={:?} b[:4]={:?}", &lnw[..4], &lnb[..4]);
+        eprintln!(
+            "conv1d real: ffn_ln w[:4]={:?} b[:4]={:?}",
+            &lnw[..4],
+            &lnb[..4]
+        );
         let q1v = mb.to_cpu_f32(&m_tower.layers[1].attn.q.w).unwrap();
         eprintln!("conv1d real: layer1 q[0,:4]={:?}", &q1v[..4.min(q1v.len())]);
         // layernorm 3D [1, 20, 1280] метал vs CPU
-        let ln_x: Vec<f32> = (0..20 * 1280).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
-        let ln_w: Vec<f32> = (0..1280).map(|i| ((i * 104729) % 100) as f32 / 1000.0).collect();
-        let ln_b: Vec<f32> = (0..1280).map(|i| (((i as u64 * 15485863) % 100) as f32) / 10000.0).collect();
+        let ln_x: Vec<f32> = (0..20 * 1280)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5)
+            .collect();
+        let ln_w: Vec<f32> = (0..1280)
+            .map(|i| ((i * 104729) % 100) as f32 / 1000.0)
+            .collect();
+        let ln_b: Vec<f32> = (0..1280)
+            .map(|i| (((i as u64 * 15485863) % 100) as f32) / 10000.0)
+            .collect();
         let m_lnx = mb.from_cpu_f32(&ln_x, vec![1, 20, 1280]).unwrap();
         let m_lnw = mb.from_cpu_f32(&ln_w, vec![1280]).unwrap();
         let m_lnb = mb.from_cpu_f32(&ln_b, vec![1280]).unwrap();
@@ -937,14 +988,37 @@ mod tests {
         for (a, b) in mlv.iter().zip(&clv) {
             ln_delta = ln_delta.max((a - b).abs());
         }
-        eprintln!("conv1d real: layernorm3d delta={ln_delta} m[0,:4]={:?} c[0,:4]={:?}",
-            &mlv[..4], &clv[..4]);
+        eprintln!(
+            "conv1d real: layernorm3d delta={ln_delta} m[0,:4]={:?} c[0,:4]={:?}",
+            &mlv[..4],
+            &clv[..4]
+        );
         let fc1v = mb.to_cpu_f32(&m_tower.layers[0].fc1.w).unwrap();
         eprintln!("conv1d real: fc1[0,:4]={:?}", &fc1v[..4.min(fc1v.len())]);
         let m_h1 = mb.zeros(vec![1, n, 1280]).unwrap();
         let c_h1 = cpu.zeros(vec![1, n, 1280]).unwrap();
-        mb.conv1d(&m_x, &m_tower.conv1_w, Some(&m_tower.conv1_b), 1, 1, 1, 1, &m_h1).unwrap();
-        cpu.conv1d(&c_x, &c_tower.conv1_w, Some(&c_tower.conv1_b), 1, 1, 1, 1, &c_h1).unwrap();
+        mb.conv1d(
+            &m_x,
+            &m_tower.conv1_w,
+            Some(&m_tower.conv1_b),
+            1,
+            1,
+            1,
+            1,
+            &m_h1,
+        )
+        .unwrap();
+        cpu.conv1d(
+            &c_x,
+            &c_tower.conv1_w,
+            Some(&c_tower.conv1_b),
+            1,
+            1,
+            1,
+            1,
+            &c_h1,
+        )
+        .unwrap();
         let m_out = mb.to_cpu_f32(&m_h1).unwrap();
         eprintln!("conv1d real: out[0,:4]={:?}", &m_out[..4.min(m_out.len())]);
         // полный forward_window (20 кадров, 2 слоя) vs python-эталон
@@ -957,7 +1031,10 @@ mod tests {
         for (a, b) in fwv.iter().zip(&cfwv) {
             fw_delta = fw_delta.max((a - b).abs());
         }
-        eprintln!("conv1d real: fw delta={fw_delta} cfw[0,:4]={:?}", &cfwv[..4.min(cfwv.len())]);
+        eprintln!(
+            "conv1d real: fw delta={fw_delta} cfw[0,:4]={:?}",
+            &cfwv[..4.min(cfwv.len())]
+        );
         let mv = mb.to_cpu_f32(&m_h1).unwrap();
         let cv = cpu.to_cpu_f32(&c_h1).unwrap();
         let mut max_delta = 0.0f32;
@@ -969,7 +1046,10 @@ mod tests {
                 worst = i;
             }
         }
-        eprintln!("conv1d real: delta {max_delta} at {worst} (m {} c {})", mv[worst], cv[worst]);
+        eprintln!(
+            "conv1d real: delta {max_delta} at {worst} (m {} c {})",
+            mv[worst], cv[worst]
+        );
         assert!(max_delta < 1e-3, "conv1d real max delta {max_delta}");
     }
 
@@ -993,7 +1073,8 @@ mod tests {
         let c_w = cpu.from_cpu_f32(&w, vec![16, 8, 3]).unwrap();
         let c_b = cpu.from_cpu_f32(&b, vec![16]).unwrap();
         let c_y = cpu.zeros(vec![1, 20, 16]).unwrap();
-        cpu.conv1d(&c_x, &c_w, Some(&c_b), 1, 1, 1, 1, &c_y).unwrap();
+        cpu.conv1d(&c_x, &c_w, Some(&c_b), 1, 1, 1, 1, &c_y)
+            .unwrap();
 
         let mv = mb.to_cpu_f32(&m_y).unwrap();
         let cv = cpu.to_cpu_f32(&c_y).unwrap();

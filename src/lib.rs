@@ -17,8 +17,9 @@
 //!   serialization; no-op on other backends).
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
 
-pub mod backend;
 pub mod audio;
+pub mod backend;
+pub mod bert;
 pub mod chat_template;
 pub mod concurrency;
 #[cfg(feature = "cpu")]
@@ -36,11 +37,13 @@ pub mod inference;
 pub mod metal;
 pub mod nn;
 pub mod omni;
+pub mod quant;
 pub mod qwen3;
 pub mod spec;
+pub mod tokenizer;
+pub mod train;
 pub mod vision;
 pub mod vision_qwen3vl;
-pub mod tokenizer;
 pub mod weights;
 pub mod weights_map;
 

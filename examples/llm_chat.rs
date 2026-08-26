@@ -96,7 +96,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     eprintln!("prompt tokens: {} ({} chars)", ids.len(), prompt_text.len());
     if std::env::var("LLM_DBG_TOKENS").is_ok() {
         for (i, &id) in ids.iter().enumerate().take(12) {
-            eprintln!("  tok[{i}]={id} {:?}", String::from_utf8_lossy(tok.piece(id)));
+            eprintln!(
+                "  tok[{i}]={id} {:?}",
+                String::from_utf8_lossy(tok.piece(id))
+            );
         }
         eprintln!("  roundtrip: {:?}", tok.decode(&ids));
     }
@@ -114,7 +117,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if std::env::var("LLM_DBG_TOKENS").is_ok() {
         let specials = [tok.bos, tok.eos, tok.pad];
         eprintln!("special ids: {:?}", specials);
-        for n in ["blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.0.attn_output.weight", "blk.0.ffn_gate.weight", "blk.3.attn_q.weight"] {
+        for n in [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.3.attn_q.weight",
+        ] {
             if let Some(t) = wm.get(n) {
                 let d = rust_inference::weights_map::dequant_f32(t);
                 let rms = (d.iter().map(|v| (v * v) as f64).sum::<f64>() / d.len() as f64).sqrt();
@@ -146,8 +156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Box::new(MetalBackend::new()?)
         };
     #[cfg(not(feature = "cpu"))]
-    let backend: Box<dyn rust_inference::backend::Backend> =
-        Box::new(MetalBackend::new()?);
+    let backend: Box<dyn rust_inference::backend::Backend> = Box::new(MetalBackend::new()?);
     let mut model = Qwen3Model::load(backend.as_ref(), &wm, cfg.clone())?;
 
     // prefill + TTFT
@@ -207,11 +216,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // LLM_SPEC_DFLASH=<draft.gguf> — DFlash v1/v2 с инжектом фич таргета)
     let spec_mode = std::env::var("LLM_SPEC").is_ok() || std::env::var("LLM_SPEC_DFLASH").is_ok();
     let spec_dflash_path = std::env::var("LLM_SPEC_DFLASH").ok();
-    let mut dflash_drafter: Option<rust_inference::dflash::DFlashDrafter> = match &spec_dflash_path {
+    let mut dflash_drafter: Option<rust_inference::dflash::DFlashDrafter> = match &spec_dflash_path
+    {
         Some(p) => {
             use rust_inference::dflash::{DFlashDrafter, DFlashModel};
             let dmodel = if p.ends_with(".safetensors") {
-                DFlashModel::load_safetensors(backend.as_ref(), std::path::Path::new(p), cfg.vocab_size)?
+                DFlashModel::load_safetensors(
+                    backend.as_ref(),
+                    std::path::Path::new(p),
+                    cfg.vocab_size,
+                )?
             } else {
                 let dfile = File::open(p)?;
                 let dmmap = unsafe { memmap2::Mmap::map(&dfile)? };
@@ -221,11 +235,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             // общие эмбеддинги и lm_head таргета
             let ew = rust_inference::weights_map::dequant_f32(
-                wm.get("token_embd.weight").ok_or("token_embd.weight missing")?,
+                wm.get("token_embd.weight")
+                    .ok_or("token_embd.weight missing")?,
             );
             let embed_t = backend.from_cpu_f32(&ew, vec![cfg.vocab_size, cfg.dim])?;
             let ow = rust_inference::weights_map::dequant_f32(
-                wm.get("output.weight").unwrap_or(wm.get("token_embd.weight").unwrap()),
+                wm.get("output.weight")
+                    .unwrap_or(wm.get("token_embd.weight").unwrap()),
             );
             let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
             let lm_head = backend.from_cpu_f16(&f16, vec![cfg.vocab_size, cfg.dim])?;
@@ -289,8 +305,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap();
         if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {
             let t_after = t_step.elapsed().as_secs_f64();
-            eprintln!("bench step {generated}: total {:.2}ms to_cpu {:.2}ms decode {:.2}ms",
-                t_after * 1e3, t_tocpu * 1e3, (t_after - t_tocpu) * 1e3);
+            eprintln!(
+                "bench step {generated}: total {:.2}ms to_cpu {:.2}ms decode {:.2}ms",
+                t_after * 1e3,
+                t_tocpu * 1e3,
+                (t_after - t_tocpu) * 1e3
+            );
         }
         if std::env::var("LLM_DBG_TOKENS").is_ok() && generated % 5 == 0 {
             let mut top: Vec<(u32, f32)> = last
@@ -364,22 +384,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mask = d.model.mask_token;
                 let mut mid = vec![next];
                 mid.resize(1 + draft.len(), mask);
-                let (lg, ext) = model.prefill_extract(
-                    &*backend,
-                    &mid,
-                    &d.model.extract_layers.clone(),
-                )?;
+                let (lg, ext) =
+                    model.prefill_extract(&*backend, &mid, &d.model.extract_layers.clone())?;
                 let v = backend.to_cpu_f32(&lg)?;
                 let vv = cfg.vocab_size;
                 let mut accepted: Vec<u32> = Vec::new();
                 let mut acc_len = 1usize;
                 for i in 0..draft.len() {
                     let row = &v[(i + 1) * vv..(i + 2) * vv];
-                    // posterior — СЭМПЛ из softmax (z-lab: sample(logits, temp))
+                    // posterior — СЭМПЛ из ПОЛНОГО softmax (z-lab: sample);
+                    // top-k для posterior НЕ применяем: усечение обеих сторон
+                    // завышает совпадение и портит текст (эксперимент)
                     let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
                     let total: f32 = w.iter().sum();
-                    rng = Some(rng.unwrap_or(0x9e3779b97f4a7c15).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+                    rng = Some(
+                        rng.unwrap_or(0x9e3779b97f4a7c15)
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407),
+                    );
                     let mut r = (rng.unwrap() >> 33) as f32 / (1u64 << 33) as f32 * total;
                     let mut post = (w.len() - 1) as u32;
                     for (ti, wv) in w.iter().enumerate() {
@@ -401,11 +424,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for c in &mut model.caches {
                     c.truncate(base + acc_len);
                 }
-                let row_idx = if acc_len == mid.len() { mid.len() - 1 } else { acc_len };
-                let logits = backend.from_cpu_f32(
-                    &v[row_idx * vv..(row_idx + 1) * vv],
-                    vec![1, 1, vv],
-                )?;
+                let row_idx = if acc_len == mid.len() {
+                    mid.len() - 1
+                } else {
+                    acc_len
+                };
+                let logits =
+                    backend.from_cpu_f32(&v[row_idx * vv..(row_idx + 1) * vv], vec![1, 1, vv])?;
                 rust_inference::qwen3::SpecOutcome {
                     accepted,
                     logits,
@@ -433,15 +458,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             let n_acc = 1 + spec.accepted.len();
             spec_accepted += n_acc;
             if std::env::var("LLM_BENCH").is_ok() {
-                eprintln!("  step {generated}: {:.1}ms (diff+inj {:.1}ms, verify {:.1}ms)",
+                eprintln!(
+                    "  step {generated}: {:.1}ms (diff+inj {:.1}ms, verify {:.1}ms)",
                     t_step0.elapsed().as_secs_f64() * 1e3,
                     t_dd0.elapsed().as_secs_f64() * 1e3,
-                    t_vf0.elapsed().as_secs_f64() * 1e3);
+                    t_vf0.elapsed().as_secs_f64() * 1e3
+                );
             }
             if std::env::var("LLM_BENCH").is_ok() && generated % 10 == 0 {
-                eprintln!("spec step {generated}: draft {} accepted {} ({:.0}%)",
-                    draft.len(), spec.accepted.len(),
-                    100.0 * n_acc as f32 / (1 + draft.len()) as f32);
+                eprintln!(
+                    "spec step {generated}: draft {} accepted {} ({:.0}%)",
+                    draft.len(),
+                    spec.accepted.len(),
+                    100.0 * n_acc as f32 / (1 + draft.len()) as f32
+                );
                 if std::env::var("LLM_DBG_SPEC").is_ok() {
                     let d0: Vec<u32> = draft.iter().take(3).copied().collect();
                     let q0: Vec<f32> = probs.iter().take(3).copied().collect();
@@ -470,8 +500,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             logits = model.decode(&*backend, next)?;
             if std::env::var("LLM_BENCH").is_ok() && generated % 5 == 0 && generated > 3 {
-                eprintln!("bench decode step {generated}: {:.2}ms",
-                    t_dec.elapsed().as_secs_f64() * 1e3);
+                eprintln!(
+                    "bench decode step {generated}: {:.2}ms",
+                    t_dec.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
         generated += 1;
@@ -482,8 +514,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dt = d0.elapsed();
     eprintln!();
     if spec_mode && spec_drafts > 0 {
-        eprintln!("spec: {} шагов, средний acceptance-length {:.2} (γ≤4)",
-            spec_drafts, spec_accepted as f32 / spec_drafts as f32);
+        eprintln!(
+            "spec: {} шагов, средний acceptance-length {:.2} (γ≤4)",
+            spec_drafts,
+            spec_accepted as f32 / spec_drafts as f32
+        );
     }
     eprintln!(
         "generated {generated} tokens in {:.2}s → {:.1} tok/s (decode)",

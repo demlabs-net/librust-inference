@@ -1,6 +1,15 @@
 # Librust Inference
 
+Собственный стек инференса (замена candle): Metal-движок (свои MSL-кернелы),
+нативные NN-слои, квантованные веса (Q4_0/Q8_0/Q4_K/Q6_K, GEMM+MMV),
+токенайзер/чат-шаблоны, Qwen3-архитектура (GQA, QK-norm, RoPE, M-RoPE,
+vision, аудио), спекулятивный декодинг с DFlash v1/v2 драфтерами
+(диффузия блоков, прямая инъекция фич, селектор), LoRA-обучение
+([`train`]: Adam на Backend, Trainer-трейт, TrainJob/JobStore, эталон
+demo-lora).
 
+Ключевые модули: [`backend`] (контракт, GPU-only), [`metal`] (движок),
+[`qwen3`] (модель+spec-decode), [`dflash`] (драфтеры), [`train`] (LoRA).
 
 ## Getting started
 

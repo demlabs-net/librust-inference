@@ -261,6 +261,19 @@ impl CudaBackend {
             .unwrap_or(1)
     }
 
+    /// Number of z-slices the tiled kernels actually WRITE. The tiled GEMMs
+    /// launch grid.z=16 slices; each covers nkz = ceil(nsup/16) k-blocks and
+    /// exits without writing when kb0 >= nsup (k not divisible by 16·nkz).
+    /// Reducing ALL 16 slices would add STALE POOL CONTENTS from an earlier
+    /// GEMM that shared the cpart buffer (a different shape in the same
+    /// bucket) — the classic pool-reuse garbage that broke every quantized
+    /// STT engine (gigaam/t-one: k=768 → only 12 of 16 slices written).
+    fn tiled_used_slices(k: usize, block_shift: u32) -> usize {
+        let nsup = k >> block_shift;
+        let nkz = (nsup + 15) / 16;
+        nsup.div_ceil(nkz).max(1)
+    }
+
     /// Combine the (S·m, n) partials into C (gemm_i8_reduce — fixed order,
     /// deterministic) and return the cpart buffer to the pool.
     fn reduce_and_pool(
@@ -412,7 +425,8 @@ impl CudaBackend {
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.reduce_and_pool(cpart, c, m, n, 16)?;
+            let used = Self::tiled_used_slices(k, 5);
+            self.reduce_and_pool(cpart, c, m, n, used)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -953,7 +967,8 @@ impl Backend for CudaBackend {
                 la.arg(&k32);
                 la.arg(&n32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.reduce_and_pool(cpart, c, m, n, 16)?;
+                let used = Self::tiled_used_slices(k, 5);
+                self.reduce_and_pool(cpart, c, m, n, used)?;
                 self.pool_a_scratch(a_arg);
                 return Ok(());
             }
@@ -2487,7 +2502,8 @@ impl CudaBackend {
             la.arg(&k32);
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
-            self.reduce_and_pool(cpart, c, m, n, 16)?;
+            let used = Self::tiled_used_slices(k, nsup_shift);
+            self.reduce_and_pool(cpart, c, m, n, used)?;
         }
         self.pool_a_scratch(a_arg);
         let _ = blk_bytes; // layout constant — kept for the kernel contract

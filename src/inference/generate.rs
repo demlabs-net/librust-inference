@@ -204,11 +204,7 @@ mod tests {
                 storage.push((p(n), rand_vec(numel), shape));
             }
         }
-        storage.push((
-            "output_norm.weight".into(),
-            rand_vec(c.dim),
-            vec![c.dim],
-        ));
+        storage.push(("output_norm.weight".into(), rand_vec(c.dim), vec![c.dim]));
         let raw: Vec<(String, Vec<u8>, Vec<u64>)> = storage
             .iter()
             .map(|(n, data, shape)| {
@@ -293,13 +289,22 @@ mod tests {
             temperature: 0.0,
             ..Default::default()
         };
-        generate(&mut model, &backend, &tiny_tokenizer(), &[1], &params, |ev| {
-            events.push(ev);
-        })
+        generate(
+            &mut model,
+            &backend,
+            &tiny_tokenizer(),
+            &[1],
+            &params,
+            |ev| {
+                events.push(ev);
+            },
+        )
         .unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, GenerateEvent::Done(FinishReason::MaxTokens))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GenerateEvent::Done(FinishReason::MaxTokens)))
+        );
         assert!(events.iter().any(|e| matches!(e, GenerateEvent::Token(_))));
     }
 }

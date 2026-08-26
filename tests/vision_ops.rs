@@ -42,7 +42,9 @@ fn merge2x2_add_matches_cpu() {
     let n = per * per;
     let x: Vec<f32> = (0..n * d).map(|i| (i % 31) as f32 * 0.5 - 3.0).collect();
     let bias: Vec<f32> = (0..d).map(|i| i as f32 * 0.25 - 2.0).collect();
-    let pos: Vec<f32> = (0..n * d).map(|i| ((i * 7) % 29) as f32 * 0.125 - 1.0).collect();
+    let pos: Vec<f32> = (0..n * d)
+        .map(|i| ((i * 7) % 29) as f32 * 0.125 - 1.0)
+        .collect();
     let want = cpu_merge2x2_add(&x, &bias, &pos, per, d);
 
     let xt = bk.from_cpu_f32(&x, vec![n, d]).unwrap();
@@ -88,7 +90,12 @@ fn group4_matches_cpu() {
 
     assert_eq!(got.len(), want.len());
     for i in 0..want.len() {
-        assert!((got[i] - want[i]).abs() < 1e-4, "group4[{i}]: got {} want {}", got[i], want[i]);
+        assert!(
+            (got[i] - want[i]).abs() < 1e-4,
+            "group4[{i}]: got {} want {}",
+            got[i],
+            want[i]
+        );
     }
 }
 

@@ -154,6 +154,28 @@ impl GgmlType {
         })
     }
 
+    /// Код типа в GGUF-файле (обратный к `from_raw`; дискриминанты enum
+    /// НЕ совпадают с кодами — для записи использовать этот метод).
+    pub fn raw(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q8_1 => 9,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+            Self::Q8K => 15,
+            Self::Bf16 => 27,
+        }
+    }
+
     /// Элементов в блоке (32 для Q-блоков, 256 для K-блоков, 1 для float).
     pub fn block_elems(self) -> u32 {
         match self {

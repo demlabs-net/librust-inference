@@ -79,7 +79,9 @@ pub struct BufferPoolState {
 
 impl BufferPoolState {
     fn new() -> Self {
-        Self { free: Mutex::new(HashMap::new()) }
+        Self {
+            free: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Взять буфер размера >= bytes (класс 4KB) или создать (маркер снят).
@@ -93,7 +95,13 @@ impl BufferPoolState {
         // Новые буферы безопасны: Metal command buffer удерживает ресурсы
         // до завершения. После end_batch (wait) пул снова активен.
         if BATCH_DEPTH.load(Ordering::Relaxed) == 0 && std::env::var("OMNI_NO_POOL").is_err() {
-            if let Some(buf) = self.free.lock().unwrap().get_mut(&class).and_then(|v| v.pop()) {
+            if let Some(buf) = self
+                .free
+                .lock()
+                .unwrap()
+                .get_mut(&class)
+                .and_then(|v| v.pop())
+            {
                 return buf;
             }
         }
@@ -131,8 +139,7 @@ impl BufferPoolState {
             let p = buf.contents();
             let dup = v.iter().filter(|b| b.contents() == p).count();
             if dup > 0 {
-                eprintln!("OMNI_DUP: DOUBLE PUSH ptr={p:?} len={}",
-                    buf.length());
+                eprintln!("OMNI_DUP: DOUBLE PUSH ptr={p:?} len={}", buf.length());
             }
         }
         v.push(buf.clone());
@@ -610,7 +617,13 @@ impl MetalCtx {
                 for buf in deferred {
                     let class = (buf.length() as usize + 4095) & !4095;
                     let class = class.max(4096);
-                    pool().free.lock().unwrap().entry(class).or_default().push(buf);
+                    pool()
+                        .free
+                        .lock()
+                        .unwrap()
+                        .entry(class)
+                        .or_default()
+                        .push(buf);
                 }
             }
         }
@@ -736,7 +749,11 @@ impl MetalCtx {
         self.run("conv1d_direct_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                2,
+                bias.map(|b| &*b.buffer),
+                bias.map(|b| b.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, cin, cout, k].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
@@ -1052,7 +1069,11 @@ impl MetalCtx {
         self.run("conv2d_nchw_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                2,
+                bias.map(|b| &*b.buffer),
+                bias.map(|b| b.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             let consts = [
                 n,
@@ -1344,7 +1365,11 @@ impl MetalCtx {
         self.run("conv1d_groups_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                2,
+                bias.map(|b| &*b.buffer),
+                bias.map(|b| b.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, cin, cout, k, cin_g].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
@@ -1399,7 +1424,11 @@ impl MetalCtx {
         self.run("conv2d_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                2,
+                bias.map(|b| &*b.buffer),
+                bias.map(|b| b.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [cin, t, f, cout, kt, kf].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
@@ -1619,7 +1648,11 @@ impl MetalCtx {
             enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
             enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
             enc.set_buffer(3, Some(&sc.buffer), sc.offset as u64);
-            enc.set_buffer(4, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                4,
+                mask.map(|m| &*m.buffer),
+                mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(5, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, t, h, hd].iter().enumerate() {
                 enc.set_bytes((6 + i) as u64, 8, (v as *const usize).cast());
@@ -1681,7 +1714,11 @@ impl MetalCtx {
         self.run("conv_transpose1d_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, bias.map(|b| &*b.buffer), bias.map(|b| b.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                2,
+                bias.map(|b| &*b.buffer),
+                bias.map(|b| b.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
             for (i, v) in [t, cin, cout, k].iter().enumerate() {
                 enc.set_bytes((4 + i) as u64, 8, (v as *const usize).cast());
@@ -1774,11 +1811,7 @@ impl MetalCtx {
 
     /// Vision merger concat: chunks ([nq, proj] ×nchunks, ≤4) → [4·nq, proj],
     /// rows interleaved: out[q·4+j] = chunk_j[q].
-    pub fn concat4_f32(
-        &self,
-        chunks: &[GpuTensor],
-        y: &GpuTensor,
-    ) -> Result<(), MetalError> {
+    pub fn concat4_f32(&self, chunks: &[GpuTensor], y: &GpuTensor) -> Result<(), MetalError> {
         let nq = y.shape[0] / 4;
         let proj = y.shape[1];
         let total = nq * 4 * proj;
@@ -1986,7 +2019,11 @@ impl MetalCtx {
             enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
             enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
             enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
-            enc.set_buffer(3, mask.map(|m| &*m.buffer), mask.as_ref().map(|m| m.offset as u64).unwrap_or(0));
+            enc.set_buffer(
+                3,
+                mask.map(|m| &*m.buffer),
+                mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+            );
             enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
             for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
                 .iter()
@@ -2405,7 +2442,8 @@ impl crate::backend::Backend for MetalBackend {
         shift: usize,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         let y = GpuTensor::zeros(&self.ctx.device, x.as_gpu().shape.clone())?;
-        self.ctx.deepstack_add_f32(x.as_gpu(), embd.as_gpu(), shift, &y)?;
+        self.ctx
+            .deepstack_add_f32(x.as_gpu(), embd.as_gpu(), shift, &y)?;
         Ok(crate::backend::Tensor::from_gpu(y))
     }
 
@@ -2941,8 +2979,13 @@ impl crate::backend::Backend for MetalBackend {
         y: &crate::backend::Tensor,
         override_id: u32,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx
-            .embedding_override_f32(idx, table.as_gpu(), vision.as_gpu(), y.as_gpu(), override_id)?;
+        self.ctx.embedding_override_f32(
+            idx,
+            table.as_gpu(),
+            vision.as_gpu(),
+            y.as_gpu(),
+            override_id,
+        )?;
         Ok(())
     }
 
@@ -3393,7 +3436,6 @@ mod quant_gemm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod batch_debug {
     use super::*;
@@ -3402,7 +3444,9 @@ mod batch_debug {
         let half_one = 0x3C00u16.to_le_bytes();
         for _ in 0..n * (k / 32) {
             b.extend_from_slice(&half_one);
-            for i in 0..32 { b.push((i % 64) as u8); }
+            for i in 0..32 {
+                b.push((i % 64) as u8);
+            }
         }
         b
     }
@@ -3413,22 +3457,35 @@ mod batch_debug {
         let mut bytes = Vec::new();
         let half_one = 0x3C00u16.to_le_bytes();
         bytes.extend_from_slice(&half_one);
-        for i in 0..32 { bytes.push(i as u8); }
+        for i in 0..32 {
+            bytes.push(i as u8);
+        }
         bytes.extend_from_slice(&half_one);
-        for i in 0..32 { bytes.push((31 - i) as u8); }
-        let b = GpuTensor::from_quantized(&ctx.device, &bytes, vec![2, 32], GpuDtype::Q8_0).unwrap();
+        for i in 0..32 {
+            bytes.push((31 - i) as u8);
+        }
+        let b =
+            GpuTensor::from_quantized(&ctx.device, &bytes, vec![2, 32], GpuDtype::Q8_0).unwrap();
         // A: m=2, k=32: a0 = [1,0,0,...], a1 = [0..31]
         let mut ad = vec![0f32; 2 * 32];
         ad[0] = 1.0;
-        for i in 0..32 { ad[32 + i] = i as f32; }
+        for i in 0..32 {
+            ad[32 + i] = i as f32;
+        }
         let a = GpuTensor::from_cpu_f32(&ctx.device, &ad, vec![2, 32]).unwrap();
         let c = GpuTensor::zeros(&ctx.device, vec![2, 2]).unwrap();
         // barrier-проверка
         {
             let c4 = GpuTensor::zeros(&ctx.device, vec![32]).unwrap();
-            ctx.run("tg_barrier_test", metal::MTLSize::new(1, 1, 32), metal::MTLSize::new(1, 1, 32), |enc| {
-                enc.set_buffer(0, Some(&c4.buffer), c4.offset as u64);
-            }).unwrap();
+            ctx.run(
+                "tg_barrier_test",
+                metal::MTLSize::new(1, 1, 32),
+                metal::MTLSize::new(1, 1, 32),
+                |enc| {
+                    enc.set_buffer(0, Some(&c4.buffer), c4.offset as u64);
+                },
+            )
+            .unwrap();
             let v4 = c4.to_cpu_f32(&ctx).unwrap();
             assert!(v4.iter().all(|&x| x == 42.0), "barrier сломан: {v4:?}");
         }
@@ -3436,15 +3493,31 @@ mod batch_debug {
         let cv = c.to_cpu_f32(&ctx).unwrap();
         // микро-бенч: attn_ar 9 токенов × 36 кэш × 32 головы
         {
-            let q9 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.1f32; 1 * 9 * 4096], vec![1, 9, 4096]).unwrap();
-            let k36 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.2f32; 1 * 36 * 1024], vec![1, 36, 1024]).unwrap();
-            let v36 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.3f32; 1 * 36 * 1024], vec![1, 36, 1024]).unwrap();
+            let q9 =
+                GpuTensor::from_cpu_f32(&ctx.device, &vec![0.1f32; 1 * 9 * 4096], vec![1, 9, 4096])
+                    .unwrap();
+            let k36 = GpuTensor::from_cpu_f32(
+                &ctx.device,
+                &vec![0.2f32; 1 * 36 * 1024],
+                vec![1, 36, 1024],
+            )
+            .unwrap();
+            let v36 = GpuTensor::from_cpu_f32(
+                &ctx.device,
+                &vec![0.3f32; 1 * 36 * 1024],
+                vec![1, 36, 1024],
+            )
+            .unwrap();
             let y9 = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
             let t0 = std::time::Instant::now();
             for _ in 0..10 {
-                ctx.attn_ar_f32(&q9, &k36, &v36, None, &y9, 32, 8, 128).unwrap();
+                ctx.attn_ar_f32(&q9, &k36, &v36, None, &y9, 32, 8, 128)
+                    .unwrap();
             }
-            eprintln!("micro: attn_ar 9x36x32 = {:.2}ms", t0.elapsed().as_secs_f64() * 1e3 / 10.0);
+            eprintln!(
+                "micro: attn_ar 9x36x32 = {:.2}ms",
+                t0.elapsed().as_secs_f64() * 1e3 / 10.0
+            );
             // rmsnorm_head 9 токенов
             let w128 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.5f32; 128], vec![128]).unwrap();
             let yn = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
@@ -3452,7 +3525,10 @@ mod batch_debug {
             for _ in 0..10 {
                 ctx.rmsnorm_head_f32(&q9, &w128, &yn, 32, 1e-6).unwrap();
             }
-            eprintln!("micro: rmsnorm_head 9t = {:.2}ms", t1.elapsed().as_secs_f64() * 1e3 / 10.0);
+            eprintln!(
+                "micro: rmsnorm_head 9t = {:.2}ms",
+                t1.elapsed().as_secs_f64() * 1e3 / 10.0
+            );
             // rope 9 токенов (напрямую через run)
             let yr = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
             let t2 = std::time::Instant::now();
@@ -3466,26 +3542,46 @@ mod batch_debug {
                         enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
                     }
                     enc.set_bytes(6, 4, (&1e6f32 as *const f32).cast());
-                }).unwrap();
+                })
+                .unwrap();
             }
-            eprintln!("micro: rope 9t = {:.2}ms", t2.elapsed().as_secs_f64() * 1e3 / 10.0);
+            eprintln!(
+                "micro: rope 9t = {:.2}ms",
+                t2.elapsed().as_secs_f64() * 1e3 / 10.0
+            );
         }
         // микро-бенч: gemm 16×4096×4096 Q8_0 (как prefill-верификация)
         {
             let m16 = 16usize;
             let k16 = 4096usize;
             let n16 = 4096usize;
-            let b16 = GpuTensor::from_quantized(&ctx.device, &bytes_rep(n16, k16), vec![n16, k16], GpuDtype::Q8_0).unwrap();
-            let a16 = GpuTensor::from_cpu_f32(&ctx.device, &vec![0.5f32; m16 * k16], vec![m16, k16]).unwrap();
+            let b16 = GpuTensor::from_quantized(
+                &ctx.device,
+                &bytes_rep(n16, k16),
+                vec![n16, k16],
+                GpuDtype::Q8_0,
+            )
+            .unwrap();
+            let a16 =
+                GpuTensor::from_cpu_f32(&ctx.device, &vec![0.5f32; m16 * k16], vec![m16, k16])
+                    .unwrap();
             let c16 = GpuTensor::zeros(&ctx.device, vec![m16, n16]).unwrap();
             let t0 = std::time::Instant::now();
             for _ in 0..3 {
                 ctx.gemm_nt_quantized(&a16, &b16, &c16).unwrap();
             }
-            eprintln!("micro: gemm 16x4096x4096 Q8_0 = {:.1}ms", t0.elapsed().as_secs_f64() * 1e3 / 3.0);
+            eprintln!(
+                "micro: gemm 16x4096x4096 Q8_0 = {:.1}ms",
+                t0.elapsed().as_secs_f64() * 1e3 / 3.0
+            );
         }
         // CPU: C[0][0] = 0 (a0·q0: 1*0=0); C[0][1] = 31; C[1][0] = Σi*i = 9455
-        let exp = vec![0.0, 31.0, 10416.0, (0..32).map(|i| (i * (31 - i)) as f32).sum()];
+        let exp = vec![
+            0.0,
+            31.0,
+            10416.0,
+            (0..32).map(|i| (i * (31 - i)) as f32).sum(),
+        ];
         assert_eq!(cv, exp, "batch Q8_0 m=2: got {cv:?} expected {exp:?}");
         // m=1: только строка 0
         let a1 = GpuTensor::from_cpu_f32(&ctx.device, &ad[..32], vec![1, 32]).unwrap();

@@ -2,10 +2,10 @@
 #![cfg(all(feature = "cuda", feature = "cpu"))]
 //! `cargo test --release --features "cuda cpu" --test mhsa_rel_pos -- --nocapture`
 
+use rust_inference::Backend;
 use rust_inference::cpu::CpuBackend;
 use rust_inference::cuda::CudaBackend;
 use rust_inference::harness::Lcg;
-use rust_inference::Backend;
 
 fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
     let gpu = CudaBackend::new(0).unwrap();
@@ -42,8 +42,21 @@ fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
     let vb_g = gpu.from_cpu_f32(&vb, vec![h * dp]).unwrap();
     let y_g = gpu.zeros(vec![t, d]).unwrap();
     let w_g = gpu.zeros(vec![h, t, t]).unwrap();
-    gpu.mhsa_rel_pos(&q_g, &k_g, &v_g, &qp_g, &p_g, &u_g, &vb_g, &y_g, Some(&w_g), dk, dp, mode)
-        .unwrap();
+    gpu.mhsa_rel_pos(
+        &q_g,
+        &k_g,
+        &v_g,
+        &qp_g,
+        &p_g,
+        &u_g,
+        &vb_g,
+        &y_g,
+        Some(&w_g),
+        dk,
+        dp,
+        mode,
+    )
+    .unwrap();
     gpu.synchronize().unwrap();
     let got = gpu.to_cpu_f32(&y_g).unwrap();
     let wgot = gpu.to_cpu_f32(&w_g).unwrap();
@@ -57,8 +70,21 @@ fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
     let vb_c = cpu.from_cpu_f32(&vb, vec![h * dp]).unwrap();
     let y_c = cpu.zeros(vec![t, d]).unwrap();
     let w_c = cpu.zeros(vec![h, t, t]).unwrap();
-    cpu.mhsa_rel_pos(&q_c, &k_c, &v_c, &qp_c, &p_c, &u_c, &vb_c, &y_c, Some(&w_c), dk, dp, mode)
-        .unwrap();
+    cpu.mhsa_rel_pos(
+        &q_c,
+        &k_c,
+        &v_c,
+        &qp_c,
+        &p_c,
+        &u_c,
+        &vb_c,
+        &y_c,
+        Some(&w_c),
+        dk,
+        dp,
+        mode,
+    )
+    .unwrap();
     let want = cpu.to_cpu_f32(&y_c).unwrap();
     let wwant = cpu.to_cpu_f32(&w_c).unwrap();
 
@@ -82,7 +108,10 @@ fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
             }
         }
     }
-    assert_eq!(bad, 0, "mhsa_rel_pos mode {mode} mismatch: {bad}, tol {tol}");
+    assert_eq!(
+        bad, 0,
+        "mhsa_rel_pos mode {mode} mismatch: {bad}, tol {tol}"
+    );
     println!("mhsa_rel_pos mode {mode} (t={t} dk={dk} dp={dp} h={h}): ok");
 }
 
@@ -108,7 +137,11 @@ fn mhsa_apply_weights_matches_cpu() {
     // row-normalize to look like softmax weights
     for hh in 0..h {
         for r in 0..t {
-            let s: f32 = w[hh * t * t + r * t..hh * t * t + (r + 1) * t].iter().sum::<f32>().abs() + 1.0;
+            let s: f32 = w[hh * t * t + r * t..hh * t * t + (r + 1) * t]
+                .iter()
+                .sum::<f32>()
+                .abs()
+                + 1.0;
             for c in 0..t {
                 w[hh * t * t + r * t + c] /= s;
             }

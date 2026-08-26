@@ -59,8 +59,12 @@ impl DrafterManifest {
 /// (DFlash — диффузия на GPU); n-граммовый его игнорирует.
 pub trait Drafter {
     /// Следующие `gamma` токенов и их вероятности q_i (для rejection).
-    fn draft(&mut self, backend: &dyn crate::backend::Backend, history: &[u32], gamma: usize)
-        -> (Vec<u32>, Vec<f32>);
+    fn draft(
+        &mut self,
+        backend: &dyn crate::backend::Backend,
+        history: &[u32],
+        gamma: usize,
+    ) -> (Vec<u32>, Vec<f32>);
 }
 
 /// Суффиксный n-граммовый драфтер: самый длинный суффикс истории с

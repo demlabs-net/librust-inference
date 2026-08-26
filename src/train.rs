@@ -25,7 +25,11 @@ const DATASET_N: usize = 512;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobStatus {
     Queued,
-    Running { step: usize, total: usize, loss: Option<f64> },
+    Running {
+        step: usize,
+        total: usize,
+        loss: Option<f64>,
+    },
     Done,
     Cancelled,
     Failed(String),
@@ -183,7 +187,11 @@ impl JobStore {
                 }
             }
         }
-        jobs.sort_by(|a, b| a.created_at.partial_cmp(&b.created_at).unwrap_or(std::cmp::Ordering::Equal));
+        jobs.sort_by(|a, b| {
+            a.created_at
+                .partial_cmp(&b.created_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(jobs)
     }
 
@@ -401,8 +409,14 @@ impl Adam {
         self.t += 1;
         let shape = grad.shape().to_vec();
         let (b1, b2) = (self.beta1 as f32, self.beta2 as f32);
-        let m = self.m.entry(name.to_string()).or_insert_with(|| bk.zeros(shape.clone()).unwrap());
-        let v = self.v.entry(name.to_string()).or_insert_with(|| bk.zeros(shape.clone()).unwrap());
+        let m = self
+            .m
+            .entry(name.to_string())
+            .or_insert_with(|| bk.zeros(shape.clone()).unwrap());
+        let v = self
+            .v
+            .entry(name.to_string())
+            .or_insert_with(|| bk.zeros(shape.clone()).unwrap());
         let m_hat_c = (1.0 / (1.0 - self.beta1.powi(self.t as i32))) as f32;
         let v_hat_c = (1.0 / (1.0 - self.beta2.powi(self.t as i32))) as f32;
 
@@ -486,8 +500,31 @@ impl Trainer for DemoLoraTrainer {
                     vec![batch, IN_DIM],
                 )?;
                 let yb = backend.from_cpu_f32(&y[start..start + batch], vec![batch, OUT_DIM])?;
-                let (out, cache) = forward(backend.as_ref(), &xb, &a, &b, &w1, &b1, &w2, &b2, scale, batch, r)?;
-                let (loss, g_a, g_b) = backward(backend.as_ref(), &xb, &yb, &out, &b, &w2, &cache, scale, batch, r)?;
+                let (out, cache) = forward(
+                    backend.as_ref(),
+                    &xb,
+                    &a,
+                    &b,
+                    &w1,
+                    &b1,
+                    &w2,
+                    &b2,
+                    scale,
+                    batch,
+                    r,
+                )?;
+                let (loss, g_a, g_b) = backward(
+                    backend.as_ref(),
+                    &xb,
+                    &yb,
+                    &out,
+                    &b,
+                    &w2,
+                    &cache,
+                    scale,
+                    batch,
+                    r,
+                )?;
                 adam.step(backend.as_ref(), "a", &mut a, &g_a)?;
                 adam.step(backend.as_ref(), "b", &mut b, &g_b)?;
                 last_loss = Some(loss);
@@ -558,7 +595,11 @@ mod tests {
             last < first,
             "loss must decrease: first={first:.4} last={last:.4}"
         );
-        assert!(path.exists(), "adapter must be exported: {}", path.display());
+        assert!(
+            path.exists(),
+            "adapter must be exported: {}",
+            path.display()
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"rank\""));
         let _ = std::fs::remove_dir_all(&out_dir);
@@ -570,7 +611,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("train-store-{}", std::process::id()));
         let store = JobStore::new(&dir);
         let mut job = TrainJob::new("j1", "m1");
-        job.status = JobStatus::Running { step: 1, total: 10, loss: Some(0.5) };
+        job.status = JobStatus::Running {
+            step: 1,
+            total: 10,
+            loss: Some(0.5),
+        };
         store.save(&job).unwrap();
         let loaded = store.load("j1").unwrap();
         assert_eq!(loaded.id, "j1");

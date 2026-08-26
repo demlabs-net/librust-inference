@@ -122,8 +122,14 @@ impl VisionModel {
         };
         let d = cfg.embedding_length;
         let patch_embd = t("v.patch_embd.weight")?;
-        let patch_embd_b = w.get("v.patch_embd.bias").map(|_| t("v.patch_embd.bias")).transpose()?;
-        let pos_embd = w.get("v.pos_embd.weight").map(|_| t("v.pos_embd.weight")).transpose()?;
+        let patch_embd_b = w
+            .get("v.patch_embd.bias")
+            .map(|_| t("v.patch_embd.bias"))
+            .transpose()?;
+        let pos_embd = w
+            .get("v.pos_embd.weight")
+            .map(|_| t("v.pos_embd.weight"))
+            .transpose()?;
         let mut layers = Vec::with_capacity(cfg.block_count);
         for i in 0..cfg.block_count {
             let p = |s: &str| format!("v.blk.{i}.{s}");
@@ -219,11 +225,24 @@ impl VisionModel {
             let qkv = qkv_b;
             let qkv = qkv.view(vec![b, tq, 3 * cfg.embedding_length]);
             let q = crate::nn::slice_last(backend, &qkv, cfg.embedding_length, 0)?;
-            let k = crate::nn::slice_last(backend, &qkv, cfg.embedding_length, cfg.embedding_length)?;
-            let v = crate::nn::slice_last(backend, &qkv, cfg.embedding_length, 2 * cfg.embedding_length)?;
+            let k =
+                crate::nn::slice_last(backend, &qkv, cfg.embedding_length, cfg.embedding_length)?;
+            let v = crate::nn::slice_last(
+                backend,
+                &qkv,
+                cfg.embedding_length,
+                2 * cfg.embedding_length,
+            )?;
             let attn = backend.zeros(vec![b, tq, cfg.embedding_length])?;
             backend.attn_ar(
-                &q, &k, &v, None, &attn, cfg.n_heads, cfg.n_heads, cfg.embedding_length / cfg.n_heads,
+                &q,
+                &k,
+                &v,
+                None,
+                &attn,
+                cfg.n_heads,
+                cfg.n_heads,
+                cfg.embedding_length / cfg.n_heads,
             )?;
             let attn = attn.view(vec![b * tq, cfg.embedding_length]);
             let ao0 = backend.zeros(vec![b * tq, cfg.embedding_length])?;
@@ -372,21 +391,18 @@ mod tests {
 
         #[cfg(feature = "cpu")]
         {
-        let cpu_b = crate::cpu::CpuBackend;
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mini-vit.gguf");
-        let buf = std::fs::read(&path).unwrap();
-        let f = crate::gguf::parse(&buf).unwrap();
-        let wm = WeightsMap::from_gguf(&f).unwrap();
-        let cfg = VisionConfig::from_gguf(&f).unwrap();
-        let cpu_model = VisionModel::load(&cpu_b, &wm, cfg).unwrap();
-        let cpu_out = cpu_model.forward(&cpu_b, &img, h, w).unwrap();
-        let cv = cpu_b.to_cpu_f32(&cpu_out).unwrap();
-        for (a, b) in gv.iter().zip(cv.iter()) {
-            assert!(
-                (a - b).abs() < 1e-3,
-                "metal {a} vs cpu {b}"
-            );
-        }
+            let cpu_b = crate::cpu::CpuBackend;
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mini-vit.gguf");
+            let buf = std::fs::read(&path).unwrap();
+            let f = crate::gguf::parse(&buf).unwrap();
+            let wm = WeightsMap::from_gguf(&f).unwrap();
+            let cfg = VisionConfig::from_gguf(&f).unwrap();
+            let cpu_model = VisionModel::load(&cpu_b, &wm, cfg).unwrap();
+            let cpu_out = cpu_model.forward(&cpu_b, &img, h, w).unwrap();
+            let cv = cpu_b.to_cpu_f32(&cpu_out).unwrap();
+            for (a, b) in gv.iter().zip(cv.iter()) {
+                assert!((a - b).abs() < 1e-3, "metal {a} vs cpu {b}");
+            }
         }
     }
 

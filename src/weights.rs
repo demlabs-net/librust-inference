@@ -162,3 +162,135 @@ fn f16_to_f32(h: u16) -> f32 {
     };
     f32::from_bits(bits)
 }
+
+// ─────────────────── по-тензорный доступ (конверсия Ф4.12) ───────────────────
+
+/// Строка заголовка safetensors: (имя, dtype, shape, смещение в data-секции).
+type StTensorInfo = (String, String, Vec<usize>, usize);
+
+/// Парсинг заголовка safetensors (имена + оффсеты, без данных).
+fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 8 {
+        anyhow::bail!("safetensors: file too short ({} bytes)", bytes.len());
+    }
+    let header_len = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
+    let header_end = 8usize
+        .checked_add(header_len)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("safetensors: header len {header_len} exceeds file size"))?;
+    let header: serde_json::Value = serde_json::from_slice(&bytes[8..header_end])?;
+    let map = header
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid safetensors header"))?;
+    let mut out = Vec::with_capacity(map.len());
+    for (name, info) in map {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = info
+            .get("dtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("F32")
+            .to_string();
+        let shape: Vec<usize> = info
+            .get("shape")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let offsets = info
+            .get("data_offsets")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("missing data_offsets for {name}"))?;
+        let start = offsets
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))?
+            as usize
+            + 8
+            + header_len;
+        out.push((name.clone(), dtype, shape, start));
+    }
+    Ok(out)
+}
+
+/// Имена тензоров safetensors (без чтения данных).
+pub fn safetensors_tensor_names(path: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(safetensors_header(path)?
+        .into_iter()
+        .map(|(n, _, _, _)| n)
+        .collect())
+}
+
+/// Число элементов тензора по имени.
+pub fn safetensors_tensor_numel(path: &Path, name: &str) -> anyhow::Result<usize> {
+    let h = safetensors_header(path)?;
+    h.into_iter()
+        .find(|(n, _, _, _)| n == name)
+        .map(|(_, _, shape, _)| shape.iter().product())
+        .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))
+}
+
+/// Прочитать ОДИН тензор с диска (f32, widened из F16/BF16/I64/U32).
+/// Для конверсий: память = один тензор, а не весь файл.
+pub fn read_safetensors_tensor_f32(
+    path: &Path,
+    name: &str,
+) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
+    let h = safetensors_header(path)?;
+    let (_, dtype, shape, start) = h
+        .into_iter()
+        .find(|(n, _, _, _)| n == name)
+        .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))?;
+    let bytes = std::fs::read(path)?;
+    let numel: usize = shape.iter().product();
+    let elem = match dtype.as_str() {
+        "F32" | "U32" => 4,
+        "F16" | "BF16" => 2,
+        "I64" => 8,
+        other => anyhow::bail!("tensor {name}: unsupported dtype {other}"),
+    };
+    let end = start
+        .checked_add(numel * elem)
+        .ok_or_else(|| anyhow::anyhow!("overflow for {name}"))?;
+    let data = bytes
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("tensor {name}: byte range out of bounds"))?;
+    let mut vec = Vec::with_capacity(numel);
+    match dtype.as_str() {
+        "F32" => {
+            for chunk in data.chunks_exact(4) {
+                vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+        "U32" => {
+            for chunk in data.chunks_exact(4) {
+                vec.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32);
+            }
+        }
+        "I64" => {
+            for chunk in data.chunks_exact(8) {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(chunk);
+                vec.push(i64::from_le_bytes(b) as f32);
+            }
+        }
+        "F16" => {
+            for chunk in data.chunks_exact(2) {
+                let h = u16::from_le_bytes([chunk[0], chunk[1]]);
+                vec.push(f16_to_f32(h));
+            }
+        }
+        _ => {
+            for chunk in data.chunks_exact(2) {
+                let h = u16::from_le_bytes([chunk[0], chunk[1]]);
+                vec.push(f32::from_bits((h as u32) << 16));
+            }
+        }
+    }
+    Ok((vec, shape))
+}

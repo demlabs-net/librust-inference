@@ -59,7 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_inf,
         dt.as_secs_f32()
     );
-    assert_eq!(out.shape(), &[1, 2304, 2048], "expected 2304 vision tokens × 2048");
+    assert_eq!(
+        out.shape(),
+        &[1, 2304, 2048],
+        "expected 2304 vision tokens × 2048"
+    );
     assert_eq!(n_nan, 0, "NaN in vision output");
     assert_eq!(n_inf, 0, "Inf in vision output");
     let row0 = &v[..16];

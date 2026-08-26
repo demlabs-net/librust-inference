@@ -144,7 +144,7 @@ fn bf16_to_f32(b: [u8; 2]) -> f32 {
     f32::from_bits((u16::from_le_bytes(b) as u32) << 16)
 }
 
-fn dequant_q4_0(data: &[u8]) -> Vec<f32> {
+pub(crate) fn dequant_q4_0(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(18)
         .flat_map(|blk| {
             let d = f16_to_f32([blk[0], blk[1]]);
@@ -155,7 +155,7 @@ fn dequant_q4_0(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
+pub(crate) fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(34)
         .flat_map(|blk| {
             let d = f16_to_f32([blk[0], blk[1]]);
@@ -164,7 +164,7 @@ fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn dequant_q4_k(data: &[u8]) -> Vec<f32> {
+pub(crate) fn dequant_q4_k(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(148)
         .flat_map(|sb| {
             let d = f16_to_f32([sb[0], sb[1]]);
@@ -188,7 +188,7 @@ fn dequant_q4_k(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
+pub(crate) fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(210)
         .flat_map(|sb| {
             let d = f16_to_f32([sb[0], sb[1]]);
@@ -211,6 +211,39 @@ fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
             })
         })
         .collect()
+}
+
+/// Деквантовать GGUF-тензор (сырой ggml-тип) в f32 — для re-quant (Ф4.12).
+pub(crate) fn dequant_gguf(
+    ggml_type: crate::gguf::GgmlType,
+    data: &[u8],
+) -> Result<Vec<f32>, crate::error::BackendError> {
+    use crate::error::BackendError;
+    use crate::gguf::GgmlType as T;
+    Ok(match ggml_type {
+        T::F32 => data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect(),
+        T::F16 => data
+            .chunks_exact(2)
+            .map(|b| f16_to_f32([b[0], b[1]]))
+            .collect(),
+        T::Bf16 => data
+            .chunks_exact(2)
+            .map(|b| bf16_to_f32([b[0], b[1]]))
+            .collect(),
+        T::Q4_0 => dequant_q4_0(data),
+        T::Q8_0 => dequant_q8_0(data),
+        T::Q4K => dequant_q4_k(data),
+        T::Q6K => dequant_q6_k(data),
+        // re-quant из прочих форматов — по мере добавления (Ф4.12)
+        other => {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "dequant {other:?} (re-quant из этого формата — следующая итерация)"
+            )));
+        }
+    })
 }
 
 /// Деквантовать тензор в f32 (CPU-референс; длина == numel).

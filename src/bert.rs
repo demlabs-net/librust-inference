@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::backend::{Backend, Tensor};
 use crate::error::BackendError;
 use crate::nn::{Embedding, Linear};
-use crate::weights::{read_safetensors_f32, F32Tensors};
+use crate::weights::{F32Tensors, read_safetensors_f32};
 
 // ---------------------------------------------------------------------------
 // WordPiece-токенайзер (BERT/bge-small)
@@ -295,10 +295,7 @@ impl BertEncoder {
         let int4 = config.intermediate_size;
         let emb = |name: &str| -> Result<Embedding, BackendError> {
             let data = get(&w, name)?;
-            let shape = w
-                .get(name)
-                .map(|(_, s)| s.clone())
-                .unwrap_or_default();
+            let shape = w.get(name).map(|(_, s)| s.clone()).unwrap_or_default();
             Embedding::from_weights(backend, data.clone(), shape)
         };
         let lin = |name: &str, out: usize, inp: usize| -> Result<(Tensor, Tensor), BackendError> {
@@ -370,7 +367,11 @@ impl BertEncoder {
 
     /// Векторизация текстов: по одному (lookup-кернел batch=1); выход —
     /// L2-нормализованные эмбеддинги размера hidden_size.
-    pub fn embed(&self, backend: &dyn Backend, texts: &[&str]) -> Result<Vec<Vec<f32>>, BackendError> {
+    pub fn embed(
+        &self,
+        backend: &dyn Backend,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, BackendError> {
         let mut out = Vec::with_capacity(texts.len());
         for text in texts {
             out.push(self.embed_one(backend, text)?);
@@ -400,11 +401,23 @@ impl BertEncoder {
         let x3 = backend.zeros(vec![1, t, d])?;
         backend.add(&x2, &seg, &x3)?;
         let ln0 = backend.zeros(vec![1, t, d])?;
-        backend.layernorm(&x, &self.emb_ln_w, &self.emb_ln_b, &ln0, self.config.layer_norm_eps)?;
+        backend.layernorm(
+            &x,
+            &self.emb_ln_w,
+            &self.emb_ln_b,
+            &ln0,
+            self.config.layer_norm_eps,
+        )?;
         x = ln0;
         let hd = d / self.config.num_attention_heads;
         for layer in &self.layers {
-            x = layer.forward(backend, &x, self.config.layer_norm_eps, self.config.num_attention_heads, hd)?;
+            x = layer.forward(
+                backend,
+                &x,
+                self.config.layer_norm_eps,
+                self.config.num_attention_heads,
+                hd,
+            )?;
         }
         // CLS = первая строка: срез через CPU (D ≤ 1024 — дёшево);
         // Linear ожидает 3D (batch, seq, hidden)
@@ -436,7 +449,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next_f32(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 40) as f32 / (1u64 << 24) as f32) - 0.5
         }
     }
@@ -453,26 +469,82 @@ mod tests {
         let mut put = |name: String, data: Vec<f32>, shape: Vec<usize>| {
             w.insert(name, (data, shape));
         };
-        put("bert.embeddings.word_embeddings.weight".into(), t(34, d), vec![34, d]);
-        put("bert.embeddings.position_embeddings.weight".into(), t(16, d), vec![16, d]);
-        put("bert.embeddings.token_type_embeddings.weight".into(), t(2, d), vec![2, d]);
-        put("bert.embeddings.LayerNorm.weight".into(), vec![1.0; d], vec![d]);
-        put("bert.embeddings.LayerNorm.bias".into(), vec![0.0; d], vec![d]);
+        put(
+            "bert.embeddings.word_embeddings.weight".into(),
+            t(34, d),
+            vec![34, d],
+        );
+        put(
+            "bert.embeddings.position_embeddings.weight".into(),
+            t(16, d),
+            vec![16, d],
+        );
+        put(
+            "bert.embeddings.token_type_embeddings.weight".into(),
+            t(2, d),
+            vec![2, d],
+        );
+        put(
+            "bert.embeddings.LayerNorm.weight".into(),
+            vec![1.0; d],
+            vec![d],
+        );
+        put(
+            "bert.embeddings.LayerNorm.bias".into(),
+            vec![0.0; d],
+            vec![d],
+        );
         for i in 0..2 {
             let p = format!("encoder.layer.{i}");
             for part in ["query", "key", "value"] {
-                put(format!("{p}.attention.self.{part}.weight").into(), t(d, d), vec![d, d]);
-                put(format!("{p}.attention.self.{part}.bias").into(), t(d, 1), vec![d]);
+                put(
+                    format!("{p}.attention.self.{part}.weight").into(),
+                    t(d, d),
+                    vec![d, d],
+                );
+                put(
+                    format!("{p}.attention.self.{part}.bias").into(),
+                    t(d, 1),
+                    vec![d],
+                );
             }
-            put(format!("{p}.attention.output.dense.weight"), t(d, d), vec![d, d]);
+            put(
+                format!("{p}.attention.output.dense.weight"),
+                t(d, d),
+                vec![d, d],
+            );
             put(format!("{p}.attention.output.dense.bias"), t(d, 1), vec![d]);
-            put(format!("{p}.attention.output.LayerNorm.weight"), vec![1.0; d], vec![d]);
-            put(format!("{p}.attention.output.LayerNorm.bias"), vec![0.0; d], vec![d]);
-            put(format!("{p}.intermediate.dense.weight"), t(int4, d), vec![int4, d]);
-            put(format!("{p}.intermediate.dense.bias"), t(int4, 1), vec![int4]);
-            put(format!("{p}.output.dense.weight"), t(d, int4), vec![d, int4]);
+            put(
+                format!("{p}.attention.output.LayerNorm.weight"),
+                vec![1.0; d],
+                vec![d],
+            );
+            put(
+                format!("{p}.attention.output.LayerNorm.bias"),
+                vec![0.0; d],
+                vec![d],
+            );
+            put(
+                format!("{p}.intermediate.dense.weight"),
+                t(int4, d),
+                vec![int4, d],
+            );
+            put(
+                format!("{p}.intermediate.dense.bias"),
+                t(int4, 1),
+                vec![int4],
+            );
+            put(
+                format!("{p}.output.dense.weight"),
+                t(d, int4),
+                vec![d, int4],
+            );
             put(format!("{p}.output.dense.bias"), t(d, 1), vec![d]);
-            put(format!("{p}.output.LayerNorm.weight"), vec![1.0; d], vec![d]);
+            put(
+                format!("{p}.output.LayerNorm.weight"),
+                vec![1.0; d],
+                vec![d],
+            );
             put(format!("{p}.output.LayerNorm.bias"), vec![0.0; d], vec![d]);
         }
         put("pooler.dense.weight".into(), t(d, d), vec![d, d]);
@@ -500,14 +572,34 @@ mod tests {
         };
         let lin = |name: &str, out: usize, inp: usize| -> (Tensor, Tensor) {
             (
-                backend.from_cpu_f32(w.get(&format!("{name}.weight")).unwrap().0.as_slice(), vec![out, inp]).unwrap(),
-                backend.from_cpu_f32(w.get(&format!("{name}.bias")).unwrap().0.as_slice(), vec![out]).unwrap(),
+                backend
+                    .from_cpu_f32(
+                        w.get(&format!("{name}.weight")).unwrap().0.as_slice(),
+                        vec![out, inp],
+                    )
+                    .unwrap(),
+                backend
+                    .from_cpu_f32(
+                        w.get(&format!("{name}.bias")).unwrap().0.as_slice(),
+                        vec![out],
+                    )
+                    .unwrap(),
             )
         };
         let ln = |name: &str| -> (Tensor, Tensor) {
             (
-                backend.from_cpu_f32(w.get(&format!("{name}.weight")).unwrap().0.as_slice(), vec![d]).unwrap(),
-                backend.from_cpu_f32(w.get(&format!("{name}.bias")).unwrap().0.as_slice(), vec![d]).unwrap(),
+                backend
+                    .from_cpu_f32(
+                        w.get(&format!("{name}.weight")).unwrap().0.as_slice(),
+                        vec![d],
+                    )
+                    .unwrap(),
+                backend
+                    .from_cpu_f32(
+                        w.get(&format!("{name}.bias")).unwrap().0.as_slice(),
+                        vec![d],
+                    )
+                    .unwrap(),
             )
         };
         let mut layers = Vec::new();
@@ -516,13 +608,24 @@ mod tests {
             let mut qkv = Vec::new();
             let mut qkv_bias = Vec::new();
             for part in ["query", "key", "value"] {
-                qkv.extend_from_slice(&w.get(&format!("{p}.attention.self.{part}.weight")).unwrap().0);
-                qkv_bias.extend_from_slice(&w.get(&format!("{p}.attention.self.{part}.bias")).unwrap().0);
+                qkv.extend_from_slice(
+                    &w.get(&format!("{p}.attention.self.{part}.weight"))
+                        .unwrap()
+                        .0,
+                );
+                qkv_bias.extend_from_slice(
+                    &w.get(&format!("{p}.attention.self.{part}.bias")).unwrap().0,
+                );
             }
             let (attn_out, attn_out_bias) = lin(&format!("{p}.attention.output.dense"), d, d);
             let (attn_ln_w, attn_ln_b) = ln(&format!("{p}.attention.output.LayerNorm"));
-            let (ffn_up, ffn_up_bias) = lin(&format!("{p}.intermediate.dense"), config.intermediate_size, d);
-            let (ffn_down, ffn_down_bias) = lin(&format!("{p}.output.dense"), d, config.intermediate_size);
+            let (ffn_up, ffn_up_bias) = lin(
+                &format!("{p}.intermediate.dense"),
+                config.intermediate_size,
+                d,
+            );
+            let (ffn_down, ffn_down_bias) =
+                lin(&format!("{p}.output.dense"), d, config.intermediate_size);
             let (ffn_ln_w, ffn_ln_b) = ln(&format!("{p}.output.LayerNorm"));
             layers.push(BertLayer {
                 attn_qkv: backend.from_cpu_f32(&qkv, vec![3 * d, d]).unwrap(),
@@ -552,7 +655,8 @@ mod tests {
             pooler_w,
             pooler_b,
         };
-        enc.embed(backend, &["hello world", "machine learning"]).unwrap()
+        enc.embed(backend, &["hello world", "machine learning"])
+            .unwrap()
     }
 
     fn test_tokenizer() -> WordPieceTokenizer {
@@ -623,8 +727,14 @@ mod tests {
         for (i, v) in out.iter().enumerate() {
             assert_eq!(v.len(), config.hidden_size);
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-3, "embedding {i} not L2-normalized: {norm}");
-            assert!(v.iter().any(|x| x.abs() > 1e-6), "embedding {i} is all zeros");
+            assert!(
+                (norm - 1.0).abs() < 1e-3,
+                "embedding {i} not L2-normalized: {norm}"
+            );
+            assert!(
+                v.iter().any(|x| x.abs() > 1e-6),
+                "embedding {i} is all zeros"
+            );
         }
         // разные тексты → разные векторы
         let d = (0..config.hidden_size)

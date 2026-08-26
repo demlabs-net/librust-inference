@@ -29,7 +29,9 @@ fn slice_last_qkv_matches_cpu() {
             for i in 0..d0 {
                 let want = x[r * d + off + i];
                 let diff = (got[r * d0 + i] - want).abs();
-                if diff > maxd { maxd = diff; }
+                if diff > maxd {
+                    maxd = diff;
+                }
             }
         }
         assert!(maxd < 1e-4, "slice off={off} d0={d0}: max diff {maxd}");

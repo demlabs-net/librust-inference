@@ -479,8 +479,14 @@ impl KvCache {
         // Grow in the SAME storage format per tensor (zeros() is f32-only;
         // q8_0 reallocates data+scales). The copy below is dtype-dispatched
         // on both tensors (kv_update_f16_f16 / q8_q8).
-        let old_k = std::mem::replace(&mut self.k, make_kv_tensor(backend, self.k_format, new_cap, d)?);
-        let old_v = std::mem::replace(&mut self.v, make_kv_tensor(backend, self.v_format, new_cap, d)?);
+        let old_k = std::mem::replace(
+            &mut self.k,
+            make_kv_tensor(backend, self.k_format, new_cap, d)?,
+        );
+        let old_v = std::mem::replace(
+            &mut self.v,
+            make_kv_tensor(backend, self.v_format, new_cap, d)?,
+        );
         if self.pos > 0 {
             backend.kv_update(&self.k, &old_k, 0)?;
             backend.kv_update(&self.v, &old_v, 0)?;
@@ -841,7 +847,14 @@ mod tests {
             b.from_cpu_f32(&[1.0, 1.0, 1.0, 1.0], vec![4, 1]).unwrap(), // cos = 1 (max_seq, hd/2)
             b.from_cpu_f32(&[0.0, 0.0, 0.0, 0.0], vec![4, 1]).unwrap(), // sin = 0
         );
-        let mut cache = KvCache::new(&b, 1, 2, crate::dtype::KvFormat::F32, crate::dtype::KvFormat::F32).unwrap();
+        let mut cache = KvCache::new(
+            &b,
+            1,
+            2,
+            crate::dtype::KvFormat::F32,
+            crate::dtype::KvFormat::F32,
+        )
+        .unwrap();
         // step 1: x=[1,0] → attention over itself → y = x
         let x1 = b.from_cpu_f32(&[1.0, 0.0], vec![1, 1, 2]).unwrap();
         let y1 = attn.forward(&b, &x1, &mut cache, 0, 1, &rope).unwrap();
@@ -867,7 +880,14 @@ mod tests {
     #[test]
     fn kv_cache_growth() {
         let b = backend();
-        let mut cache = KvCache::new(&b, 1, 2, crate::dtype::KvFormat::F32, crate::dtype::KvFormat::F32).unwrap();
+        let mut cache = KvCache::new(
+            &b,
+            1,
+            2,
+            crate::dtype::KvFormat::F32,
+            crate::dtype::KvFormat::F32,
+        )
+        .unwrap();
         for i in 0..300u32 {
             let v = i as f32;
             let k = b.from_cpu_f32(&[v, 0.0], vec![1, 1, 2]).unwrap();

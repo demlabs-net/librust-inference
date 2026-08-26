@@ -1227,8 +1227,11 @@ impl Backend for CpuBackend {
             return Err(BackendError::Shape("mhsa_rel_pos: shape mismatch".into()));
         }
         let (qd, kd, vd, qpd, pd) = (
-            data(q).to_vec(), data(k).to_vec(), data(v).to_vec(),
-            data(qp).to_vec(), data(p).to_vec(),
+            data(q).to_vec(),
+            data(k).to_vec(),
+            data(v).to_vec(),
+            data(qp).to_vec(),
+            data(p).to_vec(),
         );
         let (ud, vbd) = (data(u).to_vec(), data(vb).to_vec());
         let mut yd = data_mut(y);
@@ -1254,13 +1257,15 @@ impl Backend for CpuBackend {
                         let poff = flat % (2 * t);
                         if poff > 0 {
                             for j in 0..dp {
-                                bd += (qd[qrow * d + qo + j] + vbd[vo_b + j]) * pd[(poff - 1) * (h * dp) + po + j];
+                                bd += (qd[qrow * d + qo + j] + vbd[vo_b + j])
+                                    * pd[(poff - 1) * (h * dp) + po + j];
                             }
                         }
                     } else {
                         let poff = t - 1 + tk - qt;
                         for j in 0..dp {
-                            bd += (qpd[qt * (h * dp) + hh * dp + j] + vbd[hh * dp + j]) * pd[poff * (h * dp) + po + j];
+                            bd += (qpd[qt * (h * dp) + hh * dp + j] + vbd[hh * dp + j])
+                                * pd[poff * (h * dp) + po + j];
                         }
                     }
                     scores[tk] = (ac + bd) * scale;

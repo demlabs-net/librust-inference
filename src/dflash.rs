@@ -8,11 +8,11 @@
 //! - диффузия (token): [committed, MASK...] → dense+conv → логиты/скрытые.
 
 use crate::backend::{Backend, Tensor};
+use crate::dtype::WeightFormat;
 use crate::error::BackendError;
 use crate::nn::{Attention, KvCache, RmsNorm, SwiGLU};
 use crate::qwen3::{Qwen3Config, Qwen3Layer};
-use crate::dtype::WeightFormat;
-use crate::weights_map::{dequant_f32, WeightsMap};
+use crate::weights_map::{WeightsMap, dequant_f32};
 
 /// Conv-модуль DFlash-слоя (two-tap dynamic, attn или ffn). Отсутствует у
 /// DFlash v1 (только v2 имеет conv/selector).
@@ -96,9 +96,10 @@ impl DFlashModel {
             }
         };
         let up = |name: &str, shape: Vec<usize>| -> Result<Tensor, BackendError> {
-            let f = dequant_f32(w.get(name).ok_or_else(|| {
-                BackendError::Shape(format!("missing tensor {name}"))
-            })?);
+            let f = dequant_f32(
+                w.get(name)
+                    .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?,
+            );
             upload_f16(backend, &f, shape)
         };
         let n_groups = cfg.dim / conv_group;
@@ -111,10 +112,7 @@ impl DFlashModel {
                 // ggml-порядок base: [2, kernel, n_embd] (side·k·D + tap·D + i);
                 // v1-драфтеры не имеют conv — base/proj опциональны.
                 base: if w.get(&p("attn_conv_base")).is_some() {
-                    Some(up_q(
-                        &p("attn_conv_base"),
-                        vec![2, conv_kernel, cfg.dim],
-                    )?)
+                    Some(up_q(&p("attn_conv_base"), vec![2, conv_kernel, cfg.dim])?)
                 } else {
                     None
                 },
@@ -129,10 +127,7 @@ impl DFlashModel {
             };
             let ffn_conv = DFlashConv {
                 base: if w.get(&p("ffn_conv_base")).is_some() {
-                    Some(up_q(
-                        &p("ffn_conv_base"),
-                        vec![2, conv_kernel, cfg.dim],
-                    )?)
+                    Some(up_q(&p("ffn_conv_base"), vec![2, conv_kernel, cfg.dim])?)
                 } else {
                     None
                 },
@@ -167,9 +162,10 @@ impl DFlashModel {
             // ggml-порядок (row-major реверс): prev/next [n_vocab, rank]
             // (файл {rank, n_vocab}), hidden [rank, n_embd] (файл {n_embd, rank}).
             let up_f32 = |name: &str, shape: Vec<usize>| -> Result<Tensor, BackendError> {
-                let f = dequant_f32(w.get(name).ok_or_else(|| {
-                    BackendError::Shape(format!("missing tensor {name}"))
-                })?);
+                let f = dequant_f32(
+                    w.get(name)
+                        .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?,
+                );
                 backend.from_cpu_f32(&f, shape)
             };
             Some(Selector {
@@ -183,20 +179,23 @@ impl DFlashModel {
             None
         };
         let _ = up;
-        let out_norm = RmsNorm::from_weights(
-            backend,
-            dequant_f32(
-                w.get("output_norm.weight")
-                    .ok_or_else(|| BackendError::Shape("missing tensor output_norm.weight".into()))?,
-            ),
-            cfg.norm_eps,
-        )?;
+        let out_norm =
+            RmsNorm::from_weights(
+                backend,
+                dequant_f32(w.get("output_norm.weight").ok_or_else(|| {
+                    BackendError::Shape("missing tensor output_norm.weight".into())
+                })?),
+                cfg.norm_eps,
+            )?;
         // encoder-модуль инжекта (v1; у v2 отсутствует): fc [D, n_target·D],
         // enc.output_norm.weight — своя нормализация инжекта.
         let fc = match w.get("fc.weight") {
             Some(t) => Some(up_q(
                 "fc.weight",
-                vec![cfg.dim, t.shape.iter().map(|&d| d as usize).product::<usize>() / cfg.dim],
+                vec![
+                    cfg.dim,
+                    t.shape.iter().map(|&d| d as usize).product::<usize>() / cfg.dim,
+                ],
             )?),
             None => None,
         };
@@ -335,9 +334,15 @@ impl DFlashModel {
                 .ok_or_else(|| BackendError::Shape(format!("config: missing {k}")))
         };
         let f = |k: &str, d: f32| -> f32 {
-            cfgj.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+            cfgj.get(k)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(d)
         };
-        let dflash = cfgj.get("dflash_config").cloned().unwrap_or(serde_json::Value::Null);
+        let dflash = cfgj
+            .get("dflash_config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let mask_token = dflash
             .get("mask_token_id")
             .and_then(|v| v.as_u64())
@@ -429,13 +434,15 @@ impl DFlashModel {
         let tensors = meta
             .into_iter()
             .zip(offs)
-            .map(|((name, shape, len), off)| crate::weights_map::WeightTensor {
-                name,
-                shape,
-                format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
-                offset: off as u64,
-                data: &buf[off..off + len],
-            })
+            .map(
+                |((name, shape, len), off)| crate::weights_map::WeightTensor {
+                    name,
+                    shape,
+                    format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
+                    offset: off as u64,
+                    data: &buf[off..off + len],
+                },
+            )
             .collect::<Vec<_>>();
         let wm = crate::weights_map::WeightsMap {
             arch: "dflash".into(),
@@ -493,7 +500,12 @@ impl DFlashModel {
                 for v in &ft {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
-                meta.push((t.name.clone(), vec![sh[1] as u64, sh[0] as u64], WeightFormat::Plain(Dtype::F32), b.len()));
+                meta.push((
+                    t.name.clone(),
+                    vec![sh[1] as u64, sh[0] as u64],
+                    WeightFormat::Plain(Dtype::F32),
+                    b.len(),
+                ));
                 blobs.push(b);
             } else {
                 meta.push((t.name.clone(), t.shape.clone(), t.format, t.data.len()));
@@ -510,13 +522,15 @@ impl DFlashModel {
         let tensors = meta
             .into_iter()
             .zip(offs)
-            .map(|((name, shape, format, len), off)| crate::weights_map::WeightTensor {
-                name,
-                shape,
-                format,
-                offset: off as u64,
-                data: &buf[off..off + len],
-            })
+            .map(
+                |((name, shape, format, len), off)| crate::weights_map::WeightTensor {
+                    name,
+                    shape,
+                    format,
+                    offset: off as u64,
+                    data: &buf[off..off + len],
+                },
+            )
             .collect::<Vec<_>>();
         let wm2 = crate::weights_map::WeightsMap {
             arch: "dflash".into(),
@@ -544,18 +558,24 @@ impl DFlashModel {
         sel_top_k: Option<usize>,
     ) -> Result<Self, BackendError> {
         let mut m = Self::load(
-            backend, w, cfg, block_size, conv_kernel, conv_group, extract_layers, mask_token,
+            backend,
+            w,
+            cfg,
+            block_size,
+            conv_kernel,
+            conv_group,
+            extract_layers,
+            mask_token,
         )?;
         // перезагрузить селектор с метаданными, если они есть
-        if let (Some(rank), Some(top_k), Some(_)) = (
-            sel_rank,
-            sel_top_k,
-            w.get("selector_predecessor"),
-        ) {
+        if let (Some(rank), Some(top_k), Some(_)) =
+            (sel_rank, sel_top_k, w.get("selector_predecessor"))
+        {
             let up_f32 = |name: &str, shape: Vec<usize>| -> Result<Tensor, BackendError> {
-                let f = dequant_f32(w.get(name).ok_or_else(|| {
-                    BackendError::Shape(format!("missing tensor {name}"))
-                })?);
+                let f = dequant_f32(
+                    w.get(name)
+                        .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?,
+                );
                 backend.from_cpu_f32(&f, shape)
             };
             m.selector = Some(Selector {
@@ -663,7 +683,10 @@ impl DFlashModel {
                 .target_embed
                 .as_ref()
                 .ok_or_else(|| {
-                    BackendError::Shape("diffuse: не установлен target_embed — драфтер без общих эмбеддингов".into())
+                    BackendError::Shape(
+                        "diffuse: не установлен target_embed — драфтер без общих эмбеддингов"
+                            .into(),
+                    )
                 })?
                 .clone();
             let mut x = backend.zeros(vec![1, t, self.cfg.dim])?;
@@ -708,18 +731,40 @@ impl DFlashModel {
                 // fused qk_norm+rope (Ф8): noise-токены на [pos..pos+t)
                 let q = match &attn.q_norm {
                     Some(w) => backend.rmsnorm_head_rope(
-                        &q, w, pos, attn.head_dim, self.cfg.rope_theta, attn.n_heads, 1e-6,
+                        &q,
+                        w,
+                        pos,
+                        attn.head_dim,
+                        self.cfg.rope_theta,
+                        attn.n_heads,
+                        1e-6,
                     )?,
                     None => crate::qwen3::rope_standard(
-                        backend, &q, pos, t, attn.head_dim, self.cfg.rope_theta,
+                        backend,
+                        &q,
+                        pos,
+                        t,
+                        attn.head_dim,
+                        self.cfg.rope_theta,
                     )?,
                 };
                 let k = match &attn.k_norm {
                     Some(w) => backend.rmsnorm_head_rope(
-                        &k, w, pos, attn.head_dim, self.cfg.rope_theta, attn.n_kv_heads, 1e-6,
+                        &k,
+                        w,
+                        pos,
+                        attn.head_dim,
+                        self.cfg.rope_theta,
+                        attn.n_kv_heads,
+                        1e-6,
                     )?,
                     None => crate::qwen3::rope_standard(
-                        backend, &k, pos, t, attn.head_dim, self.cfg.rope_theta,
+                        backend,
+                        &k,
+                        pos,
+                        t,
+                        attn.head_dim,
+                        self.cfg.rope_theta,
                     )?,
                 };
                 // прямая инъекция фич (z-lab: concat([k_ctx, k_noise])) —
@@ -734,11 +779,21 @@ impl DFlashModel {
                     let vc = crate::nn::slice_last(backend, &qkv2, kv_size, q_size + kv_size)?;
                     let kc = match &attn.k_norm {
                         Some(w) => backend.rmsnorm_head_rope(
-                            &kc, w, kctx_pos, attn.head_dim, self.cfg.rope_theta,
-                            attn.n_kv_heads, 1e-6,
+                            &kc,
+                            w,
+                            kctx_pos,
+                            attn.head_dim,
+                            self.cfg.rope_theta,
+                            attn.n_kv_heads,
+                            1e-6,
                         )?,
                         None => crate::qwen3::rope_standard(
-                            backend, &kc, kctx_pos, ctx, attn.head_dim, self.cfg.rope_theta,
+                            backend,
+                            &kc,
+                            kctx_pos,
+                            ctx,
+                            attn.head_dim,
+                            self.cfg.rope_theta,
                         )?,
                     };
                     self.caches[i].update_at(backend, &kc, &vc, past_len)?;
@@ -813,9 +868,10 @@ impl DFlashModel {
         logits: &Tensor,
         hidden: &Tensor,
     ) -> Result<SelectResult, BackendError> {
-        let sel = self.selector.as_ref().ok_or_else(|| {
-            BackendError::Shape("select: у драфтера нет селектора (v1)".into())
-        })?;
+        let sel = self
+            .selector
+            .as_ref()
+            .ok_or_else(|| BackendError::Shape("select: у драфтера нет селектора (v1)".into()))?;
         let (t, vocab) = (logits.shape()[1], logits.shape()[2]);
         let (rank, top_k) = (sel.rank, sel.top_k.min(vocab));
         let lg = backend.to_cpu_f32(logits)?; // [T, V]
@@ -830,7 +886,11 @@ impl DFlashModel {
         for pos in 0..t {
             let row = &lg[pos * vocab..(pos + 1) * vocab];
             let mut idx: Vec<usize> = (0..vocab).collect();
-            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+            idx.sort_by(|&a, &b| {
+                row[b]
+                    .partial_cmp(&row[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for k in 0..top_k {
                 cand[pos][k] = idx[k] as u32;
                 unary[pos][k] = row[idx[k]];
@@ -1003,13 +1063,17 @@ impl crate::spec::Drafter for DFlashDrafter {
                 self.features.as_ref().map(|f| f.shape()[0])
             );
         }
-        let res = match self.model.diffuse(backend, &ids, &self.lm_head, pos, self.features.as_ref()) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("DFlashDrafter: диффузия не удалась: {e}");
-                return (vec![], vec![]);
-            }
-        };
+        let res =
+            match self
+                .model
+                .diffuse(backend, &ids, &self.lm_head, pos, self.features.as_ref())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("DFlashDrafter: диффузия не удалась: {e}");
+                    return (vec![], vec![]);
+                }
+            };
         let (tokens, probs) = if self.model.selector.is_some() {
             match self.model.select(backend, &res.logits, &res.hidden) {
                 Ok(s) => (s.tokens, s.probs),
@@ -1058,11 +1122,7 @@ pub struct DiffusionResult {
 /// conv-проекция шума: dynamic = x @ proj^T — [n_tokens, n_groups·k·2]
 /// (ggml [proj, T] column-major = row-major [T, proj]; coeff-строка
 /// r = g + n_groups·(tap + k·side) — колонка).
-fn conv_dynamic(
-    backend: &dyn Backend,
-    proj: &Tensor,
-    x: &Tensor,
-) -> Result<Tensor, BackendError> {
+fn conv_dynamic(backend: &dyn Backend, proj: &Tensor, x: &Tensor) -> Result<Tensor, BackendError> {
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let x2 = x.view(vec![b * t, d]);
     let y = backend.zeros(vec![b * t, proj.shape()[0]])?;
@@ -1115,10 +1175,9 @@ fn load_dense_layer(
             .get(name)
             .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
         match tensor.format {
-            WeightFormat::Q4_0
-            | WeightFormat::Q8_0
-            | WeightFormat::Q4_K
-            | WeightFormat::Q6_K => backend.from_quantized(tensor.raw(), shape, tensor.format),
+            WeightFormat::Q4_0 | WeightFormat::Q8_0 | WeightFormat::Q4_K | WeightFormat::Q6_K => {
+                backend.from_quantized(tensor.raw(), shape, tensor.format)
+            }
             _ => {
                 let f = dequant_f32(tensor);
                 upload_f16(backend, &f, shape)
@@ -1126,46 +1185,57 @@ fn load_dense_layer(
         }
     };
     // q/k/v fused (как Qwen3Model::load): wqkv [q_size + 2·kv_size, dim]
-    let mut wqkv = dequant_f32(w.get(&p("attn_q.weight")).ok_or_else(|| {
-        BackendError::Shape("attn_q.weight missing".into())
-    })?);
-    wqkv.extend(dequant_f32(w.get(&p("attn_k.weight")).ok_or_else(|| {
-        BackendError::Shape("attn_k.weight missing".into())
-    })?));
-    wqkv.extend(dequant_f32(w.get(&p("attn_v.weight")).ok_or_else(|| {
-        BackendError::Shape("attn_v.weight missing".into())
-    })?));
+    let mut wqkv = dequant_f32(
+        w.get(&p("attn_q.weight"))
+            .ok_or_else(|| BackendError::Shape("attn_q.weight missing".into()))?,
+    );
+    wqkv.extend(dequant_f32(w.get(&p("attn_k.weight")).ok_or_else(
+        || BackendError::Shape("attn_k.weight missing".into()),
+    )?));
+    wqkv.extend(dequant_f32(w.get(&p("attn_v.weight")).ok_or_else(
+        || BackendError::Shape("attn_v.weight missing".into()),
+    )?));
     let attn = Attention {
         wqkv: upload_f16(
             backend,
             &wqkv,
-            vec![cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim, cfg.dim],
+            vec![
+                cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
+                cfg.dim,
+            ],
         )?,
         wo: up(&p("attn_output.weight"), vec![cfg.dim, cfg.dim])?,
         qkv_bias: None,
-        q_norm: Some(backend.from_cpu_f32(
-            &dequant_f32(w.get(&p("attn_q_norm.weight")).ok_or_else(|| {
-                BackendError::Shape("attn_q_norm.weight missing".into())
-            })?),
-            vec![cfg.head_dim],
-        )?),
-        k_norm: Some(backend.from_cpu_f32(
-            &dequant_f32(w.get(&p("attn_k_norm.weight")).ok_or_else(|| {
-                BackendError::Shape("attn_k_norm.weight missing".into())
-            })?),
-            vec![cfg.head_dim],
-        )?),
+        q_norm: Some(
+            backend.from_cpu_f32(
+                &dequant_f32(
+                    w.get(&p("attn_q_norm.weight"))
+                        .ok_or_else(|| BackendError::Shape("attn_q_norm.weight missing".into()))?,
+                ),
+                vec![cfg.head_dim],
+            )?,
+        ),
+        k_norm: Some(
+            backend.from_cpu_f32(
+                &dequant_f32(
+                    w.get(&p("attn_k_norm.weight"))
+                        .ok_or_else(|| BackendError::Shape("attn_k_norm.weight missing".into()))?,
+                ),
+                vec![cfg.head_dim],
+            )?,
+        ),
         n_heads: cfg.n_heads,
         n_kv_heads: cfg.n_kv_heads,
         head_dim: cfg.head_dim,
     };
     // gate/up fused (как Qwen3Model::load): w13 [2·ffn, dim]
-    let mut w13 = dequant_f32(w.get(&p("ffn_gate.weight")).ok_or_else(|| {
-        BackendError::Shape("ffn_gate.weight missing".into())
-    })?);
-    w13.extend(dequant_f32(w.get(&p("ffn_up.weight")).ok_or_else(|| {
-        BackendError::Shape("ffn_up.weight missing".into())
-    })?));
+    let mut w13 = dequant_f32(
+        w.get(&p("ffn_gate.weight"))
+            .ok_or_else(|| BackendError::Shape("ffn_gate.weight missing".into()))?,
+    );
+    w13.extend(dequant_f32(w.get(&p("ffn_up.weight")).ok_or_else(
+        || BackendError::Shape("ffn_up.weight missing".into()),
+    )?));
     let ffn = SwiGLU {
         w13: upload_f16(backend, &w13, vec![2 * cfg.ffn_dim, cfg.dim])?,
         w2: up(&p("ffn_down.weight"), vec![cfg.dim, cfg.ffn_dim])?,
@@ -1173,17 +1243,19 @@ fn load_dense_layer(
     Ok(Qwen3Layer {
         attn_norm: RmsNorm::from_weights(
             backend,
-            dequant_f32(w.get(&p("attn_norm.weight")).ok_or_else(|| {
-                BackendError::Shape("attn_norm.weight missing".into())
-            })?),
+            dequant_f32(
+                w.get(&p("attn_norm.weight"))
+                    .ok_or_else(|| BackendError::Shape("attn_norm.weight missing".into()))?,
+            ),
             cfg.norm_eps,
         )?,
         attn,
         ffn_norm: RmsNorm::from_weights(
             backend,
-            dequant_f32(w.get(&p("ffn_norm.weight")).ok_or_else(|| {
-                BackendError::Shape("ffn_norm.weight missing".into())
-            })?),
+            dequant_f32(
+                w.get(&p("ffn_norm.weight"))
+                    .ok_or_else(|| BackendError::Shape("ffn_norm.weight missing".into()))?,
+            ),
             cfg.norm_eps,
         )?,
         ffn,
@@ -1191,7 +1263,11 @@ fn load_dense_layer(
 }
 
 /// f16-загрузка весов (как upload_w в qwen3.rs).
-fn upload_f16(backend: &dyn Backend, data: &[f32], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+fn upload_f16(
+    backend: &dyn Backend,
+    data: &[f32],
+    shape: Vec<usize>,
+) -> Result<Tensor, BackendError> {
     if backend.supports_f16_weights() {
         let f16: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
         backend.from_cpu_f16(&f16, shape)
@@ -1373,8 +1449,14 @@ mod tests {
         assert_eq!(m.conv_kernel, 3);
         assert_eq!(m.mask_token, 151850);
         // conv-тензоры загружены (f16 — проверяем shape; base в ggml-порядке)
-        assert_eq!(m.layers[0].attn_conv.base.as_ref().unwrap().shape(), &[2, 3, 16]);
-        assert_eq!(m.layers[0].attn_conv.proj.as_ref().unwrap().shape(), &[24, 16]);
+        assert_eq!(
+            m.layers[0].attn_conv.base.as_ref().unwrap().shape(),
+            &[2, 3, 16]
+        );
+        assert_eq!(
+            m.layers[0].attn_conv.proj.as_ref().unwrap().shape(),
+            &[24, 16]
+        );
         // селектор: [vocab, rank] кодбуки + hidden [rank, dim]
         let s = m.selector.as_ref().unwrap();
         assert_eq!(s.predecessor.shape(), &[8, 4]);
@@ -1404,9 +1486,7 @@ mod tests {
         rng.fill(&mut dd);
         let xt = backend.from_cpu_f32(&xd, vec![tokens, dim]).unwrap();
         let bt = backend.from_cpu_f32(&bd, vec![2, kernel, dim]).unwrap();
-        let dt = backend
-            .from_cpu_f32(&dd, vec![tokens, proj])
-            .unwrap();
+        let dt = backend.from_cpu_f32(&dd, vec![tokens, proj]).unwrap();
         let (xc, bc, dc) = (
             cpu.from_cpu_f32(&xd, vec![tokens, dim]).unwrap(),
             cpu.from_cpu_f32(&bd, vec![2, kernel, dim]).unwrap(),
@@ -1493,7 +1573,8 @@ mod tests {
             }],
         };
         let mut qwen = crate::qwen3::Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
-        let mut dflash = DFlashModel::load(&backend, &wm, c.clone(), 16, 3, 4, vec![0], 151850).unwrap();
+        let mut dflash =
+            DFlashModel::load(&backend, &wm, c.clone(), 16, 3, 4, vec![0], 151850).unwrap();
         assert!(dflash.layers[0].attn_conv.proj.is_none());
         // общие эмбеддинги (те же данные, что у qwen)
         let ew = dequant_f32(wm.get("token_embd.weight").unwrap());
@@ -1502,7 +1583,9 @@ mod tests {
         // lm_head таргета (f16, как Qwen3Model::load)
         let ow = dequant_f32(wm.get("output.weight").unwrap());
         let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
-        let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
+        let lm_head = backend
+            .from_cpu_f16(&f16, vec![c.vocab_size, c.dim])
+            .unwrap();
 
         // t=1: каузальная маска не строится ни в одном пути — пути тождественны
         let ids = [3u32];
@@ -1626,8 +1709,7 @@ mod tests {
                 let cid = cand[pos][k] as usize;
                 let mut s = unary[pos][k];
                 for r in 0..rank {
-                    s += sd[cid * rank + r]
-                        * (pd[pred as usize * rank + r] * hid[pos][r]);
+                    s += sd[cid * rank + r] * (pd[pred as usize * rank + r] * hid[pos][r]);
                 }
                 if s > bs {
                     bs = s;
@@ -1691,7 +1773,9 @@ mod tests {
         let embed = Embedding::from_weights(&backend, ew, vec![c.vocab_size, c.dim]).unwrap();
         let ow = dequant_f32(wm.get("output.weight").unwrap());
         let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
-        let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
+        let lm_head = backend
+            .from_cpu_f16(&f16, vec![c.vocab_size, c.dim])
+            .unwrap();
         let mut drafter = DFlashDrafter::new(m, embed.table.clone(), lm_head);
         // без истории — пустой draft (таргет декодит сам)
         let (t0, q0) = crate::spec::Drafter::draft(&mut drafter, &backend, &[], 4);
@@ -1733,15 +1817,30 @@ mod tests {
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            layout.push((name.clone(), shape.iter().map(|&d| d as u64).collect(), off as u64, data.len() * 4));
+            layout.push((
+                name.clone(),
+                shape.iter().map(|&d| d as u64).collect(),
+                off as u64,
+                data.len() * 4,
+            ));
         }
-        let tensors = layout.into_iter().map(|(name, shape, off, len)| crate::weights_map::WeightTensor {
-            name, shape, format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32), offset: off,
-            data: &bytes[off as usize..off as usize + len],
-        }).collect();
+        let tensors = layout
+            .into_iter()
+            .map(|(name, shape, off, len)| crate::weights_map::WeightTensor {
+                name,
+                shape,
+                format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
+                offset: off,
+                data: &bytes[off as usize..off as usize + len],
+            })
+            .collect();
         let wm = crate::weights_map::WeightsMap {
-            arch: "dflash".into(), tensors,
-            storage: vec![crate::weights_map::Storage { offset: 0, data: &bytes }],
+            arch: "dflash".into(),
+            tensors,
+            storage: vec![crate::weights_map::Storage {
+                offset: 0,
+                data: &bytes,
+            }],
         };
         let mut m = DFlashModel::load(&backend, &wm, c.clone(), 8, 3, 4, vec![0], 5).unwrap();
         let ew = dequant_f32(wm.get("token_embd.weight").unwrap());
@@ -1749,7 +1848,9 @@ mod tests {
         m.set_target_embed(embed.table.clone());
         let ow = dequant_f32(wm.get("output.weight").unwrap());
         let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
-        let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
+        let lm_head = backend
+            .from_cpu_f16(&f16, vec![c.vocab_size, c.dim])
+            .unwrap();
         let ids = [3u32, 5, 5, 5];
         // без инжекта
         let r0 = m.diffuse(&backend, &ids, &lm_head, 3, None).unwrap();
@@ -1812,7 +1913,9 @@ mod tests {
         m.set_target_embed(embed.table.clone());
         let ow = dequant_f32(wm.get("output.weight").unwrap());
         let f16: Vec<half::f16> = ow.iter().map(|&x| half::f16::from_f32(x)).collect();
-        let lm_head = backend.from_cpu_f16(&f16, vec![c.vocab_size, c.dim]).unwrap();
+        let lm_head = backend
+            .from_cpu_f16(&f16, vec![c.vocab_size, c.dim])
+            .unwrap();
         let ids = [3u32, 5, 5, 5];
         let r = m.diffuse(&backend, &ids, &lm_head, 0, None).unwrap();
         let lg = backend.to_cpu_f32(&r.logits).unwrap();
@@ -1838,7 +1941,10 @@ mod tests {
                 rows_eq = false;
             }
         }
-        assert!(!rows_eq, "Metal: hidden-строки позиций идентичны — диффузия вырождена");
+        assert!(
+            !rows_eq,
+            "Metal: hidden-строки позиций идентичны — диффузия вырождена"
+        );
         // то же на CPU-бэкенде (отделяет логику от Metal-кернелов)
         let cpu = crate::cpu::CpuBackend::default();
         let wm_c = crate::weights_map::WeightsMap {
@@ -1859,7 +1965,12 @@ mod tests {
         let mut tops_q = Vec::new();
         for pos in 0..4 {
             let row = &qhv[pos * c.dim..(pos + 1) * c.dim];
-            let best = row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            let best = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0;
             tops_q.push(best);
         }
         eprintln!("qwen-prefill tops: {tops_q:?}");
@@ -1890,5 +2001,3 @@ mod tests {
         );
     }
 }
-
-

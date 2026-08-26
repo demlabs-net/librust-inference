@@ -282,9 +282,7 @@ impl Qwen3Model {
                     .map(|b| {
                         backend.from_cpu_f32(
                             &b,
-                            vec![
-                                cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
-                            ],
+                            vec![cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim],
                         )
                     })
                     .transpose()?,
@@ -301,12 +299,7 @@ impl Qwen3Model {
             let gn = p("ffn_gate.weight");
             let un = p("ffn_up.weight");
             let ffn = SwiGLU {
-                w13: Self::upload_fused(
-                    backend,
-                    w,
-                    &[&gn, &un],
-                    vec![2 * cfg.ffn_dim, cfg.dim],
-                )?,
+                w13: Self::upload_fused(backend, w, &[&gn, &un], vec![2 * cfg.ffn_dim, cfg.dim])?,
                 w2: Self::upload_q(
                     backend,
                     w,
@@ -335,9 +328,7 @@ impl Qwen3Model {
             Some(_) if !w.tied_aliases("output.weight").is_empty() => {
                 upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?
             }
-            Some(_) => {
-                Self::upload_q(backend, w, "output.weight", vec![cfg.vocab_size, cfg.dim])?
-            }
+            Some(_) => Self::upload_q(backend, w, "output.weight", vec![cfg.vocab_size, cfg.dim])?,
             None => upload_w(backend, &embed_w, vec![cfg.vocab_size, cfg.dim])?,
         };
 
@@ -400,7 +391,10 @@ impl Qwen3Model {
                     li += 1;
                 }
                 let t0 = std::time::Instant::now();
-                if prof { backend.end_batch()?; backend.begin_batch()?; }
+                if prof {
+                    backend.end_batch()?;
+                    backend.begin_batch()?;
+                }
                 let h = layer.attn_norm.forward(backend, &x)?;
                 let h = Self::rope_and_attn(
                     &self.cfg,
@@ -415,20 +409,33 @@ impl Qwen3Model {
                     None,
                 )?;
                 x = backend_add(backend, &x, &h)?;
-                if prof { backend.end_batch()?; backend.begin_batch()?; }
-                if prof { p_attn += t0.elapsed().as_secs_f64(); }
+                if prof {
+                    backend.end_batch()?;
+                    backend.begin_batch()?;
+                }
+                if prof {
+                    p_attn += t0.elapsed().as_secs_f64();
+                }
                 let t1 = std::time::Instant::now();
                 let h = layer.ffn_norm.forward(backend, &x)?;
                 let f = ffn_forward(backend, &h, &layer.ffn)?;
                 x = backend_add(backend, &x, &f)?;
-                if prof { backend.end_batch()?; backend.begin_batch()?; }
-                if prof { p_ffn += t1.elapsed().as_secs_f64(); }
+                if prof {
+                    backend.end_batch()?;
+                    backend.begin_batch()?;
+                }
+                if prof {
+                    p_ffn += t1.elapsed().as_secs_f64();
+                }
             }
             if prof {
                 eprintln!(
                     "PROF prefill_extract t={}: attn {:.1}ms ({:.2}/layer) ffn {:.1}ms ({:.2}/layer)",
-                    t, p_attn * 1e3, p_attn * 1e3 / self.layers.len() as f64,
-                    p_ffn * 1e3, p_ffn * 1e3 / self.layers.len() as f64
+                    t,
+                    p_attn * 1e3,
+                    p_attn * 1e3 / self.layers.len() as f64,
+                    p_ffn * 1e3,
+                    p_ffn * 1e3 / self.layers.len() as f64
                 );
             }
             let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
@@ -512,17 +519,24 @@ impl Qwen3Model {
                 None,
             )?;
             x = backend_add(backend, &x, &h)?;
-            if prof { prof_attn += t0.elapsed().as_secs_f64(); }
+            if prof {
+                prof_attn += t0.elapsed().as_secs_f64();
+            }
             if std::env::var("OMNI_REF").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let last = xv.len() - self.cfg.dim;
-                eprintln!("OMNI_REF after_attn_layer0[-1,:8]={:?}", &xv[last..last + 8]);
+                eprintln!(
+                    "OMNI_REF after_attn_layer0[-1,:8]={:?}",
+                    &xv[last..last + 8]
+                );
             }
             let t1 = std::time::Instant::now();
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
-            if prof { prof_ffn += t1.elapsed().as_secs_f64(); }
+            if prof {
+                prof_ffn += t1.elapsed().as_secs_f64();
+            }
             if std::env::var("OMNI_REF").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let last = xv.len() - self.cfg.dim;
@@ -844,9 +858,18 @@ impl Qwen3Model {
             let kvv = backend.to_cpu_f32(&k)?;
             let hv = backend.to_cpu_f32(h)?;
             let t = tq;
-            eprintln!("OMNI_REF our_ln[-1,:8]={:?}", &hv[(t - 1) * q_size..(t - 1) * q_size + 8]);
-            eprintln!("OMNI_REF our_q0[-1,:8]={:?}", &qv[(t - 1) * q_size..(t - 1) * q_size + 8]);
-            eprintln!("OMNI_REF our_k0[-1,:8]={:?}", &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]);
+            eprintln!(
+                "OMNI_REF our_ln[-1,:8]={:?}",
+                &hv[(t - 1) * q_size..(t - 1) * q_size + 8]
+            );
+            eprintln!(
+                "OMNI_REF our_q0[-1,:8]={:?}",
+                &qv[(t - 1) * q_size..(t - 1) * q_size + 8]
+            );
+            eprintln!(
+                "OMNI_REF our_k0[-1,:8]={:?}",
+                &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]
+            );
         }
         let (q, k) = if attn.q_norm.is_some() && attn.k_norm.is_some() {
             (
@@ -876,13 +899,25 @@ impl Qwen3Model {
             // (CPU/CUDA) — два шага
             let q = match &attn.q_norm {
                 Some(w) => backend.rmsnorm_head_rope(
-                    &q, w, pos, attn.head_dim, cfg.rope_theta, attn.n_heads, 1e-6,
+                    &q,
+                    w,
+                    pos,
+                    attn.head_dim,
+                    cfg.rope_theta,
+                    attn.n_heads,
+                    1e-6,
                 )?,
                 None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
             };
             let k = match &attn.k_norm {
                 Some(w) => backend.rmsnorm_head_rope(
-                    &k, w, pos, attn.head_dim, cfg.rope_theta, attn.n_kv_heads, 1e-6,
+                    &k,
+                    w,
+                    pos,
+                    attn.head_dim,
+                    cfg.rope_theta,
+                    attn.n_kv_heads,
+                    1e-6,
                 )?,
                 None => rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
             };
@@ -903,7 +938,13 @@ impl Qwen3Model {
                 None
             }
         } else if causal && t > 1 {
-            Some(crate::nn::build_causal_mask(backend, t, cache.pos, pos, cfg.swa_window)?)
+            Some(crate::nn::build_causal_mask(
+                backend,
+                t,
+                cache.pos,
+                pos,
+                cfg.swa_window,
+            )?)
         } else {
             None
         };
@@ -924,7 +965,11 @@ impl Qwen3Model {
             )?;
         }
         if std::env::var("LLM_BENCH").is_ok() && tq == 1 {
-            eprintln!("  attn_ar {:.2}ms kv_update {:.2}ms", t_at.elapsed().as_secs_f64() * 1e3, t_upd_d * 1e3);
+            eprintln!(
+                "  attn_ar {:.2}ms kv_update {:.2}ms",
+                t_at.elapsed().as_secs_f64() * 1e3,
+                t_upd_d * 1e3
+            );
         }
 
         let out = Linear {
@@ -1023,7 +1068,11 @@ pub fn rope_standard(
 ///   gm = silu(x @ ffn_gate) * (x @ ffn_up) → down.
 /// В GGUF Qwen3-VL ffn_gate/ffn_up лежат именно в этом порядке
 /// (проверено: python-эталон совпал с llama.cpp при silu(gate)*up, corr 1.0).
-pub fn ffn_forward(backend: &dyn Backend, x: &Tensor, ffn: &SwiGLU) -> Result<Tensor, BackendError> {
+pub fn ffn_forward(
+    backend: &dyn Backend,
+    x: &Tensor,
+    ffn: &SwiGLU,
+) -> Result<Tensor, BackendError> {
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let x2 = x.view(vec![b * t, d]);
     let ffn_dim = ffn.w2.shape()[1];
@@ -1165,7 +1214,9 @@ mod tests {
         model.reset_cache(&backend).unwrap();
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
-        let out = model.decode_spec(&backend, 5, &[], &[], &mut rng, &[]).unwrap();
+        let out = model
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[])
+            .unwrap();
         assert!(out.accepted.is_empty(), "γ=0: draft-токенов нет");
         let a = backend.to_cpu_f32(&d1).unwrap();
         let b = backend.to_cpu_f32(&out.logits).unwrap();
@@ -1215,7 +1266,9 @@ mod tests {
             let x = m.embed_forward_test(&backend, &ids).unwrap();
             let t = ids.len();
             backend.begin_batch().unwrap();
-            let r = m.forward_layers_hidden(&backend, x, t, None, Some(k)).unwrap();
+            let r = m
+                .forward_layers_hidden(&backend, x, t, None, Some(k))
+                .unwrap();
             backend.end_batch().unwrap();
             r
         };
@@ -1316,8 +1369,12 @@ mod tests {
         let sects = [24usize, 20, 20, 0];
         // текст: pos4d = (p,p,p,0)
         let text_pos: Vec<u32> = vec![1, 1, 1, 0, 2, 2, 2, 0];
-        let a = backend.rope_mrope(&xt, &text_pos, 4, 5_000_000.0, sects).unwrap();
-        let b = backend.rope_mrope_text(&xt, 1, 4, 5_000_000.0, sects).unwrap();
+        let a = backend
+            .rope_mrope(&xt, &text_pos, 4, 5_000_000.0, sects)
+            .unwrap();
+        let b = backend
+            .rope_mrope_text(&xt, 1, 4, 5_000_000.0, sects)
+            .unwrap();
         let av = backend.to_cpu_f32(&a).unwrap();
         let bv = backend.to_cpu_f32(&b).unwrap();
         for (i, (x, y)) in av.iter().zip(&bv).enumerate() {
@@ -1329,7 +1386,9 @@ mod tests {
         // картинка: первый токен pos4d=(1, 2, 3, 0): пара 1 (sector%3==1) — h-позиция 2.
         // С мёртвой h-категорией (старый баг sections) пара 1 не ротировалась бы.
         let img_pos: Vec<u32> = vec![1, 2, 3, 0, 5, 6, 7, 0];
-        let c = backend.rope_mrope(&xt, &img_pos, 4, 5_000_000.0, sects).unwrap();
+        let c = backend
+            .rope_mrope(&xt, &img_pos, 4, 5_000_000.0, sects)
+            .unwrap();
         let cv = backend.to_cpu_f32(&c).unwrap();
         // пара 1 токена 0: x0=0.5, x1=1.5, угол p=2·inv, inv=theta^-0.5≈4.47e-4
         let inv = 5_000_000f32.powf(-0.5);
@@ -1366,9 +1425,15 @@ mod attn_tests {
         let (b, tq, tkv, h, kvh, hd) = (1usize, 20usize, 20usize, 16usize, 8usize, 128usize);
         let d = h * hd;
         let kvd = kvh * hd;
-        let qv: Vec<f32> = (0..b * tq * d).map(|_| (rng() >> 32) as f32 / (1u64 << 32) as f32 - 0.5).collect();
-        let kv: Vec<f32> = (0..b * tkv * kvd).map(|_| (rng() >> 32) as f32 / (1u64 << 32) as f32 - 0.5).collect();
-        let vv: Vec<f32> = (0..b * tkv * kvd).map(|_| (rng() >> 32) as f32 / (1u64 << 32) as f32 - 0.5).collect();
+        let qv: Vec<f32> = (0..b * tq * d)
+            .map(|_| (rng() >> 32) as f32 / (1u64 << 32) as f32 - 0.5)
+            .collect();
+        let kv: Vec<f32> = (0..b * tkv * kvd)
+            .map(|_| (rng() >> 32) as f32 / (1u64 << 32) as f32 - 0.5)
+            .collect();
+        let vv: Vec<f32> = (0..b * tkv * kvd)
+            .map(|_| (rng() >> 32) as f32 / (1u64 << 32) as f32 - 0.5)
+            .collect();
         // маска: каузальная: j > t → -inf
         let mut mv = vec![0.0f32; b * tq * tkv];
         for t in 0..tq {
@@ -1383,7 +1448,9 @@ mod attn_tests {
         let v = backend.from_cpu_f32(&vv, vec![b, tkv, kvd]).unwrap();
         let mask = backend.from_cpu_f32(&mv, vec![b, tq, tkv]).unwrap();
         let y = backend.zeros(vec![b, tq, d]).unwrap();
-        backend.attn_ar(&q, &k, &v, Some(&mask), &y, h, kvh, hd).unwrap();
+        backend
+            .attn_ar(&q, &k, &v, Some(&mask), &y, h, kvh, hd)
+            .unwrap();
         let yv = backend.to_cpu_f32(&y).unwrap();
         // CPU-референс
         let scale = 1.0 / (hd as f32).sqrt();
@@ -1416,7 +1483,13 @@ mod attn_tests {
         }
         for i in 0..yv.len() {
             let dlt = (yv[i] - want[i]).abs();
-            assert!(dlt < 1e-3, "idx {i}: got {} want {} delta {}", yv[i], want[i], dlt);
+            assert!(
+                dlt < 1e-3,
+                "idx {i}: got {} want {} delta {}",
+                yv[i],
+                want[i],
+                dlt
+            );
         }
         eprintln!("attn_ar_matches_cpu_reference OK ({} elems)", yv.len());
     }

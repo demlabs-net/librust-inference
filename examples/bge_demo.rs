@@ -52,7 +52,14 @@ fn main() -> anyhow::Result<()> {
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let emb = enc.embed(backend.as_ref(), &refs)?;
     for (i, (text, e)) in texts.iter().zip(&emb).enumerate() {
-        println!("[{i}] {text:?} → [{:.3}, {:.3}, {:.3}, {:.3} …] (dim {})", e[0], e[1], e[2], e[3], e.len());
+        println!(
+            "[{i}] {text:?} → [{:.3}, {:.3}, {:.3}, {:.3} …] (dim {})",
+            e[0],
+            e[1],
+            e[2],
+            e[3],
+            e.len()
+        );
     }
     println!("\nкосинусная похожесть:");
     for i in 0..emb.len() {

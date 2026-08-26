@@ -23,11 +23,14 @@ fn gemm_f16_m21_k2048_n4096_row20() {
     let b = genr(2, n * k);
     let bf16: Vec<f32> = b.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
     let at = bk.from_cpu_f32(&a, vec![m, k]).unwrap();
-    let bt = bk.from_cpu_f16(
-        &b.iter().map(|&v| half::f16::from_f32(v)).collect::<Vec<_>>(),
-        vec![n, k],
-    )
-    .unwrap();
+    let bt = bk
+        .from_cpu_f16(
+            &b.iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect::<Vec<_>>(),
+            vec![n, k],
+        )
+        .unwrap();
     let ct = bk.zeros(vec![m, n]).unwrap();
     bk.gemm_nt(&at, &bt, &ct).unwrap();
     let got = bk.to_cpu_f32(&ct).unwrap();
@@ -36,7 +39,10 @@ fn gemm_f16_m21_k2048_n4096_row20() {
             let want: f32 = (0..k).map(|kk| a[row * k + kk] * bf16[col * k + kk]).sum();
             let g = got[row * n + col];
             let rel = (g - want).abs() / want.abs().max(1e-6);
-            assert!(rel < 1e-3, "gemm[{row},{col}]: got {g} want {want} rel {rel}");
+            assert!(
+                rel < 1e-3,
+                "gemm[{row},{col}]: got {g} want {want} rel {rel}"
+            );
         }
     }
 }

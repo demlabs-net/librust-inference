@@ -33,7 +33,10 @@ fn quantize_q8(src: &[f32], d: usize) -> (Vec<i8>, Vec<f32>) {
 }
 
 fn dequant_q8(q: &[i8], sc: &[f32]) -> Vec<f32> {
-    q.iter().enumerate().map(|(i, &v)| f32::from(v) * sc[i / 32]).collect()
+    q.iter()
+        .enumerate()
+        .map(|(i, &v)| f32::from(v) * sc[i / 32])
+        .collect()
 }
 
 #[test]
@@ -133,16 +136,22 @@ fn attn_ar_pair(
     let v_g = v_store(&gpu, v_cpu, vec![b, tkv, kv_heads * hd]);
     let m_g = gpu.from_cpu_f32(&mask, vec![tq, tkv]).unwrap();
     let y_g = gpu.zeros(vec![b, tq, heads * hd]).unwrap();
-    gpu.attn_ar(&q_g, &k_g, &v_g, Some(&m_g), &y_g, heads, kv_heads, hd).unwrap();
+    gpu.attn_ar(&q_g, &k_g, &v_g, Some(&m_g), &y_g, heads, kv_heads, hd)
+        .unwrap();
     gpu.synchronize().unwrap();
     let g = gpu.to_cpu_f32(&y_g).unwrap();
 
     let q_c = cpu.from_cpu_f32(&q, vec![b, tq, heads * hd]).unwrap();
-    let k_c = cpu.from_cpu_f32(k_cpu, vec![b, tkv, kv_heads * hd]).unwrap();
-    let v_c = cpu.from_cpu_f32(v_cpu, vec![b, tkv, kv_heads * hd]).unwrap();
+    let k_c = cpu
+        .from_cpu_f32(k_cpu, vec![b, tkv, kv_heads * hd])
+        .unwrap();
+    let v_c = cpu
+        .from_cpu_f32(v_cpu, vec![b, tkv, kv_heads * hd])
+        .unwrap();
     let m_c = cpu.from_cpu_f32(&mask, vec![tq, tkv]).unwrap();
     let y_c = cpu.zeros(vec![b, tq, heads * hd]).unwrap();
-    cpu.attn_ar(&q_c, &k_c, &v_c, Some(&m_c), &y_c, heads, kv_heads, hd).unwrap();
+    cpu.attn_ar(&q_c, &k_c, &v_c, Some(&m_c), &y_c, heads, kv_heads, hd)
+        .unwrap();
     let c = cpu.to_cpu_f32(&y_c).unwrap();
     (g, c)
 }
@@ -153,9 +162,7 @@ fn assert_close(g: &[f32], c: &[f32], what: &str) {
     for i in 0..g.len() {
         // NaN always fails the comparison — count it explicitly so a
         // broken kernel can't pass vacuously.
-        let ok = g[i].is_finite()
-            && c[i].is_finite()
-            && (g[i] - c[i]).abs() <= tol;
+        let ok = g[i].is_finite() && c[i].is_finite() && (g[i] - c[i]).abs() <= tol;
         if !ok {
             bad += 1;
             if bad < 5 {
@@ -310,7 +317,8 @@ fn attn_ar_long_window() {
     let k_g = gpu.from_cpu_f32(&kv, vec![b, tkv, kv_heads * hd]).unwrap();
     let m_g = gpu.from_cpu_f32(&mask, vec![tq, tkv]).unwrap();
     let y_g = gpu.zeros(vec![b, tq, heads * hd]).unwrap();
-    gpu.attn_ar(&q_g, &k_g, &k_g, Some(&m_g), &y_g, heads, kv_heads, hd).unwrap();
+    gpu.attn_ar(&q_g, &k_g, &k_g, Some(&m_g), &y_g, heads, kv_heads, hd)
+        .unwrap();
     gpu.synchronize().unwrap();
     let g = gpu.to_cpu_f32(&y_g).unwrap();
 
@@ -318,7 +326,8 @@ fn attn_ar_long_window() {
     let k_c = cpu.from_cpu_f32(&kv, vec![b, tkv, kv_heads * hd]).unwrap();
     let m_c = cpu.from_cpu_f32(&mask, vec![tq, tkv]).unwrap();
     let y_c = cpu.zeros(vec![b, tq, heads * hd]).unwrap();
-    cpu.attn_ar(&q_c, &k_c, &k_c, Some(&m_c), &y_c, heads, kv_heads, hd).unwrap();
+    cpu.attn_ar(&q_c, &k_c, &k_c, Some(&m_c), &y_c, heads, kv_heads, hd)
+        .unwrap();
     let c = cpu.to_cpu_f32(&y_c).unwrap();
 
     let tol = 2e-3 + 2e-3 * c.iter().fold(0f32, |m, &v| m.max(v.abs()));
@@ -332,8 +341,16 @@ fn attn_ar_long_window() {
             }
         }
     }
-    assert_eq!(bad, 0, "attn_ar long window mismatch: {bad}/{}, tol {tol}", g.len());
-    println!("attn_ar long window (tkv={tkv}): ok ({} elems, tol {tol:.4})", g.len());
+    assert_eq!(
+        bad,
+        0,
+        "attn_ar long window mismatch: {bad}/{}, tol {tol}",
+        g.len()
+    );
+    println!(
+        "attn_ar long window (tkv={tkv}): ok ({} elems, tol {tol:.4})",
+        g.len()
+    );
 }
 
 #[test]

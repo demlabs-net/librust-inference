@@ -24,11 +24,14 @@ fn gemm_f16_m21_k2048_matches_cpu() {
     let a = genr(1, m * k);
     let b = genr(2, n * k);
     let at = bk.from_cpu_f32(&a, vec![m, k]).unwrap();
-    let bt = bk.from_cpu_f16(
-        &b.iter().map(|&v| half::f16::from_f32(v)).collect::<Vec<_>>(),
-        vec![n, k],
-    )
-    .unwrap();
+    let bt = bk
+        .from_cpu_f16(
+            &b.iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect::<Vec<_>>(),
+            vec![n, k],
+        )
+        .unwrap();
     let ct = bk.zeros(vec![m, n]).unwrap();
     bk.gemm_nt(&at, &bt, &ct).unwrap();
     let got = bk.to_cpu_f32(&ct).unwrap();

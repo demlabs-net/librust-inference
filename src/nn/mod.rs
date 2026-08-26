@@ -404,10 +404,9 @@ fn make_kv_tensor(
             let z = vec![0i8; cap * d];
             let sc = vec![1.0f32; cap * (d / 32)];
             backend.from_cpu_i8(&z, &sc, vec![1, cap, d])
-        }
-        // K49: KvFormat::Q4_0 was declared but never implemented (this arm
-        // returned Err) — removed from the enum; KV quantization is
-        // fp16/q8_0 only.
+        } // K49: KvFormat::Q4_0 was declared but never implemented (this arm
+          // returned Err) — removed from the enum; KV quantization is
+          // fp16/q8_0 only.
     }
 }
 

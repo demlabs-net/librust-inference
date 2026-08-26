@@ -382,13 +382,13 @@ impl BertEncoder {
     fn embed_one(&self, backend: &dyn Backend, text: &str) -> Result<Vec<f32>, BackendError> {
         let d = self.config.hidden_size;
         let ids = self.tokenizer.encode(text);
-        if ids.len() > self.config.max_position_embeddings {
-            return Err(BackendError::Shape(format!(
-                "sequence {} > max_position_embeddings {}",
-                ids.len(),
-                self.config.max_position_embeddings
-            )));
-        }
+        // обрезка по max_position_embeddings: bge-протокол (и промышленная
+        // практика SentenceTransformers) — хвост отбрасывается, а не ошибка
+        let ids: Vec<u32> = if ids.len() > self.config.max_position_embeddings {
+            ids[..self.config.max_position_embeddings].to_vec()
+        } else {
+            ids
+        };
         let t = ids.len();
         let word = self.word_emb.forward(backend, &ids, t)?;
         let pos_ids: Vec<u32> = (0..t as u32).collect();

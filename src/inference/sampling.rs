@@ -208,7 +208,10 @@ mod tests {
         for _ in 0..50 {
             let ta = top_p_sample_vec(&logits, &mk(3), &mut rng_a);
             let tb = top_p_sample_vec(&logits, &mk(0), &mut rng_b);
-            assert!(ta < 3 || ta == 2, "top_k=3 must stay in the top-3 window, got {ta}");
+            assert!(
+                ta < 3 || ta == 2,
+                "top_k=3 must stay in the top-3 window, got {ta}"
+            );
             // The full-sort path returns one of the 3 largest (0.9, 0.8, 0.7).
             assert!([1usize, 6, 3].contains(&(tb as usize)), "unexpected {tb}");
         }

@@ -636,8 +636,7 @@ impl Backend for CpuBackend {
                         // index (causal padding) — in usize that underflows
                         // (panic in debug builds); `src >= 0` on usize was
                         // also a useless comparison.
-                        let src = to as isize * stride as isize
-                            + kk as isize * dil as isize
+                        let src = to as isize * stride as isize + kk as isize * dil as isize
                             - pad_l as isize;
                         let v = if src >= 0 && (src as usize) < t {
                             xd[(bi * t + src as usize) * cin + ci]

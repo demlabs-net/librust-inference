@@ -289,7 +289,10 @@ impl CudaBackend {
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // J7: poison-resilient pool lock (a panic while the pool mutex was
         // held must not abort the next take()).
-        lock_poison_resilient(&self.pool).entry(s * m * n).or_default().push(cpart);
+        lock_poison_resilient(&self.pool)
+            .entry(s * m * n)
+            .or_default()
+            .push(cpart);
         Ok(())
     }
 
@@ -1976,7 +1979,10 @@ impl Backend for CudaBackend {
         }
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // C6: return the dummy scales to the pool — they leaked per call.
-        lock_poison_resilient(&self.pool).entry(1).or_default().push(dummy);
+        lock_poison_resilient(&self.pool)
+            .entry(1)
+            .or_default()
+            .push(dummy);
         // Merge the partials into the output.
         let f = self.function("attn_ar_v4_combine")?;
         let cfg = LaunchConfig {
@@ -2072,7 +2078,10 @@ impl Backend for CudaBackend {
         }
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
         // C6: return the dummy scales to the pool (they leaked per call).
-        lock_poison_resilient(&self.pool).entry(1).or_default().push(dummy);
+        lock_poison_resilient(&self.pool)
+            .entry(1)
+            .or_default()
+            .push(dummy);
         Ok(())
     }
 

@@ -325,8 +325,18 @@ impl Tensor {
     /// view (offset через set_buffer); CPU/CUDA — contiguous КОПИЯ со сдвигом
     /// (та же семантика результата, без разделяемого хранилища). Используется
     /// KV compaction (Metal) и q/k/v-разрезкой fused-qkv (без slice-кернелов).
+    ///
+    /// D7: the offset is a real semantic (the old CUDA/CPU path silently
+    /// IGNORED it and returned the buffer from 0). Bounds are checked at
+    /// runtime, not just by debug_assert — an out-of-range offset is a
+    /// programming error and must fail loudly, never return wrong data.
     pub fn view_offset(&self, shape: Vec<usize>, elem_offset: usize) -> Tensor {
-        debug_assert!(shape.iter().product::<usize>() + elem_offset <= self.numel());
+        let n: usize = shape.iter().product();
+        assert!(
+            elem_offset + n <= self.numel(),
+            "view_offset out of bounds: offset {elem_offset} + len {n} > numel {}",
+            self.numel()
+        );
         #[cfg(feature = "metal")]
         {
             if let TensorInner::Metal(g) = &self.inner {
@@ -339,7 +349,6 @@ impl Tensor {
         }
         #[cfg(feature = "cpu")]
         {
-            let n: usize = shape.iter().product();
             let data = self.cpu_read();
             let mut v = Vec::with_capacity(n);
             v.extend_from_slice(&data[elem_offset..elem_offset + n]);

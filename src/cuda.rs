@@ -67,6 +67,17 @@ fn map_err(e: impl std::fmt::Display) -> BackendError {
     }
 }
 
+/// J7: never panic on a poisoned pool/cache mutex. A thread panicking while
+/// it holds one of these locks (e.g. mid-GEMM in the TTS top-up thread)
+/// poisons it; a second panic on the next take() would abort the whole
+/// process (panic across the GStreamer FFI boundary). The guarded data is
+/// always in a usable state — the lock is never held across a fallible
+/// operation — so recovering the guard degrades the pool instead of killing
+/// the bridge.
+fn lock_poison_resilient<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Pooled CUDA buffer (Phase 3.5b): owns a `CudaSlice<f32>` and returns it
 /// to the backend's size-keyed pool when the last `Arc` reference drops —
 /// inference allocates hundreds of temporaries per token, so avoiding
@@ -90,7 +101,7 @@ impl CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if let (Some(s), Some(pool)) = (self.slice.take(), &self.pool) {
-            let mut pool = pool.lock().unwrap();
+            let mut pool = lock_poison_resilient(&pool);
             let bucket = pool.entry(s.len()).or_default();
             // Cap the pool per bucket AND by byte size: without the byte
             // cap, grown KV buffers (~16 MB+ per cache row) returned by
@@ -118,7 +129,7 @@ fn push_capped<T>(
 ) {
     const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
     const MAX_PER_BUCKET: usize = 8;
-    let mut pool = pool.lock().unwrap();
+    let mut pool = lock_poison_resilient(&pool);
     let bucket = pool.entry(sl.len()).or_default();
     if bucket.len() < MAX_PER_BUCKET && sl.len() * elem_bytes <= MAX_POOL_BYTES {
         bucket.push(sl);
@@ -184,7 +195,7 @@ impl CudaBackend {
         &self,
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<half::f16>, BackendError> {
-        let mut pool = self.pool_f16.lock().unwrap();
+        let mut pool = lock_poison_resilient(&self.pool_f16);
         if let Some(bucket) = pool.get_mut(&n) {
             if let Some(s) = bucket.pop() {
                 return Ok(s);
@@ -197,7 +208,7 @@ impl CudaBackend {
         &self,
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<half::bf16>, BackendError> {
-        let mut pool = self.pool_bf16.lock().unwrap();
+        let mut pool = lock_poison_resilient(&self.pool_bf16);
         if let Some(bucket) = pool.get_mut(&n) {
             if let Some(s) = bucket.pop() {
                 return Ok(s);
@@ -278,7 +289,7 @@ impl CudaBackend {
         la.arg(&s32);
         la.arg(&m32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
-        self.pool.lock().unwrap().entry(s * m * n).or_default().push(cpart);
+        lock_poison_resilient(&self.pool).entry(s * m * n).or_default().push(cpart);
         Ok(())
     }
 
@@ -463,7 +474,7 @@ impl CudaBackend {
         if std::env::var_os("CUDA_NO_CUBLAS").is_some() {
             return Ok(false);
         }
-        let mut guard = self.cublas.lock().unwrap();
+        let mut guard = lock_poison_resilient(&self.cublas);
         if guard.is_none() {
             match CudaBlas::new(self.stream.clone()) {
                 Ok(b) => *guard = Some(Arc::new(b)),
@@ -500,7 +511,7 @@ impl CudaBackend {
     }
 
     fn take_pooled(&self, n: usize) -> Result<CudaSlice<f32>, BackendError> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = lock_poison_resilient(&self.pool);
         if let Some(bucket) = pool.get_mut(&n) {
             if let Some(s) = bucket.pop() {
                 return Ok(s);
@@ -510,7 +521,7 @@ impl CudaBackend {
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, BackendError> {
-        let mut cache = self.functions.lock().unwrap();
+        let mut cache = lock_poison_resilient(&self.functions);
         if let Some(f) = cache.get(name) {
             return Ok(f.clone());
         }
@@ -1933,7 +1944,7 @@ impl Backend for CudaBackend {
         }
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // C6: return the dummy scales to the pool — they leaked per call.
-        self.pool.lock().unwrap().entry(1).or_default().push(dummy);
+        lock_poison_resilient(&self.pool).entry(1).or_default().push(dummy);
         // Merge the partials into the output.
         let f = self.function("attn_ar_v4_combine")?;
         let cfg = LaunchConfig {
@@ -2021,7 +2032,7 @@ impl Backend for CudaBackend {
         }
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
         // C6: return the dummy scales to the pool (they leaked per call).
-        self.pool.lock().unwrap().entry(1).or_default().push(dummy);
+        lock_poison_resilient(&self.pool).entry(1).or_default().push(dummy);
         Ok(())
     }
 
@@ -2303,11 +2314,6 @@ impl CudaBackend {
         bn: usize,
         name: &str,
     ) -> Result<(), BackendError> {
-        let (splitk, tiled) = match name {
-            "gemm_q6k" => ("gemm_q6k_splitk_v2", "gemm_q6k_tiled_v3"),
-            "gemm_q4k" => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
-            _ => unreachable!("gemm_packed_nt: unknown family {name}"),
-        };
         let k32 = k as i32;
         let n32 = n as i32;
         let m32 = m as i32;

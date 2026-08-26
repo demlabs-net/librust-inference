@@ -1091,6 +1091,16 @@ impl Backend for CpuBackend {
         if y.shape() != &[b, tq, d] || kv_d != kv_heads * hd || v.shape()[2] != kv_d {
             return Err(BackendError::Shape("attn_ar: shape mismatch".into()));
         }
+        // D8: the mask is indexed as [tq, tkv] below (m[t * tkv + tk]) — a
+        // too-small mask would read out of bounds (panic) or wrong values.
+        if let Some(m) = mask {
+            if m.numel() < tq * tkv {
+                return Err(BackendError::Shape(format!(
+                    "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
+                    m.numel()
+                )));
+            }
+        }
         let n_rep = n_heads / kv_heads;
         let (qd, kd, vd) = (data(q).to_vec(), data(k).to_vec(), data(v).to_vec());
         let md: Option<Vec<f32>> = mask.map(|m| data(m).to_vec());
@@ -1155,6 +1165,16 @@ impl Backend for CpuBackend {
         let hd = d / h;
         if y.shape() != &[b, t, d] {
             return Err(BackendError::Shape("mhsa: output shape mismatch".into()));
+        }
+        // D8: the mask is indexed as [t, t] below (m[tq * t + tk]) — a
+        // too-small mask would read out of bounds (panic) or wrong values.
+        if let Some(m) = mask {
+            if m.numel() < t * t {
+                return Err(BackendError::Shape(format!(
+                    "mhsa: mask numel {} < t·t {t}·{t}",
+                    m.numel()
+                )));
+            }
         }
         if mode == 2 {
             // uniform: out = mean over time of V per head? The uniform kernel

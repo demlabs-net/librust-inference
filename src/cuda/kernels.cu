@@ -646,6 +646,37 @@ extern "C" __global__ void embedding_f32(
     y[i] = table[idx[r] * d + j];
 }
 
+/// Half-precision embedding tables (bf16/f16 — the TTS text/codebook
+/// embeddings live in half to halve their VRAM; the OUTPUT stays f32 so
+/// the downstream GEMMs are unchanged).
+extern "C" __global__ void embedding_bf16(
+    const unsigned int* __restrict__ idx,
+    const __nv_bfloat16* __restrict__ table,
+    float* __restrict__ y,
+    int n,
+    int d)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * d) return;
+    int r = i / d;
+    int j = i % d;
+    y[i] = __bfloat162float(table[idx[r] * d + j]);
+}
+
+extern "C" __global__ void embedding_f16(
+    const unsigned int* __restrict__ idx,
+    const __half* __restrict__ table,
+    float* __restrict__ y,
+    int n,
+    int d)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * d) return;
+    int r = i / d;
+    int j = i % d;
+    y[i] = __half2float(table[idx[r] * d + j]);
+}
+
 /// y (b, c) = mean over time of v (b, t, c)
 extern "C" __global__ void uniform_attn_f32(
     const float* __restrict__ v,

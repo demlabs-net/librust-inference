@@ -1568,16 +1568,27 @@ impl Backend for CudaBackend {
         let n = idx.len();
         let d = table.shape()[1] as i32;
         let idx_dev = self.stream.clone_htod(idx).map_err(map_err)?;
-        let f = self.function("embedding_f32")?;
         let cfg = LaunchConfig::for_num_elems((n * d as usize) as u32);
-        let mut la = self.stream.launch_builder(&f);
-        la.arg(&idx_dev);
-        la.arg(table.as_cuda());
-        la.arg(y.as_cuda());
-        let __a50 = n as i32;
-        la.arg(&__a50);
-        la.arg(&d);
-        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+        let n32 = n as i32;
+        macro_rules! launch_embedding {
+            ($fname:literal, $table:expr) => {{
+                let f = self.function($fname)?;
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&idx_dev);
+                la.arg($table);
+                la.arg(y.as_cuda());
+                la.arg(&n32);
+                la.arg(&d);
+                unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+            }};
+        }
+        // Half-precision tables (TTS embeddings): the dedicated kernels
+        // convert to f32 on read — the output tensor stays f32.
+        match &table.inner {
+            crate::backend::TensorInner::CudaBF16(t) => launch_embedding!("embedding_bf16", t),
+            crate::backend::TensorInner::CudaF16(t) => launch_embedding!("embedding_f16", t),
+            _ => launch_embedding!("embedding_f32", table.as_cuda()),
+        }
     }
 
     fn rope(

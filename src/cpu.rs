@@ -1272,6 +1272,7 @@ impl Backend for CpuBackend {
         dk: usize,
         dp: usize,
         mode: u32,
+        scale: f32,
     ) -> Result<(), BackendError> {
         let (t, d) = (q.shape()[0], q.shape()[1]);
         let h = d / dk;
@@ -1289,7 +1290,8 @@ impl Backend for CpuBackend {
         let mut yd = data_mut(y);
         yd.fill(0.0);
         let mut wfd: Option<Vec<f32>> = wfull.map(|_| vec![0.0f32; h * t * t]);
-        let scale = 1.0 / (dk as f32).sqrt();
+        // scale passed by the caller (NeMo √dk form, zipformer 1.0)
+        let scale = scale;
         for hh in 0..h {
             let (qo, ko, vo, po) = (hh * dk, hh * dk, hh * dk, hh * dp);
             let (uo, vo_b) = (hh * dk, hh * dk);

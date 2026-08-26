@@ -1139,7 +1139,8 @@ extern "C" __global__ void mhsa_rel_pos_f32(
     int dk,
     int dp,
     int H,
-    int mode)
+    int mode,
+    float scale)
 {
     const int Q = 4;
     __shared__ float scs[Q][2048];
@@ -1154,7 +1155,9 @@ extern "C" __global__ void mhsa_rel_pos_f32(
     const float* ph = p + hh * dp;
     const float* uh = u + hh * dk;
     const float* vbh = vb + hh * dp;
-    float scale = rsqrtf((float)dk);
+    // scale passed by the caller: NeMo divides by √dk (its scores use the
+    // standard scaled-dot form), zipformer does NOT (the scale is baked into
+    // its in_proj weights — icefall RelPositionMultiheadAttentionWeights).
     // ── scores for the chunk's Q query rows ──
     int pairs = Q * T;
     for (int i = tid; i < pairs; i += 256) {

@@ -1277,6 +1277,7 @@ pub trait Backend: Send + Sync {
         _dk: usize,
         _dp: usize,
         _mode: u32,
+        _scale: f32,
     ) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedFormat(
             "mhsa_rel_pos: backend does not implement relative-position attention".into(),

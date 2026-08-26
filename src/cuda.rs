@@ -2276,6 +2276,7 @@ impl Backend for CudaBackend {
         dk: usize,
         dp: usize,
         mode: u32,
+        scale: f32,
     ) -> Result<(), BackendError> {
         let (t, d) = (q.shape()[0], q.shape()[1]);
         let h = d / dk;
@@ -2309,6 +2310,7 @@ impl Backend for CudaBackend {
         la.arg(&h32);
         let m32 = mode as i32;
         la.arg(&m32);
+        la.arg(&scale);
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 

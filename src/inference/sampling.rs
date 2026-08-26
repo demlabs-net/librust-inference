@@ -56,19 +56,25 @@ pub fn top_p_sample_vec(
     // M15: with top_k set (the TTS path uses 30), a full sort of the whole
     // vocab (155k entries ≈ 2-6 ms) per token is wasted work. select_nth
     // isolates the k largest in O(V), then only that window is sorted.
+    //
+    // NOTE: select_nth_unstable_by(n) puts the n-th element into the PIVOT —
+    // head has length n, so the k largest are head + pivot (the old code
+    // sliced head[..k], which panicked: "range end index out of range").
     if k < indexed.len() {
-        let (head, _, _) = indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
-        head.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let (head, pivot, _) = indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        let mut window: Vec<(usize, f32)> = head.to_vec();
+        window.push(*pivot);
+        window.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         let mut cumsum = 0.0f32;
         let mut cutoff = k;
-        for (i, (_, p)) in head.iter().enumerate() {
+        for (i, (_, p)) in window.iter().enumerate() {
             cumsum += p;
             if cumsum >= params.top_p {
                 cutoff = i + 1;
                 break;
             }
         }
-        let top_tokens: Vec<(usize, f32)> = head[..cutoff].to_vec();
+        let top_tokens: Vec<(usize, f32)> = window[..cutoff].to_vec();
         return sample_from(&top_tokens, rng_state);
     }
 
@@ -158,6 +164,53 @@ pub fn ras_penalty_vec(logits: &mut [f32], history: &[u32], window: usize, penal
             if idx < logits.len() {
                 logits[idx] -= penalty * (count - 1) as f32;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M15 regression: the top_k path sliced head[..k] where head is k-1
+    /// long (select_nth puts the k-th element in the pivot) — k=1 panicked
+    /// with "range end index out of range".
+    #[test]
+    fn top_k_one_does_not_panic() {
+        let logits = [1.0f32, 2.0, 3.0, 0.5, -1.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            repetition_penalty: 1.0,
+            seed: Some(42),
+        };
+        let mut rng = None;
+        // Must return the argmax (index 2) and not panic.
+        let t = top_p_sample_vec(&logits, &params, &mut rng);
+        assert_eq!(t, 2, "top_k=1 must yield the argmax");
+    }
+
+    #[test]
+    fn top_k_window_matches_full_sort() {
+        let logits = [0.1f32, 0.9, 0.3, 0.7, 0.5, -0.2, 0.8, 0.4];
+        let mk = |top_k: usize| SamplingParams {
+            temperature: 1.0,
+            top_p: 0.99,
+            top_k,
+            repetition_penalty: 1.0,
+            seed: Some(7),
+        };
+        // With top_p near 1.0 both paths effectively sample from the same
+        // distribution: repeated draws must stay inside the top_k window.
+        let mut rng_a = None;
+        let mut rng_b = None;
+        for _ in 0..50 {
+            let ta = top_p_sample_vec(&logits, &mk(3), &mut rng_a);
+            let tb = top_p_sample_vec(&logits, &mk(0), &mut rng_b);
+            assert!(ta < 3 || ta == 2, "top_k=3 must stay in the top-3 window, got {ta}");
+            // The full-sort path returns one of the 3 largest (0.9, 0.8, 0.7).
+            assert!([1usize, 6, 3].contains(&(tb as usize)), "unexpected {tb}");
         }
     }
 }

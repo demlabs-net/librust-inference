@@ -314,8 +314,14 @@ pub fn write_gguf<W: Write>(
         w.write_all(&vec![0u8; pad])
             .map_err(|e| BackendError::Native(format!("gguf write: {e}")))?;
     }
+    // данные с межтензорными паддингами (оффсеты считались с выравниванием 32)
     let mut done = 0u64;
     for t in tensors {
+        while !done.is_multiple_of(TENSOR_ALIGN) {
+            w.write_all(&[0u8])
+                .map_err(|e| BackendError::Native(format!("gguf write: {e}")))?;
+            done += 1;
+        }
         w.write_all(&t.data)
             .map_err(|e| BackendError::Native(format!("gguf write: {e}")))?;
         done += t.data.len() as u64;

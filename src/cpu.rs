@@ -632,9 +632,15 @@ impl Backend for CpuBackend {
             for to in 0..tout {
                 for ci in 0..cin {
                     for kk in 0..k {
-                        let src = to * stride + kk * dil - pad_l;
-                        let v = if src >= 0 && src < t {
-                            xd[(bi * t + src) * cin + ci]
+                        // Signed arithmetic: pad_l can exceed the source
+                        // index (causal padding) — in usize that underflows
+                        // (panic in debug builds); `src >= 0` on usize was
+                        // also a useless comparison.
+                        let src = to as isize * stride as isize
+                            + kk as isize * dil as isize
+                            - pad_l as isize;
+                        let v = if src >= 0 && (src as usize) < t {
+                            xd[(bi * t + src as usize) * cin + ci]
                         } else {
                             0.0
                         };

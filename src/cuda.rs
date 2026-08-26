@@ -107,6 +107,24 @@ impl Drop for CudaBuffer {
     }
 }
 
+/// Pool-cap helper shared by the f32 / f16 / bf16 scratch pools (A1): same
+/// per-bucket and byte limits as [`CudaBuffer`]'s Drop, parameterized by the
+/// element size so a 2-byte type gets a byte-fair cap (32 MB of f16 elements
+/// would otherwise be the f32-equivalent of 8 MB).
+fn push_capped<T>(
+    pool: &Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<T>>>>>,
+    sl: cudarc::driver::CudaSlice<T>,
+    elem_bytes: usize,
+) {
+    const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_PER_BUCKET: usize = 8;
+    let mut pool = pool.lock().unwrap();
+    let bucket = pool.entry(sl.len()).or_default();
+    if bucket.len() < MAX_PER_BUCKET && sl.len() * elem_bytes <= MAX_POOL_BYTES {
+        bucket.push(sl);
+    }
+}
+
 /// CUDA backend over the own PTX kernels. One device, one stream, one
 /// module; `&dyn Backend` consumers never touch this type.
 pub struct CudaBackend {
@@ -264,14 +282,16 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Return the activation cast scratch (if any) to its pool.
+    /// Return the activation cast scratch (if any) to its pool, capped like
+    /// the f32 pool (A1): same MAX_POOL_BYTES / MAX_PER_BUCKET limits, so
+    /// TTS_ACTIVATION=fp16/bf16 cannot grow VRAM without bound.
     fn pool_a_scratch(&self, a_arg: KernA) {
         match a_arg {
             KernA::F16(sl) => {
-                self.pool_f16.lock().unwrap().entry(sl.len()).or_default().push(sl);
+                push_capped(&self.pool_f16, sl, std::mem::size_of::<half::f16>());
             }
             KernA::BF16(sl) => {
-                self.pool_bf16.lock().unwrap().entry(sl.len()).or_default().push(sl);
+                push_capped(&self.pool_bf16, sl, std::mem::size_of::<half::bf16>());
             }
             KernA::F32(_) => {}
         }
@@ -455,7 +475,13 @@ impl CudaBackend {
                 }
             }
         }
-        let blas = guard.as_ref().unwrap().clone();
+        // J2/C8: the handle MUST stay locked for the GEMM — cuBLAS handles
+        // are not thread-safe. The old code cloned the Arc, dropped the
+        // guard and called gemm() unlocked: the TTS top-up thread and the
+        // generation thread raced the same handle (silent corruption under
+        // concurrent calls). Serializing here is correct; per-thread handles
+        // are the future optimization.
+        let blas = guard.as_ref().unwrap();
         unsafe { blas.gemm(cfg, x.as_cuda(), y.as_cuda(), c.as_cuda_mut()) }
             .map_err(|e| map_err(format!("cublasSgemm: {e}")))?;
         Ok(true)
@@ -1093,11 +1119,17 @@ impl Backend for CudaBackend {
         la.arg(y.as_cuda());
         la.arg(&n_tokens);
         la.arg(&n_embd);
-        la.arg(&(kernel as i32));
-        la.arg(&(group_size as i32));
-        la.arg(&(block_size as i32));
+        // N1 (build fix): the `&(expr as i32)` temporaries were dropped while
+        // borrowed (E0716); bind to locals so the launch builder can borrow them.
+        let kernel32 = kernel as i32;
+        let group32 = group_size as i32;
+        let block32 = block_size as i32;
+        la.arg(&kernel32);
+        la.arg(&group32);
+        la.arg(&block32);
         la.arg(&n_groups);
-        la.arg(&(side as i32));
+        let side32 = side as i32;
+        la.arg(&side32);
         unsafe { la.launch(cfg).map_err(map_err)? };
         Ok(())
     }
@@ -1900,6 +1932,8 @@ impl Backend for CudaBackend {
             _ => { la.arg(&dummy2); }
         }
         unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // C6: return the dummy scales to the pool — they leaked per call.
+        self.pool.lock().unwrap().entry(1).or_default().push(dummy);
         // Merge the partials into the output.
         let f = self.function("attn_ar_v4_combine")?;
         let cfg = LaunchConfig {
@@ -1985,7 +2019,10 @@ impl Backend for CudaBackend {
             crate::backend::TensorInner::CudaI8 { scale, .. } => { la.arg(scale); }
             _ => { la.arg(&dummy2); }
         }
-        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
+        unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
+        // C6: return the dummy scales to the pool (they leaked per call).
+        self.pool.lock().unwrap().entry(1).or_default().push(dummy);
+        Ok(())
     }
 
     fn mhsa_rel_pos(
@@ -2213,6 +2250,15 @@ impl Backend for CudaBackend {
         let rows = x.shape()[0] * x.shape()[1];
         let d = x.shape()[2];
         let v = table.shape()[0];
+        // A2: validate before launching — copy_from_slice below panics on a
+        // length mismatch, and a mismatched idx would tear the whole bridge
+        // down (the CPU reference returns Err on the same contract).
+        if idx.len() != rows {
+            return Err(BackendError::Shape(format!(
+                "codebook_search: idx {} != rows {rows}",
+                idx.len()
+            )));
+        }
         let idx_dev = self.stream.alloc_zeros::<u32>(rows).map_err(map_err)?;
         let f = self.function("codebook_search_f32")?;
         // One block per row — the kernel indexes rows via blockIdx.x.

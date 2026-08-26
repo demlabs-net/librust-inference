@@ -1178,7 +1178,9 @@ fn upload_f16(backend: &dyn Backend, data: &[f32], shape: Vec<usize>) -> Result<
     }
 }
 
-#[cfg(test)]
+/// N1 (build fix): the tests need both the Metal backend AND the CPU harness —
+/// bare `#[cfg(test)]` broke `cargo test` on Linux (E0432).
+#[cfg(all(test, feature = "metal", feature = "cpu"))]
 mod tests {
     use super::*;
     use crate::metal::MetalBackend;

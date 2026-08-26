@@ -47,13 +47,33 @@ pub fn top_p_sample_vec(
 
     let mut indexed: Vec<(usize, f32)> =
         probs_vec.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-    indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     let k = if params.top_k > 0 {
         params.top_k.min(indexed.len())
     } else {
         indexed.len()
     };
+    // M15: with top_k set (the TTS path uses 30), a full sort of the whole
+    // vocab (155k entries ≈ 2-6 ms) per token is wasted work. select_nth
+    // isolates the k largest in O(V), then only that window is sorted.
+    if k < indexed.len() {
+        let (head, _, _) = indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        head.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let mut cumsum = 0.0f32;
+        let mut cutoff = k;
+        for (i, (_, p)) in head.iter().enumerate() {
+            cumsum += p;
+            if cumsum >= params.top_p {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        let top_tokens: Vec<(usize, f32)> = head[..cutoff].to_vec();
+        return sample_from(&top_tokens, rng_state);
+    }
+
+    indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
     let mut cumsum = 0.0f32;
     let mut cutoff = k;
     for (i, (_, p)) in indexed[..k].iter().enumerate() {
@@ -65,6 +85,11 @@ pub fn top_p_sample_vec(
     }
 
     let top_tokens: Vec<(usize, f32)> = indexed[..cutoff].to_vec();
+    sample_from(&top_tokens, rng_state)
+}
+
+/// Sample one token from a small (already top-p filtered) distribution.
+fn sample_from(top_tokens: &[(usize, f32)], rng_state: &mut Option<u64>) -> u32 {
     let total: f32 = top_tokens.iter().map(|(_, p)| p).sum();
 
     let r = match rng_state {
@@ -90,7 +115,7 @@ pub fn top_p_sample_vec(
 
     let threshold = r * total;
     let mut cumsum = 0.0f32;
-    for (idx, p) in &top_tokens {
+    for (idx, p) in top_tokens {
         cumsum += p;
         if cumsum >= threshold {
             return *idx as u32;

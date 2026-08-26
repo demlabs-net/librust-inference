@@ -1139,18 +1139,18 @@ pub trait Backend: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn mhsa_rel_pos(
         &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        qp: &Tensor,
-        p: &Tensor,
-        u: &Tensor,
-        vb: &Tensor,
-        y: &Tensor,
-        wfull: Option<&Tensor>,
-        dk: usize,
-        dp: usize,
-        mode: u32,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _qp: &Tensor,
+        _p: &Tensor,
+        _u: &Tensor,
+        _vb: &Tensor,
+        _y: &Tensor,
+        _wfull: Option<&Tensor>,
+        _dk: usize,
+        _dp: usize,
+        _mode: u32,
     ) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedFormat(
             "mhsa_rel_pos: backend does not implement relative-position attention".into(),
@@ -1161,10 +1161,10 @@ pub trait Backend: Send + Sync {
     /// y (T, H·vh) = w (H, T, T) · x (T, H·vh). f32-compute.
     fn mhsa_apply_weights(
         &self,
-        w: &Tensor,
-        x: &Tensor,
-        y: &Tensor,
-        vh: usize,
+        _w: &Tensor,
+        _x: &Tensor,
+        _y: &Tensor,
+        _vh: usize,
     ) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedFormat(
             "mhsa_apply_weights: backend does not implement attention-weight application".into(),

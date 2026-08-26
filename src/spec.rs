@@ -116,7 +116,9 @@ impl Drafter for NGramDrafter {
     }
 }
 
-#[cfg(test)]
+/// N1 (build fix): these tests use the CPU backend — gate on the cpu feature
+/// so bare `cargo test` on non-cpu builds does not fail to compile.
+#[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
 

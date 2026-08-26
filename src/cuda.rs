@@ -2510,3 +2510,30 @@ impl CudaBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tiled GEMMs write ceil(nsup/nkz) of the 16 z-slices; reducing
+    /// more would sum stale pool contents (the STT-garbage bug).
+    #[test]
+    fn tiled_used_slices_math() {
+        // k=768 (gigaam/t-one): nsup=24, nkz=2 → 12 slices written.
+        assert_eq!(CudaBackend::tiled_used_slices(768, 5), 12);
+        // k=3072: nsup=96, nkz=6 → all 16.
+        assert_eq!(CudaBackend::tiled_used_slices(3072, 5), 16);
+        // k=384: nsup=12, nkz=1 → 12.
+        assert_eq!(CudaBackend::tiled_used_slices(384, 5), 12);
+        // k=32: nsup=1, nkz=1 → 1.
+        assert_eq!(CudaBackend::tiled_used_slices(32, 5), 1);
+        // k=16384: nsup=512, nkz=32 → 16.
+        assert_eq!(CudaBackend::tiled_used_slices(16384, 5), 16);
+        // k=1056: nsup=33, nkz=3 → 11.
+        assert_eq!(CudaBackend::tiled_used_slices(1056, 5), 11);
+        // Q6_K block (256 elems): k=2048 → nsup=8, nkz=1 → 8.
+        assert_eq!(CudaBackend::tiled_used_slices(2048, 8), 8);
+        // Q4_0 block (64 elems): k=768 → nsup=12, nkz=1 → 12.
+        assert_eq!(CudaBackend::tiled_used_slices(768, 6), 12);
+    }
+}

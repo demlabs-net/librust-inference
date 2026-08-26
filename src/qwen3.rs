@@ -491,6 +491,10 @@ impl Qwen3Model {
         upto: Option<usize>,
     ) -> Result<Tensor, BackendError> {
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
+        if std::env::var("INFER_LLM_DEBUG").is_ok() {
+            let xv = backend.to_cpu_f32(&x)?;
+            eprintln!("INFER_DEBUG embed[0,:8]={:?}", &xv[..8]);
+        }
         // текстовый deepstack (Qwen3-VL): к слоям 0..N-1 добавляются входные
         // эмбеддинги со сдвигом (il+1) токенов (llama.cpp t_inp_embd view);
         // для последних токенов сдвиг выходит за границу — вклад нулевой.
@@ -506,6 +510,10 @@ impl Qwen3Model {
             }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
+            if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
+                let hv = backend.to_cpu_f32(&h)?;
+                eprintln!("INFER_DEBUG norm[0,:8]={:?}", &hv[..8]);
+            }
             let h = Self::rope_and_attn(
                 &self.cfg,
                 backend,
@@ -519,6 +527,18 @@ impl Qwen3Model {
                 None,
             )?;
             x = backend_add(backend, &x, &h)?;
+            if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
+                let xv = backend.to_cpu_f32(&x)?;
+                let first = xv.len() - t * self.cfg.dim;
+                eprintln!(
+                    "INFER_DEBUG t={t} after_attn_layer0[0,:8]={:?}",
+                    &xv[first..first + 8]
+                );
+                eprintln!(
+                    "INFER_DEBUG t={t} after_attn_layer0[-1,:8]={:?}",
+                    &xv[xv.len() - self.cfg.dim..xv.len() - self.cfg.dim + 8]
+                );
+            }
             if prof {
                 prof_attn += t0.elapsed().as_secs_f64();
             }
@@ -853,6 +873,12 @@ impl Qwen3Model {
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
+        if std::env::var("INFER_LLM_DEBUG").is_ok() {
+            for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
+                let tv = backend.to_cpu_f32(t)?;
+                eprintln!("INFER_DEBUG {tag}_slice[:8]={:?}", &tv[..8.min(tv.len())]);
+            }
+        }
         if std::env::var("OMNI_REF").is_ok() {
             let qv = backend.to_cpu_f32(&q)?;
             let kvv = backend.to_cpu_f32(&k)?;
@@ -898,15 +924,27 @@ impl Qwen3Model {
             // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4; дефолт
             // (CPU/CUDA) — два шага
             let q = match &attn.q_norm {
-                Some(w) => backend.rmsnorm_head_rope(
-                    &q,
-                    w,
-                    pos,
-                    attn.head_dim,
-                    cfg.rope_theta,
-                    attn.n_heads,
-                    1e-6,
-                )?,
+                Some(w) => {
+                    let q = if std::env::var("SKIP_QK_NORM").is_ok() {
+                        // ДИАГНОСТИКА: вход, вероятно, уже нормирован
+                        q
+                    } else {
+                        backend.rmsnorm_head_rope(
+                            &q,
+                            w,
+                            pos,
+                            attn.head_dim,
+                            cfg.rope_theta,
+                            attn.n_heads,
+                            1e-6,
+                        )?
+                    };
+                    if std::env::var("INFER_LLM_DEBUG").is_ok() {
+                        let qv = backend.to_cpu_f32(&q)?;
+                        eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
+                    }
+                    q
+                }
                 None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
             };
             let k = match &attn.k_norm {

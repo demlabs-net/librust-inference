@@ -160,6 +160,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut model = Qwen3Model::load(backend.as_ref(), &wm, cfg.clone())?;
 
     // prefill + TTFT
+    if std::env::var("INFER_LLM_DEBUG").is_ok() {
+        eprintln!("INFER_DEBUG ids={ids:?}");
+    }
     let t0 = Instant::now();
     let mut logits = if std::env::var("LLM_BATCH").is_ok() {
         model.prefill(&*backend, &ids)?

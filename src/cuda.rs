@@ -728,6 +728,44 @@ impl Backend for CudaBackend {
         self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
         Ok(Tensor::from_cuda_q4k(s, shape))
     }
+    fn from_cpu_q5k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        let per: usize = shape[1..].iter().product();
+        if per % 256 != 0 {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q5k: per-dim {per} not a multiple of 256 (Q5_K super-blocks)"
+            )));
+        }
+        let expect = shape[0] * (per / 256) * 176;
+        if data.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q5k: {} packed bytes for shape {shape:?} (expected {expect})",
+                data.len()
+            )));
+        }
+        let mut s = unsafe { self.stream.alloc::<u8>(data.len()) }.map_err(map_err)?;
+        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        Ok(Tensor::from_cuda_q5k(s, shape))
+    }
+
+    fn from_cpu_q3k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        let per: usize = shape[1..].iter().product();
+        if per % 256 != 0 {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q3k: per-dim {per} not a multiple of 256 (Q3_K super-blocks)"
+            )));
+        }
+        let expect = shape[0] * (per / 256) * 110;
+        if data.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q3k: {} packed bytes for shape {shape:?} (expected {expect})",
+                data.len()
+            )));
+        }
+        let mut s = unsafe { self.stream.alloc::<u8>(data.len()) }.map_err(map_err)?;
+        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        Ok(Tensor::from_cuda_q3k(s, shape))
+    }
+
 
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
@@ -835,6 +873,87 @@ impl Backend for CudaBackend {
                 }
                 Ok(out)
             }
+            crate::backend::TensorInner::CudaQ5K(data) => {
+                let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
+                let per: usize = t.shape()[1..].iter().product();
+                let rows = t.shape()[0];
+                let nsuper = per / 256;
+                let mut out = vec![0f32; rows * per];
+                for r in 0..rows {
+                    for sb in 0..nsuper {
+                        // kb-major: block (sb, r) at (sb·rows + r)·176.
+                        let blk = &raw[(sb * rows + r) * 176..(sb * rows + r + 1) * 176];
+                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+                        let mn = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
+                        for j in 0..256 {
+                            let b = j >> 5;
+                            let l = j & 31;
+                            let is = (b >> 1) * 2;
+                            let (sc, m) = if is < 4 {
+                                (blk[4 + is] & 63, blk[4 + is + 4] & 63)
+                            } else {
+                                (
+                                    (blk[4 + is + 4] & 0xF) | ((blk[4 + is - 4] >> 6) << 4),
+                                    (blk[4 + is + 4] >> 4) | ((blk[4 + is] >> 6) << 4),
+                                )
+                            };
+                            let dl = d * sc as f32;
+                            let ml = mn * m as f32;
+                            let half = b & 1;
+                            let mut q = if half == 0 { blk[16 + l] & 0xF } else { blk[16 + l] >> 4 };
+                            let u = 1 << (2 * (b >> 1) + half);
+                            if blk[144 + l] & u != 0 {
+                                q += 16;
+                            }
+                            out[r * per + sb * 256 + j] = dl * q as f32 - ml;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            crate::backend::TensorInner::CudaQ3K(data) => {
+                let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
+                let per: usize = t.shape()[1..].iter().product();
+                let rows = t.shape()[0];
+                let nsuper = per / 256;
+                let mut out = vec![0f32; rows * per];
+                for r in 0..rows {
+                    for sb in 0..nsuper {
+                        // kb-major: block (sb, r) at (sb·rows + r)·110.
+                        let blk = &raw[(sb * rows + r) * 110..(sb * rows + r + 1) * 110];
+                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[108], blk[109]])));
+                        // scales[12] → 16 int8 via the ggml aux permutation.
+                        let a0 = u32::from_le_bytes([blk[96], blk[97], blk[98], blk[99]]);
+                        let a1 = u32::from_le_bytes([blk[100], blk[101], blk[102], blk[103]]);
+                        let tmp = u32::from_le_bytes([blk[104], blk[105], blk[106], blk[107]]);
+                        let k1 = 0x03030303u32;
+                        let k2 = 0x0f0f0f0fu32;
+                        let b0 = (a0 & k2) | (((tmp >> 0) & k1) << 4);
+                        let b1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+                        let b2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+                        let b3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+                        let scs: [i8; 16] = [
+                            b0 as i8, (b0 >> 8) as i8, (b0 >> 16) as i8, (b0 >> 24) as i8,
+                            b1 as i8, (b1 >> 8) as i8, (b1 >> 16) as i8, (b1 >> 24) as i8,
+                            b2 as i8, (b2 >> 8) as i8, (b2 >> 16) as i8, (b2 >> 24) as i8,
+                            b3 as i8, (b3 >> 8) as i8, (b3 >> 16) as i8, (b3 >> 24) as i8,
+                        ];
+                        for j in 0..256 {
+                            let s = j >> 4;
+                            let l = j & 15;
+                            let dl = d * (scs[s] as f32 - 32.0);
+                            let qbase = (s % 2) * 16 + (s / 8) * 32;
+                            let shift = ((s / 2) % 4) * 2;
+                            let hbase = (s % 2) * 16;
+                            let mbit = 1 << ((s / 2) % 4);
+                            let q2 = ((blk[32 + qbase + l] >> shift) & 3) as i32;
+                            let h = if blk[hbase + l] & mbit != 0 { 0 } else { 4 };
+                            out[r * per + sb * 256 + j] = dl * (q2 - h) as f32;
+                        }
+                    }
+                }
+                Ok(out)
+            }
             crate::backend::TensorInner::CudaQ4K(data) => {
                 let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
                 let per: usize = t.shape()[1..].iter().product();
@@ -904,6 +1023,12 @@ impl Backend for CudaBackend {
         // uses the row-chunk kernel — the same policy as the int8 path.
         if let crate::backend::TensorInner::CudaQ6K(bpack) = &b.inner {
             return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 210, 32, "gemm_q6k");
+        }
+        if let crate::backend::TensorInner::CudaQ5K(bpack) = &b.inner {
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 176, 32, "gemm_q5k");
+        }
+        if let crate::backend::TensorInner::CudaQ3K(bpack) = &b.inner {
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 110, 32, "gemm_q3k");
         }
         if let crate::backend::TensorInner::CudaQ4K(bpack) = &b.inner {
             return self.gemm_packed_nt(a, bpack, c, m, k, n, 5, 18, 256, "gemm_q4k");
@@ -2469,6 +2594,8 @@ impl CudaBackend {
             (KernA::F16(_), "gemm_q4k") => ("gemm_q4k_f16_splitk", "gemm_q4k_f16_tiled"),
             (KernA::BF16(_), "gemm_q4k") => ("gemm_q4k_bf16_splitk", "gemm_q4k_bf16_tiled"),
             (_, "gemm_q6k") => ("gemm_q6k_splitk_v2_f32", "gemm_q6k_tiled_v3"),
+            (_, "gemm_q5k") => ("gemm_q5k_splitk_v2_f32", "gemm_q5k_tiled_v3"),
+            (_, "gemm_q3k") => ("gemm_q3k_splitk_v2_f32", "gemm_q3k_tiled_v3"),
             (_, "gemm_q4k") => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
             _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };

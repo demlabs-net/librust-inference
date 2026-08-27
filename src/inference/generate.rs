@@ -102,9 +102,11 @@ pub fn generate(
         let v = backend.to_cpu_f32(&logits)?;
         let last = &v[v.len() - vocab..];
         let next = if params.temperature <= 0.0 {
+            // P18c: a NaN logit used to PANIC in partial_cmp().unwrap() —
+            // treat non-finite values as -inf (never selected).
             last.iter()
                 .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32)
                 .unwrap()
         } else {

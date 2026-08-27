@@ -226,8 +226,84 @@ impl Backend for CpuBackend {
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         elemwise(x, y, |v| v / (1.0 + (-v).exp()))
     }
+    /// O7: CPU reference of the vision patch-merge (the trait default used to
+    /// compute into a throwaway tensor — silent garbage on CUDA). Writes into
+    /// y properly.
+    fn merge2x2_add(
+        &self,
+        x: &Tensor,
+        bias: &Tensor,
+        pos: &Tensor,
+        y: &Tensor,
+        per: usize,
+    ) -> Result<(), BackendError> {
+        let d = x.shape()[1];
+        let xd = x.cpu_read();
+        let bd = bias.cpu_read();
+        let pd = pos.cpu_read();
+        let half = per / 2;
+        let mut yd = y.cpu_write();
+        for by in 0..half {
+            for bx in 0..half {
+                let dst_block = (by * half + bx) * 4 * d;
+                let srcs = [
+                    (2 * by * per + 2 * bx) * d,
+                    (2 * by * per + 2 * bx + 1) * d,
+                    ((2 * by + 1) * per + 2 * bx) * d,
+                    ((2 * by + 1) * per + 2 * bx + 1) * d,
+                ];
+                for (j, &src) in srcs.iter().enumerate() {
+                    let dst = dst_block + j * d;
+                    for k in 0..d {
+                        yd[dst + k] = xd[src + k] + bd[k] + pd[src + k];
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// O7: CPU reference of the vision 4-token group (see merge2x2_add).
+    fn group4(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        let (n, d) = (x.shape()[0], x.shape()[1]);
+        let xd = x.cpu_read();
+        let mut yd = y.cpu_write();
+        for i in 0..n / 4 {
+            for j in 0..4 {
+                let src = (i * 4 + j) * d;
+                let dst = i * 4 * d + j * d;
+                yd[dst..dst + d].copy_from_slice(&xd[src..src + d]);
+            }
+        }
+        Ok(())
+    }
+
+    /// O7: CPU reference of the vision chunk concat (see merge2x2_add).
+    fn concat4(&self, chunks: &[Tensor], y: &Tensor) -> Result<(), BackendError> {
+        let (nq, proj) = (y.shape()[0] / 4, y.shape()[1]);
+        let mut yd = y.cpu_write();
+        for (j, c) in chunks.iter().take(4).enumerate() {
+            let cd = c.cpu_read();
+            for q in 0..nq {
+                let src = q * proj;
+                let dst = (q * 4 + j) * proj;
+                yd[dst..dst + proj].copy_from_slice(&cd[src..src + proj]);
+            }
+        }
+        Ok(())
+    }
+
     fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError> {
-        let (n, d) = (y.numel(), y.shape().last().copied().unwrap_or(0));
+        let n = y.numel();
+        // Q21: use the CONTRACT param ffn as the width (the CUDA kernel
+        // does) — the old `y.shape().last()` silently diverged when the two
+        // disagreed. Also guards d==0 (div-by-zero panic).
+        let d = ffn;
+        if d == 0 || n % d != 0 {
+            return Err(BackendError::Shape(format!(
+                "silu_mul_fused: ffn={ffn} does not divide y numel {n}"
+            )));
+        }
         let xr = x.cpu_read();
         let mut yr = y.cpu_write();
         for i in 0..n {
@@ -236,7 +312,6 @@ impl Backend for CpuBackend {
             let up = xr[row * 2 * d + d + i % d];
             yr[i] = (g / (1.0 + (-g).exp())) * up;
         }
-        let _ = ffn;
         Ok(())
     }
     fn dflash2_conv(
@@ -301,13 +376,25 @@ impl Backend for CpuBackend {
         // A (C,), X (…, C) flattened; element i uses A[i % C].
         check_len(x, y.numel())?;
         let c = a.numel();
+        // Q21/R28: c==0 would divide by zero (panic); a==0 makes sin²(ax)/a
+        // NaN — the mathematical limit is x (sin²(ax)/a → 0).
+        if c == 0 || x.numel() % c != 0 {
+            return Err(BackendError::Shape(format!(
+                "snake: channel count {c} does not divide x ({})",
+                x.numel()
+            )));
+        }
         let xd: Vec<f32> = data(x).to_vec();
         let ad = data(a);
         let mut yd = data_mut(y);
         for (i, xi) in xd.iter().enumerate() {
             let av = ad[i % c];
-            let s = (av * *xi).sin();
-            yd[i] = *xi + s * s / av;
+            yd[i] = if av == 0.0 {
+                *xi
+            } else {
+                let s = (av * *xi).sin();
+                *xi + s * s / av
+            };
         }
         Ok(())
     }
@@ -403,8 +490,12 @@ impl Backend for CpuBackend {
         // g = co / Cin_g (depthwise when Cin_g == 1).
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (cout, cin_g, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
-        if cin % groups != 0 || cin_g != cin / groups {
-            return Err(BackendError::Shape("conv1d_groups: group mismatch".into()));
+        // Q22: groups==0 or groups>cout would divide by zero at
+        // `co / (cout / groups)` — validate up front.
+        if groups == 0 || cout % groups != 0 || cin % groups != 0 || cin_g != cin / groups {
+            return Err(BackendError::Shape(format!(
+                "conv1d_groups: group mismatch (cout={cout}, cin={cin}, groups={groups}, cin_g={cin_g})"
+            )));
         }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
         if y.shape() != &[b, tout, cout] {
@@ -526,6 +617,10 @@ impl Backend for CpuBackend {
     fn maxpool2d(&self, x: &Tensor, y: &Tensor, kh: usize, kw: usize) -> Result<(), BackendError> {
         // kernel == stride; X/Y (N,C,H,W).
         let (n, c, h, w) = (x.shape()[0], x.shape()[1], x.shape()[2], x.shape()[3]);
+        // Q22: kh/kw==0 would divide by zero computing oh/ow.
+        if kh == 0 || kw == 0 {
+            return Err(BackendError::Shape("maxpool2d: kernel 0".into()));
+        }
         let (oh, ow) = (h / kh, w / kw);
         if y.shape() != &[n, c, oh, ow] {
             return Err(BackendError::Shape(
@@ -711,6 +806,13 @@ impl Backend for CpuBackend {
     fn slice_time(&self, x: &Tensor, y: &Tensor, u: usize) -> Result<(), BackendError> {
         // X (B,T,C) → Y (B,T-u,C): drop the last u frames.
         let (b, t, c) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        // Q22: u > t would underflow `t - u` (panic in debug, wrap in
+        // release) — validate before the subtraction.
+        if u > t {
+            return Err(BackendError::Shape(format!(
+                "slice_time: u={u} > t={t}"
+            )));
+        }
         if y.shape() != &[b, t - u, c] {
             return Err(BackendError::Shape(
                 "slice_time: output shape mismatch".into(),
@@ -795,6 +897,13 @@ impl Backend for CpuBackend {
                 y.numel(),
                 idx.len() * d
             )));
+        }
+        // Q22: an EMPTY table would make `(id as usize).min(v - 1)` underflow
+        // to usize::MAX and read OOB.
+        if v == 0 {
+            return Err(BackendError::Shape(
+                "embedding_override: empty table".into(),
+            ));
         }
         let (td, vd) = (data(table).to_vec(), data(vision).to_vec());
         let mut yd = data_mut(y);

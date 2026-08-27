@@ -247,6 +247,11 @@ pub(crate) fn dequant_gguf(
 }
 
 /// Деквантовать тензор в f32 (CPU-референс; длина == numel).
+/// Q26: the Int4/Nf4 arm must NOT panic (it is reachable via
+/// `Backend::from_quantized` from a malformed checkpoint); the prod path
+/// rejects those formats with an Err BEFORE calling this (backend.rs), and
+/// here the fallback is an empty vec + a loud marker — the test harness
+/// asserts len == numel and fails loudly.
 pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
     match t.format {
         WeightFormat::Plain(Dtype::F32) => t
@@ -269,7 +274,14 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Q4_K => dequant_q4_k(t.data),
         WeightFormat::Q6_K => dequant_q6_k(t.data),
         WeightFormat::Int4 | WeightFormat::Nf4 => {
-            unimplemented!("Int4/Nf4 dequant lands with the quantization phase (Ф4.12)")
+            eprintln!(
+                "dequant_f32: {} dequant not implemented — returning EMPTY weights (caller must reject the format)",
+                match t.format {
+                    WeightFormat::Int4 => "Int4",
+                    _ => "Nf4",
+                }
+            );
+            Vec::new()
         }
         WeightFormat::Plain(_) => unreachable!("I8 weights not produced by GGUF normalization"),
     }

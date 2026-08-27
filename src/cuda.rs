@@ -2035,7 +2035,17 @@ impl Backend for CudaBackend {
         let (b, tq, _) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let tkv = k.shape()[1];
         let n_rep = n_heads / kv_heads;
+        // Q20: the v4 kernel stages one warp per 32 columns in an 8-warp
+        // block — hd > 256 would overflow sh_p[8][64] (and nwarps > 8).
+        if hd > 256 {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "attn_ar: head_dim {hd} > 256 not supported by attn_ar_v4"
+            )));
+        }
         if tkv == 0 {
+            // Q24: zero the output — a stale pool buffer must not come back
+            // as "attention result" for an empty cache.
+            self.stream.memset_zeros(y.as_cuda_mut()).map_err(map_err)?;
             return Ok(());
         }
         // Two-kernel warp-chunked attention (attn_ar_v4): each (chunk, warp)
@@ -2179,12 +2189,11 @@ impl Backend for CudaBackend {
         la.arg(&nw32);
         la.arg(&nc32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
-        self.pool
-            .lock()
-            .unwrap()
-            .entry(scratch.len())
-            .or_default()
-            .push(scratch);
+        // Q19: return the scratch to the pool WITH the byte/per-bucket caps
+        // (the old code pushed unconditionally via `.unwrap()` — a poisoned
+        // lock aborted the process, and unbounded buckets grew VRAM on long
+        // generations: every new tkv created a new bucket entry forever).
+        push_capped(&self.pool, scratch, 4);
         Ok(())
     }
 
@@ -2298,7 +2307,7 @@ impl Backend for CudaBackend {
         if let Some(w) = wfull {
             la.arg(w.as_cuda_mut());
         } else {
-            la.arg(y.as_cuda()); // dummy — kernel guards via wfull != NULL
+            la.arg(y.as_cuda()); // dummy pointer — never NULL, see has_wfull below (O4)
         }
         let t32 = t as i32;
         la.arg(&t32);
@@ -2311,6 +2320,12 @@ impl Backend for CudaBackend {
         let m32 = mode as i32;
         la.arg(&m32);
         la.arg(&scale);
+        // O4: the kernel must know whether the wfull pointer is REAL — the
+        // dummy above is never NULL, and the old `wfull != NULL` guard made
+        // wfull=None (NeMo mode 0) write post-softmax weights into the
+        // output buffer y (concurrent blocks raced it; OOB past y when T > d).
+        let has_wfull = i32::from(wfull.is_some());
+        la.arg(&has_wfull);
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 
@@ -2378,6 +2393,18 @@ impl Backend for CudaBackend {
         let p32 = pos as i32;
         let d32 = d as i32;
         let c32 = cap as i32;
+        // P18a: bf16 KV storage has no real kernels — the old (f32→bf16)
+        // arm ran the f16 kernel (f16 bits written into a bf16 buffer →
+        // garbage on read), (bf16→f16) did a raw 16-bit copy (different
+        // exponent layouts) and (bf16→bf16) fell into the generic Err.
+        // Fail loudly until a proper __float2bfloat16 kernel exists.
+        if matches!(src.inner, crate::backend::TensorInner::CudaBF16(_))
+            || matches!(dst.inner, crate::backend::TensorInner::CudaBF16(_))
+        {
+            return Err(BackendError::UnsupportedFormat(
+                "kv_update: bf16 KV storage is not supported on CUDA (no bf16 kernel — the f16 kernels corrupted cross-format data)".into(),
+            ));
+        }
         // Explicit per-pair branches: writes quantize (f32 → f16/q8_0),
         // grows copy in the same format (f16→f16, q8_0→q8_0).
         match (&src.inner, &dst.inner) {
@@ -2394,18 +2421,6 @@ impl Backend for CudaBackend {
                 unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
             }
             (crate::backend::TensorInner::Cuda(_), crate::backend::TensorInner::CudaF16(b)) => {
-                let f = self.function("kv_update_f16")?;
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(src.as_cuda());
-                la.arg(b);
-                la.arg(&k32);
-                la.arg(&t32);
-                la.arg(&p32);
-                la.arg(&d32);
-                la.arg(&c32);
-                unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
-            }
-            (crate::backend::TensorInner::Cuda(_), crate::backend::TensorInner::CudaBF16(b)) => {
                 let f = self.function("kv_update_f16")?;
                 let mut la = self.stream.launch_builder(&f);
                 la.arg(src.as_cuda());
@@ -2450,18 +2465,6 @@ impl Backend for CudaBackend {
                 let mut la = self.stream.launch_builder(&f);
                 la.arg(a);
                 la.arg(dst.as_cuda());
-                la.arg(&k32);
-                la.arg(&t32);
-                la.arg(&p32);
-                la.arg(&d32);
-                la.arg(&c32);
-                unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
-            }
-            (crate::backend::TensorInner::CudaBF16(a), crate::backend::TensorInner::CudaF16(b)) => {
-                let f = self.function("kv_update_f16_f16")?;
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(a);
-                la.arg(b);
                 la.arg(&k32);
                 la.arg(&t32);
                 la.arg(&p32);

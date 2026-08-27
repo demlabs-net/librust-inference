@@ -287,9 +287,15 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Result<String, GgufError> {
 
 fn read_value(buf: &[u8], pos: &mut usize, vtype: u32) -> Result<GgufValue, GgufError> {
     match vtype {
-        0 => Ok(GgufValue::U8(
-            buf.get(*pos..*pos + 1).ok_or(GgufError::Truncated("u8"))?[0],
-        )),
+        0 => {
+            // P18b: U8 must advance the position like every other type —
+            // the old code read the byte but did NOT `*pos += 1`, so any
+            // file with a U8 metadata value desynced the whole metadata
+            // block (wrong keys/values or a bogus Truncated).
+            let v = buf.get(*pos..*pos + 1).ok_or(GgufError::Truncated("u8"))?[0];
+            *pos += 1;
+            Ok(GgufValue::U8(v))
+        }
         1 => {
             let v = buf.get(*pos..*pos + 1).ok_or(GgufError::Truncated("i8"))?[0] as i8;
             *pos += 1;

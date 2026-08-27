@@ -389,7 +389,11 @@ impl Tensor {
     /// Metal wrappers read — the view REBUILDS it so both stay in sync
     /// (a stale inner shape made every view-using gemm fail shape checks).
     pub fn view(&self, shape: Vec<usize>) -> Tensor {
-        debug_assert_eq!(shape.iter().product::<usize>(), self.numel());
+        // R30: a release build must not rely on debug_assert — an oversized
+        // view silently corrupts downstream indexing. Panic with a message
+        // (programming-error backstop, not a data path).
+        let n = shape.iter().product::<usize>();
+        assert!(n == self.numel(), "view: {n} != numel {}", self.numel());
         self.view_inner(shape)
     }
 
@@ -397,7 +401,10 @@ impl Tensor {
     /// KV cache exposing only the first `pos` rows). No numel check — the
     /// caller guarantees `product(shape) ≤ numel()`.
     pub fn view_restricted(&self, shape: Vec<usize>) -> Tensor {
-        debug_assert!(shape.iter().product::<usize>() <= self.numel());
+        // R30: same as view — the debug_assert alone was a release-mode
+        // silent-corruption hole.
+        let n = shape.iter().product::<usize>();
+        assert!(n <= self.numel(), "view_restricted: {n} > numel {}", self.numel());
         self.view_inner(shape)
     }
 
@@ -434,6 +441,18 @@ impl Tensor {
             v.extend_from_slice(&data[elem_offset..elem_offset + n]);
             drop(data);
             return Tensor::from_cpu(v, shape);
+        }
+        // O8: the CUDA fallthrough below used to IGNORE elem_offset and
+        // return a view of element 0 — KvCache::compact then copied the
+        // STALE half of the cache instead of [shift..pos) (silent long-
+        // context corruption on Qwen3 roll). A real device-side offset copy
+        // needs backend/stream access (a CUDA-backend task); until then a
+        // nonzero offset is a loud programming error, not wrong data.
+        if elem_offset != 0 {
+            panic!(
+                "view_offset: nonzero elem_offset {elem_offset} on CUDA is not supported \
+                 (the old code silently returned data from element 0)"
+            );
         }
         #[allow(unreachable_code)]
         self.view_restricted(shape)
@@ -701,7 +720,15 @@ pub trait Backend: Send + Sync {
         sections: [usize; 4],
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        debug_assert_eq!(pos4d.len(), tq * 4, "pos4d: {tq} токенов × 4");
+        // Q27: release builds must not rely on debug_assert — a short pos4d
+        // would index OOB below (panic inside the default impl).
+        if pos4d.len() != tq * 4 {
+            return Err(BackendError::Shape(format!(
+                "rope_mrope: pos4d {} != tq·4 {}",
+                pos4d.len(),
+                tq * 4
+            )));
+        }
         let xd = self.to_cpu_f32(x)?;
         let mut yd = vec![0.0f32; xd.len()];
         let half = hd / 2;
@@ -813,6 +840,14 @@ pub trait Backend: Send + Sync {
             offset: 0,
             data,
         };
+        // Q26: reject unsupported formats HERE with an Err — the old path
+        // fell into dequant_f32's `unimplemented!()` (a panic from a pub
+        // path reachable with a malformed checkpoint).
+        if matches!(format, crate::dtype::WeightFormat::Int4 | crate::dtype::WeightFormat::Nf4) {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "from_quantized: {format:?} dequant not implemented"
+            )));
+        }
         let f = crate::weights_map::dequant_f32(&tmp);
         self.from_cpu_f32(&f, shape)
     }
@@ -884,7 +919,7 @@ pub trait Backend: Send + Sync {
     /// Vision patch merge 2×2 + patch_bias + position_embd (Qwen3-VL):
     /// conv-сетка (per×per) → 4 токена на блок в порядке (c0a0,c1a0,c0a1,c1a1);
     /// pos_embd переставляется той же перестановкой. X/POS [per², d] → Y.
-    /// Default — CPU-референс; Metal — кернел merge2x2_add_f32.
+    /// CPU-референс в cpu.rs, Metal — кернел merge2x2_add_f32.
     fn merge2x2_add(
         &self,
         x: &Tensor,
@@ -893,69 +928,35 @@ pub trait Backend: Send + Sync {
         y: &Tensor,
         per: usize,
     ) -> Result<(), BackendError> {
-        let d = x.shape()[1];
-        let xd = self.to_cpu_f32(x)?;
-        let bd = self.to_cpu_f32(bias)?;
-        let pd = self.to_cpu_f32(pos)?;
-        let half = per / 2;
-        let mut yd = vec![0.0f32; per * per * d];
-        for by in 0..half {
-            for bx in 0..half {
-                let dst_block = (by * half + bx) * 4 * d;
-                let srcs = [
-                    (2 * by * per + 2 * bx) * d,
-                    (2 * by * per + 2 * bx + 1) * d,
-                    ((2 * by + 1) * per + 2 * bx) * d,
-                    ((2 * by + 1) * per + 2 * bx + 1) * d,
-                ];
-                for (j, &src) in srcs.iter().enumerate() {
-                    let dst = dst_block + j * d;
-                    for k in 0..d {
-                        yd[dst + k] = xd[src + k] + bd[k] + pd[src + k];
-                    }
-                }
-            }
-        }
-        let yt = self.from_cpu_f32(&yd, y.shape().to_vec())?;
-        let _ = &yt;
-        Ok(())
+        // O7: the old default COMPUTED the result and threw it away
+        // (`let _ = &yt`) — silent garbage on any backend without a kernel
+        // (CUDA!): Qwen3-VL vision inputs were zeros/stale pool data with
+        // no error anywhere. Fail loudly until a real kernel exists.
+        let _ = (x, bias, pos, y, per);
+        Err(BackendError::UnsupportedFormat(
+            "merge2x2_add: no kernel on this backend (CPU reference lives in cpu.rs, Metal has a kernel, CUDA does not)".into(),
+        ))
     }
 
     /// Vision group 4 соседних токенов: [n, d] → [n/4, 4·d] (deepstack,
-    /// post_ln). Default — CPU-референс; Metal — кернел group4_f32.
+    /// post_ln). CPU-референс в cpu.rs; Metal — кернел group4_f32.
     fn group4(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
-        let (n, d) = (x.shape()[0], x.shape()[1]);
-        let xd = self.to_cpu_f32(x)?;
-        let mut yd = vec![0.0f32; (n / 4) * 4 * d];
-        for i in 0..n / 4 {
-            for j in 0..4 {
-                let src = (i * 4 + j) * d;
-                let dst = i * 4 * d + j * d;
-                yd[dst..dst + d].copy_from_slice(&xd[src..src + d]);
-            }
-        }
-        let yt = self.from_cpu_f32(&yd, y.shape().to_vec())?;
-        let _ = &yt;
-        Ok(())
+        // O7: see merge2x2_add — the old default threw the result away.
+        let _ = (x, y);
+        Err(BackendError::UnsupportedFormat(
+            "group4: no kernel on this backend (CPU reference lives in cpu.rs, Metal has a kernel, CUDA does not)".into(),
+        ))
     }
 
     /// Vision merger concat: chunks ([nq, proj], ≤4) → [4·nq, proj], строки
-    /// чередуются: out[q·4+j] = chunk_j[q]. Default — CPU-референс; Metal —
+    /// чередуются: out[q·4+j] = chunk_j[q]. CPU-референс в cpu.rs; Metal —
     /// кернел concat4_f32.
     fn concat4(&self, chunks: &[Tensor], y: &Tensor) -> Result<(), BackendError> {
-        let (nq, proj) = (y.shape()[0] / 4, y.shape()[1]);
-        let mut yd = vec![0.0f32; nq * 4 * proj];
-        for (j, c) in chunks.iter().take(4).enumerate() {
-            let cd = self.to_cpu_f32(c)?;
-            for q in 0..nq {
-                let src = q * proj;
-                let dst = (q * 4 + j) * proj;
-                yd[dst..dst + proj].copy_from_slice(&cd[src..src + proj]);
-            }
-        }
-        let yt = self.from_cpu_f32(&yd, y.shape().to_vec())?;
-        let _ = &yt;
-        Ok(())
+        // O7: see merge2x2_add — the old default threw the result away.
+        let _ = (chunks, y);
+        Err(BackendError::UnsupportedFormat(
+            "concat4: no kernel on this backend (CPU reference lives in cpu.rs, Metal has a kernel, CUDA does not)".into(),
+        ))
     }
 
     // ── norms ──
@@ -1081,38 +1082,13 @@ pub trait Backend: Send + Sync {
         y: &Tensor,
         override_id: u32,
     ) -> Result<(), BackendError> {
-        // Default: CPU-совместимый путь (используется CPU-референсом и как
-        // fallback; Metal переопределяет кернелом).
-        let (v, d) = (table.shape()[0], table.shape()[1]);
-        if y.numel() != idx.len() * d {
-            return Err(BackendError::Shape(format!(
-                "embedding_override: y numel {} != {}",
-                y.numel(),
-                idx.len() * d
-            )));
-        }
-        let td = self.to_cpu_f32(table)?;
-        let vd = self.to_cpu_f32(vision)?;
-        let mut yd = self.to_cpu_f32(y)?;
-        let nv = vision.shape()[0];
-        let mut vi = 0usize;
-        for (i, &id) in idx.iter().enumerate() {
-            let dst = &mut yd[i * d..(i + 1) * d];
-            if id == override_id {
-                if vi < nv {
-                    dst.copy_from_slice(&vd[vi * d..(vi + 1) * d]);
-                } else {
-                    dst.fill(0.0);
-                }
-                vi += 1;
-            } else {
-                let row = (id as usize).min(v - 1);
-                dst.copy_from_slice(&td[row * d..(row + 1) * d]);
-            }
-        }
-        let out = self.from_cpu_f32(&yd, vec![1, idx.len(), d])?;
-        let _ = &out;
-        Ok(())
+        // O7: the old default COMPUTED the result and threw it away
+        // (`let _ = &out`) — silent garbage on CUDA (the CPU reference is
+        // overridden in cpu.rs, Metal has a kernel). Fail loudly instead.
+        let _ = (idx, table, vision, y, override_id);
+        Err(BackendError::UnsupportedFormat(
+            "embedding_override: no kernel on this backend (CPU reference lives in cpu.rs, Metal has a kernel, CUDA does not)".into(),
+        ))
     }
 
     // ── RoPE ──

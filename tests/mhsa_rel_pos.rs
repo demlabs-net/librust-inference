@@ -8,6 +8,13 @@ use rust_inference::cuda::CudaBackend;
 use rust_inference::harness::Lcg;
 
 fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
+    // scale mirrors the real callers: NeMo (mode 0) divides by √dk, icefall
+    // zipformer (mode 1) bakes the scale into in_proj (passes 1.0).
+    let scale = if mode == 0 {
+        1.0 / (dk as f32).sqrt()
+    } else {
+        1.0
+    };
     let gpu = CudaBackend::new(0).unwrap();
     let cpu = CpuBackend;
     let d = h * dk;
@@ -55,6 +62,7 @@ fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
         dk,
         dp,
         mode,
+        scale,
     )
     .unwrap();
     gpu.synchronize().unwrap();
@@ -83,6 +91,7 @@ fn run_case(mode: u32, t: usize, dk: usize, dp: usize, h: usize, seed: u64) {
         dk,
         dp,
         mode,
+        scale,
     )
     .unwrap();
     let want = cpu.to_cpu_f32(&y_c).unwrap();

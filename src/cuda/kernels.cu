@@ -1426,7 +1426,12 @@ __device__ inline float q5k_weight(const unsigned char* blk, int j) {
     float dl = d * (float)sc;
     float ml = mn * (float)m;
     int half = b & 1;
-    int q = half == 0 ? (blk[16 + l] & 0xF) : (blk[16 + l] >> 4);
+    // qs is packed chunk-major (16 + 32·c + l holds values 64c + l in the
+    // low nibble and 64c + 32 + l in the high nibble); block pair p maps to
+    // chunk p. The old code read blk[16 + l] for every pair — blocks 2..7
+    // decoded chunk 0's bytes under their own scales.
+    int qsb = 32 * pair;
+    int q = half == 0 ? (blk[16 + qsb + l] & 0xF) : (blk[16 + qsb + l] >> 4);
     int u = 1 << (2 * pair + half); // u1/u2 scheme: bit 2·pair (+1 for odd)
     if (blk[144 + l] & u) q += 16;
     return dl * (float)q - ml;
@@ -1458,7 +1463,11 @@ __device__ inline float q3k_weight(const unsigned char* blk, int j) {
     int qbase = (s % 2) * 16 + (s / 8) * 32;
     int shift = ((s / 2) % 4) * 2;
     int hbase = (s % 2) * 16;
-    int mbit = 1 << ((s / 2) % 4);
+    // R (Q3_K): canonical ggml hmask bit is s/2 (8 bits per byte) — the old
+    // (s/2)%4 made sub-blocks s and s+8 write the SAME bit, so with mixed
+    // signs one sub-block's hmask OR-corrupted the other (decoded as the
+    // wrong sign / zero). CPU encode+decode changed in lockstep.
+    int mbit = 1 << (s / 2);
     int q2 = (blk[32 + qbase + l] >> shift) & 3;
     int h = (blk[hbase + l] & mbit) ? 0 : 4;
     return d * (float)(scs - 32) * (float)(q2 - h);

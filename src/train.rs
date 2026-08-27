@@ -259,7 +259,7 @@ fn rng() -> rand::rngs::StdRng {
 fn dataset(n: usize) -> (Vec<f32>, Vec<f32>) {
     let mut rng = rng();
     let x: Vec<f32> = (0..n * IN_DIM)
-        .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+        .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
         .collect();
     let y: Vec<f32> = x
         .chunks_exact(IN_DIM)
@@ -272,11 +272,11 @@ fn dataset(n: usize) -> (Vec<f32>, Vec<f32>) {
 fn base_weights() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut rng = rng();
     let w1: Vec<f32> = (0..HID_DIM * IN_DIM)
-        .map(|_| rand::Rng::gen_range(&mut rng, -0.5..0.5))
+        .map(|_| rand::Rng::random_range(&mut rng, -0.5..0.5))
         .collect();
     let b1 = vec![0.0f32; HID_DIM];
     let w2: Vec<f32> = (0..OUT_DIM * HID_DIM)
-        .map(|_| rand::Rng::gen_range(&mut rng, -0.5..0.5))
+        .map(|_| rand::Rng::random_range(&mut rng, -0.5..0.5))
         .collect();
     let b2 = vec![0.0f32; OUT_DIM];
     (w1, b1, w2, b2)
@@ -486,7 +486,7 @@ impl Trainer for DemoLoraTrainer {
         let b2 = backend.from_cpu_f32(&b2, vec![OUT_DIM])?;
 
         let a_init: Vec<f32> = (0..r * IN_DIM)
-            .map(|_| rand::Rng::gen_range(&mut rng(), -0.1..0.1))
+            .map(|_| rand::Rng::random_range(&mut rng(), -0.1..0.1))
             .collect();
         let mut a = backend.from_cpu_f32(&a_init, vec![r, IN_DIM])?;
         let mut b = backend.from_cpu_f32(&vec![0.0f32; HID_DIM * r], vec![HID_DIM, r])?;

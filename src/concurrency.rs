@@ -38,15 +38,19 @@ impl Semaphore {
     }
 
     fn acquire(&self) {
-        let mut c = self.count.lock().unwrap();
+        // Poisoned-mutex recovery: the semaphore holds a plain usize — a
+        // poison flag from an unrelated panic cannot corrupt it. Recover the
+        // lock instead of panicking (a panic here would tear down the whole
+        // engine pool).
+        let mut c = self.count.lock().unwrap_or_else(|e| e.into_inner());
         while *c == 0 {
-            c = self.cv.wait(c).unwrap();
+            c = self.cv.wait(c).unwrap_or_else(|e| e.into_inner());
         }
         *c -= 1;
     }
 
     fn release(&self) {
-        let mut c = self.count.lock().unwrap();
+        let mut c = self.count.lock().unwrap_or_else(|e| e.into_inner());
         *c += 1;
         self.cv.notify_one();
     }

@@ -302,8 +302,13 @@ impl CudaBackend {
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // J7: poison-resilient pool lock (a panic while the pool mutex was
         // held must not abort the next take()).
+        // T5-8: the caller allocates cpart with 16 z-slices and takes it
+        // back by 16·m·n — pushing under the used-slice size s·m·n stranded
+        // every tiled cpart in an unreachable bucket (one 16·m·n allocation
+        // leaked per tiled GEMM). Slices ≥ s are stale but never reduced.
+        let cap = 16 * m * n;
         lock_poison_resilient(&self.pool)
-            .entry(s * m * n)
+            .entry(cap)
             .or_default()
             .push(cpart);
         Ok(())
@@ -1293,6 +1298,16 @@ impl Backend for CudaBackend {
     fn snake(&self, x: &Tensor, a: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // Per-channel (Metal semantics): A (C,), X flattened (n·c).
         let c = a.numel() as i32;
+        // Q21/R28 (mirror of the CPU reference): c == 0 divides by zero
+        // (x.numel() / c — host and kernel); c not dividing x.numel() would
+        // truncate the tail. (a == 0 is fine — the kernel treats it as the
+        // sin²(ax)/a → 0 limit.)
+        if c == 0 || x.numel() % c as usize != 0 {
+            return Err(BackendError::Shape(format!(
+                "snake: channel count {c} does not divide x ({})",
+                x.numel()
+            )));
+        }
         let n = (x.numel() / c as usize) as i32;
         let f = self.function("snake_f32")?;
         let cfg = LaunchConfig::for_num_elems((n * c) as u32);
@@ -1385,6 +1400,21 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (cout, _, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
+        // Q22 (mirror of the CPU reference): groups == 0 divides by zero in
+        // the kernel (`cin / groups`, `cout / groups`); groups > cin or a
+        // cin not divisible by groups reads wrong weight rows; the weight
+        // row count cin_g must equal cin / groups.
+        let cin_g = w.shape()[1];
+        if groups == 0
+            || groups > cin
+            || cin % groups != 0
+            || cout % groups != 0
+            || cin_g != cin / groups
+        {
+            return Err(BackendError::Shape(format!(
+                "conv1d_groups: group mismatch (cout={cout}, cin={cin}, groups={groups}, cin_g={cin_g})"
+            )));
+        }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
         let n = b * tout * cout;
         let f = self.function("conv1d_f32")?;
@@ -1866,6 +1896,14 @@ impl Backend for CudaBackend {
         eps: f32,
     ) -> Result<(), BackendError> {
         let rows = x.shape()[0];
+        // h == 0 divides by zero (x.shape()[1] / h) and would launch a
+        // degenerate (rows, 0) grid.
+        if h == 0 {
+            return Err(BackendError::Shape(format!(
+                "rmsnorm_head: head count h=0 (x dim {})",
+                x.shape()[1]
+            )));
+        }
         let hd = x.shape()[1] / h;
         let f = self.function("rmsnorm_head_f32")?;
         // One block per (row, head) — kernel indexes via blockIdx.(x, y).
@@ -2068,6 +2106,21 @@ impl Backend for CudaBackend {
             crate::backend::TensorInner::CudaI8 { .. } => 2,
             _ => unreachable!(),
         };
+        // P18b: the v4 kernels have f32/f16/q8_0 KV variants ONLY (KV_READ
+        // decodes __half2float for fmt=1). A CudaBF16 K/V buffer must never
+        // be passed to the f16 kernel — bf16 and f16 are different exponent
+        // layouts, so every value would decode as garbage. There is no
+        // bf16→f16 conversion kernel (cast_f32_f16/cast_f32_bf16 both read
+        // f32) and the cache-creation path is f32/f16/q8_0 only, so a bf16
+        // KV cache cannot exist; refuse loudly if one ever appears (same
+        // contract as kv_update's P18a guard).
+        if matches!(k.inner, crate::backend::TensorInner::CudaBF16(_))
+            || matches!(v.inner, crate::backend::TensorInner::CudaBF16(_))
+        {
+            return Err(BackendError::UnsupportedFormat(
+                "attn_ar: bf16 KV storage is not supported on CUDA (no bf16 kernel — the f16 kernels would decode bf16 bits as f16)".into(),
+            ));
+        }
         let fname: &'static str = match (kfmt, vfmt) {
             (0, 0) => "attn_ar_v4_f32f32",
             (0, 1) => "attn_ar_v4_f32f16",
@@ -2289,6 +2342,15 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         let (t, d) = (q.shape()[0], q.shape()[1]);
         let h = d / dk;
+        // The kernel stages per-chunk score rows in
+        // `__shared__ float scs[Q][2048]` — T > 2048 would index past the
+        // shared array (OOB). Guard before launch (the CPU reference errors
+        // on the same contract).
+        if t > 2048 {
+            return Err(BackendError::Shape(format!(
+                "mhsa_rel_pos: T {t} exceeds the kernel's 2048-element shared-memory score limit"
+            )));
+        }
         let f = self.function("mhsa_rel_pos_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (((t + 3) / 4) as u32, h as u32, 1),
@@ -2386,6 +2448,12 @@ impl Backend for CudaBackend {
             )));
         }
         let cap = dst.shape()[1];
+        // Mirror of the CPU reference guard: dst (B, cap, D), src (B, Tq, D)
+        // — pos + tq must fit within the capacity (the kernel writes rows
+        // [pos, pos+tq) of dst; past-cap rows would be OOB).
+        if dst.shape()[2] != d || pos + tq > cap {
+            return Err(BackendError::Shape("kv_update: capacity exceeded".into()));
+        }
         let n = b * tq * d;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let k32 = b as i32;
@@ -2582,12 +2650,19 @@ impl CudaBackend {
         // The m=1 split-k follows the activation axis (f16/bf16 cast the A
         // rows — half-width A shared tile and traffic); the m>1 tiled
         // kernel keeps the f32 activation tile (A is amortized in shared
-        // there — the axis would buy nothing).
+        // there — the axis would buy nothing). The f16/bf16 splitk variants
+        // exist only for q6k/q4k — q5k/q3k kernels are f32-only; casting and
+        // handing the f16 pointer to the f32 kernel would read garbage (the
+        // old dispatch fell through to the f32 arm). Decode A is 1×k, so the
+        // cast buys nothing on q5k/q3k anyway.
         let act = self.activation_dtype();
         let a_arg: KernA = if m == 1 {
-            match act {
-                crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
-                crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
+            match name {
+                "gemm_q6k" | "gemm_q4k" => match act {
+                    crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
+                    crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
+                    _ => KernA::F32(a),
+                },
                 _ => KernA::F32(a),
             }
         } else {

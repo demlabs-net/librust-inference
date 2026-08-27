@@ -1060,6 +1060,13 @@ impl Backend for CpuBackend {
         // X (rows, h·hd), w (hd) shared across heads. X may be 2D/3D
         // (batched tokens); rows = all leading dims flattened.
         let last = x.shape().len() - 1;
+        // h == 0 divides by zero (x.shape()[last] / h) — mirror the CUDA
+        // backend's guard so both paths reject it.
+        if h == 0 {
+            return Err(BackendError::Shape(
+                "rmsnorm_head: head count h=0".into(),
+            ));
+        }
         let hd = x.shape()[last] / h;
         let rows = x.numel() / (h * hd);
         check_len(x, y.numel())?;
@@ -1385,6 +1392,15 @@ impl Backend for CpuBackend {
     ) -> Result<(), BackendError> {
         let (t, d) = (q.shape()[0], q.shape()[1]);
         let h = d / dk;
+        // The CUDA kernel stages score rows in `__shared__ float scs[Q][2048]`
+        // — T > 2048 is out of bounds there. Keep both paths on the same
+        // contract so the CPU oracle cannot silently accept what the GPU
+        // rejects.
+        if t > 2048 {
+            return Err(BackendError::Shape(format!(
+                "mhsa_rel_pos: T {t} exceeds the kernel's 2048-element shared-memory score limit"
+            )));
+        }
         if y.shape() != &[t, d] || p.shape()[0] != 2 * t - 1 {
             return Err(BackendError::Shape("mhsa_rel_pos: shape mismatch".into()));
         }
@@ -1403,7 +1419,13 @@ impl Backend for CpuBackend {
         let scale = scale;
         for hh in 0..h {
             let (qo, ko, vo, po) = (hh * dk, hh * dk, hh * dk, hh * dp);
-            let (uo, vo_b) = (hh * dk, hh * dk);
+            // pos_bias_u is (H, dk) (content side); pos_bias_v is (H, dp)
+            // (position side — NeMo: dk == dp; icefall zipformer:
+            // (h, pos_dim) with pos_dim == dp). The CUDA kernel strides vb
+            // by dp per head (vbh = vb + hh·dp) and the semantic reference
+            // indexes vb[hh·dp + j] — the old hh·dk offset disagreed
+            // whenever dk != dp (zipformer dk=24/dp=4).
+            let (uo, vo_b) = (hh * dk, hh * dp);
             for qt in 0..t {
                 let mut scores = vec![0.0f32; t];
                 for tk in 0..t {

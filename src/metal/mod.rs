@@ -396,6 +396,11 @@ pub struct MetalCtx {
     pub device: Device,
     queue: CommandQueue,
     pipelines: Mutex<HashMap<&'static str, ComputePipelineState>>,
+    /// Компилированная библиотека — ОДНА на процесс. Раньше `pipeline(name)`
+    /// на каждый новый кернел заново компилировал kernels.metal (290
+    /// кернелов — минуты на первый вызов); здесь one-shot: первое имя
+    /// компилирует, остальные пайплайны создаются мгновенно.
+    library: OnceLock<Library>,
     /// Persistent batch state: while `depth > 0`, every kernel dispatch
     /// goes into ONE command buffer (no per-op commit+wait) and a single
     /// [`MetalCtx::flush_batch`] syncs the GPU. The wake/VAD paths run a
@@ -434,6 +439,7 @@ impl MetalCtx {
             device,
             queue,
             pipelines: Mutex::new(HashMap::new()),
+            library: OnceLock::new(),
             batch: Mutex::new(BatchState::default()),
         };
         // Compile the whole kernel library once; pipelines are built lazily
@@ -503,11 +509,14 @@ impl MetalCtx {
         if let Some(p) = self.pipelines.lock().unwrap().get(name) {
             return Ok(p.clone());
         }
-        let options = CompileOptions::new();
-        let library = self
-            .device
-            .new_library_with_source(include_str!("kernels.metal"), &options)
-            .map_err(MetalError::LibraryCompile)?;
+        // Библиотека — ОДИН раз на процесс (раньше: компиляция всего
+        // kernels.metal на каждый новый кернел → минуты холодного старта).
+        let library = self.library.get_or_init(|| {
+            let options = CompileOptions::new();
+            self.device
+                .new_library_with_source(include_str!("kernels.metal"), &options)
+                .unwrap_or_else(|e| panic!("metal kernel library compile failed: {e}"))
+        });
         let func = library
             .get_function(name, None)
             .map_err(|e| MetalError::KernelNotFound(name, e))?;

@@ -1,5 +1,5 @@
 target/
-Cargo.lock
+# R35: lockfile committed (binary crate)
 .DS_Store
 src/.DS_Store
 

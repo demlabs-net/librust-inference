@@ -1413,13 +1413,25 @@ impl Backend for CpuBackend {
                     }
                     let mut bd = 0.0f32;
                     if mode == 0 {
-                        // XL shift: position term reads query row
-                        // ((tk+1)·T + qt)/(2T) and p offset ((tk+1)·T + qt) % (2T) − 1.
-                        let flat = (tk + 1) * t + qt;
+                        // P17: GigaAM rel_shift (gigaam_encoder.py):
+                        //   x = pad(bd, (1,0))            → (t, 2t), col 0 = 0
+                        //   x = x.view(2t, t); x = x[1:]   → drop row 0
+                        //   pos = x.view(t, 2t−1)[:, :, :t]
+                        // → pos[q][k] = bd[q][k−q+t−1] (0 outside), i.e. the
+                        //   flat index i = q·(2t−1) + k + t into the padded
+                        //   (2t)-wide matrix: row = i/(2t), col = i%(2t).
+                        // The old code used flat=(tk+1)·t+qt (the transposed
+                        // index) with the same 2t divisor — every pair read
+                        // the wrong p row (systematic position-term error).
+                        let flat = qt * (2 * t - 1) + tk + t;
                         let qrow = flat / (2 * t);
                         let poff = flat % (2 * t);
                         if poff > 0 {
-                            for j in 0..dp {
+                            // The dot runs over min(dk, dp): q rows stride dk,
+                            // p rows stride dp (NeMo uses dk == dp; the min
+                            // guards the general case — the old loop ran to
+                            // dp and read PAST the q row when dk < dp).
+                            for j in 0..dk.min(dp) {
                                 bd += (qd[qrow * d + qo + j] + vbd[vo_b + j])
                                     * pd[(poff - 1) * (h * dp) + po + j];
                             }

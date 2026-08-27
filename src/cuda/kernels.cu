@@ -1115,9 +1115,11 @@ ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
 // Bidirectional MHSA with relative position scores:
 //   ac = (q + u) · kᵀ                          content–content (over dk)
 //   bd = (q + v) · pᵀ                          content–position (over dp)
-//   mode 0 (NeMo Transformer-XL): bd [T, 2T−1] shifted with the XL pad:
-//     shifted[t][t'] = bd_pad[((t'+1)·T + t) / (2T)][((t'+1)·T + t) % (2T)]
-//     with bd_pad[r][0] = 0;  u/v = pos_bias_u/v (per-head, flattened).
+//   mode 0 (GigaAM/NeMo Transformer-XL): bd [T, 2T−1] shifted with the XL
+//     pad: shifted[q][k] = bd_pad[(q·(2T−1) + k + T) / (2T)]
+//     [(q·(2T−1) + k + T) % (2T)] with bd_pad[r][0] = 0 (P17 — matches
+//     gigaam_encoder.py rel_shift: pad(bd,(1,0)) → view(2T,T) → drop
+//     row 0 → view(T,2T−1) → [:,:,:,:T]).
 //   mode 1 (icefall zipformer): shifted[t][t'] = bd[t][T−1 + t' − t]
 //     (no padding, no u/v biases — pass zeros).
 // scores = (ac + bd)/√dk; softmax over keys; y = softmax·v (over dk cols).
@@ -1175,13 +1177,23 @@ extern "C" __global__ void mhsa_rel_pos_f32(
         }
         float bd = 0.0f;
         if (mode == 0) {
-            int flat = (t1 + 1) * T + qt;
+            // P17: GigaAM rel_shift (gigaam_encoder.py): pad(bd,(1,0)) →
+            // view(2T,T) → drop row 0 → view(T,2T−1)[:, :, :T], i.e.
+            // pos[q][k] = bd[q][k−q+T−1] with the flat index
+            // i = q·(2T−1) + k + T into the padded (2T)-wide matrix.
+            // The old code used flat=(t1+1)·T+qt — the transposed index —
+            // every (q,k) pair read the wrong p row.
+            int flat = qt * (2 * T - 1) + t1 + T;
             int qrow_i = flat / (2 * T);
             int poff = flat % (2 * T);
             if (poff > 0) {
                 const float* qr = qh + qrow_i * (H * dk);
                 const float* pr = ph + (poff - 1) * (H * dp);
-                for (int j = 0; j < dp; ++j) {
+                // min(dk, dp): q rows stride dk, p rows stride dp (see the
+                // CPU oracle — the old dp-bound loop read past the q row
+                // when dk < dp).
+                int jd = dk < dp ? dk : dp;
+                for (int j = 0; j < jd; ++j) {
                     bd += (qr[j] + vbh[j]) * pr[j];
                 }
             }

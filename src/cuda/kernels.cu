@@ -2013,19 +2013,22 @@ DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_weight)
 DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_weight)
 DEFINE_K_SPLITK(q5k, f32, float, 176, q5k_weight)
 DEFINE_K_SPLITK(q3k, f32, float, 110, q3k_weight)
-DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_weight)
-DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_weight)
 
 /// K-quant GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
 /// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The
 /// 32×256 activation tile is staged in shared; the packed B tile is staged
 /// too and the dequant is broadcast per column (the 4 row-threads of a
 /// column read the same bytes).
+// K-quant tiled GEMM (m > 1): A (m,k), B packed (col·nsuper + kb)·BLK,
+// Cpart (S·m, n) with grid.z k-slices. NOTE: NO `//` comments inside the
+// macro parameter list — the trailing `\` splices lines BEFORE comment
+// removal, so an inline comment swallows the next parameter (this broke
+// the whole file silently; the runtime ran a stale committed ptx).
 #define DEFINE_K_TILED(NAME, BLK, WREAD)                                      \
 extern "C" __global__ void gemm_##NAME##_tiled_v3(                            \
-    const float* __restrict__ A,        // (m, k)                            \
-    const unsigned char* __restrict__ B,// packed blocks, (col·nsuper + kb)·BLK \
-    float* __restrict__ Cpart,          // (S·m, n) — grid.z k-slices        \
+    const float* __restrict__ A,                                              \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ Cpart,                                                \
     int m,                                                                   \
     int k,                                                                   \
     int n)                                                                   \
@@ -2042,7 +2045,7 @@ extern "C" __global__ void gemm_##NAME##_tiled_v3(                            \
     if (kb0 >= nsup) return;                                                  \
     int kb1 = nsup < kb0 + nkz ? nsup : kb0 + nkz;                            \
     int col = tid & 63;                                                       \
-    int rq = tid >> 6;      // 0..3 — eight rows per thread                   \
+    int rq = tid >> 6;                                                         \
     float acc[8];                                                             \
     for (int q = 0; q < 8; ++q) acc[q] = 0.0f;                                \
     for (int kb = kb0; kb < kb1; ++kb) {                                      \

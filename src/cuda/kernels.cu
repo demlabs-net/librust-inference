@@ -1499,9 +1499,13 @@ __device__ inline float q3k_weight(const unsigned char* blk, int j) {
     return d * (float)(scs - 32) * (float)(q2 - h);
 }
 
-/// Q4_0 canonical layout, 18 bytes per 32-weight block: f16 d (bytes 0..2)
-/// + 16 bytes of 4-bit nibbles. Dequant: w = ((nib & 0xF) - 8)·d (the -8
-/// offset is baked into the dequant — no stored zero-point).
+/// Q4_0 packed-weight dequant, 18 bytes per 32-weight block: f16 d (bytes
+/// 0..2) + 16 bytes of 4-bit nibbles. NOTE (iter-10): this is the SPEECH-
+/// crate dialect — byte j holds weights (2j, 2j+1) — NOT the canonical ggml
+/// pairing (j, j+16) used by the GGUF path. This kernel is fed only by
+/// from_cpu_q4k (the speech quantizer's output); GGUF Q4_0 flows dequant→f32
+/// and never reaches it. Do NOT "fix" the pairing here without changing the
+/// speech quantizer and CudaQ4K::to_cpu together.
 __device__ inline float q4k_weight(const unsigned char* blk, int j) {
     float d = __half2float(*(const __half*)(blk));
     int nib = blk[2 + (j >> 1)];

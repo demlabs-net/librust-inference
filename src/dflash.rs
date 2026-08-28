@@ -396,11 +396,20 @@ impl DFlashModel {
             .unwrap_or_default();
         let dim = g("hidden_size")?;
         let n_layers = g("num_hidden_layers")?;
-        let head_dim = g("head_dim").unwrap_or(dim / g("num_attention_heads")?);
+        // N (iter-10): the safetensors config reader had NONE of the
+        // load_gguf guards — head_count = 0 panicked in the div below and
+        // block_size = 0 underflowed Vec::with_capacity(t - 1) at decode.
+        let n_heads = g("num_attention_heads")?;
+        if n_heads == 0 {
+            return Err(BackendError::Shape(
+                "dflash safetensors: num_attention_heads must be >= 1, got 0".into(),
+            ));
+        }
+        let head_dim = g("head_dim").unwrap_or(dim / n_heads);
         let cfg = Qwen3Config {
             dim,
             n_layers,
-            n_heads: g("num_attention_heads")?,
+            n_heads,
             n_kv_heads: g("num_key_value_heads")?,
             head_dim,
             ffn_dim: g("intermediate_size")?,
@@ -413,6 +422,11 @@ impl DFlashModel {
             n_deepstack: None,
         };
         let block_size = g("block_size")?;
+        if block_size == 0 {
+            return Err(BackendError::Shape(
+                "dflash safetensors: block_size must be >= 1, got 0".into(),
+            ));
+        }
         // safetensors → WeightsMap (f32, имена blk.*)
         let st = crate::weights::read_safetensors_f32(model_path)
             .map_err(|e| BackendError::Shape(format!("safetensors: {e}")))?;

@@ -61,6 +61,14 @@ impl Qwen3Config {
         };
         let dim = u(&p("embedding_length"))?;
         let n_heads = u(&p("attention.head_count"))?;
+        // N (iter-10): GGUF metadata is external input — head_count = 0
+        // panicked in the dim / n_heads fallback below (the same class the
+        // dflash guard closed; qwen3 was left unguarded).
+        if n_heads == 0 {
+            return Err(BackendError::Shape(
+                format!("{arch}.attention.head_count must be >= 1, got 0"),
+            ));
+        }
         let n_kv_heads = u(&p("attention.head_count_kv"))?;
         let ffn_dim = u(&p("feed_forward_length"))?;
         let n_layers = u(&p("block_count"))?;

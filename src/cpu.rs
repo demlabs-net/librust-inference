@@ -930,7 +930,9 @@ impl Backend for CpuBackend {
         }
         let (td, vd) = (data(table).to_vec(), data(vision).to_vec());
         let mut yd = data_mut(y);
-        let nv = vision.shape()[0];
+        // Число vision-строк: vision может быть [V, D] или 3D-вид [1, V, D] —
+        // shape()[0] дал бы 1 (зеркалит metal/mod.rs embedding_override_f32).
+        let nv = vision.numel() / d;
         let mut vi = 0usize;
         for (i, &id) in idx.iter().enumerate() {
             let dst = &mut yd[i * d..(i + 1) * d];

@@ -104,15 +104,25 @@ impl ToolCallParser {
                 self.pending.clear();
                 continue;
             }
-            // Открывающего тега нет: если pending заканчивается префиксом
-            // OPEN (тег может прийти фрагментами) — не выдаём его как текст,
-            // ждём следующий кусок.
-            if OPEN.starts_with(&self.pending) && self.pending.len() < OPEN.len() {
-                return;
-            }
-            if !self.pending.is_empty() {
-                self.out
-                    .push(ToolEvent::Text(std::mem::take(&mut self.pending)));
+            // Открывающего тега нет: НЕ выдаём хвост как текст целиком —
+            // самый длинный СУФФИКС pending, являющийся префиксом OPEN, может
+            // быть началом тега, пришедшего фрагментами (например, chunk
+            // "text <tool" — раньше целиком утекал в текст, т.к. проверка
+            // `OPEN.starts_with(pending)` работала только когда pending
+            // НАЧИНАЛСЯ с тега). Префикс перед суффиксом — обычный текст.
+            let keep = (1..=self.pending.len().min(OPEN.len() - 1))
+                .rev()
+                .find(|&len| {
+                    let start = self.pending.len() - len;
+                    self.pending.is_char_boundary(start)
+                        && OPEN.starts_with(&self.pending[start..])
+                })
+                .unwrap_or(0);
+            let text_len = self.pending.len() - keep;
+            if text_len > 0 {
+                let text = self.pending[..text_len].to_string();
+                self.pending.drain(..text_len);
+                self.out.push(ToolEvent::Text(text));
             }
             return;
         }
@@ -193,6 +203,50 @@ mod tests {
                 name: "a".into(),
                 arguments: "{}".into(),
             })]
+        );
+    }
+
+    /// Частичный тег ПОСЛЕ обычного текста: раньше pending "text <tool"
+    /// целиком утекал в текст (проверка `OPEN.starts_with(pending)` работала
+    /// только когда pending начинался с тега) — тег разваливался, тело вызова
+    /// приходило как текст.
+    #[test]
+    fn open_tag_split_after_text() {
+        let mut p = ToolCallParser::new();
+        let mut events = Vec::new();
+        events.extend(p.feed("text <tool"));
+        // Текст до тега выдан, частичный тег удержан.
+        assert_eq!(events, vec![ToolEvent::Text("text ".into())]);
+        events.extend(p.feed("_call>{\"name\": \"a\", \"arguments\": {}}</tool_call>"));
+        events.extend(p.finish());
+        assert_eq!(
+            events,
+            vec![
+                ToolEvent::Text("text ".into()),
+                ToolEvent::ToolCall(ToolCall {
+                    name: "a".into(),
+                    arguments: "{}".into(),
+                }),
+            ]
+        );
+    }
+
+    /// Ложное совпадение суффикса: удержанный префикс тега, за которым тег
+    /// НЕ продолжился, доезжает до потребителя как текст (в исходном порядке).
+    #[test]
+    fn held_back_prefix_flushed_when_tag_aborts() {
+        let mut p = ToolCallParser::new();
+        let mut events = Vec::new();
+        events.extend(p.feed("abc <to"));
+        assert_eq!(events, vec![ToolEvent::Text("abc ".into())]);
+        events.extend(p.feed("ol of text"));
+        events.extend(p.finish());
+        assert_eq!(
+            events,
+            vec![
+                ToolEvent::Text("abc ".into()),
+                ToolEvent::Text("<tool of text".into()),
+            ]
         );
     }
 

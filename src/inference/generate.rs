@@ -5,7 +5,9 @@
 
 use crate::backend::Backend;
 use crate::error::BackendError;
-use crate::inference::sampling::{SamplingParams, top_p_sample_vec_history};
+use crate::inference::sampling::{
+    apply_repetition_penalty_vec_unique, SamplingParams, top_p_sample_vec_history,
+};
 use crate::qwen3::Qwen3Model;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
@@ -105,9 +107,19 @@ pub fn generate(
         let v = backend.to_cpu_f32(&logits)?;
         let last = &v[v.len() - vocab..];
         let next = if params.temperature <= 0.0 {
+            // Greedy: ТОТ ЖЕ repetition penalty, что и в сэмплирующей ветке
+            // (раньше greedy игнорировал history-штраф). Копия — last
+            // остаётся нетронутым для следующих итераций.
+            let mut penalized = last.to_vec();
+            apply_repetition_penalty_vec_unique(
+                &mut penalized,
+                &history,
+                params.repeat_penalty,
+            );
             // P18c: a NaN logit used to PANIC in partial_cmp().unwrap() —
             // treat non-finite values as -inf (never selected).
-            last.iter()
+            penalized
+                .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32)

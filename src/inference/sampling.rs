@@ -27,18 +27,21 @@ impl Default for SamplingParams {
 /// Top-p sample over a CPU logits vector (temperature + repetition penalty
 /// applied inside). `history` — токены уже в контексте (промпт + порождённые):
 /// их логиты штрафуются `repetition_penalty` (раньше параметр был no-op).
+/// История ДЕДУПЛИЦИРУЕТСЯ (уникальные токены — как в HF); порядок HF:
+/// сначала штраф по сырым логитам, потом температура.
 pub fn top_p_sample_vec_history(
     logits: &[f32],
     params: &SamplingParams,
     history: &[u32],
     rng_state: &mut Option<u64>,
 ) -> u32 {
-    let mut logits_vec: Vec<f32> = if params.temperature != 1.0 {
-        logits.iter().map(|&l| l / params.temperature).collect()
-    } else {
-        logits.to_vec()
-    };
-    apply_repetition_penalty_vec(&mut logits_vec, history, params.repetition_penalty);
+    let mut logits_vec = logits.to_vec();
+    apply_repetition_penalty_vec_unique(&mut logits_vec, history, params.repetition_penalty);
+    if params.temperature != 1.0 {
+        for l in logits_vec.iter_mut() {
+            *l /= params.temperature;
+        }
+    }
     let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp_vals: Vec<f32> = logits_vec.iter().map(|&l| (l - max_logit).exp()).collect();
     let sum_exp: f32 = exp_vals.iter().sum();
@@ -147,16 +150,17 @@ fn sample_from(top_tokens: &[(usize, f32)], rng_state: &mut Option<u64>) -> u32 
 /// Repetition penalty over a CPU logits vector (in place). Standard
 /// behaviour (HF): every UNIQUE token of the history with nonzero logit is
 /// penalised once — logit > 0 divided by the penalty, otherwise multiplied.
+///
+/// Wave-8 note: this fn is per-OCCURRENCE — the speech crate's TTS calls it
+/// directly with the full history each step, and the previous dedup here
+/// silently changed TTS penalty semantics (compounding per repeat). The
+/// once-per-unique-token behaviour lives in
+/// [`apply_repetition_penalty_vec_unique`] / [`top_p_sample_vec_history`].
 pub fn apply_repetition_penalty_vec(logits: &mut [f32], history: &[u32], penalty: f32) {
     if penalty == 1.0 || history.is_empty() {
         return;
     }
-    // Штраф ОДИН раз на уникальный токен (повтор в истории не усиливает
-    // штраф — как в HF RepetitionPenaltyLogitsProcessor).
-    let mut seen: Vec<u32> = history.to_vec();
-    seen.sort_unstable();
-    seen.dedup();
-    for token_id in seen {
+    for &token_id in history {
         let idx = token_id as usize;
         if idx < logits.len() {
             if logits[idx] > 0.0 {
@@ -166,6 +170,20 @@ pub fn apply_repetition_penalty_vec(logits: &mut [f32], history: &[u32], penalty
             }
         }
     }
+}
+
+/// Dedup-вариант для LLM-генерации ([`top_p_sample_vec_history`],
+/// greedy в [`crate::inference::generate`]): штраф ОДИН раз на уникальный
+/// токен истории — повтор в истории не усиливает штраф (HF
+/// RepetitionPenaltyLogitsProcessor).
+pub fn apply_repetition_penalty_vec_unique(logits: &mut [f32], history: &[u32], penalty: f32) {
+    if penalty == 1.0 || history.is_empty() {
+        return;
+    }
+    let mut seen: Vec<u32> = history.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    apply_repetition_penalty_vec(logits, &seen, penalty);
 }
 
 /// RAS penalty over a CPU logits vector (in place).
@@ -274,5 +292,39 @@ mod tests {
         // penalty == 1.0 — no-op.
         let mut rng = None;
         assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[0], &mut rng), 0);
+    }
+
+    /// Wave-8 revert: direct `apply_repetition_penalty_vec` is per-OCCURRENCE
+    /// (the speech crate's TTS calls it with the full history each step —
+    /// the dedup here had silently changed TTS penalty semantics). The dedup
+    /// lives in the history path (`top_p_sample_vec_history` / `_unique`).
+    #[test]
+    fn direct_penalty_compounds_per_occurrence() {
+        let mut lg = vec![2.0f32, 1.5, 0.9, 0.1];
+        apply_repetition_penalty_vec(&mut lg, &[0, 0], 2.0);
+        // 2.0 /2 /2 = 0.5 < 0.9 — повтор УСИЛИЛ штраф (как до wave-8).
+        assert!((lg[0] - 0.5).abs() < 1e-6, "per-occurrence: {}", lg[0]);
+        // Dedup-вариант: [0,0] → один штраф → 1.0.
+        let mut lg = vec![2.0f32, 1.5, 0.9, 0.1];
+        apply_repetition_penalty_vec_unique(&mut lg, &[0, 0], 2.0);
+        assert!((lg[0] - 1.0).abs() < 1e-6, "unique: {}", lg[0]);
+    }
+
+    /// Штраф применяется по сырым логитам, температура — после (HF-порядок;
+    /// для скалярных делений результат эквивалентен — фиксируем контракт).
+    #[test]
+    fn penalty_before_temperature() {
+        let logits = [2.0f32, 1.5, 0.9, 0.1];
+        let params = SamplingParams {
+            temperature: 0.5,
+            top_p: 1.0,
+            top_k: 1,
+            repetition_penalty: 2.0,
+            seed: Some(3),
+        };
+        let mut rng = None;
+        // Штраф: [1.0, 1.5, 0.9, 0.1]; температура: [2.0, 3.0, 1.8, 0.2]
+        // → argmax = 1.
+        assert_eq!(top_p_sample_vec_history(&logits, &params, &[0], &mut rng), 1);
     }
 }

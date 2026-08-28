@@ -143,6 +143,9 @@ pub struct Qwen3Model {
 /// Результат спекулятивного шага (Ф2.1).
 pub struct SpecOutcome {
     /// Принятые токены (первый — гарантированно; остальные — draft).
+    /// ВНИМАНИЕ: последний элемент при `n_draft_accepted < draft.len()` —
+    /// пересэмпл, он в KV-кэше НЕ лежит (кэш откатывается до принятых) —
+    /// следующий decode/decode_spec обязан прогнать его через forward.
     pub accepted: Vec<u32>,
     /// Логиты последней позиции (продолжение, если приняты все draft).
     pub logits: Tensor,
@@ -563,6 +566,24 @@ impl Qwen3Model {
         let mut prof_attn = 0.0f64;
         let mut prof_ffn = 0.0f64;
         let prof = std::env::var("LLM_BENCH").is_ok();
+        // Конфиг обещает deepstack-слои (Qwen3-VL), а блоков нет (пустой
+        // срез от caller'а / vision-энкодера) — молча пропущенное сложение
+        // искажает hidden states image-позиций. Громкое предупреждение один
+        // раз на forward (Q3_NO_DS — осознанное отключение, без варнинга).
+        if mrope.is_some()
+            && std::env::var("Q3_NO_DS").is_err()
+            && deepstack.map_or(true, |d| d.is_empty())
+        {
+            if let Some(n) = self.cfg.n_deepstack {
+                if n > 0 {
+                    tracing::warn!(
+                        n_deepstack = n,
+                        "mrope/vision forward: config expects {n} deepstack blocks, \
+                         none provided — vision hidden states will miss the deepstack adds"
+                    );
+                }
+            }
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(u) = upto {
                 if i >= u {

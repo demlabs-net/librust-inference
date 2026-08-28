@@ -442,8 +442,11 @@ impl KvCache {
     /// positions for the kept tokens; since that is not implemented, the
     /// cache REFUSES to compact (see `compact`): a loud error instead of
     /// silent context corruption.
+    /// Values < 2 are clamped to 2: with max_cap < 2 `pos/2 == 0` always,
+    /// compact degenerates to a no-op and the limit would be silently
+    /// exceeded instead of failing loudly.
     pub fn set_max_cap(&mut self, max: Option<usize>) {
-        self.max_cap = max;
+        self.max_cap = max.map(|m| m.max(2));
     }
 
     /// Drop the oldest half of the window — REFUSED: the data move itself

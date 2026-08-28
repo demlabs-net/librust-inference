@@ -234,7 +234,13 @@ pub fn safetensors_tensor_numel(path: &Path, name: &str) -> anyhow::Result<usize
     let h = safetensors_header(path)?;
     h.into_iter()
         .find(|(n, _, _, _)| n == name)
-        .map(|(_, _, shape, _)| shape.iter().product())
+        .map(|(_, _, shape, _)| {
+            shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| anyhow::anyhow!("tensor {name}: numel overflow"))
+        })
+        .transpose()?
         .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))
 }
 
@@ -250,7 +256,11 @@ pub fn read_safetensors_tensor_f32(
         .find(|(n, _, _, _)| n == name)
         .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))?;
     let bytes = std::fs::read(path)?;
-    let numel: usize = shape.iter().product();
+    // checked product (битый shape в заголовке → чистый Err, не wrap).
+    let numel: usize = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| anyhow::anyhow!("tensor {name}: numel overflow"))?;
     let elem = match dtype.as_str() {
         "F32" | "U32" => 4,
         "F16" | "BF16" => 2,

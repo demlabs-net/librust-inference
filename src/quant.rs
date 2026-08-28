@@ -1,9 +1,13 @@
 //! Квантование и конверсия моделей (Ф4.12): safetensors → GGUF во всех
-//! наших форматах (Q4_0/Q8_0/Q4_K_M/BF16/F16/F32) + GGUF re-quant.
+//! наших форматах (Q4_0/Q8_0/Q4_K_M/Q6_K/BF16/F16/F32) + GGUF re-quant.
 //!
-//! Раскладки блоков — по ggml (fixture-gen, golden-сверка Ф1.1):
+//! Раскладки блоков — канонический ggml (дешифраторы совместимы с реальными
+//! llama.cpp-файлами):
 //! Q4_0 {f16 d, 16×u8 нибблы} = 18 Б/32; Q8_0 {f16 d, 32×i8} = 34 Б/32;
-//! Q4_K {f16 d, f16 dmin, 16×u8 scales, 128×u8 qs} = 148 Б/256.
+//! Q4_K {f16 d, f16 dmin, u8 scales[12], u8 qs[128]} = 144 Б/256
+//! (упаковка scales — get_scale_min_k4, как в Q5_K; y = d·sc·q − dmin·m);
+//! Q6_K {u8 ql[128], u8 qh[64], i8 scales[16], f16 d} = 210 Б/256
+//! (d в КОНЦЕ блока, байты 208..210; y = d·sc·(q − 32)).
 
 use std::io::Write;
 use std::path::Path;
@@ -135,38 +139,181 @@ pub fn quant_q8_0(weights: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Q4_K (Q4_K_M): блок 256 → f16 d, f16 dmin, 16×u8 scales, 128×u8 qs.
-/// 16 подблоков по 16 весов: 8 бит = {4-бит scale, 4-бит min} на подблок.
+/// Канонический Q4_K (ggml block_q4_K): блок 256 → 144 байта:
+///   d (f16, 0..2), dmin (f16, 2..4), scales[12] (4..16 — 6-битные
+///   scale/min 8 подблоков по 32, упаковка get_scale_min_k4 — та же, что в
+///   Q5_K), qs[128] (16..144 — 4-битные значения, чанк-мажор: байт 32c+l
+///   держит {low: 64c+l, high: 64c+32+l}, 4 чанка по 64).
+/// Деквант (ggml dequantize_row_q4_K): y = d·sc·q − dmin·m, q ∈ 0..15.
+/// Схема квантования — упрощённый ggml (без итерационного уточнения
+/// make_qkx2_quants): на подблок raw_sc = (max−min(min,0))/15, глобальные
+/// d = max(raw_sc)/63, dmin = max(−min(min,0))/63; значение q = round((x+ml)/dl),
+/// где dl = d·sc, ml = dmin·m. Энкодер не побитово равен llama.cpp, но
+/// РАСКЛАДКА каноническая — блок декодируется любым ggml-ридером.
 pub fn quant_q4_k(weights: &[f32]) -> Vec<u8> {
     assert!(weights.len().is_multiple_of(256), "Q4_K: len % 256 == 0");
-    let mut out = Vec::with_capacity(weights.len() / 256 * 148);
+    let mut out = Vec::with_capacity(weights.len() / 256 * 144);
     for blk in weights.chunks_exact(256) {
-        let mut scales = [0u8; 16];
-        let mut mins = [0u8; 16];
-        let mut qs = [0u8; 128];
-        for (sb, sub) in blk.chunks_exact(16).enumerate() {
-            let max_abs = sub.iter().fold(0.0f32, |m, w| m.max(w.abs()));
-            let min = sub.iter().fold(0.0f32, |m, w| m.min(*w));
-            let d = if max_abs > 0.0 { max_abs / 7.0 } else { 0.0 };
-            let m = min;
-            scales[sb] = ((d / 0.0078125).round() as i32).clamp(0, 15) as u8;
-            mins[sb] = ((-m / 0.0078125).round() as i32).clamp(0, 15) as u8;
-            for (i, w) in sub.iter().enumerate() {
-                let q = ((w - m) / d).round().clamp(0.0, 15.0) as u8;
-                let byte_idx = sb * 8 + i / 2;
-                if i % 2 == 0 {
-                    qs[byte_idx] = q & 0x0F;
-                } else {
-                    qs[byte_idx] |= (q & 0x0F) << 4;
-                }
-            }
+        let mut raw_sc = [0f32; 8];
+        let mut raw_min = [0f32; 8];
+        for b in 0..8 {
+            let sub = &blk[b * 32..(b + 1) * 32];
+            let max = sub.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min = sub.iter().cloned().fold(f32::INFINITY, f32::min);
+            // Низ диапазона: min(min, 0). В формате m ≥ 0 (деквант вычитает
+            // dmin·m ≥ 0), поэтому подблок с ПОЛОЖИТЕЛЬНЫМ min кодируется от
+            // нуля — иначе весь DC подблока теряется (q клипается в 15).
+            let low = min.min(0.0);
+            raw_sc[b] = (max - low) / 15.0;
+            raw_min[b] = low;
         }
-        let d = blk.iter().fold(0.0f32, |m, w| m.max(w.abs())) / 127.0;
-        let dmin = blk.iter().fold(0.0f32, |m, w| m.min(*w)) / 127.0;
+        let mut d = raw_sc.iter().cloned().fold(0.0f32, f32::max) / 63.0;
+        let mut dmin = raw_min.iter().map(|m| m.abs()).fold(0.0f32, f32::max) / 63.0;
+        // Нулевой блок: d = 0 — деквант даёт 0 при любых q (мусор в битах не
+        // важен); крошечный знаменатель ниже исключает деление на 0.
+        if d == 0.0 {
+            d = 1e-8;
+        }
+        if dmin == 0.0 {
+            dmin = 1e-8;
+        }
         out.extend_from_slice(&f16_bits(d));
         out.extend_from_slice(&f16_bits(dmin));
+        let mut sc6 = [0u8; 8];
+        let mut mn6 = [0u8; 8];
+        for j in 0..8 {
+            sc6[j] = ((raw_sc[j] / d).round() as i32).clamp(0, 63) as u8;
+            // ggml хранит min КАК −min (положительное); деквант ВЫЧИТАЕТ
+            // dmin·m. Для подблока с min > 0 код mn6 = 0 (сатурация — та же
+            // особенность, что у Q5_K/q5k_encode: верх диапазона клипается).
+            mn6[j] = ((-raw_min[j] / dmin).round() as i32).clamp(0, 63) as u8;
+        }
+        // scales[12]: упаковка get_scale_min_k4 (та же, что в Q5_K):
+        //   j<4:  scales[j] = ls;          scales[j+4] = lm
+        //   j>=4: scales[j+4] = (ls&0xF) | ((lm&0xF)<<4);
+        //         scales[j-4] |= (ls>>4)<<6;  scales[j] |= (lm>>4)<<6
+        let mut scales = [0u8; 12];
+        for j in 0..8 {
+            let ls = sc6[j];
+            let lm = mn6[j];
+            if j < 4 {
+                scales[j] = ls & 63;
+                scales[j + 4] = lm & 63;
+            } else {
+                scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                scales[j - 4] |= (ls >> 4) << 6;
+                scales[j] |= (lm >> 4) << 6;
+            }
+        }
         out.extend_from_slice(&scales);
-        out.extend_from_slice(&qs);
+        // qs[128]: q = round((x + ml)/dl), dl = d·sc6[b], ml = dmin·mn6[b];
+        // чанк-мажор: байт 32c+l = {low: значение 64c+l, high: 64c+32+l}.
+        let mut qv = [0u8; 256];
+        for b in 0..8 {
+            let sub = &blk[b * 32..(b + 1) * 32];
+            let dl = d * sc6[b] as f32;
+            let ml = dmin * mn6[b] as f32;
+            for (i, &x) in sub.iter().enumerate() {
+                qv[b * 32 + i] = if dl > 0.0 {
+                    ((x + ml) / dl).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                };
+            }
+        }
+        for c in 0..4 {
+            for l in 0..32 {
+                let lo = qv[64 * c + l] & 0x0F;
+                let hi = (qv[64 * c + 32 + l] & 0x0F) << 4;
+                out.push(lo | hi);
+            }
+        }
+    }
+    out
+}
+
+/// Канонический Q6_K (ggml block_q6_K): блок 256 → 210 байт: ql[128]
+/// (низкие 4 бита, по байту l: {low: q(l), high: q(l+64)} и {low: q(l+32),
+/// high: q(l+96)}), qh[64] (старшие 2 бита, байт l: q(l)|q(l+32)<<2|
+/// q(l+64)<<4|q(l+96)<<6 на каждую 128-половину), scales[16] (int8 на
+/// 16-элементные подблоки), d (f16) в КОНЦЕ, байты 208..210. Деквант:
+/// y = d·sc·(q − 32), q ∈ 0..63. Схема — как в speech-крейте
+/// (librust-inference-speech quant::quant_q6k_block): симметрично, без
+/// zero-point, 6-битное сведение подблоковых scale к d.
+pub fn quant_q6_k(weights: &[f32]) -> Vec<u8> {
+    assert!(weights.len().is_multiple_of(256), "Q6_K: len % 256 == 0");
+    let mut out = Vec::with_capacity(weights.len() / 256 * 210);
+    for blk in weights.chunks_exact(256) {
+        // Подблоковые scale (16×16): L-стейджинг [0, 63] как в make_qx_quants.
+        let mut l = [0i8; 256];
+        let mut scales = [0f32; 16];
+        let mut max_abs_scale = 0f32;
+        let mut max_scale = 0f32;
+        for ib in 0..16 {
+            let sub = &blk[ib * 16..(ib + 1) * 16];
+            let mut amax = 0f32;
+            let mut max = 0f32;
+            for &v in sub {
+                let av = v.abs();
+                if av > amax {
+                    amax = av;
+                    max = v;
+                }
+            }
+            let scale = if amax < 1e-15 {
+                0.0
+            } else {
+                let iscale = -32.0 / max;
+                for (i, &v) in sub.iter().enumerate() {
+                    let q = (iscale * v).round_ties_even().clamp(-32.0, 31.0) as i8;
+                    l[ib * 16 + i] = q + 32;
+                }
+                -max / 32.0
+            };
+            scales[ib] = scale;
+            if scale.abs() > max_abs_scale {
+                max_abs_scale = scale.abs();
+                max_scale = scale;
+            }
+        }
+        if max_abs_scale < 1e-15 {
+            // Нулевой блок: d = 0, ql/qh/scales остаются нулями (210 байт).
+            out.extend_from_slice(&[0u8; 210]);
+            continue;
+        }
+        let iscale = -128.0 / max_scale;
+        let d = 1.0 / iscale;
+        out.resize(out.len() + 208, 0);
+        let base = out.len() - 208;
+        out.extend_from_slice(&f16_bits(d));
+        for j in 0..16 {
+            let sc = (iscale * scales[j]).round_ties_even() as i32;
+            out[base + 192 + j] = (sc.min(127) as i8) as u8;
+            let dj = d * sc as f32;
+            if dj == 0.0 {
+                continue;
+            }
+            for ii in 0..16 {
+                let q = (blk[j * 16 + ii] / dj).round_ties_even().clamp(-32.0, 31.0) as i8;
+                l[j * 16 + ii] = q + 32;
+            }
+        }
+        // Упаковка ql/qh (две 128-половины).
+        for half in 0..2 {
+            let b = half * 128;
+            for k in 0..32 {
+                let q1 = l[b + k] & 0xF;
+                let q2 = l[b + k + 32] & 0xF;
+                let q3 = l[b + k + 64] & 0xF;
+                let q4 = l[b + k + 96] & 0xF;
+                out[base + half * 64 + k] = (q1 | (q3 << 4)) as u8;
+                out[base + half * 64 + k + 32] = (q2 | (q4 << 4)) as u8;
+                out[base + 128 + half * 32 + k] = (((l[b + k] >> 4) & 0x3)
+                    | (((l[b + k + 32] >> 4) & 0x3) << 2)
+                    | (((l[b + k + 64] >> 4) & 0x3) << 4)
+                    | (((l[b + k + 96] >> 4) & 0x3) << 6)) as u8;
+            }
+        }
     }
     out
 }
@@ -593,12 +740,57 @@ mod tests {
     fn q4_k_size_and_roundtrip() {
         let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 64.0).collect();
         let enc = quant_q4_k(&w);
-        assert_eq!(enc.len(), 148);
-        // d/dmin на месте, блок читается без паники — точность грубая
-        assert_eq!(
-            &enc[0..2],
-            &f16_bits(w.iter().fold(0.0f32, |m, x| m.max(x.abs())) / 127.0)
-        );
+        // Канонический блок: 2+2+12+128 = 144 байта.
+        assert_eq!(enc.len(), 144);
+        // Полный roundtrip через канонический декодер (weights_map).
+        let dec = crate::weights_map::dequant_q4_k(&enc);
+        // Ошибка ≤ dl/2 + f16-округление d/dmin. Подблоки с ПОЛОЖИТЕЛЬНЫМ
+        // min кодируются от нуля (формат не хранит m < 0) — шаг вдвое
+        // грубее: dl = 2/15 на крайнем правом подблоке.
+        approx(&dec, &w, 0.08);
+    }
+
+    /// Q4_K-декодер читает КАНОНИЧЕСКУЮ раскладку (сверено с ggml
+    /// dequantize_row_q4_K): d, dmin, scales[12] (get_scale_min_k4), qs
+    /// чанк-мажор. Ручной блок с известными коэффициентами — контроль
+    /// раскладки независимо от энкодера.
+    #[test]
+    fn q4_k_canonical_layout_vector() {
+        // d = 0.5, dmin = 0.25; подблок 0: sc = 2, m = 1 → y = 0.5·2·q − 0.25.
+        // Чанк 0: значения 0..31 (low-nibbles) → подблок is=0, значения
+        // 32..63 (high-nibbles) → подблок is=1 (тот же (2,1) для простоты).
+        let mut blk = vec![0u8; 144];
+        blk[0..2].copy_from_slice(&f16_bits(0.5));
+        blk[2..4].copy_from_slice(&f16_bits(0.25));
+        // get_scale_min_k4(0) = (scales[0], scales[4]); get_scale_min_k4(1) =
+        // (scales[1], scales[5]) — все (2, 1).
+        for j in [0usize, 1] {
+            blk[4 + j] = 2;
+            blk[8 + j] = 1;
+        }
+        // qs чанк-мажор: значение q(i) в nibble байта 32c+l.
+        // q = 0 → y = −0.25; q = 15 → y = 15·1 − 0.25 = 14.75.
+        blk[16] = 0xF0; // value 0 = low nibble 0, value 32 = high nibble 15
+        let y = crate::weights_map::dequant_q4_k(&blk);
+        assert_eq!(y.len(), 256);
+        assert_eq!(y[0], 0.5 * 2.0 * 0.0 - 0.25);
+        assert_eq!(y[32], 0.5 * 2.0 * 15.0 - 0.25);
+        // Остальные подблоки: sc/m = 0 → y = 0.
+        assert_eq!(y[64], 0.0);
+    }
+
+    #[test]
+    fn q6_k_size_and_roundtrip() {
+        let w: Vec<f32> = (0..256).map(|i| ((i as f32 * 1.7).sin()) * 0.3).collect();
+        let enc = quant_q6_k(&w);
+        // Канонический блок: 128+64+16+2 = 210 байт, d в хвосте.
+        assert_eq!(enc.len(), 210);
+        let d = f32::from(f16::from_le_bytes([enc[208], enc[209]]));
+        assert!(d != 0.0, "super-block scale must sit at bytes 208..210");
+        // Roundtrip через канонический декодер (weights_map).
+        let dec = crate::weights_map::dequant_q6_k(&enc);
+        let scale = w.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        approx(&dec, &w, 0.06 * scale.max(1e-9));
     }
 
     #[test]

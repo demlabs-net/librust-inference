@@ -295,7 +295,14 @@ impl BertEncoder {
         let int4 = config.intermediate_size;
         let emb = |name: &str| -> Result<Embedding, BackendError> {
             let data = get(&w, name)?;
-            let shape = w.get(name).map(|(_, s)| s.clone()).unwrap_or_default();
+            // Shape — с ТЕМ ЖЕ bert.-фолбэком, что и get() выше: для
+            // SentenceTransformers-экспорта тензор лежит под "bert.<name>",
+            // и старый точечный lookup возвращал пустой shape.
+            let shape = w
+                .get(name)
+                .or_else(|| w.get(&format!("bert.{name}")))
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
             Embedding::from_weights(backend, data.clone(), shape)
         };
         let lin = |name: &str, out: usize, inp: usize| -> Result<(Tensor, Tensor), BackendError> {
@@ -395,11 +402,12 @@ impl BertEncoder {
         let pos = self.pos_emb.forward(backend, &pos_ids, t)?;
         let seg_ids = vec![0u32; t];
         let seg = self.seg_emb.forward(backend, &seg_ids, t)?;
+        // HF BERT: embeddings = LayerNorm(word + pos + token_type) — seg_emb
+        // обязана участвовать (раньше x3 строилась, а норм применялся к
+        // word+pos — сегментные эмбеддинги молча отбрасывались).
         let mut x = backend.zeros(vec![1, t, d])?;
         backend.add(&word, &pos, &x)?;
-        let x2 = x.clone();
-        let x3 = backend.zeros(vec![1, t, d])?;
-        backend.add(&x2, &seg, &x3)?;
+        backend.add(&x, &seg, &x)?;
         let ln0 = backend.zeros(vec![1, t, d])?;
         backend.layernorm(
             &x,

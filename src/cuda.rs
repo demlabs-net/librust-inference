@@ -1483,10 +1483,9 @@ impl Backend for CudaBackend {
         }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
         if tout == 0 {
-            // Window larger than the padded input: the CPU reference returns
-            // Ok with a zero-filled output — mirror it here (a 0-element
-            // launch would build an invalid 0-block grid). Unreachable since
-            // the Q22b guard, kept as belt-and-braces.
+            // Unreachable since the Q22b window guard (the CPU now returns
+            // Err for this case as well) — kept as belt-and-braces against a
+            // 0-element launch (invalid 0-block grid).
             self.stream.memset_zeros(y.as_cuda_mut()).map_err(map_err)?;
             return Ok(());
         }
@@ -1545,6 +1544,24 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         let (n, ci, h, wdim) = (x.shape()[0], x.shape()[1], x.shape()[2], x.shape()[3]);
         let (co, _, kh, kw) = (w.shape()[0], w.shape()[1], w.shape()[2], w.shape()[3]);
+        if ci != w.shape()[1] {
+            return Err(BackendError::Shape("conv2d: channel mismatch".into()));
+        }
+        if stride_t == 0 || stride_f == 0 {
+            return Err(BackendError::Shape("conv2d: stride 0".into()));
+        }
+        // R (iter-8 review): the same usize-underflow class conv1d guarded —
+        // a window larger than the padded input wrapped oh/ow to a huge
+        // value and the launch OOB-wrote y (no shape check here).
+        if h + pad_h < kh || wdim + pad_w < kw {
+            return Err(BackendError::Shape(format!(
+                "conv2d: padded input {}x{} smaller than the kernel {}x{}",
+                h + pad_h,
+                wdim + pad_w,
+                kh,
+                kw
+            )));
+        }
         // LEFT padding (Metal conv2d_f32 semantics) — symmetric padding here
         // would make the kernel write past the output buffer (oh too big).
         let (oh, ow) = (

@@ -164,51 +164,86 @@ pub(crate) fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Канонический Q4_K (ggml block_q4_K, 144 Б/256): d (f16, 0..2), dmin
+/// (f16, 2..4), scales[12] (4..16 — 6-битные scale/min 8 подблоков по 32,
+/// упаковка get_scale_min_k4), qs[128] (16..144 — чанк-мажор: байт 32c+l
+/// = {low: 64c+l, high: 64c+32+l}). Деквант (ggml dequantize_row_q4_K):
+/// y = d·sc·q − dmin·m, q ∈ 0..15. Совместимо с реальными llama.cpp-файлами
+/// (старая 148-байтная раскладка была кастомным диалектом — волна ревью 8).
 pub(crate) fn dequant_q4_k(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(148)
+    data.chunks_exact(144)
         .flat_map(|sb| {
             let d = f16_to_f32([sb[0], sb[1]]);
             let dmin = f16_to_f32([sb[2], sb[3]]);
-            let min = d * dmin;
-            let mut sc = [0u8; 16];
-            for j in 0..16 {
-                sc[j] = (sb[4 + j / 2] >> ((j % 2) * 4)) & 0x0F;
+            let scales = &sb[4..16];
+            let qs = &sb[16..144];
+            let mut y = Vec::with_capacity(256);
+            let mut is = 0usize;
+            // 4 чанка по 64: low-nibbles → подблок is, high-nibbles → is+1.
+            for c in 0..4 {
+                let (sc, m) = scale_min_k4(is, scales);
+                let d1 = d * sc as f32;
+                let m1 = dmin * m as f32;
+                let (sc2, m2) = scale_min_k4(is + 1, scales);
+                let d2 = d * sc2 as f32;
+                let m2 = dmin * m2 as f32;
+                for l in 0..32 {
+                    y.push(d1 * (qs[32 * c + l] & 0x0F) as f32 - m1);
+                }
+                for l in 0..32 {
+                    y.push(d2 * (qs[32 * c + l] >> 4) as f32 - m2);
+                }
+                is += 2;
             }
-            let qs = &sb[20..148];
-            (0..8).flat_map(move |b| {
-                let s = sc[b] as f32;
-                qs[b * 16..b * 16 + 16].iter().flat_map(move |&q| {
-                    [
-                        min + d * s * ((q & 0x0F) as f32 - 8.0),
-                        min + d * s * ((q >> 4) as f32 - 8.0),
-                    ]
-                })
-            })
+            y
         })
         .collect()
 }
 
+/// ggml get_scale_min_k4: 12 байт scales → (scale, min) 6-битные коды
+/// подблока j (та же упаковка, что у Q5_K).
+fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let sc = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (sc, m)
+    }
+}
+
+/// Канонический Q6_K (ggml block_q6_K, 210 Б/256): ql[128] (низкие 4 бита),
+/// qh[64] (старшие 2 бита), scales[16] (int8 на 16-элементные подблоки),
+/// d (f16) в КОНЦЕ блока (байты 208..210). Деквант: y = d·sc·(q − 32).
+/// Бит-упаковка qh: на каждую 128-половину байт qh[lane] держит старшие
+/// 2 бита значений lane|lane+32<<2|lane+64<<4|lane+96<<6 (сверено с CUDA
+/// q6k_weight и speech-квантайзером — bit-exact).
 pub(crate) fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(210)
         .flat_map(|sb| {
-            let d = f16_to_f32([sb[0], sb[1]]);
-            let ql = &sb[2..130];
-            let qh = &sb[130..194];
-            let scales = &sb[194..210];
-            (0..8).flat_map(move |b| {
-                let sc = ((scales[b] & 0x0F) | ((scales[b + 8] & 0x0F) << 4)) as f32;
-                (0..32).map(move |j| {
-                    let idx = b * 32 + j;
-                    let lo = if j % 2 == 0 {
-                        ql[idx / 2] & 0x0F
-                    } else {
-                        ql[idx / 2] >> 4
-                    };
-                    let hi = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x03;
-                    let q = (lo | (hi << 4)) as f32;
-                    d * sc * (q - 32.0)
-                })
-            })
+            let d = f16_to_f32([sb[208], sb[209]]);
+            let ql = &sb[0..128];
+            let qh = &sb[128..192];
+            let scales = &sb[192..208];
+            let mut y = vec![0f32; 256];
+            for half in 0..2 {
+                let qlh = &ql[half * 64..half * 64 + 64];
+                let qhh = &qh[half * 32..half * 32 + 32];
+                let sch = &scales[half * 8..half * 8 + 8];
+                for lane in 0..32 {
+                    let ql0 = qlh[lane];
+                    let ql1 = qlh[lane + 32];
+                    let qhv = qhh[lane];
+                    let base = half * 128 + lane;
+                    let s = |off: usize| sch[(lane >> 4) + off] as i8 as f32;
+                    let q = |v: u8| (v as i32 - 32) as f32;
+                    y[base] = d * s(0) * q((ql0 & 0xF) | ((qhv & 3) << 4));
+                    y[base + 32] = d * s(2) * q((ql1 & 0xF) | ((qhv >> 2 & 3) << 4));
+                    y[base + 64] = d * s(4) * q((ql0 >> 4) | ((qhv >> 4 & 3) << 4));
+                    y[base + 96] = d * s(6) * q((ql1 >> 4) | ((qhv >> 6 & 3) << 4));
+                }
+            }
+            y
         })
         .collect()
 }

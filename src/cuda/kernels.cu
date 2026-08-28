@@ -1450,10 +1450,24 @@ __device__ inline float q5k_weight(const unsigned char* blk, int j) {
 __device__ inline float q3k_weight(const unsigned char* blk, int j) {
     int s = j >> 4;
     int l = j & 15;
-    // scales[12] → 16 int8 via the ggml aux permutation.
-    unsigned int a0 = *(const unsigned int*)(blk + 96);
-    unsigned int a1 = *(const unsigned int*)(blk + 100);
-    unsigned int tmp = *(const unsigned int*)(blk + 104);
+    // scales[12] → 16 int8 via the ggml aux permutation. R: read BYTE-wise —
+    // the old `*(const unsigned int*)(blk + 96)` was misaligned for odd
+    // columns (blk = Bs + col·110, 110 ≡ 2 mod 4 → 96+110·col ≡ 2 mod 4);
+    // the misaligned shared LDS faulted sporadically with
+    // CUDA_ERROR_MISALIGNED_ADDRESS (JIT-dependent — the q3k splitk GEMM
+    // failed intermittently while the tiled variant happened to survive).
+    unsigned int a0 = (unsigned int)blk[96]
+        | ((unsigned int)blk[97] << 8)
+        | ((unsigned int)blk[98] << 16)
+        | ((unsigned int)blk[99] << 24);
+    unsigned int a1 = (unsigned int)blk[100]
+        | ((unsigned int)blk[101] << 8)
+        | ((unsigned int)blk[102] << 16)
+        | ((unsigned int)blk[103] << 24);
+    unsigned int tmp = (unsigned int)blk[104]
+        | ((unsigned int)blk[105] << 8)
+        | ((unsigned int)blk[106] << 16)
+        | ((unsigned int)blk[107] << 24);
     const unsigned int k1 = 0x03030303u;
     const unsigned int k2 = 0x0f0f0f0fu;
     unsigned int b0 = (a0 & k2) | (((tmp >> 0) & k1) << 4);

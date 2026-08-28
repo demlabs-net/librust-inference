@@ -992,6 +992,11 @@ impl Backend for CudaBackend {
                 Ok(out)
             }
             crate::backend::TensorInner::CudaQ4K(data) => {
+                // N (iter-9): this is the SPEECH-crate fused-kernel dialect
+                // ((2j, 2j+1) pairing — from_cpu_q4k only receives the speech
+                // quantizer's output), NOT the canonical ggml Q4_0 layout
+                // (j, j+16) used by the GGUF path. GGUF Q4_0 never reaches
+                // this branch (it flows dequant→f32 via from_quantized).
                 let raw: Vec<u8> = self.stream.clone_dtoh(data).map_err(map_err)?;
                 let per: usize = t.shape()[1..].iter().product();
                 let rows = t.shape()[0];

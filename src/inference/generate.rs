@@ -116,14 +116,19 @@ pub fn generate(
                 &history,
                 params.repeat_penalty,
             );
-            // P18c: a NaN logit used to PANIC in partial_cmp().unwrap() —
-            // treat non-finite values as -inf (never selected).
-            penalized
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap()
+            // P18c: a NaN logit used to PANIC in partial_cmp().unwrap().
+            // N (iter-9): the claim "treat non-finite as -inf" is now real —
+            // the old max_by kept a NaN at index 0 as the running max
+            // (partial_cmp(NaN, x) == None → Equal → accumulator survives).
+            let mut best: Option<(usize, f32)> = None;
+            for (i, l) in penalized.iter().enumerate() {
+                let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
+                if best.map_or(true, |(_, bl)| l > bl) {
+                    best = Some((i, l));
+                }
+            }
+            best.map(|(i, _)| i as u32)
+                .ok_or_else(|| BackendError::Shape("greedy: empty logits row".into()))?
         } else {
             let sp = SamplingParams {
                 temperature: params.temperature,

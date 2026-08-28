@@ -74,8 +74,10 @@ impl WeightFormat {
             WeightFormat::Plain(d) => (d.bytes() * 8) as f32,
             WeightFormat::Q4_0 => 4.5, // 32 × 4 bit + f16 scale over 32 elems
             WeightFormat::Q8_0 => 8.5, // 32 × 8 bit + 32-bit scale over 32 elems
-            WeightFormat::Q4_K => 4.5625, // 256-elem super-block: 144 B (canonical ggml)
-            WeightFormat::Q6_K => 6.5625, // 256-elem super-block, k-quants layout
+            // N (iter-9): 144 B × 8 / 256 = 4.5 (the old 4.5625 matched
+            // neither the old 148 B nor the canonical 144 B layout).
+            WeightFormat::Q4_K => 4.5, // 256-elem super-block: 144 B (canonical ggml)
+            WeightFormat::Q6_K => 6.5625, // 256-elem super-block: 210 B (canonical ggml)
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -205,7 +207,7 @@ mod tests {
         assert_eq!(WeightFormat::Q8_0.bits_per_weight(), 8.5);
         assert!((WeightFormat::Q6_K.bits_per_weight() - 6.5625).abs() < 1e-6);
         assert!((WeightFormat::Q4_0.bits_per_weight() - 4.5).abs() < 1e-6);
-        assert!((WeightFormat::Q4_K.bits_per_weight() - 4.5625).abs() < 1e-6);
+        assert!((WeightFormat::Q4_K.bits_per_weight() - 4.5).abs() < 1e-6);
         assert!(WeightFormat::Q8_0.is_quantized());
         assert!(WeightFormat::Q4_0.is_quantized());
         assert!(WeightFormat::Q4_K.is_quantized());

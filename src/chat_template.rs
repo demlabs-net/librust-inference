@@ -136,6 +136,9 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
         }
         // закрытие: '-}}'/'}}' для expr, '-%}'/'%}' для tag
         let after = &rest[idx + 2 + usize::from(trim_before)..];
+        // N (iter-9): take the EARLIEST match of any candidate — the old
+        // list-order `find` closed `{{ '}}' -}}` at the trailing `-}}`,
+        // swallowing the inner `}}` and misparsing the tag.
         let mut end: Option<(usize, bool)> = None;
         let close_pats: &[&str] = if is_expr {
             &["-}}", "}}"]
@@ -144,8 +147,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
         };
         for cp in close_pats {
             if let Some(p) = after.find(cp) {
-                end = Some((p, cp.starts_with('-')));
-                break;
+                let cand = (p, cp.starts_with('-'));
+                if end.map_or(true, |(best, _)| p < best) {
+                    end = Some(cand);
+                }
             }
         }
         let Some((p, trim_after)) = end else {
@@ -516,7 +521,10 @@ fn split_plus(e: &str) -> Option<(&str, &str)> {
             None => match ch {
                 '\'' | '"' => quote = Some(ch),
                 '(' | '[' => depth += 1,
-                ')' | ']' => depth -= 1,
+                // N (iter-9): a malformed expression with `)` before any
+                // `(` used to underflow usize (panic in debug, silently
+                // wrong parse in release).
+                ')' | ']' => depth = depth.saturating_sub(1),
                 '+' if depth == 0 => return Some((&e[..i], &e[i + 1..])),
                 _ => {}
             },

@@ -583,6 +583,19 @@ impl Backend for CpuBackend {
         if ci != ci2 {
             return Err(BackendError::Shape("conv2d: channel mismatch".into()));
         }
+        // N (iter-9): mirror the CUDA guards — stride 0 is a div-by-zero
+        // panic and a window larger than the padded input underflows usize
+        // (the commit message claimed the CPU was guarded; only conv1d was).
+        if stride_t == 0 || stride_f == 0 {
+            return Err(BackendError::Shape(
+                "conv2d: stride must be >= 1".into(),
+            ));
+        }
+        if h + pad_h < kh || wdim + pad_w < kw {
+            return Err(BackendError::Shape(
+                "conv2d: kernel larger than the padded input".into(),
+            ));
+        }
         // LEFT padding on both axes (Metal conv2d_f32 semantics — the tone
         // pre-encode convs left-pad time by pad_t; symmetric padding would
         // shift the output by pad_h).

@@ -102,7 +102,24 @@ impl DFlashModel {
             );
             upload_f16(backend, &f, shape)
         };
+        // N (iter-9): load_with_selector is pub — guard here too (not just
+        // in load_gguf): conv_group == 0 is a div-by-zero below, and a
+        // kernel of 0 with conv tensors present makes degenerate shapes
+        // that panic in conv_side.
+        if conv_group == 0 {
+            return Err(BackendError::Shape(
+                "dflash: conv_group_size must be >= 1".into(),
+            ));
+        }
         let n_groups = cfg.dim / conv_group;
+        let conv_tensors_present = ["attn_conv_base", "ffn_conv_base"]
+            .iter()
+            .any(|n| w.get(&format!("blk.0.{n}")).is_some());
+        if conv_tensors_present && conv_kernel == 0 {
+            return Err(BackendError::Shape(
+                "dflash: conv_kernel_size must be >= 1 when conv tensors are present".into(),
+            ));
+        }
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut caches = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -259,12 +276,18 @@ impl DFlashModel {
         };
         let dim = u(&p("embedding_length"))?;
         let n_layers = u(&p("block_count"))?;
+        let n_heads = u(&p("attention.head_count"))?;
+        if n_heads == 0 {
+            return Err(BackendError::Shape(
+                format!("{arch}.attention.head_count must be >= 1, got 0"),
+            ));
+        }
         let cfg = Qwen3Config {
             dim,
             n_layers,
-            n_heads: u(&p("attention.head_count"))?,
+            n_heads,
             n_kv_heads: u(&p("attention.head_count_kv"))?,
-            head_dim: u(&p("attention.key_length")).unwrap_or(dim / u(&p("attention.head_count"))?),
+            head_dim: u(&p("attention.key_length")).unwrap_or(dim / n_heads),
             ffn_dim: u(&p("feed_forward_length"))?,
             vocab_size,
             rope_theta: f(&p("rope.freq_base"), 1e6),
@@ -278,8 +301,21 @@ impl DFlashModel {
             n_deepstack: None,
         };
         let block_size = u(&p("block_size"))?;
+        // N (iter-9): GGUF metadata is external input — 0/absent values
+        // panicked later (Vec::with_capacity(t - 1) underflow at decode,
+        // div-by-zero in dim / head_count).
+        if block_size == 0 {
+            return Err(BackendError::Shape(
+                format!("{arch}.block_size must be >= 1, got 0"),
+            ));
+        }
         let conv_kernel = u(&p("conv_kernel_size")).unwrap_or(0);
         let conv_group = u(&p("conv_group_size")).unwrap_or(1);
+        if conv_group == 0 {
+            return Err(BackendError::Shape(
+                format!("{arch}.conv_group_size must be >= 1, got 0"),
+            ));
+        }
         let extract = gf
             .get(&p("target_layers"))
             .and_then(GgufValue::as_array)
@@ -998,7 +1034,8 @@ impl DFlashDrafter {
         if top_k > 0 && top_k < w.len() {
             // оставить топ-N по весу, остальные — 0
             let mut idx: Vec<usize> = (0..w.len()).collect();
-            idx.sort_by(|&a, &b| w[b].partial_cmp(&w[a]).unwrap());
+            // N (iter-9): a NaN logit made partial_cmp return None → panic.
+            idx.sort_by(|&a, &b| w[b].partial_cmp(&w[a]).unwrap_or(std::cmp::Ordering::Equal));
             for &i in &idx[top_k..] {
                 w[i] = 0.0;
             }
@@ -1144,7 +1181,19 @@ fn conv_side(
 ) -> Result<Tensor, BackendError> {
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let kernel = base.shape()[1];
+    // N (iter-9): degenerate conv metadata (kernel 0 / groups 0) used to
+    // div-by-zero — clean error instead.
+    if kernel == 0 {
+        return Err(BackendError::Shape(
+            "dflash conv: kernel dimension is 0".into(),
+        ));
+    }
     let n_groups = dynamic.shape()[1] / (kernel * 2);
+    if n_groups == 0 {
+        return Err(BackendError::Shape(
+            "dflash conv: dynamic width smaller than kernel*2 groups".into(),
+        ));
+    }
     let group = d / n_groups;
     let y = backend.zeros(x.shape().to_vec())?;
     backend.dflash2_conv(

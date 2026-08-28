@@ -309,12 +309,40 @@ impl IncrementalDecoder {
         while i < self.pending.len() {
             let b = self.pending[i];
             let len = utf8_char_len(b);
-            if len == 0 || i + len > self.pending.len() {
-                break; // неполный/невалидный хвост — держим в pending
+            // N (iter-9): an invalid head used to wedge the decoder FOREVER —
+            // the scan restarted at byte 0 every time, so once the head was
+            // permanently broken (a lone continuation byte, or a lead byte
+            // whose continuation never arrived), every push broke at i == 0,
+            // nothing was ever drained and `pending` grew by the whole
+            // remaining stream (the comment's "stream continues" was wrong).
+            if len == 0 {
+                // Continuation byte at a char boundary — invalid: skip lossily.
+                out.push(char::REPLACEMENT_CHARACTER);
+                i += 1;
+                continue;
+            }
+            if i + len > self.pending.len() {
+                // The char is incomplete so far. If the byte right after the
+                // lead can never continue it (not a continuation byte), the
+                // char is broken — flush the lead lossily instead of holding
+                // a tail that can never become valid.
+                let broken = self.pending[i + 1..]
+                    .first()
+                    .map(|&n| !(0x80..=0xBF).contains(&n))
+                    .unwrap_or(false);
+                if broken {
+                    out.push(char::REPLACEMENT_CHARACTER);
+                    i += 1;
+                    continue;
+                }
+                break; // неполный хвост — ждём продолжения
             }
             let chunk = &self.pending[i..i + len];
             if std::str::from_utf8(chunk).is_err() {
-                break; // битые байты — держим (потеря минимальна, стрим продолжается)
+                // Битые байты: отдаём lossy и двигаемся (не застреваем).
+                out.push_str(&String::from_utf8_lossy(chunk));
+                i += len;
+                continue;
             }
             out.push_str(unsafe { std::str::from_utf8_unchecked(chunk) });
             i += len;
@@ -451,6 +479,25 @@ mod tests {
         assert_eq!(d.push(&[0x80]), "р");
         assert_eq!(d.push(b"!"), "!");
         assert_eq!(d.finish(), "");
+    }
+
+    /// N (iter-9): a permanently broken head must not wedge the decoder —
+    /// the old code broke at i == 0 forever and lost the whole stream.
+    #[test]
+    fn incremental_decoder_survives_broken_head() {
+        // Lone continuation byte at the head (never valid).
+        let mut d = IncrementalDecoder::new();
+        assert_eq!(d.push(&[0x80]), "\u{FFFD}");
+        assert_eq!(d.push(b"ab"), "ab");
+        assert_eq!(d.push(&[0x80, 0x41]), "\u{FFFD}A");
+        assert!(d.pending.is_empty(), "pending: {:?}", d.pending);
+
+        // Lead byte whose continuation never arrives, then more text.
+        let mut d2 = IncrementalDecoder::new();
+        assert_eq!(d2.push(&[0xE2]), ""); // может стать символом — ждём
+        assert_eq!(d2.push(b"x"), "\u{FFFD}x"); // 0xE2 + 'x' никогда не валиден
+        assert_eq!(d2.push(&[0xE2, 0x82, 0xAC]), "\u{20AC}"); // € (3 байта)
+        assert!(d2.pending.is_empty(), "pending: {:?}", d2.pending);
     }
 
     #[test]

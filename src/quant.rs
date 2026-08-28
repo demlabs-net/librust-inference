@@ -103,7 +103,12 @@ pub fn bf16_bits(x: f32) -> [u8; 2] {
 
 // ── квант-энкодеры (f32 → байты формата) ───────────────────────────────────
 
-/// Q4_0: блок 32 → f16 d + 16 байт нибблов; y = (q - 8) * d.
+/// Q4_0 canonical ggml layout: блок 32 → f16 d + 16 байт нибблов;
+/// y = (q - 8) * d. Каноническая парность НИББЛОВ (ggml dequantize_row_
+/// q4_0): байт j держит веса j и j+16 — low ниббл = w[j], high = w[j+16].
+/// (Раньше здесь была парность (2j, 2j+1) — кастомный диалект, из-за
+/// которого каждый реальный llama.cpp Q4_0 GGUF молча декодировался
+/// переставленным внутри каждого 32-блока.)
 pub fn quant_q4_0(weights: &[f32]) -> Vec<u8> {
     assert!(
         weights.len().is_multiple_of(32),
@@ -115,9 +120,9 @@ pub fn quant_q4_0(weights: &[f32]) -> Vec<u8> {
         let max_abs = blk.iter().fold(0.0f32, |m, w| m.max(w.abs()));
         let d = if max_abs > 0.0 { max_abs / 8.0 } else { 0.0 };
         out.extend_from_slice(&f16_bits(d));
-        for pair in blk.chunks_exact(2) {
-            let q0 = ((pair[0] / d).round() as i32 + 8).clamp(0, 15) as u8;
-            let q1 = ((pair[1] / d).round() as i32 + 8).clamp(0, 15) as u8;
+        for j in 0..16 {
+            let q0 = ((blk[j] / d).round() as i32 + 8).clamp(0, 15) as u8;
+            let q1 = ((blk[j + 16] / d).round() as i32 + 8).clamp(0, 15) as u8;
             out.push((q0 & 0x0F) | ((q1 & 0x0F) << 4));
         }
     }
@@ -699,18 +704,38 @@ mod tests {
     }
 
     fn dequant_q4_0(data: &[u8], n: usize) -> Vec<f32> {
-        let mut out = Vec::with_capacity(n);
-        for blk in data.chunks_exact(18) {
+        let mut out = vec![0.0f32; n];
+        for (bi, blk) in data.chunks_exact(18).enumerate() {
             let d = f32::from(f16::from_le_bytes([blk[0], blk[1]]));
-            for byte in &blk[2..] {
-                let lo = byte & 0x0F;
-                let hi = byte >> 4;
-                out.push((lo as i8 - 8) as f32 * d);
-                out.push((hi as i8 - 8) as f32 * d);
+            // Canonical ggml pairing: byte j = w[j] (low) | w[j+16] << 4.
+            for (j, byte) in blk[2..].iter().enumerate() {
+                let base = bi * 32 + j;
+                out[base] = ((byte & 0x0F) as i8 - 8) as f32 * d;
+                out[base + 16] = ((byte >> 4) as i8 - 8) as f32 * d;
             }
         }
         out.truncate(n);
         out
+    }
+
+    /// N (iter-9): a REAL llama.cpp Q4_0 block (canonical pairing) must
+    /// decode to the expected values — guards the mirrored-bug class that
+    /// shipped the old dialect (encoder+decoder both wrong still round-trip).
+    #[test]
+    fn q4_0_canonical_layout_vector() {
+        // Hand-crafted canonical block: d = 1.0, byte 0 = 0x12 → w[0] =
+        // 2-8 = -6 (low nibble), w[16] = 1-8 = -7 (high nibble); all other
+        // bytes 0 → w[j] = -8.
+        let mut data = vec![0u8; 18];
+        data[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        data[2] = 0x12;
+        let v = dequant_q4_0(&data, 32);
+        assert_eq!(v.len(), 32);
+        assert!((v[0] - (-6.0)).abs() < 1e-4, "w[0] = {}", v[0]);
+        assert!((v[16] - (-7.0)).abs() < 1e-4, "w[16] = {}", v[16]);
+        for j in [1usize, 15, 17, 31] {
+            assert!((v[j] - (-8.0)).abs() < 1e-4, "w[{j}] = {}", v[j]);
+        }
     }
 
     #[test]

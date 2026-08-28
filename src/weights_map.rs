@@ -145,14 +145,22 @@ fn bf16_to_f32(b: [u8; 2]) -> f32 {
 }
 
 pub(crate) fn dequant_q4_0(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(18)
-        .flat_map(|blk| {
-            let d = f16_to_f32([blk[0], blk[1]]);
-            blk[2..]
-                .iter()
-                .flat_map(move |&b| [((b & 0x0F) as f32 - 8.0) * d, ((b >> 4) as f32 - 8.0) * d])
-        })
-        .collect()
+    let mut out = Vec::with_capacity(data.len() / 18 * 32);
+    for blk in data.chunks_exact(18) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        // N (iter-9): canonical ggml pairing — byte j holds weights
+        // j (low nibble) and j+16 (high nibble). Positions are INDEXED
+        // (j and j+16) — the old consecutive push interleaved them as
+        // (2j, 2j+1), silently misparsing every real llama.cpp Q4_0 GGUF.
+        let qs = &blk[2..];
+        for j in 0..16 {
+            out.push(((qs[j] & 0x0F) as f32 - 8.0) * d); // w[j]
+        }
+        for j in 0..16 {
+            out.push(((qs[j] >> 4) as f32 - 8.0) * d); // w[j+16]
+        }
+    }
+    out
 }
 
 pub(crate) fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
@@ -445,4 +453,5 @@ mod tests {
         assert_eq!(m.tied_aliases("output.weight"), vec!["token_embd.weight"]);
         assert_eq!(dequant_f32(t0), dequant_f32(t1));
     }
+
 }

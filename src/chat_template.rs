@@ -335,9 +335,13 @@ fn eval_list(
 }
 
 fn render_message(m: &HashMap<String, String>) -> String {
-    // сообщение сериализуется как `{'role': '...', 'content': '...'}`
-    let role = m.get("role").map(String::as_str).unwrap_or("");
-    let content = m.get("content").map(String::as_str).unwrap_or("");
+    // сообщение сериализуется как `{'role': '...', 'content': '...'}`;
+    // кавычка и backslash экранируются, иначе dict_get обрезает значение
+    // на первой же апострофе («don't stop» → «don») — раньше содержимое
+    // вставлялось raw.
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+    let role = esc(m.get("role").map(String::as_str).unwrap_or(""));
+    let content = esc(m.get("content").map(String::as_str).unwrap_or(""));
     format!("{{'role': '{role}', 'content': '{content}'}}")
 }
 
@@ -428,17 +432,38 @@ fn eval_index(
     }
 }
 
-/// Достать значение из сериализованного словаря `{'role': '...', 'content': '...'}`.
+/// Достать значение из сериализованного словаря `{'role': '...', 'content':
+/// '...'}`. Значение читается с учётом backslash-эскейпов (render_message
+/// экранирует `\` и `'`): `\'` → `'`, `\\` → `\`; неэкранированная `'`
+/// завершает значение.
 fn dict_get(v: &str, key: &str) -> VResult {
     let pat = format!("'{key}': '");
     let start = v
         .find(&pat)
         .ok_or_else(|| TemplateError::NotString(format!("dict[{key}]")))?;
     let tail = &v[start + pat.len()..];
-    let end = tail
-        .find('\'')
-        .ok_or_else(|| TemplateError::NotString(format!("dict[{key}]")))?;
-    Ok(tail[..end].to_string())
+    let mut out = String::new();
+    let mut escaped = false;
+    let mut closed = false;
+    for c in tail.chars() {
+        if escaped {
+            out.push(c); // \' → ', \\ → \ (второй символ экраНа — как есть)
+            escaped = false;
+        } else {
+            match c {
+                '\\' => escaped = true,
+                '\'' => {
+                    closed = true;
+                    break;
+                }
+                other => out.push(other),
+            }
+        }
+    }
+    if !closed {
+        return Err(TemplateError::NotString(format!("dict[{key}]")));
+    }
+    Ok(out)
 }
 
 fn eval_truthy(
@@ -580,6 +605,21 @@ mod tests {
     fn unsupported_construct_is_error_not_garbage() {
         let t = Template::compile("{% macro x() %}y{% endmacro %}", HashMap::new());
         assert!(t.is_err());
+    }
+
+    /// Апостроф и backslash в content не должны обрезать значение:
+    /// render_message экранирует их, dict_get разворачивает.
+    #[test]
+    fn apostrophe_in_content_is_not_truncated() {
+        let t = Template::compile(
+            "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}{% endfor %}",
+            HashMap::new(),
+        )
+        .unwrap();
+        let out = t
+            .render(&ctx(&[("user", "don't stop, 100% \\ real")]))
+            .unwrap();
+        assert_eq!(out, "user: don't stop, 100% \\ real");
     }
 }
 

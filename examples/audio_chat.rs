@@ -171,6 +171,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &backend,
             &ids,
             &audio_features,
+            &[], // deepstack: у Omni-аудио его нет
             model.cfg.thinker.audio_token_id,
             &pos4d,
             pos_after,

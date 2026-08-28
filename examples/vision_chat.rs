@@ -92,18 +92,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect();
         let t0 = Instant::now();
-        let vemb = v.forward(&backend, &img, h, w)?;
+        let (vemb, vds) = v.forward(&backend, &img, h, w)?;
         eprintln!(
-            "vision forward: shape {:?} in {:.1}s",
+            "vision forward: main {:?} + {} deepstack-блока {:?} в {:.1}s",
             vemb.shape(),
+            vds.len(),
+            vds.first().map(|d| d.shape()),
             t0.elapsed().as_secs_f32()
         );
-        Some((v, vemb))
+        Some((v, vemb, vds))
     } else {
         eprintln!("vision: text-only (mmproj не грузим)");
         None
     };
-    let n_img = vision.as_ref().map(|(v, _)| v.n_tokens()).unwrap_or(2304);
+    let n_img = vision.as_ref().map(|(v, _, _)| v.n_tokens()).unwrap_or(576);
 
     let mut ids: Vec<u32> = if text_only {
         tok.encode(&format!(
@@ -172,8 +174,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut model = Qwen3Model::load(&backend, &wm, cfg.clone())?;
     let t0 = Instant::now();
-    let mut logits = if let Some((_, vemb)) = &vision {
-        model.prefill_with_vision(&backend, &ids, vemb, IMAGE_PAD, &pos4d, pos_after)?
+    let mut logits = if let Some((_, vemb, vds)) = &vision {
+        model.prefill_with_vision(
+            &backend,
+            &ids,
+            vemb,
+            vds,
+            IMAGE_PAD,
+            &pos4d,
+            pos_after,
+        )?
     } else {
         model.prefill(&backend, &ids)?
     };

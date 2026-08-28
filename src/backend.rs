@@ -888,7 +888,10 @@ pub trait Backend: Send + Sync {
     fn sigmoid(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
-    /// Fused SwiGLU gate: Y[i] = silu(X[i]) * X[ffn + i]; X [rows, 2*ffn].
+    /// Fused SwiGLU gate, row-major per-row gate|up halves: X is (rows, 2·ffn),
+    /// and for row r / col c the op writes
+    /// Y[r·ffn + c] = silu(X[r·2·ffn + c]) · X[r·2·ffn + ffn + c].
+    /// (The gate and up halves are PER ROW, not one flat split of X.)
     fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError>;
 
     /// DFlash2 two-tap dynamic conv (спека PR #27342):

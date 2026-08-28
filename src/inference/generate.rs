@@ -5,7 +5,7 @@
 
 use crate::backend::Backend;
 use crate::error::BackendError;
-use crate::inference::sampling::{SamplingParams, top_p_sample_vec};
+use crate::inference::sampling::{SamplingParams, top_p_sample_vec_history};
 use crate::qwen3::Qwen3Model;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
@@ -96,6 +96,9 @@ pub fn generate(
     let mut rng_state: Option<u64> = None;
     let mut decoder = IncrementalDecoder::new();
     let mut acc = String::new(); // накопленный текст (для stop-строк)
+    // История для repetition penalty: промпт + уже порождённые токены
+    // (раньше params.repeat_penalty молча игнорировался).
+    let mut history: Vec<u32> = ids.to_vec();
     let mut finish: Option<FinishReason> = None;
 
     for _ in 0..params.max_tokens {
@@ -117,7 +120,7 @@ pub fn generate(
                 repetition_penalty: params.repeat_penalty,
                 seed: None,
             };
-            top_p_sample_vec(last, &sp, &mut rng_state)
+            top_p_sample_vec_history(last, &sp, &history, &mut rng_state)
         };
 
         if let Some(r) = check_stop(next, tok.eos, &acc, &params.stop_strings) {
@@ -132,6 +135,7 @@ pub fn generate(
         }
         on_event(GenerateEvent::Token(next));
         generated.push(next);
+        history.push(next);
 
         logits = model.decode(backend, next)?;
     }

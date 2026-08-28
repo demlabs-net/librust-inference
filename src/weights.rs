@@ -206,13 +206,16 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
             .get("data_offsets")
             .and_then(|v| v.as_array())
             .ok_or_else(|| anyhow::anyhow!("missing data_offsets for {name}"))?;
-        let start = offsets
+        // checked-арифметика как в read_safetensors_f32: битый заголовок
+        // (обрезанный файл) — ошибка, а не переполнение/паника.
+        let raw = offsets
             .first()
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))?
-            as usize
-            + 8
-            + header_len;
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))? as usize;
+        let start = raw
+            .checked_add(8)
+            .and_then(|s| s.checked_add(header_len))
+            .ok_or_else(|| anyhow::anyhow!("data offset overflow for {name}"))?;
         out.push((name.clone(), dtype, shape, start));
     }
     Ok(out)
@@ -254,8 +257,12 @@ pub fn read_safetensors_tensor_f32(
         "I64" => 8,
         other => anyhow::bail!("tensor {name}: unsupported dtype {other}"),
     };
+    // checked (как в стриминг-ридере): битый shape → ошибка, не wrap.
+    let nbytes = numel
+        .checked_mul(elem)
+        .ok_or_else(|| anyhow::anyhow!("tensor {name}: size overflow"))?;
     let end = start
-        .checked_add(numel * elem)
+        .checked_add(nbytes)
         .ok_or_else(|| anyhow::anyhow!("overflow for {name}"))?;
     let data = bytes
         .get(start..end)

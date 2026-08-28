@@ -39,9 +39,12 @@ pub struct Qwen3Config {
     /// MROPE-секции (Qwen3-VL, IMROPE): [t, h, w, e] в парах; текст ротирует
     /// t/h/w-пары позицией pos, e-пары — позицией 0 (не ротируются).
     pub mrope_sections: Option<[usize; 4]>,
-    /// Текстовый deepstack (Qwen3-VL): после первых N слоёв к выходу
-    /// добавляются входные эмбеддинги со сдвигом (il+1) токенов
-    /// (llama.cpp qwen3vl.cpp: t_inp_embd view). None = нет.
+    /// Текстовый deepstack (Qwen3-VL): после слоёв 0..N-1 к скрытым
+    /// состояниям НА ПОЗИЦИЯХ image-токенов добавляются deepstack-фичи
+    /// vision-энкодера (HF `_deepstack_process`: hidden[visual_pos] +=
+    /// ds[layer]; в llama.cpp qwen3vl.cpp per-token компоненты
+    /// [main|ds0|ds1|ds2] входного буфера для текстовых токенов нулевые).
+    /// None = нет.
     pub n_deepstack: Option<usize>,
 }
 
@@ -358,7 +361,7 @@ impl Qwen3Model {
         let r = (|| {
             let t = ids.len();
             let x = self.embed.forward(backend, ids, t)?;
-            let logits = self.forward_layers(backend, x, t, None)?;
+            let logits = self.forward_layers(backend, x, t, None, None)?;
             self.pos_rope = self.caches[0].pos;
             Ok(logits)
         })();
@@ -452,15 +455,20 @@ impl Qwen3Model {
 
     /// Prefill с vision-эмбеддингами (Ф1.11): токены == `vision_token`
     /// заменяются строками vision-энкодера (по порядку появления) — всё на
-    /// GPU (embedding_override). `pos4d` — M-RoPE позиции (t,h,w,e) на токен
-    /// (len = t*4; текст: t=h=w=pos, e=0; картинка: t=pos_0, h=pos_0+i/nx,
-    /// w=pos_0+i%nx, e=0). `pos_after` — логическая позиция (секция t)
-    /// следующего decode (после картинки pos_0+24, а не +2304).
+    /// GPU (embedding_override). `deepstack` — блоки vision-энкодера
+    /// (VisionQwen3Vl::forward, 3 × [1, n_img, dim]; пустой срез = нет);
+    /// после слоёв 0..n_deepstack-1 они добавляются к скрытым состояниям
+    /// image-позиций (HF _deepstack_process). `pos4d` — M-RoPE позиции
+    /// (t,h,w,e) на токен (len = t*4; текст: t=h=w=pos, e=0; картинка:
+    /// t=pos_0, h=pos_0+i/nx, w=pos_0+i%nx, e=0). `pos_after` — логическая
+    /// позиция (секция t) следующего decode (после картинки pos_0+24,
+    /// а не +2304).
     pub fn prefill_with_vision(
         &mut self,
         backend: &dyn Backend,
         ids: &[u32],
         vision: &Tensor,
+        deepstack: &[Tensor],
         vision_token: u32,
         pos4d: &[u32],
         pos_after: usize,
@@ -471,7 +479,13 @@ impl Qwen3Model {
             assert_eq!(pos4d.len(), t * 4, "pos4d: {t} токенов × 4");
             let x = backend.zeros(vec![1, t, self.cfg.dim])?;
             backend.embedding_override(ids, &self.embed.table, vision, &x, vision_token)?;
-            let logits = self.forward_layers(backend, x, t, Some(pos4d))?;
+            // Выровнять deepstack-блоки по токен-позициям: фичи на строках
+            // image-токенов, нули вне их — полное сложение x += aligned[il]
+            // тогда совпадает с HF (на текстовые токены deepstack не
+            // действует; llama.cpp кладёт в буфере нули).
+            let ds_aligned = self.align_deepstack(backend, ids, deepstack, vision_token)?;
+            let ds = ds_aligned.as_deref();
+            let logits = self.forward_layers(backend, x, t, Some(pos4d), ds)?;
             self.pos_rope = pos_after;
             Ok(logits)
         })();
@@ -479,9 +493,59 @@ impl Qwen3Model {
         r
     }
 
+    /// Выровнять deepstack-блоки: блок [1, n_img, dim] → [1, T, dim], где
+    /// строки image-токенов (ids == vision_token) содержат фичи блока (по
+    /// порядку), остальные — нули. Размерность T нужна, чтобы одно сложение
+    /// x += aligned шло по всем токен-позициям сразу.
+    fn align_deepstack(
+        &self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        deepstack: &[Tensor],
+        vision_token: u32,
+    ) -> Result<Option<Vec<Tensor>>, BackendError> {
+        if deepstack.is_empty() {
+            return Ok(None);
+        }
+        let dim = self.cfg.dim;
+        let t = ids.len();
+        let img_rows: Vec<usize> = (0..t)
+            .filter(|&k| ids[k] == vision_token)
+            .collect();
+        if img_rows.is_empty() {
+            return Err(BackendError::Shape(
+                "deepstack: нет image-токенов в ids (vision_token не найден)".into(),
+            ));
+        }
+        let n_img = img_rows.len();
+        let mut out = Vec::with_capacity(deepstack.len());
+        for (il, block) in deepstack.iter().enumerate() {
+            let (b, n, d) = (block.shape()[0], block.shape()[1], block.shape()[2]);
+            if d != dim {
+                return Err(BackendError::Shape(format!(
+                    "deepstack[{il}]: dim {d} != {dim}"
+                )));
+            }
+            if b * n != n_img {
+                return Err(BackendError::Shape(format!(
+                    "deepstack[{il}]: {b}×{n} строк != n_image_tokens {n_img}"
+                )));
+            }
+            let feats = backend.to_cpu_f32(block)?;
+            let mut padded = vec![0.0f32; t * dim];
+            for (k, &row) in img_rows.iter().enumerate() {
+                padded[row * dim..(row + 1) * dim]
+                    .copy_from_slice(&feats[k * dim..(k + 1) * dim]);
+            }
+            out.push(backend.from_cpu_f32(&padded, vec![1, t, dim])?);
+        }
+        Ok(Some(out))
+    }
+
     /// Скрытые состояния после `upto` слоёв (None — все) + out_norm.
     /// Для DFlash-драфтеров (conditioning на hidden states) и сверки
-    /// DraftModel-среза с полной моделью.
+    /// DraftModel-среза с полной моделью. `deepstack` — выровненные
+    /// deepstack-блоки ([1, T, dim], Some только в vision-пути).
     fn forward_layers_hidden(
         &mut self,
         backend: &dyn Backend,
@@ -489,16 +553,13 @@ impl Qwen3Model {
         t: usize,
         mrope: Option<&[u32]>,
         upto: Option<usize>,
+        deepstack: Option<&[Tensor]>,
     ) -> Result<Tensor, BackendError> {
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
         if std::env::var("INFER_LLM_DEBUG").is_ok() {
             let xv = backend.to_cpu_f32(&x)?;
             eprintln!("INFER_DEBUG embed[0,:8]={:?}", &xv[..8]);
         }
-        // текстовый deepstack (Qwen3-VL): к слоям 0..N-1 добавляются входные
-        // эмбеддинги со сдвигом (il+1) токенов (llama.cpp t_inp_embd view);
-        // для последних токенов сдвиг выходит за границу — вклад нулевой.
-        let embd_in = x.clone();
         let mut prof_attn = 0.0f64;
         let mut prof_ffn = 0.0f64;
         let prof = std::env::var("LLM_BENCH").is_ok();
@@ -562,16 +623,19 @@ impl Qwen3Model {
                 let last = xv.len() - self.cfg.dim;
                 eprintln!("OMNI_REF after_ffn_layer0[-1,:8]={:?}", &xv[last..last + 8]);
             }
-            // deepstack: x[t] += embd_in[t + il + 1] — только в vision-пути
-            // (llama.cpp: в text-only токен-пути расширенный входной буфер
-            // пэддится нулями — вклад нулевой; смещения кладёт mtmd при
-            // vision-входе). Временная CPU-проверка, потом — MSL-кернел.
+            // deepstack (Qwen3-VL): после слоя il < N к скрытым состояниям
+            // image-позиций добавляется блок il (HF _deepstack_process:
+            // hidden[visual_pos] += ds[layer]; llama.cpp qwen3vl.cpp: cur +=
+            // view t_inp_embd — per-token компоненты [main|ds0|ds1|ds2], для
+            // текстовых токенов нулевые). Блоки выровнены по токен-позициям
+            // в prefill_with_vision (нули вне image-строк) — полное сложение.
+            // Старый вариант `x[t] += embd_in[t + il + 1]` сдвигал на il+1
+            // ТОКЕН эмбеддингов текста — не deepstack-фичи (ошибка).
             if mrope.is_some() && std::env::var("Q3_NO_DS").is_err() {
                 if let Some(n_ds) = self.cfg.n_deepstack {
                     if i < n_ds {
-                        let shift = i + 1;
-                        if t > shift {
-                            x = backend.deepstack(&x, &embd_in, shift)?;
+                        if let Some(ds) = deepstack.and_then(|d| d.get(i)) {
+                            x = backend.deepstack(&x, ds, 0)?;
                         }
                     }
                 }
@@ -593,15 +657,17 @@ impl Qwen3Model {
     }
 
     /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
+    /// `deepstack` — выровненные deepstack-блоки (только vision-путь).
     fn forward_layers(
         &mut self,
         backend: &dyn Backend,
         x: Tensor,
         t: usize,
         mrope: Option<&[u32]>,
+        deepstack: Option<&[Tensor]>,
     ) -> Result<Tensor, BackendError> {
         let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-        let h = self.forward_layers_hidden(backend, x, t, mrope, None)?;
+        let h = self.forward_layers_hidden(backend, x, t, mrope, None, deepstack)?;
         let h2 = h.view(vec![b * tq, d]);
         let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;
@@ -618,7 +684,7 @@ impl Qwen3Model {
         let r = (|| {
             let t = ids.len();
             let x = self.embed.forward(backend, ids, t)?;
-            let h = self.forward_layers_hidden(backend, x, t, None, None)?;
+            let h = self.forward_layers_hidden(backend, x, t, None, None, None)?;
             Ok(h)
         })();
         backend.end_batch()?;
@@ -698,8 +764,20 @@ impl Qwen3Model {
         if total <= 0.0 {
             return draft_tok; // вырожденный случай — масса целиком в draft
         }
-        // LCG как в inference::sampling::top_p_sample_vec.
-        let r = match rng {
+        let mut r = Self::uniform01(rng) * total;
+        for (i, &v) in w.iter().enumerate() {
+            r -= v;
+            if r <= 0.0 {
+                return i as u32;
+            }
+        }
+        (w.len() - 1) as u32
+    }
+
+    /// Равномерное U(0,1) — тот же LCG, что в inference::sampling
+    /// (state = None → сид из часов, пишется обратно в state).
+    fn uniform01(rng: &mut Option<u64>) -> f32 {
+        match rng {
             Some(state) => {
                 *state = state
                     .wrapping_mul(6364136223846793005)
@@ -718,15 +796,7 @@ impl Qwen3Model {
                 *rng = Some(st);
                 (st >> 33) as f32 / (1u64 << 33) as f32
             }
-        };
-        let mut r = r * total;
-        for (i, &v) in w.iter().enumerate() {
-            r -= v;
-            if r <= 0.0 {
-                return i as u32;
-            }
         }
-        (w.len() - 1) as u32
     }
 
     /// Спекулятивный decode (Ф2.1 каркас): батч-верификация draft одним
@@ -734,6 +804,12 @@ impl Qwen3Model {
     /// непринятого хвоста. `draft_probs` — вероятности драфтера q_i.
     /// `extract_layers` — собрать скрытые этих слоёв (DFlash-инжект Ф2.4;
     /// пустой — без сбора).
+    ///
+    /// Верификация draft[i] — по распределению на позиции ПЕРЕД ним (row i:
+    /// row 0 — после id, row k — после draft[k-1]); при отклонении пересэмпл
+    /// из той же строки. Возвращаемые логиты — row accepted_len-1: строка,
+    /// соответствующая состоянию кэша после отката (при полном принятии —
+    /// последняя, продолжение).
     pub fn decode_spec(
         &mut self,
         backend: &dyn Backend,
@@ -751,17 +827,22 @@ impl Qwen3Model {
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?; // [1, T, V]
         let v = logits.shape()[2];
         let ld = backend.to_cpu_f32(&logits)?;
-        // 2. Rejection-sampling по позициям.
+        // 2. Честное rejection-sampling (Leviathan et al., алгоритм 2):
+        // draft[i] принимается с вероятностью min(1, p/q), где p — softmax
+        // таргета на draft[i], q — вероятность драфтера. Раньше сравнение
+        // было детерминированным (q <= p → принять) — не сэмплирование.
         let mut accepted: Vec<u32> = Vec::new();
         let mut accepted_len = 1usize;
         for i in 0..draft.len() {
-            let row = &ld[(i + 1) * v..(i + 2) * v];
+            let row = &ld[i * v..(i + 1) * v];
             let p = Self::softmax_prob(row, draft[i]);
-            if draft_probs[i] <= p {
+            let q = draft_probs[i];
+            let u = Self::uniform01(rng);
+            if q <= 0.0 || u * q <= p {
                 accepted.push(draft[i]);
                 accepted_len += 1;
             } else {
-                accepted.push(Self::sample_modified(row, draft[i], draft_probs[i], rng));
+                accepted.push(Self::sample_modified(row, draft[i], q, rng));
                 break;
             }
         }
@@ -773,14 +854,10 @@ impl Qwen3Model {
             }
             self.pos_rope = base + accepted_len;
         }
-        // Логиты позиции accepted_len (первой после принятой части) — они
-        // СООТВЕТСТВУЮТ откаченному кэшу. При полном принятии это последняя
-        // строка (продолжение после всех draft) — как раньше.
-        let row_idx = if accepted_len == ids.len() {
-            ids.len() - 1
-        } else {
-            accepted_len
-        };
+        // Логиты позиции accepted_len-1 — СООТВЕТСТВУЮТ откаченному кэшу
+        // (распределение после последнего принятого токена; при полном
+        // принятии — последняя строка, продолжение после всех draft).
+        let row_idx = accepted_len - 1;
         let row = &ld[row_idx * v..(row_idx + 1) * v];
         let logits = backend.from_cpu_f32(row, vec![1, 1, v])?;
         let n_draft_accepted = accepted_len.saturating_sub(1);
@@ -799,7 +876,7 @@ impl Qwen3Model {
         backend.begin_batch()?;
         let r = (|| {
             let x = self.embed.forward(backend, &[id], 1)?;
-            let logits = self.forward_layers(backend, x, 1, None)?;
+            let logits = self.forward_layers(backend, x, 1, None, None)?;
             self.pos_rope += 1;
             Ok(logits)
         })();
@@ -1034,18 +1111,30 @@ pub fn qk_norm_pub(
 
 /// M-RoPE attention mask: каузальность по t-позициям (секция 0). Токены
 /// картинки имеют равные t → видят всю картинку; текст после картинки
-/// (t больше) видит всё до себя. tkv — позиция в кэше (cache.pos).
+/// (t больше) видит всё до себя. tkv — размер кэша (cache.pos, ПОСЛЕ
+/// записи текущих токенов); `tq` последних слотов — текущие токены,
+/// их t-значения — pos4d. Слоты ДО них (прошлые ходы, j < tkv - tq) —
+/// старый контекст: их сохранённые t недоступны, поэтому безопасный
+/// фолбэк — считать их текстом (t = 0, секция 0): 0 ≤ ti для любых
+/// текущих ti → старые слоты видны всем текущим токенам (каузальность
+/// по порядку следования сохраняется).
 fn build_mrope_mask(
     backend: &dyn Backend,
     tq: usize,
     tkv: usize,
     pos4d: &[u32],
 ) -> Result<Tensor, BackendError> {
+    let cache_start = tkv.saturating_sub(tq); // слот первого текущего токена
     let mut data = vec![0.0f32; tq * tkv];
     for i in 0..tq {
         let ti = pos4d[i * 4];
         for j in 0..tkv {
-            let tj = if j < tq { pos4d[j * 4] } else { 0 };
+            // j-й слот кэша: текущий токен — свой t из pos4d; старый — 0.
+            let tj = if j >= cache_start {
+                pos4d[(j - cache_start) * 4]
+            } else {
+                0
+            };
             if tj > ti {
                 data[i * tkv + j] = f32::NEG_INFINITY;
             }
@@ -1064,7 +1153,10 @@ fn upload_w(
     if backend.supports_f16_weights() {
         let n: usize = shape.iter().product();
         if n != data.len() {
-            eprintln!("DBG upload_w MISMATCH shape={shape:?} data={}", data.len());
+            return Err(BackendError::Shape(format!(
+                "upload_w: numel mismatch shape={shape:?} data={}",
+                data.len()
+            )));
         }
         let f16: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
         backend.from_cpu_f16(&f16, shape)
@@ -1247,30 +1339,89 @@ mod tests {
         assert_eq!(a, b, "spec(γ=0) должен совпадать с decode");
     }
 
-    /// Ф2.1: draft отклоняется (q=1 > p), KV откатывается — следующий
-    /// decode совпадает с обычным decode после того же prefill.
+    /// Ф2.1: честное rejection-sampling — draft отклоняется, когда случайный
+    /// u > p/q (сид выбран так, что первый u > p токена 3 при q=1), KV
+    /// откатывается — следующий decode совпадает с обычным decode после
+    /// того же prefill.
     #[test]
     fn decode_spec_rejects_and_rolls_back() {
         let (backend, mut model) = mini_model();
         let ids = [1u32, 2, 3, 4];
+        // p3 — вероятность draft-токена 3 в распределении проверки (row 0:
+        // после id=5; γ=0-spec возвращает именно эту строку логитов).
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = None;
+        let probe = model
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[])
+            .unwrap();
+        let pv = backend.to_cpu_f32(&probe.logits).unwrap();
+        let p3 = Qwen3Model::softmax_prob(&pv, 3);
+        // Детерминированный сид: первый draw LCG > p3 → u·q = u > p —
+        // гарантированное отклонение (при q=1 принятие ⇔ u ≤ p).
+        let seed = (1u64..)
+            .find(|&s| {
+                let st = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (st >> 33) as f32 / (1u64 << 33) as f32 > p3
+            })
+            .unwrap();
+
+        model.reset_cache(&backend).unwrap();
         model.prefill(&backend, &ids).unwrap();
         let l1 = model.decode(&backend, 5).unwrap();
         let l2 = model.decode(&backend, 6).unwrap();
 
         model.reset_cache(&backend).unwrap();
         model.prefill(&backend, &ids).unwrap();
-        let mut rng = None;
+        let mut rng = Some(seed);
         let out = model
             .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[])
             .unwrap();
         assert_eq!(out.accepted.len(), 1, "мусорный draft отклонён");
-        assert_ne!(out.accepted[0], 3, "q=1 > p — токен 3 не принимается");
+        assert_ne!(
+            out.accepted[0], 3,
+            "отклонён → пересэмпл ≠ draft (q=1 вычитает его массу)"
+        );
         // KV откачен (остался id=5) — decode(6) даёт обычный результат.
         let l2s = model.decode(&backend, 6).unwrap();
         let a = backend.to_cpu_f32(&l2).unwrap();
         let b = backend.to_cpu_f32(&l2s).unwrap();
         assert_eq!(a, b, "после отката decode должен совпадать с обычным");
         let _ = l1;
+    }
+
+    /// Честное RS: при q < p принятие детерминировано (min(1, p/q) > 1) —
+    /// draft-токен принимается при любом u, кэш не откатывается.
+    #[test]
+    fn decode_spec_accepts_when_q_below_p() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = None;
+        let probe = model
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[])
+            .unwrap();
+        let pv = backend.to_cpu_f32(&probe.logits).unwrap();
+        let a = pv
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        let p = Qwen3Model::softmax_prob(&pv, a);
+        let q = p * 0.5; // min(1, p/q) = 2 → принятие при любом u < 1
+
+        model.reset_cache(&backend).unwrap();
+        model.prefill(&backend, &ids).unwrap();
+        let mut rng = Some(0xDEAD_BEEF);
+        let out = model
+            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[])
+            .unwrap();
+        assert_eq!(out.accepted, vec![a], "q < p → гарантированное принятие");
+        assert_eq!(out.n_draft_accepted, 1);
+        // Полное принятие: кэш не откатывался (база + id + draft).
+        assert_eq!(model.caches[0].pos, ids.len() + 2);
     }
 
     /// Ф2.2: DraftModel = Qwen3Model с n_layers=k — его forward_hidden
@@ -1291,7 +1442,7 @@ mod tests {
             let t = ids.len();
             backend.begin_batch().unwrap();
             let r = m
-                .forward_layers_hidden(&backend, x, t, None, Some(k))
+                .forward_layers_hidden(&backend, x, t, None, Some(k), None)
                 .unwrap();
             backend.end_batch().unwrap();
             r

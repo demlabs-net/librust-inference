@@ -24,17 +24,21 @@ impl Default for SamplingParams {
     }
 }
 
-/// Top-p sample over a CPU logits vector (temperature applied inside).
-pub fn top_p_sample_vec(
+/// Top-p sample over a CPU logits vector (temperature + repetition penalty
+/// applied inside). `history` — токены уже в контексте (промпт + порождённые):
+/// их логиты штрафуются `repetition_penalty` (раньше параметр был no-op).
+pub fn top_p_sample_vec_history(
     logits: &[f32],
     params: &SamplingParams,
+    history: &[u32],
     rng_state: &mut Option<u64>,
 ) -> u32 {
-    let logits_vec: Vec<f32> = if params.temperature != 1.0 {
+    let mut logits_vec: Vec<f32> = if params.temperature != 1.0 {
         logits.iter().map(|&l| l / params.temperature).collect()
     } else {
         logits.to_vec()
     };
+    apply_repetition_penalty_vec(&mut logits_vec, history, params.repetition_penalty);
     let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp_vals: Vec<f32> = logits_vec.iter().map(|&l| (l - max_logit).exp()).collect();
     let sum_exp: f32 = exp_vals.iter().sum();
@@ -94,6 +98,16 @@ pub fn top_p_sample_vec(
     sample_from(&top_tokens, rng_state)
 }
 
+/// Старое API (без истории) — speech-крейт и прежние вызовы. Без истории
+/// repetition penalty не применяется; для штрафа — top_p_sample_vec_history.
+pub fn top_p_sample_vec(
+    logits: &[f32],
+    params: &SamplingParams,
+    rng_state: &mut Option<u64>,
+) -> u32 {
+    top_p_sample_vec_history(logits, params, &[], rng_state)
+}
+
 /// Sample one token from a small (already top-p filtered) distribution.
 fn sample_from(top_tokens: &[(usize, f32)], rng_state: &mut Option<u64>) -> u32 {
     let total: f32 = top_tokens.iter().map(|(_, p)| p).sum();
@@ -130,12 +144,19 @@ fn sample_from(top_tokens: &[(usize, f32)], rng_state: &mut Option<u64>) -> u32 
     top_tokens[0].0 as u32
 }
 
-/// Repetition penalty over a CPU logits vector (in place).
+/// Repetition penalty over a CPU logits vector (in place). Standard
+/// behaviour (HF): every UNIQUE token of the history with nonzero logit is
+/// penalised once — logit > 0 divided by the penalty, otherwise multiplied.
 pub fn apply_repetition_penalty_vec(logits: &mut [f32], history: &[u32], penalty: f32) {
     if penalty == 1.0 || history.is_empty() {
         return;
     }
-    for &token_id in history {
+    // Штраф ОДИН раз на уникальный токен (повтор в истории не усиливает
+    // штраф — как в HF RepetitionPenaltyLogitsProcessor).
+    let mut seen: Vec<u32> = history.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    for token_id in seen {
         let idx = token_id as usize;
         if idx < logits.len() {
             if logits[idx] > 0.0 {
@@ -187,7 +208,7 @@ mod tests {
         };
         let mut rng = None;
         // Must return the argmax (index 2) and not panic.
-        let t = top_p_sample_vec(&logits, &params, &mut rng);
+        let t = top_p_sample_vec_history(&logits, &params, &[], &mut rng);
         assert_eq!(t, 2, "top_k=1 must yield the argmax");
     }
 
@@ -206,8 +227,8 @@ mod tests {
         let mut rng_a = None;
         let mut rng_b = None;
         for _ in 0..50 {
-            let ta = top_p_sample_vec(&logits, &mk(3), &mut rng_a);
-            let tb = top_p_sample_vec(&logits, &mk(0), &mut rng_b);
+            let ta = top_p_sample_vec_history(&logits, &mk(3), &[], &mut rng_a);
+            let tb = top_p_sample_vec_history(&logits, &mk(0), &[], &mut rng_b);
             assert!(
                 ta < 3 || ta == 2,
                 "top_k=3 must stay in the top-3 window, got {ta}"
@@ -215,5 +236,43 @@ mod tests {
             // The full-sort path returns one of the 3 largest (0.9, 0.8, 0.7).
             assert!([1usize, 6, 3].contains(&(tb as usize)), "unexpected {tb}");
         }
+    }
+
+    /// Repetition penalty больше не no-op: токен из истории выталкивается
+    /// из top-1 окна; повтор токена в истории не усиливает штраф
+    /// (уникальные токены, как в HF).
+    #[test]
+    fn repetition_penalty_demotes_history_tokens() {
+        let logits = [2.0f32, 1.5, 0.9, 0.1];
+        let mk = |rp: f32| SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            repetition_penalty: rp,
+            seed: Some(11),
+        };
+        // Без истории: argmax = 0 (top_k=1 — только он в окне).
+        let mut rng = None;
+        assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[], &mut rng), 0);
+        // Токен 0 в истории: 2.0/2 = 1.0 < 1.5 → argmax = 1 → top_k=1 окно
+        // не содержит 0 → ни один draw не вернёт 0.
+        let mut rng = None;
+        for _ in 0..10 {
+            assert_ne!(
+                top_p_sample_vec_history(&logits, &mk(2.0), &[0], &mut rng),
+                0,
+                "penalised token must leave the top-1 window"
+            );
+        }
+        // Повтор в истории не удваивает штраф: [0,0] → по-прежнему 2.0/2 =
+        // 1.0 (без dedup было бы 0.5 → argmax 2).
+        let mut rng = None;
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &mk(2.0), &[0, 0], &mut rng),
+            1
+        );
+        // penalty == 1.0 — no-op.
+        let mut rng = None;
+        assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[0], &mut rng), 0);
     }
 }

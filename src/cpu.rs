@@ -504,6 +504,22 @@ impl Backend for CpuBackend {
                 "conv1d_groups: group mismatch (cout={cout}, cin={cin}, groups={groups}, cin_g={cin_g})"
             )));
         }
+        // Q22b (mirror of the CUDA backend): stride == 0 divides by zero,
+        // and a padded input smaller than the dilated kernel window
+        // underflowed the usize `tout` (wrap in release, panic in debug).
+        // Guard BEFORE computing tout.
+        if stride == 0 {
+            return Err(BackendError::Shape(format!(
+                "conv1d_groups: stride 0 (t={t}, pad_l={pad_l}, pad_r={pad_r}, dil={dil}, k={k})"
+            )));
+        }
+        if t + pad_l + pad_r < dil * (k - 1) + 1 {
+            return Err(BackendError::Shape(format!(
+                "conv1d_groups: padded input {} smaller than the dilated kernel window {} (t={t}, pad_l={pad_l}, pad_r={pad_r}, dil={dil}, k={k})",
+                t + pad_l + pad_r,
+                dil * (k - 1) + 1
+            )));
+        }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
         if y.shape() != &[b, tout, cout] {
             return Err(BackendError::Shape(format!(
@@ -1067,12 +1083,14 @@ impl Backend for CpuBackend {
         // X (rows, h·hd), w (hd) shared across heads. X may be 2D/3D
         // (batched tokens); rows = all leading dims flattened.
         let last = x.shape().len() - 1;
-        // h == 0 divides by zero (x.shape()[last] / h) — mirror the CUDA
-        // backend's guard so both paths reject it.
-        if h == 0 {
-            return Err(BackendError::Shape(
-                "rmsnorm_head: head count h=0".into(),
-            ));
+        // h == 0 divides by zero (x.shape()[last] / h); a non-multiple x dim
+        // truncates hd and mis-addresses rows — mirror the CUDA backend's
+        // strict divisibility check so both paths reject it.
+        if h == 0 || x.shape()[last] % h != 0 {
+            return Err(BackendError::Shape(format!(
+                "rmsnorm_head: head count h={h} does not divide x dim {}",
+                x.shape()[last]
+            )));
         }
         let hd = x.shape()[last] / h;
         let rows = x.numel() / (h * hd);
@@ -1555,7 +1573,11 @@ impl Backend for CpuBackend {
         // mismatched dst batch would slice OOB (panic) instead of failing
         // loudly like the capacity guard.
         if dst.shape()[0] != b || dst.shape()[2] != d || pos + tq > cap {
-            return Err(BackendError::Shape("kv_update: capacity exceeded".into()));
+            return Err(BackendError::Shape(format!(
+                "kv_update: dst batch {} / dim {} != src batch {b} / dim {d}, or pos {pos} + tq {tq} > cap {cap}",
+                dst.shape()[0],
+                dst.shape()[2]
+            )));
         }
         let s = data(src);
         let mut dd = data_mut(dst);

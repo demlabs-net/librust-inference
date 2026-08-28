@@ -47,7 +47,15 @@ fn parity_case(quant: WeightQuant, rows: usize, per: usize, seed: u64) {
     let mut w = vec![0f32; rows * per];
     Lcg::new(seed).fill(&mut w);
 
-    let b_g = upload_quant(&gpu, quant, "w", &w, &[rows, per]).unwrap();
+    // The speech cache keys on (name, shape) WITHOUT the quant — distinct
+    // names keep a future same-shape cross-quant case from colliding with
+    // this one's cached tensor.
+    let name = match quant {
+        WeightQuant::Q5KM => "w_q5k",
+        WeightQuant::Q3KS => "w_q3k",
+        _ => unreachable!("parity_case supports Q5KM/Q3KS only"),
+    };
+    let b_g = upload_quant(&gpu, quant, name, &w, &[rows, per]).unwrap();
     gpu.synchronize().unwrap();
     let got = gpu.to_cpu_f32(&b_g).unwrap();
     assert_eq!(got.len(), rows * per);

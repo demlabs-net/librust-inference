@@ -45,24 +45,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let t0 = std::time::Instant::now();
-    let out = model.forward(&backend, &img, h, w)?;
+    let (out, ds) = model.forward(&backend, &img, h, w)?;
     let dt = t0.elapsed();
     let v = backend.to_cpu_f32(&out)?;
     let n_nan = v.iter().filter(|x| x.is_nan()).count();
     let n_inf = v.iter().filter(|x| x.is_infinite()).count();
     let mean: f32 = v.iter().sum::<f32>() / v.len() as f32;
     println!(
-        "out: shape {:?} values={} nan={} inf={} mean={mean:.4} in {:.1}s",
+        "out: shape {:?} values={} nan={} inf={} mean={mean:.4} in {:.1}s (deepstack: {} блока {:?})",
         out.shape(),
         v.len(),
         n_nan,
         n_inf,
-        dt.as_secs_f32()
+        dt.as_secs_f32(),
+        ds.len(),
+        ds.first().map(|d| d.shape()),
     );
     assert_eq!(
         out.shape(),
-        &[1, 2304, 2048],
-        "expected 2304 vision tokens × 2048"
+        &[1, 576, 2048],
+        "expected 576 vision tokens (24×24 после merge 2×2) × 2048"
     );
     assert_eq!(n_nan, 0, "NaN in vision output");
     assert_eq!(n_inf, 0, "Inf in vision output");
@@ -73,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("VISION_DUMP").is_ok() {
         // полный выход для сверки с python-эталоном (vision_py.npy)
         let mut out = String::new();
-        for val in v.iter().take(2304 * 2048) {
+        for val in v.iter().take(576 * 2048) {
             out.push_str(&format!("{val:.9}\n"));
         }
         std::fs::write("/tmp/vision_rust.txt", out)?;

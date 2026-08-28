@@ -1,7 +1,9 @@
 //! Ф1.11 Qwen3-VL vision (спец-граф llama.cpp qwen3vl.cpp): conv-patch ×2
 //! (сумма), spatial merge 2×2, position_embd, 24 блока БЕЗ GQA (fused qkv,
 //! hd=64, FFN up/down + ERF-GELU, без gate), deepstack-ветки (слои 5/11/17),
-//! post_ln, merger mm.0→gelu→mm.2, concat(deepstack) → 2304×2048.
+//! post_ln, merger mm.0→gelu→mm.2 → main [576, 2048]; deepstack-блоки
+//! (3 × [576, 2048]) возвращаются РАЗДЕЛЬНО — их добавляет к скрытым
+//! состояниям image-позиций LLM (Qwen3Model::prefill_with_vision).
 //!
 //! M-RoPE vision для ОДНОЙ картинки — identity (t=0; роуп нужен только
 //! видео); позиции даёт learned position_embd.
@@ -169,19 +171,27 @@ impl VisionQwen3Vl {
         })
     }
 
-    /// Число vision-токенов: (image/32)² × 4 (merge 2×2 → 4 токена на блок).
+    /// Число vision-токенов: (image/32)² — ОДИН токен на 2×2 блок патчей
+    /// (spatial merge 2×2): 768² → 24² = 576. Совпадает с числом строк
+    /// main-выхода forward (nq).
     pub fn n_tokens(&self) -> usize {
         let per = self.image_size / (self.patch_size * 2); // 24
-        per * per * 4 // 2304
+        per * per // 576
     }
 
+    /// Прогнать изображение → (main, deepstack):
+    /// main — входные эмбеддинги LLM [1, nq, projection_dim] (nq = 576 для
+    /// 768²), deepstack — 3 блока (слои 5/11/17) по [1, nq, projection_dim].
+    /// Deepstack НЕ конкатенируются с main как отдельные токены — они
+    /// добавляются к скрытым состояниям image-позиций внутри первых слоёв
+    /// LLM (Qwen3Model::prefill_with_vision; HF _deepstack_process).
     pub fn forward(
         &self,
         backend: &dyn Backend,
         image_rgb: &[f32],
         h: usize,
         w: usize,
-    ) -> Result<Tensor, BackendError> {
+    ) -> Result<(Tensor, Vec<Tensor>), BackendError> {
         let n_embd = self.n_embd;
         let p = self.patch_size;
         let per = self.image_size / p; // 48 патчей по стороне
@@ -330,14 +340,14 @@ impl VisionQwen3Vl {
             let dv = backend.to_cpu_f32(&main)?;
             eprintln!("DBG main row0[0..4]: {:?}", &dv[..4]);
         }
-        // 7) concat(main, deepstack…) → [nq, 4·proj] → [4·nq, proj] — кернел
-        let mut chunks: Vec<Tensor> = Vec::with_capacity(1 + deepstack_out.len());
-        chunks.push(main);
-        chunks.extend(deepstack_out);
-        let n_out = nq * 4;
-        let out = backend.zeros(vec![n_out, self.projection_dim])?;
-        backend.concat4(&chunks, &out)?;
-        Ok(out.view(vec![1, n_out, self.projection_dim]))
+        // 7) main + deepstack — РАЗДЕЛЬНО: main [1, nq, proj] — входные
+        // эмбеддинги LLM; три deepstack-блока [1, nq, proj] добавляются
+        // к скрытым состояниям image-позиций после слоёв 0..2 LLM
+        // (см. Qwen3Model::prefill_with_vision). Конкатенация блоков как
+        // «дополнительных токенов» (4·nq строк) была ошибкой: deepstack —
+        // НЕ токены, а добавки к позициям.
+        let main = main.view(vec![1, nq, self.projection_dim]);
+        Ok((main, deepstack_out))
     }
 }
 

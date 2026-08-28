@@ -849,10 +849,12 @@ impl DFlashModel {
     }
 
     /// Сброс кэшей до инжектной длины (после диффузии; spec-decode
-    /// сохраняет только принятые токены).
+    /// сохраняет только принятые токены). Раньше pos присваивался
+    /// безусловно — inject_len БОЛЬШЕ текущего pos расширял кэш в
+    /// незаписанную (нулевую) зону; truncate зажимает min-ом.
     pub fn truncate_caches(&mut self, inject_len: usize) {
         for c in &mut self.caches {
-            c.pos = inject_len;
+            c.truncate(inject_len);
         }
     }
 

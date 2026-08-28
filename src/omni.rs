@@ -280,8 +280,11 @@ impl OmniAudioTower {
             }
             let x = backend.from_cpu_f32(&data, vec![1, len, n_mel])?;
             let tokens = self.forward_window(backend, &x)?;
-            out_rows.extend(backend.to_cpu_f32(&tokens)?);
             start += len;
+            // Окно короче 3 кадров (l2 < 2) даёт 0 токенов — пропускаем.
+            if let Some(tokens) = tokens {
+                out_rows.extend(backend.to_cpu_f32(&tokens)?);
+            }
         }
         backend.from_cpu_f32(
             &out_rows,
@@ -291,14 +294,24 @@ impl OmniAudioTower {
 
     /// Одно окно (≤ 200 кадров): conv → pos → слои → ln_post → avg-pool → proj.
     /// x — time-major [1, T, n_mel] (как conv1d).
+    /// Возвращает None для хвоста короче 3 кадров: l2 = (len-1)/2+1 < 2 →
+    /// HF-референс даёт (l2-2)//2+1 = 0 токенов (раньше `(l2 - 2)` был
+    /// usize-underflow: panic в debug / мусор в release).
     pub(crate) fn forward_window(
         &self,
         backend: &dyn Backend,
         x: &Tensor,
-    ) -> Result<Tensor, BackendError> {
+    ) -> Result<Option<Tensor>, BackendError> {
         let cfg = &self.cfg;
         let d = cfg.d_model;
         let len = x.shape()[1];
+
+        // conv2 (stride 2): l2 = (len - 1)/2 + 1; avg-pool парами:
+        // n_pool = (l2 - 2)/2 + 1 — при l2 < 2 (len < 3) токенов нет.
+        let l2 = (len - 1) / 2 + 1;
+        if l2 < 2 {
+            return Ok(None);
+        }
 
         // conv1 (stride 1) → GELU
         let h1 = backend.zeros(vec![1, len, d])?;
@@ -311,8 +324,7 @@ impl OmniAudioTower {
             );
         }
         backend.gelu_erf(&h1, &h1)?;
-        // conv2 (stride 2) → GELU; l2 = (len - 1)/2 + 1
-        let l2 = (len - 1) / 2 + 1;
+        // conv2 (stride 2) → GELU (l2 вычислен и проверен выше)
         let mut h = backend.zeros(vec![1, l2, d])?;
         backend.conv1d(&h1, &self.conv2_w, Some(&self.conv2_b), 2, 1, 1, 1, &h)?;
         backend.gelu_erf(&h, &h)?;
@@ -406,7 +418,7 @@ impl OmniAudioTower {
             b: Some(self.proj_b.clone()),
         }
         .forward(backend, &p)?;
-        Ok(y.view(vec![n_pool, cfg.output_dim]))
+        Ok(Some(y.view(vec![n_pool, cfg.output_dim])))
     }
 }
 
@@ -785,8 +797,8 @@ mod tests {
         let win: Vec<f32> = mel[..20 * 8].to_vec();
         let m_x = mb.from_cpu_f32(&win, vec![1, 20, 8]).unwrap();
         let c_x = cpu.from_cpu_f32(&win, vec![1, 20, 8]).unwrap();
-        let m_w = m_tower.forward_window(&mb, &m_x).unwrap();
-        let c_w = c_tower.forward_window(&cpu, &c_x).unwrap();
+        let m_w = m_tower.forward_window(&mb, &m_x).unwrap().unwrap();
+        let c_w = c_tower.forward_window(&cpu, &c_x).unwrap().unwrap();
         let mv = mb.to_cpu_f32(&m_w).unwrap();
         let cv = cpu.to_cpu_f32(&c_w).unwrap();
         let mut max_delta = 0.0f32;
@@ -1022,10 +1034,10 @@ mod tests {
         let m_out = mb.to_cpu_f32(&m_h1).unwrap();
         eprintln!("conv1d real: out[0,:4]={:?}", &m_out[..4.min(m_out.len())]);
         // полный forward_window (20 кадров, 2 слоя) vs python-эталон
-        let fw = m_tower.forward_window(&mb, &m_x).unwrap();
+        let fw = m_tower.forward_window(&mb, &m_x).unwrap().unwrap();
         let fwv = mb.to_cpu_f32(&fw).unwrap();
         eprintln!("conv1d real: fw[0,:4]={:?}", &fwv[..4.min(fwv.len())]);
-        let cfw = c_tower.forward_window(&cpu, &c_x).unwrap();
+        let cfw = c_tower.forward_window(&cpu, &c_x).unwrap().unwrap();
         let cfwv = cpu.to_cpu_f32(&cfw).unwrap();
         let mut fw_delta = 0.0f32;
         for (a, b) in fwv.iter().zip(&cfwv) {

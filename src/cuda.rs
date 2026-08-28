@@ -273,8 +273,11 @@ impl CudaBackend {
         if nsup == 0 {
             // k < 256 (Q6_K/Q5_K/Q3_K) or k < 32 (Q4_0/halfw): no k-block at
             // all — the tiled kernels exit immediately for nsup==0, so the
-            // reduce of a single (stale-data) slice is harmless. Returning
-            // early also avoids the 0/0 in div_ceil below.
+            // reduce would fold a NEVER-WRITTEN (stale pool) slice. That
+            // shape class is unreachable from from_cpu_q* (they enforce
+            // k-block multiples), so this is only a guard against the
+            // 0/0 panic in div_ceil below — it must NOT be treated as a
+            // "reducing stale data is fine" license.
             return 1;
         }
         let nkz = (nsup + 15) / 16;
@@ -290,7 +293,12 @@ impl CudaBackend {
         m: usize,
         n: usize,
         s: usize,
-        pool_cap: usize,
+        // Named for the contract it documents: cpart was allocated with
+        // exactly this many elements (take_pooled(pool_cap)), so push_capped
+        // keys its bucket on cpart.len() == pool_cap — the ALLOCATION-size
+        // key T5-8/R requires. Kept in the signature (read by none) so the
+        // invariant stays explicit at every call site.
+        _pool_cap: usize,
     ) -> Result<(), BackendError> {
         let n32 = n as i32;
         let m32 = m as i32;
@@ -317,10 +325,13 @@ impl CudaBackend {
         // the tiled bucket: the tiled take could then pop an s·m·n buffer
         // and write 16 slices into it (OOB), and every splitk call stranded
         // its buffer (the bucket grows unbounded).
-        lock_poison_resilient(&self.pool)
-            .entry(pool_cap)
-            .or_default()
-            .push(cpart);
+        // A1: push THROUGH push_capped (same MAX_POOL_BYTES / MAX_PER_BUCKET
+        // discipline as CudaBuffer::drop and pool_a_scratch) — the cpart of
+        // a split-k GEMM with a varying m (STT prefill) would otherwise
+        // strand one big buffer per unique shape forever. cpart came from
+        // take_pooled(pool_cap), so cpart.len() == pool_cap and the bucket
+        // key is unchanged.
+        push_capped(&self.pool, cpart, std::mem::size_of::<f32>());
         Ok(())
     }
 
@@ -1215,6 +1226,15 @@ impl Backend for CudaBackend {
     fn add_bias(&self, x: &Tensor, bias: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         let n = x.numel();
         let cols = bias.numel() as i32;
+        // Mirror of the CPU oracle's guard: cols == 0 divides by zero in the
+        // kernel (i % cols) and a non-multiple n would bias the wrong
+        // columns / run off the tail.
+        if cols == 0 || n % cols as usize != 0 {
+            return Err(BackendError::Shape(format!(
+                "add_bias: bias {} does not divide x {n}",
+                cols
+            )));
+        }
         let n32 = n as i32;
         let f = self.function("add_bias_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
@@ -1252,7 +1272,16 @@ impl Backend for CudaBackend {
         self.elementwise(ElemOp::Silu, x, None, y, 0.0)
     }
     fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError> {
-        let n = y.numel() as i32;
+        let numel = y.numel();
+        // Mirror of the CPU oracle's guard: the row-major kernel computes
+        // row = i / ffn, col = i % ffn — ffn == 0 divides by zero and a
+        // non-multiple numel would mis-slice the last row.
+        if ffn == 0 || numel % ffn != 0 {
+            return Err(BackendError::Shape(format!(
+                "silu_mul_fused: ffn={ffn} does not divide y numel {numel}"
+            )));
+        }
+        let n = numel as i32;
         let ffn_i = ffn as i32;
         let xd = x.as_cuda();
         let od = y.as_cuda();
@@ -1436,11 +1465,28 @@ impl Backend for CudaBackend {
                 "conv1d_groups: group mismatch (cout={cout}, cin={cin}, groups={groups}, cin_g={cin_g})"
             )));
         }
+        // Q22b: stride == 0 divides by zero, and a padded input smaller
+        // than the dilated kernel window underflowed the usize `tout`
+        // (wrapped → nonsense shape / huge grid). Guard BEFORE computing
+        // tout — the CPU oracle shares the same arithmetic.
+        if stride == 0 {
+            return Err(BackendError::Shape(format!(
+                "conv1d_groups: stride 0 (t={t}, pad_l={pad_l}, pad_r={pad_r}, dil={dil}, k={k})"
+            )));
+        }
+        if t + pad_l + pad_r < dil * (k - 1) + 1 {
+            return Err(BackendError::Shape(format!(
+                "conv1d_groups: padded input {} smaller than the dilated kernel window {} (t={t}, pad_l={pad_l}, pad_r={pad_r}, dil={dil}, k={k})",
+                t + pad_l + pad_r,
+                dil * (k - 1) + 1
+            )));
+        }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
         if tout == 0 {
             // Window larger than the padded input: the CPU reference returns
             // Ok with a zero-filled output — mirror it here (a 0-element
-            // launch would build an invalid 0-block grid).
+            // launch would build an invalid 0-block grid). Unreachable since
+            // the Q22b guard, kept as belt-and-braces.
             self.stream.memset_zeros(y.as_cuda_mut()).map_err(map_err)?;
             return Ok(());
         }
@@ -1706,6 +1752,16 @@ impl Backend for CudaBackend {
         let rows = x.shape()[0];
         let d = x.shape()[1];
         let d0 = y.shape()[1];
+        // Mirror of the CPU oracle's guard: off + d0 past D (or a mismatched
+        // y) would read/write OOB device memory — the GPU has no panic to
+        // catch it.
+        if off + d0 > d || y.shape() != &[rows, d0] {
+            return Err(BackendError::Shape(format!(
+                "slice_last: x {:?} y {:?} off {off}",
+                x.shape(),
+                y.shape()
+            )));
+        }
         let n = rows * d0;
         let f = self.function("slice_last_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
@@ -1725,6 +1781,17 @@ impl Backend for CudaBackend {
 
     fn slice_time(&self, x: &Tensor, y: &Tensor, u: usize) -> Result<(), BackendError> {
         let (b, t, c) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        // Mirror of the CPU oracle's guards (Q22): u > t underflows
+        // `t - u` (wrap in release, panic in debug), and a mismatched
+        // output shape would read/write past the buffers.
+        if u > t {
+            return Err(BackendError::Shape(format!("slice_time: u={u} > t={t}")));
+        }
+        if y.shape() != &[b, t - u, c] {
+            return Err(BackendError::Shape(
+                "slice_time: output shape mismatch".into(),
+            ));
+        }
         let keep = t - u;
         let n = b * keep * c;
         let f = self.function("slice_time_f32")?;
@@ -1925,10 +1992,12 @@ impl Backend for CudaBackend {
     ) -> Result<(), BackendError> {
         let rows = x.shape()[0];
         // h == 0 divides by zero (x.shape()[1] / h) and would launch a
-        // degenerate (rows, 0) grid.
-        if h == 0 {
+        // degenerate (rows, 0) grid; a non-multiple x dim silently truncates
+        // hd and mis-addresses rows — strict divisibility, same as the CPU
+        // reference.
+        if h == 0 || x.shape()[1] % h != 0 {
             return Err(BackendError::Shape(format!(
-                "rmsnorm_head: head count h=0 (x dim {})",
+                "rmsnorm_head: head count h={h} does not divide x dim {}",
                 x.shape()[1]
             )));
         }
@@ -2101,6 +2170,17 @@ impl Backend for CudaBackend {
         let (b, tq, _) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let tkv = k.shape()[1];
         let n_rep = n_heads / kv_heads;
+        // D8 (mirror of the CPU oracle): the mask is indexed as [tq, tkv] —
+        // a too-small mask would read OOB device memory (garbage bias, no
+        // panic to catch it on the GPU).
+        if let Some(m) = mask {
+            if m.numel() < tq * tkv {
+                return Err(BackendError::Shape(format!(
+                    "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
+                    m.numel()
+                )));
+            }
+        }
         // Q20: the v4 kernel stages one warp per 32 columns in an 8-warp
         // block — hd > 256 would overflow sh_p[8][64] (and nwarps > 8).
         if hd > 256 {
@@ -2119,6 +2199,15 @@ impl Backend for CudaBackend {
         // block-level syncs in the hot loop; attn_ar_v4_combine merges them.
         let nwarps = (hd + 31) / 32;
         let nchunks = tkv.div_ceil(64).max(1);
+        // CUDA grid.z is limited to 65535 — a huge batch × chunk product
+        // would fail the launch with CUDA_ERROR_INVALID_VALUE (or be
+        // silently truncated by a wrap in the cast) instead of Err.
+        let grid_z = b * nchunks;
+        if grid_z > 65535 {
+            return Err(BackendError::Shape(format!(
+                "attn_ar: grid.z {grid_z} (b={b} · nchunks={nchunks}) exceeds the CUDA limit 65535"
+            )));
+        }
         let scratch = self.take_pooled(b * tq * n_heads * nchunks * nwarps * 34)?;
         // K/V storage dtype: 0=f32, 1=f16/bf16, 2=q8_0 — the v4 kernels
         // dequantize inline on read (f16 → float, q8_0 block-scale).
@@ -2293,6 +2382,16 @@ impl Backend for CudaBackend {
         let (b, t, d) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let h = sc.shape()[1];
         let hd = d / h;
+        // D8 (mirror of the CPU oracle): the mask is indexed as [t, t] — a
+        // too-small mask would read OOB device memory.
+        if let Some(m) = mask {
+            if m.numel() < t * t {
+                return Err(BackendError::Shape(format!(
+                    "mhsa: mask numel {} < t·t {t}·{t}",
+                    m.numel()
+                )));
+            }
+        }
         let f = self.function("mhsa_f32")?;
         // 3D grid: (b, h, t) — one block per (batch, head, query).
         let cfg = LaunchConfig {
@@ -2377,6 +2476,15 @@ impl Backend for CudaBackend {
         if t > 2048 {
             return Err(BackendError::Shape(format!(
                 "mhsa_rel_pos: T {t} exceeds the kernel's 2048-element shared-memory score limit"
+            )));
+        }
+        // The kernel's weighted-V stage is one thread per column in a
+        // 256-thread block (`if (tid < dk)`) — dk > 256 would SILENTLY DROP
+        // the columns past 256 instead of failing. Real callers use
+        // dk ≤ 128 (NeMo/zipformer); refuse anything larger loudly.
+        if dk > 256 {
+            return Err(BackendError::Shape(format!(
+                "mhsa_rel_pos: dk {dk} exceeds the kernel's 256-thread weighted-V limit"
             )));
         }
         let f = self.function("mhsa_rel_pos_f32")?;
@@ -2483,7 +2591,11 @@ impl Backend for CudaBackend {
         // the dst buffer (silent OOB on the GPU, where the CPU slice-copy
         // would panic).
         if dst.shape()[0] != b || dst.shape()[2] != d || pos + tq > cap {
-            return Err(BackendError::Shape("kv_update: capacity exceeded".into()));
+            return Err(BackendError::Shape(format!(
+                "kv_update: dst batch {} / dim {} != src batch {b} / dim {d}, or pos {pos} + tq {tq} > cap {cap}",
+                dst.shape()[0],
+                dst.shape()[2]
+            )));
         }
         let n = b * tq * d;
         let cfg = LaunchConfig::for_num_elems(n as u32);
@@ -2611,7 +2723,15 @@ impl Backend for CudaBackend {
         let v = table.shape()[0];
         // A2: validate before launching — copy_from_slice below panics on a
         // length mismatch, and a mismatched idx would tear the whole bridge
-        // down (the CPU reference returns Err on the same contract).
+        // down (the CPU reference returns Err on the same contract). The
+        // table width must also match d: the kernel indexes tbl[vi·d + j],
+        // so a narrower/wider table reads OOB device memory.
+        if table.shape()[1] != d {
+            return Err(BackendError::Shape(format!(
+                "codebook_search: table dim {} != x dim {d}",
+                table.shape()[1]
+            )));
+        }
         if idx.len() != rows {
             return Err(BackendError::Shape(format!(
                 "codebook_search: idx {} != rows {rows}",

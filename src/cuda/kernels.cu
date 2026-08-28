@@ -15,7 +15,12 @@
 /// Generic elementwise kernel, one thread per element.
 /// `op` selects the function (see ElemOp in cuda.rs); `c` is the scalar
 /// operand for add_scalar/scale/max_scalar. `y` may alias `out` (in-place).
-// Fused SwiGLU gate: y[i] = silu(x[i]) * x[ffn + i]; x [rows, 2*ffn].
+// Fused SwiGLU gate, row-major per-row gate|up halves — exactly the CPU
+// oracle's indexing (cpu.rs silu_mul_fused): with x (rows, 2*ffn) row-major,
+// element i of y maps to row i/ffn, col i%ffn and reads
+// gate = x[row*2*ffn + col], up = x[row*2*ffn + ffn + col]. The old flat
+// y[i] = silu(x[i]) * x[ffn + i] was only correct for row 0 — every row ≥ 1
+// read across the row boundary (garbage FFN for all rows > 1).
 extern "C" __global__ void silu_mul_fused_f32(
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -24,8 +29,10 @@ extern "C" __global__ void silu_mul_fused_f32(
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float g = x[i];
-        float up = x[ffn + i];
+        int row = i / ffn;
+        int col = i % ffn;
+        float g = x[row * 2 * ffn + col];
+        float up = x[row * 2 * ffn + ffn + col];
         y[i] = (g / (1.0f + expf(-g))) * up;
     }
 }

@@ -1,5 +1,6 @@
-//! Ф1.8 KV-cache: context-window roll (GPU compact via offset views) and
-//! SWA masks — Metal backend (dev machine GPU-only rule).
+//! Ф1.8 KV-cache: context-window roll — compact ОТКАЗЫВАЕТСЯ (ломает
+//! абсолютные позиции/каузальную маску) и SWA masks — Metal backend
+//! (dev machine GPU-only rule).
 //!
 //! `cargo test --release --features metal --test kv_compact`
 
@@ -19,7 +20,7 @@ fn fill(bk: &dyn Backend, base: f32, n: usize, d: usize) -> Tensor {
 }
 
 #[test]
-fn compact_drops_oldest_half_on_overflow() {
+fn compact_refuses_instead_of_corrupting_positions() {
     let bk = backend();
     let mut cache = KvCache::new(
         &bk,
@@ -31,32 +32,31 @@ fn compact_drops_oldest_half_on_overflow() {
     .expect("cache");
     cache.set_max_cap(Some(8));
     let d = 8usize;
-    // 10 single-token updates; max_cap 8 → compact fires at the 9th write
-    // (pos 8 → keep 4), then tokens 8,9 append → pos 6, contents = tokens 4..9.
-    for i in 0..10 {
+    // 8 single-token updates fill the window; the 9th would overflow →
+    // compact must REFUSE (dropping the oldest half halves cache.pos and
+    // breaks the caller's absolute rope positions/causal mask) — a loud
+    // error instead of silent context corruption.
+    for i in 0..8 {
         let k = fill(&bk, i as f32 * 10.0, 1, d);
         let v = fill(&bk, i as f32 * 100.0, 1, d);
         cache.update(&bk, &k, &v).expect("update");
     }
-    assert_eq!(cache.pos, 6, "pos after compact");
-    let kd = bk.to_cpu_f32(&cache.view()).unwrap();
-    assert_eq!(kd.len(), 6 * d);
-    // row 0 must be token 4: base 40.0
-    let expected: Vec<f32> = (0..d).map(|i| 40.0 + (i % 7) as f32 * 0.25).collect();
-    for (got, want) in kd[..d].iter().zip(&expected) {
-        assert!((got - want).abs() < 1e-4, "k row0: got {got} want {want}");
-    }
-    // last row must be token 9: base 90.0
-    let expected9: Vec<f32> = (0..d).map(|i| 90.0 + (i % 7) as f32 * 0.25).collect();
-    for (got, want) in kd[5 * d..].iter().zip(&expected9) {
-        assert!((got - want).abs() < 1e-4, "k row5: got {got} want {want}");
-    }
-    // v must roll the same way (row0 = token 4, base 400.0)
-    let vd = bk.to_cpu_f32(&cache.view_v()).unwrap();
-    let expected_v: Vec<f32> = (0..d).map(|i| 400.0 + (i % 7) as f32 * 0.25).collect();
-    for (got, want) in vd[..d].iter().zip(&expected_v) {
-        assert!((got - want).abs() < 1e-4, "v row0: got {got} want {want}");
-    }
+    assert_eq!(cache.pos, 8, "window filled");
+    let before_k = bk.to_cpu_f32(&cache.view()).unwrap();
+    let before_v = bk.to_cpu_f32(&cache.view_v()).unwrap();
+
+    let r = cache.update(
+        &bk,
+        &fill(&bk, 80.0, 1, d),
+        &fill(&bk, 800.0, 1, d),
+    );
+    assert!(r.is_err(), "compact must be refused, not performed");
+    assert_eq!(cache.pos, 8, "pos must be untouched after the refusal");
+    // содержимое кэша не тронуто
+    let after_k = bk.to_cpu_f32(&cache.view()).unwrap();
+    let after_v = bk.to_cpu_f32(&cache.view_v()).unwrap();
+    assert_eq!(before_k, after_k, "k content untouched");
+    assert_eq!(before_v, after_v, "v content untouched");
 }
 
 #[test]

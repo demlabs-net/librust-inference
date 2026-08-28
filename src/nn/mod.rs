@@ -435,35 +435,37 @@ impl KvCache {
     }
 
     /// Context-window limit (n_ctx). When `update` would exceed it, the
-    /// cache compacts: the oldest half of the window is dropped (the
-    /// standard long-context roll: newest positions are kept, absolute
-    /// positions shift — attention stays correct because RoPE positions
-    /// are tracked by the caller, not by the cache).
+    /// cache WOULD compact (drop the oldest half) — but compaction halves
+    /// `pos`, which breaks the caller's absolute RoPE positions and the
+    /// causal mask (mask uses `pos + i` as the current absolute position).
+    /// Full compaction therefore requires the CALLER to reset absolute
+    /// positions for the kept tokens; since that is not implemented, the
+    /// cache REFUSES to compact (see `compact`): a loud error instead of
+    /// silent context corruption.
     pub fn set_max_cap(&mut self, max: Option<usize>) {
         self.max_cap = max;
     }
 
-    /// Drop the oldest half of the window — entirely on the GPU: an
-    /// offset view reads k[shift..pos] and the data is moved through a
-    /// temp buffer (the source and destination overlap, so a direct
-    /// self-copy would race in the parallel kernel).
-    fn compact(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
-        let d = self.k.shape()[2];
-        let shift = self.pos / 2;
+    /// Drop the oldest half of the window — REFUSED: the data move itself
+    /// would need an offset view (`view_offset` at shift != 0 panics on
+    /// CUDA and mis-slices elsewhere), and even a correct move halves
+    /// `pos`, breaking the invariant that cache slot j ↔ absolute position
+    /// j (absolute RoPE positions and the causal mask are computed by the
+    /// caller from `pos`). Compaction requires the caller to remap absolute
+    /// positions for the kept tokens — not implemented; return an error
+    /// instead of silently corrupting attention.
+    fn compact(&mut self, _backend: &dyn Backend) -> Result<(), BackendError> {
+        let pos = self.pos;
+        let shift = pos / 2;
         if shift == 0 {
+            // Нечего сдвигать — фактического compaction нет.
             return Ok(());
         }
-        let keep = self.pos - shift;
-        let k_src = self.k.view_offset(vec![1, keep, d], shift * d);
-        let v_src = self.v.view_offset(vec![1, keep, d], shift * d);
-        let tmp_k = make_kv_tensor(backend, self.k_format, keep, d)?;
-        let tmp_v = make_kv_tensor(backend, self.v_format, keep, d)?;
-        backend.kv_update(&tmp_k, &k_src, 0)?;
-        backend.kv_update(&tmp_v, &v_src, 0)?;
-        backend.kv_update(&self.k, &tmp_k, 0)?;
-        backend.kv_update(&self.v, &tmp_v, 0)?;
-        self.pos = keep;
-        Ok(())
+        Err(BackendError::Shape(format!(
+            "kv compact refused: dropping the oldest half (pos={pos}, shift={shift}) \
+             breaks absolute rope positions/causal mask; \
+             caller must reset absolute positions after compaction (not implemented)"
+        )))
     }
 
     fn ensure(&mut self, backend: &dyn Backend, needed: usize) -> Result<(), BackendError> {

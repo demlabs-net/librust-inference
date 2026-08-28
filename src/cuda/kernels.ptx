@@ -80,8 +80,8 @@
 {
 	.reg .pred 	%p<2>;
 	.reg .f32 	%f<22>;
-	.reg .b32 	%r<9>;
-	.reg .b64 	%rd<10>;
+	.reg .b32 	%r<15>;
+	.reg .b64 	%rd<11>;
 
 
 	ld.param.u64 	%rd1, [silu_mul_fused_f32_param_0];
@@ -95,12 +95,18 @@
 	setp.ge.s32 	%p1, %r1, %r3;
 	@%p1 bra 	$L__BB0_2;
 
-	cvta.to.global.u64 	%rd3, %rd2;
-	cvta.to.global.u64 	%rd4, %rd1;
-	mul.wide.s32 	%rd5, %r1, 4;
-	add.s64 	%rd6, %rd4, %rd5;
-	mul.wide.s32 	%rd7, %r2, 4;
-	add.s64 	%rd8, %rd6, %rd7;
+	cvta.to.global.u64 	%rd3, %rd1;
+	cvta.to.global.u64 	%rd4, %rd2;
+	div.s32 	%r7, %r1, %r2;
+	shl.b32 	%r8, %r7, 1;
+	mul.lo.s32 	%r9, %r7, %r2;
+	sub.s32 	%r10, %r1, %r9;
+	mad.lo.s32 	%r11, %r8, %r2, %r10;
+	mul.wide.s32 	%rd5, %r11, 4;
+	add.s64 	%rd6, %rd3, %rd5;
+	add.s32 	%r12, %r11, %r2;
+	mul.wide.s32 	%rd7, %r12, 4;
+	add.s64 	%rd8, %rd3, %rd7;
 	ld.global.nc.f32 	%f1, [%rd6];
 	neg.f32 	%f2, %f1;
 	mov.f32 	%f3, 0f3F000000;
@@ -116,16 +122,17 @@
 	fma.rn.f32 	%f13, %f2, %f12, %f11;
 	mov.f32 	%f14, 0f32A57060;
 	fma.rn.f32 	%f15, %f2, %f14, %f13;
-	mov.b32 	%r7, %f9;
-	shl.b32 	%r8, %r7, 23;
-	mov.b32 	%f16, %r8;
+	mov.b32 	%r13, %f9;
+	shl.b32 	%r14, %r13, 23;
+	mov.b32 	%f16, %r14;
 	ex2.approx.ftz.f32 	%f17, %f15;
 	fma.rn.f32 	%f18, %f17, %f16, 0f3F800000;
 	div.rn.f32 	%f19, %f1, %f18;
 	ld.global.nc.f32 	%f20, [%rd8];
 	mul.f32 	%f21, %f20, %f19;
-	add.s64 	%rd9, %rd3, %rd5;
-	st.global.f32 	[%rd9], %f21;
+	mul.wide.s32 	%rd9, %r1, 4;
+	add.s64 	%rd10, %rd4, %rd9;
+	st.global.f32 	[%rd10], %f21;
 
 $L__BB0_2:
 	ret;

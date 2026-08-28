@@ -102,7 +102,9 @@ pub struct VisionModel {
     pos_embd: Option<Tensor>,
     layers: Vec<VisionLayer>,
     norm_w: Tensor,
-    norm_b: Option<Tensor>,
+    /// Required: a missing `v.norm.bias` is a load error (was: the weight
+    /// silently used as bias).
+    norm_b: Tensor,
     output: Tensor,
 }
 
@@ -149,7 +151,10 @@ impl VisionModel {
             });
         }
         let norm_w = t("v.norm.weight")?;
-        let norm_b = w.get("v.norm.bias").map(|_| t("v.norm.bias")).transpose()?;
+        // bias ОБЯЗАТЕЛЕН: раньше отсутствие v.norm.bias молча подставляло
+        // ВЕС как bias (`unwrap_or(&self.norm_w)`) — мусорная нормализация.
+        // Остальные нормы файла (ln1/ln2) тоже требуются при загрузке.
+        let norm_b = t("v.norm.bias")?;
         let output = t("v.output.weight")?;
         let _ = d;
         Ok(Self {
@@ -179,7 +184,7 @@ impl VisionModel {
         w: usize,
     ) -> Result<Tensor, BackendError> {
         let cfg = &self.cfg;
-        let patches = preprocess(image_rgb, h, w, cfg);
+        let patches = preprocess(image_rgb, h, w, cfg)?;
         let n_patches = patches.0;
         // patch_embd: [n_patches, D] = patches · W^T (+bias)
         let x = backend.from_cpu_f32(&patches.1, vec![n_patches, patches.2])?;
@@ -277,12 +282,11 @@ impl VisionModel {
                 ));
             }
         }
-        // final norm → projector
+        // final norm → projector (norm_b required at load)
         let (b, tq, _) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let xv = x.view(vec![b * tq, cfg.embedding_length]);
         let xn2d = backend.zeros(vec![b * tq, cfg.embedding_length])?;
-        let nb = self.norm_b.as_ref().unwrap_or(&self.norm_w);
-        backend.layernorm(&xv, &self.norm_w, nb, &xn2d, cfg.norm_eps)?;
+        backend.layernorm(&xv, &self.norm_w, &self.norm_b, &xn2d, cfg.norm_eps)?;
         let x4 = xn2d.view(vec![b * tq, cfg.embedding_length]);
         let out = backend.zeros(vec![b * tq, cfg.projection_dim])?;
         backend.gemm_nt(&x4, &self.output, &out)?;
@@ -291,13 +295,28 @@ impl VisionModel {
 }
 
 /// Хост-препроцессинг: resize (билинейный) → normalize → patchify.
-/// Возвращает (n_patches, данные [n_patches, C·P·P], C·P·P).
+/// Валидация входа (раньше отсутствие проверок давало панику/мусор:
+/// `resized.copy_from_slice` при коротком буфере, `h - 1`/`w - 1`
+/// underflow при нулевых размерах). Возвращает
+/// (n_patches, данные [n_patches, C·P·P], C·P·P).
 fn preprocess(
     image_rgb: &[f32],
     h: usize,
     w: usize,
     cfg: &VisionConfig,
-) -> (usize, Vec<f32>, usize) {
+) -> Result<(usize, Vec<f32>, usize), BackendError> {
+    if h == 0 || w == 0 {
+        return Err(BackendError::Shape(format!(
+            "preprocess: пустое изображение {w}×{h}"
+        )));
+    }
+    if image_rgb.len() != h * w * 3 {
+        return Err(BackendError::Shape(format!(
+            "preprocess: ожидалось {w}×{h}×3 = {} значений, получено {}",
+            h * w * 3,
+            image_rgb.len()
+        )));
+    }
     let target = cfg.image_size;
     // 1) билинейный resize до (target, target)
     let mut resized = vec![0.0f32; target * target * 3];
@@ -348,7 +367,7 @@ fn preprocess(
             }
         }
     }
-    (per_side * per_side, out, cpp)
+    Ok((per_side * per_side, out, cpp))
 }
 
 #[cfg(all(test, feature = "metal"))]
@@ -412,5 +431,25 @@ mod tests {
         // покрыто проверкой в forward; здесь просто держим сигнатуру.
         let (_, m) = load_mini();
         assert!(m.n_patches() > 0);
+    }
+
+    /// Preprocess отклоняет неверный вход вместо паники/мусора:
+    /// короткий буфер, нулевые размеры.
+    #[test]
+    fn preprocess_rejects_bad_input() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mini-vit.gguf");
+        let buf = std::fs::read(&path).unwrap();
+        let f = crate::gguf::parse(&buf).unwrap();
+        let cfg = VisionConfig::from_gguf(&f).unwrap();
+
+        // пустое изображение
+        assert!(preprocess(&[], 0, 0, &cfg).is_err());
+        // буфер не h·w·3
+        assert!(preprocess(&[0.5f32; 100], 32, 32, &cfg).is_err());
+        // корректный размер — Ok
+        let img = vec![128.0f32; 32 * 32 * 3];
+        let (n, data, cpp) = preprocess(&img, 32, 32, &cfg).unwrap();
+        assert_eq!((n, cpp), (4, 3 * 16 * 16));
+        assert_eq!(data.len(), n * cpp);
     }
 }

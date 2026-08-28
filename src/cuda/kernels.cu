@@ -325,6 +325,145 @@ extern "C" __global__ void rope_interleaved_f32(
     }
 }
 
+/// Rotate-half RoPE (HF/Qwen3) computed INLINE — no cos/sin tables, no host
+/// round-trip. Exact CPU-reference semantics (NEOX halves: pairs (i, i+hd/2),
+/// one thread per (t, head, pair); d = h·hd). N (iter-10): the CUDA backend
+/// previously ran the trait default = to_cpu_f32 → host sin/cos loop →
+/// from_cpu_f32, 2 full syncs × 36 layers per decode token.
+extern "C" __global__ void rope_std_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int tq, int d, int hd, int pos, float theta)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_pairs = hd / 2;
+    int per_t = (d / hd) * n_pairs;
+    int t = i / per_t;
+    if (t >= tq) return;
+    int rem = i - t * per_t;
+    int h = rem / n_pairs;
+    int pair = rem - h * n_pairs;
+    float p = (float)(pos + t);
+    float inv = 1.0f / powf(theta, 2.0f * (float)pair / (float)hd);
+    float c = cosf(p * inv);
+    float s = sinf(p * inv);
+    int base = t * d + h * hd + pair;
+    float x0 = x[base];
+    float x1 = x[base + n_pairs];
+    y[base] = x0 * c - x1 * s;
+    y[base + n_pairs] = x1 * c + x0 * s;
+}
+
+/// Fused per-head RMSNorm + rotate-half RoPE: Y = rope(rmsnorm_head(X)),
+/// one thread per (t, head, pair). Matches the CPU default (rmsnorm_head:
+/// y = x·rsqrt(mean(x²)+eps)·w, no mean subtraction) composed with
+/// rope_std_f32 — in ONE kernel instead of 3 launches + 2 host round-trips.
+extern "C" __global__ void rmsnorm_head_rope_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int tq, int h, int hd, float eps, int pos, float theta)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_pairs = hd / 2;
+    int per_t = h * n_pairs;
+    int t = i / per_t;
+    if (t >= tq) return;
+    int rem = i - t * per_t;
+    int hh = rem / n_pairs;
+    int pair = rem - hh * n_pairs;
+    const float* row = x + t * h * hd + hh * hd;
+    float sum = 0.0f;
+    for (int j = 0; j < hd; ++j) sum += row[j] * row[j];
+    float inv = rsqrtf(sum / (float)hd + eps);
+    float p = (float)(pos + t);
+    float inv_f = 1.0f / powf(theta, 2.0f * (float)pair / (float)hd);
+    float c = cosf(p * inv_f);
+    float s = sinf(p * inv_f);
+    float* out = y + t * h * hd + hh * hd;
+    float x0 = row[pair] * inv * w[pair];
+    float x1 = row[pair + n_pairs] * inv * w[pair + n_pairs];
+    out[pair] = x0 * c - x1 * s;
+    out[pair + n_pairs] = x1 * c + x0 * s;
+}
+
+/// M-RoPE text (Qwen3-VL IMROPE): halves pairs; the e-section (4th
+/// position = 0 for text) is not rotated. Port of the CPU default.
+extern "C" __global__ void rope_mrope_text_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int tq, int d, int hd, int pos, float theta,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_pairs = hd / 2;
+    int per_t = (d / hd) * n_pairs;
+    int t = i / per_t;
+    if (t >= tq) return;
+    int rem = i - t * per_t;
+    int h = rem / n_pairs;
+    int pair = rem - h * n_pairs;
+    int sector = pair % sect_dims;
+    bool is_e = !((sector % 3 == 0 && sector < 3 * s0)
+               || (sector % 3 == 1 && sector < 3 * s1)
+               || (sector % 3 == 2 && sector < 3 * s2));
+    int base = t * d + h * hd + pair;
+    if (is_e) {
+        y[base] = x[base];
+        y[base + n_pairs] = x[base + n_pairs];
+        return;
+    }
+    float p = (float)(pos + t);
+    float inv = 1.0f / powf(theta, 2.0f * (float)pair / (float)hd);
+    float c = cosf(p * inv);
+    float s = sinf(p * inv);
+    float x0 = x[base];
+    float x1 = x[base + n_pairs];
+    y[base] = x0 * c - x1 * s;
+    y[base + n_pairs] = x1 * c + x0 * s;
+}
+
+/// M-RoPE per-token 4D (Qwen3-VL IMROPE): pos4d [tq·4] = (t, h, w, e) as
+/// FLOAT (positions < 2^24 are exact in f32); the per-pair position comes
+/// from the category's axis (e = no rotation). Port of the CPU default.
+extern "C" __global__ void rope_mrope_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ pos4d,
+    float* __restrict__ y,
+    int tq, int d, int hd, float theta,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_pairs = hd / 2;
+    int per_t = (d / hd) * n_pairs;
+    int t = i / per_t;
+    if (t >= tq) return;
+    int rem = i - t * per_t;
+    int h = rem / n_pairs;
+    int pair = rem - h * n_pairs;
+    int sector = pair % sect_dims;
+    int base = t * d + h * hd + pair;
+    float p;
+    if (sector % 3 == 0 && sector < 3 * s0) {
+        p = pos4d[t * 4];
+    } else if (sector % 3 == 1 && sector < 3 * s1) {
+        p = pos4d[t * 4 + 1];
+    } else if (sector % 3 == 2 && sector < 3 * s2) {
+        p = pos4d[t * 4 + 2];
+    } else {
+        y[base] = x[base];
+        y[base + n_pairs] = x[base + n_pairs];
+        return;
+    }
+    float inv = 1.0f / powf(theta, 2.0f * (float)pair / (float)hd);
+    float c = cosf(p * inv);
+    float s = sinf(p * inv);
+    float x0 = x[base];
+    float x1 = x[base + n_pairs];
+    y[base] = x0 * c - x1 * s;
+    y[base + n_pairs] = x1 * c + x0 * s;
+}
+
 /// Per-head halved RoPE: x (b, t, h·hd), cos/sin global by t (same rotation
 /// for every head, matching the Metal kernel).
 extern "C" __global__ void rope_head_f32(
@@ -1449,6 +1588,35 @@ __device__ inline float q5k_weight(const unsigned char* blk, int j) {
     return dl * (float)q - ml;
 }
 
+/// Canonical Q4_K (GGUF, llama.cpp block_q4_K), 144 bytes per 256-weight
+/// super-block: d (f16 @0..2), dmin (f16 @2..4), scales[12] (@4..16 —
+/// get_scale_min_k4 6-bit packing of 8 sub-blocks × (scale, min)),
+/// qs[128] (@16..144, chunk-major). Dequant (ggml dequantize_row_q4_K):
+/// w = d·sc·q − dmin·m, q = 4-bit nibble. N (iter-10): GGUF Q4_K tensors
+/// previously ran dequantized to f32 (7x DRAM); this feeds the v2 GEMM.
+__device__ inline float q4kc_weight(const unsigned char* blk, int j) {
+    int b = j >> 5;   // 0..7 (32-weight sub-blocks)
+    int l = j & 31;
+    // get_scale_min_k4 (ggml): sub-block b → (scale, min) from the 12
+    // packed bytes — verified against the crate's canonical decoder.
+    int sc, mn;
+    if (b < 4) {
+        sc = blk[4 + b] & 63;
+        mn = blk[8 + b] & 63;
+    } else {
+        sc = (blk[4 + b + 4] & 0xF) | ((blk[4 + b - 4] >> 6) << 4);
+        mn = (blk[4 + b + 4] >> 4) | ((blk[4 + b] >> 6) << 4);
+    }
+    // chunk-major qs: byte 16 + 32c + (j&31) holds w[64c + (j&31)] in the
+    // low nibble and w[64c + 32 + (j&31)] in the high nibble.
+    int c = j >> 6;
+    int l32 = j & 31;
+    int q = ((j >> 5) & 1) ? (blk[16 + 32 * c + l32] >> 4) : (blk[16 + 32 * c + l32] & 0xF);
+    float d = __half2float(*(const __half*)(blk));
+    float dmin = __half2float(*(const __half*)(blk + 2));
+    return d * (float)sc * (float)q - dmin * (float)mn;
+}
+
 /// Q3_K canonical llama.cpp layout, 110 bytes per 256-weight super-block:
 /// hmask[32] (non-negative bits), qs[64] (2-bit values), scales[12]
 /// (6-bit sub-scales via the aux permutation), d[2] (f16 super-scale).
@@ -2052,6 +2220,12 @@ DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_weight)
 DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_weight)
 DEFINE_K_SPLITK(q5k, f32, float, 176, q5k_weight)
 DEFINE_K_SPLITK(q3k, f32, float, 110, q3k_weight)
+// N (iter-10): canonical Q4_K (GGUF) — 144 B/256, the same v2 structure as
+// q6k (dequant-amortized f32 tile). Previously GGUF Q4_K was dequantized to
+// f32 on the host (7x DRAM traffic); this kernel is fed by from_cpu_q4kc.
+DEFINE_K_SPLITK(q4kc, f32, float, 144, q4kc_weight)
+DEFINE_K_SPLITK(q4kc, f16, __half, 144, q4kc_weight)
+DEFINE_K_SPLITK(q4kc, bf16, __nv_bfloat16, 144, q4kc_weight)
 
 /// K-quant GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
 /// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The
@@ -2134,6 +2308,7 @@ extern "C" __global__ void gemm_##NAME##_tiled_v3(                            \
 DEFINE_K_TILED(q6k, 210, q6k_weight)
 DEFINE_K_TILED(q5k, 176, q5k_weight)
 DEFINE_K_TILED(q3k, 110, q3k_weight)
+DEFINE_K_TILED(q4kc, 144, q4kc_weight)
 
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //
@@ -2231,4 +2406,184 @@ extern "C" __global__ void dflash2_conv_f32(
         acc += (coeff + b) * v;
     }
     y[t * n_embd + i] = acc;
+}
+
+// ───────────────── TTS top-k sampling on GPU (N iter-10) ────────────────
+// The TTS slow-AR path downloaded the full vocab row every token and did
+// the repetition/RAS penalties + bias + softmax + top-k on the host
+// (~0.5-5 ms/token, GPU idle). These kernels compute the EXACT same
+// pipeline on the GPU and return only the top-k window + the softmax
+// denominator, so the host just does the RNG draw over ≤ k candidates.
+//
+// Semantics mirrored from the CPU reference:
+//   val = logits[v];  per-occurrence rep penalty (logit>0 ? /=pen^c :
+//   *=pen^c); RAS: last ras_window tokens with count>1 → −ras·(cnt−1);
+//   += bias[v] (−inf outside the semantic range); /= temperature;
+//   probs = exp(val − max)/sum.
+
+/// Per-vocab occurrence counts from the history (u32 histogram).
+extern "C" __global__ void hist_counts_u32(
+    const unsigned int* __restrict__ history,
+    unsigned int* __restrict__ counts,
+    int h)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < h) atomicAdd(&counts[history[i]], 1u);
+}
+
+/// Penalize + per-thread local top-k heap + block max/sum-exp. Scratch:
+/// heap [256·k] (value,idx pairs), max [1], sum [1].
+extern "C" __global__ void tts_topk_penalized_f32(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    const unsigned int* __restrict__ counts,
+    const unsigned int* __restrict__ history,
+    int h, int v, int k,
+    float rep_pen, float ras_pen, int ras_window, float temperature,
+    float* __restrict__ heap_val,
+    unsigned int* __restrict__ heap_idx,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum)
+{
+    const int stride = blockDim.x;
+    int n = (v + stride - 1) / stride;
+    float hval[64];
+    unsigned int hidx[64];
+    for (int i = 0; i < k; ++i) { hval[i] = -INFINITY; hidx[i] = 0; }
+    float local_max = -INFINITY;
+    // Pass 1: penalize + heap insert + local max.
+    for (int j = 0; j < n; ++j) {
+        int gid = j * stride + threadIdx.x;
+        if (gid >= v) continue;
+        float val = logits[gid];
+        unsigned int c = counts[gid];
+        if (c > 0 && rep_pen != 1.0f) {
+            float f = powf(rep_pen, (float)c);
+            val = val > 0.0f ? val / f : val * f;
+        }
+        if (ras_pen != 1.0f && h >= 2) {
+            int ws = h > ras_window ? h - ras_window : 0;
+            unsigned int cnt = 0;
+            for (int i = ws; i < h; ++i) if (history[i] == (unsigned int)gid) ++cnt;
+            if (cnt > 1) val -= ras_pen * (float)(cnt - 1);
+        }
+        if (bias != NULL) val += bias[gid];
+        val /= temperature;
+        if (val > local_max) local_max = val;
+        if (val > hval[k - 1]) {
+            int pos = k - 1;
+            hval[pos] = val; hidx[pos] = (unsigned int)gid;
+            while (pos > 0 && hval[pos] > hval[pos - 1]) {
+                float tv = hval[pos]; hval[pos] = hval[pos - 1]; hval[pos - 1] = tv;
+                unsigned int ti = hidx[pos]; hidx[pos] = hidx[pos - 1]; hidx[pos - 1] = ti;
+                --pos;
+            }
+        }
+    }
+    // Block max (tree reduce).
+    __shared__ float sh[256];
+    sh[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s && sh[threadIdx.x + s] > sh[threadIdx.x])
+            sh[threadIdx.x] = sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float gmax = sh[0];
+    // Pass 2: block sum of exp(val − gmax) (recompute val — cheap).
+    float local_sum = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        int gid = j * stride + threadIdx.x;
+        if (gid >= v) continue;
+        float val = logits[gid];
+        unsigned int c = counts[gid];
+        if (c > 0 && rep_pen != 1.0f) {
+            float f = powf(rep_pen, (float)c);
+            val = val > 0.0f ? val / f : val * f;
+        }
+        if (ras_pen != 1.0f && h >= 2) {
+            int ws = h > ras_window ? h - ras_window : 0;
+            unsigned int cnt = 0;
+            for (int i = ws; i < h; ++i) if (history[i] == (unsigned int)gid) ++cnt;
+            if (cnt > 1) val -= ras_pen * (float)(cnt - 1);
+        }
+        if (bias != NULL) val += bias[gid];
+        val /= temperature;
+        local_sum += expf(val - gmax);
+    }
+    sh[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out_max[0] = gmax;
+        out_sum[0] = sh[0];
+    }
+    // Dump the per-thread heaps to global scratch (one column per thread).
+    for (int i = 0; i < k; ++i) {
+        heap_val[threadIdx.x * k + i] = hval[i];
+        heap_idx[threadIdx.x * k + i] = hidx[i];
+    }
+}
+
+/// Merge 256·k heap entries → top-k (single block, k rounds of tree reduce;
+/// each thread owns its 32-entry slice with a taken-mask in registers).
+extern "C" __global__ void tts_topk_merge_f32(
+    const float* __restrict__ heap_val,
+    const unsigned int* __restrict__ heap_idx,
+    int n,      // 256·k candidates
+    int k,
+    float* __restrict__ out_val,
+    unsigned int* __restrict__ out_idx)
+{
+    const int per = (n + blockDim.x - 1) / blockDim.x; // ≤ 32 for n ≤ 8192
+    float lv[32];
+    unsigned int li[32];
+    unsigned int taken = 0u; // bitmask of taken slots
+    for (int i = 0; i < per; ++i) {
+        int c = threadIdx.x + i * blockDim.x;
+        if (c < n) {
+            lv[i] = heap_val[c];
+            li[i] = heap_idx[c];
+        } else {
+            lv[i] = -INFINITY;
+            li[i] = 0;
+        }
+    }
+    __shared__ float sh[256];
+    __shared__ unsigned int shi[256];
+    for (int r = 0; r < k; ++r) {
+        // each thread: best untaken slot
+        float best = -INFINITY;
+        unsigned int best_i = 0;
+        int best_slot = -1;
+        for (int i = 0; i < per; ++i) {
+            if (!(taken & (1u << i)) && lv[i] > best) {
+                best = lv[i];
+                best_i = li[i];
+                best_slot = i;
+            }
+        }
+        sh[threadIdx.x] = best;
+        shi[threadIdx.x] = best_i;
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (threadIdx.x < s && sh[threadIdx.x + s] > sh[threadIdx.x]) {
+                sh[threadIdx.x] = sh[threadIdx.x + s];
+                shi[threadIdx.x] = shi[threadIdx.x + s];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            out_val[r] = sh[0];
+            out_idx[r] = shi[0];
+        }
+        // mark the winner's slot taken (only the owner thread)
+        if (best_slot >= 0 && best == sh[0] && best_i == shi[0]) {
+            taken |= (1u << best_slot);
+        }
+        __syncthreads();
+    }
 }

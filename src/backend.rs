@@ -66,6 +66,12 @@ pub(crate) enum TensorInner {
     /// f16 d) — dequantized inline in the fused GEMM kernel.
     #[cfg(feature = "cuda")]
     CudaQ3K(cudarc::driver::CudaSlice<u8>),
+    /// Canonical Q4_K packed weights (GEMM operands only): llama.cpp
+    /// block_q4_K, 144 bytes per 256-weight super-block (d + dmin f16,
+    /// scales[12] get_scale_min_k4, chunk-major qs) — GGUF Q4_K tensors
+    /// (N iter-10: previously dequantized to f32 on the host, ~7x DRAM).
+    #[cfg(feature = "cuda")]
+    CudaQ4KC(cudarc::driver::CudaSlice<u8>),
     /// Q4_0 packed weights (GEMM operands only): canonical llama.cpp layout,
     /// 18 bytes per 32-weight block (f16 d + 16 nibble bytes) — dequantized
     /// inline in the fused GEMM kernel.
@@ -146,6 +152,7 @@ impl Tensor {
             | TensorInner::CudaQ6K(_)
             | TensorInner::CudaQ5K(_)
             | TensorInner::CudaQ3K(_)
+            | TensorInner::CudaQ4KC(_)
             | TensorInner::CudaQ4K(_) => panic!("cpu_read() on a non-CPU tensor"),
         }
     }
@@ -165,6 +172,7 @@ impl Tensor {
             | TensorInner::CudaQ6K(_)
             | TensorInner::CudaQ5K(_)
             | TensorInner::CudaQ3K(_)
+            | TensorInner::CudaQ4KC(_)
             | TensorInner::CudaQ4K(_) => panic!("cpu_write() on a non-CPU tensor"),
         }
     }
@@ -270,6 +278,16 @@ impl Tensor {
         }
     }
 
+    /// Canonical Q4_K packed-weight tensor (144 B / 256-weight blocks).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn from_cuda_q4kc(data: cudarc::driver::CudaSlice<u8>, shape: Vec<usize>) -> Self {
+        Self {
+            inner: TensorInner::CudaQ4KC(data),
+            shape,
+            dtype: Dtype::I8,
+        }
+    }
+
     /// Q5_K packed-weight tensor (canonical 176 B / 256-weight super-blocks).
     #[cfg(feature = "cuda")]
     pub(crate) fn from_cuda_q5k(data: cudarc::driver::CudaSlice<u8>, shape: Vec<usize>) -> Self {
@@ -324,6 +342,7 @@ impl Tensor {
             | TensorInner::CudaQ6K(_)
             | TensorInner::CudaQ5K(_)
             | TensorInner::CudaQ3K(_)
+            | TensorInner::CudaQ4KC(_)
             | TensorInner::CudaQ4K(_) => panic!("as_cuda() on a half/int8/K-quant tensor"),
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda() on a non-CUDA tensor"),
@@ -362,6 +381,7 @@ impl Tensor {
             | TensorInner::CudaQ6K(_)
             | TensorInner::CudaQ5K(_)
             | TensorInner::CudaQ3K(_)
+            | TensorInner::CudaQ4KC(_)
             | TensorInner::CudaQ4K(_) => panic!("as_cuda_mut() on a half/int8/K-quant tensor"),
             #[cfg(feature = "metal")]
             TensorInner::Metal(_) => panic!("as_cuda_mut() on a non-CUDA tensor"),
@@ -544,6 +564,7 @@ pub trait Backend: Send + Sync {
     /// Upload host data (row-major) into a new tensor.
     fn from_cpu_f32(&self, data: &[f32], shape: Vec<usize>) -> Result<Tensor, BackendError>;
 
+
     /// Upload fp16 data (GEMM weight storage; activations stay fp32).
     /// Default: convert to f32 and behave like `from_cpu_f32` (CPU reference,
     /// backend-less builds); CUDA stores true fp16.
@@ -604,6 +625,15 @@ pub trait Backend: Send + Sync {
     fn from_cpu_q4k(&self, _data: &[u8], _shape: Vec<usize>) -> Result<Tensor, BackendError> {
         Err(BackendError::UnsupportedFormat(
             "from_cpu_q4k: only the CUDA backend stores packed Q4_0 weights".into(),
+        ))
+    }
+
+    /// Upload canonical Q4_K packed weights (llama.cpp block_q4_K — 144
+    /// bytes per 256-weight super-block; GGUF Q4_K tensors). Only the CUDA
+    /// backend stores the packed form; default: unsupported.
+    fn from_cpu_q4kc(&self, _data: &[u8], _shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "from_cpu_q4kc: only the CUDA backend stores packed Q4_K weights".into(),
         ))
     }
 
@@ -808,6 +838,96 @@ pub trait Backend: Send + Sync {
     /// implement this.
     fn begin_batch(&self) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// N (iter-10): exact top-k over the FULL penalty pipeline of one logits
+    /// row (the TTS slow-AR sampler): per-occurrence repetition penalty
+    /// (logit>0 ? /=pen^count : *=pen^count), RAS window penalty (−ras·(cnt−1)
+    /// for tokens repeated within the last `ras_window` of history),
+    /// semantic bias add, temperature division, then the top-k (index,
+    /// probability) pairs sorted descending — probabilities use the
+    /// FULL-vocab softmax denominator, so the caller reproduces the
+    /// reference `top_p_sample_vec` exactly with only the RNG draw over ≤ k
+    /// candidates. `logits` is the last row of the LM head output (still on
+    /// the device on CUDA — only the k window + denominator come back).
+    /// Default: the exact host reference computation.
+    #[allow(clippy::too_many_arguments)]
+    fn penalized_topk(
+        &self,
+        logits: &Tensor,
+        bias: &Tensor,
+        history: &[u32],
+        rep_penalty: f32,
+        ras_penalty: f32,
+        ras_window: usize,
+        temperature: f32,
+        k: usize,
+    ) -> Result<Vec<(u32, f32)>, BackendError> {
+        let v = logits.shape()[logits.shape().len() - 1];
+        let lg = self.to_cpu_f32(logits)?;
+        let bv = self.to_cpu_f32(bias)?;
+        let mut pen = lg.clone();
+        if rep_penalty != 1.0 {
+            for &t in history {
+                let idx = t as usize;
+                if idx < pen.len() {
+                    if pen[idx] > 0.0 {
+                        pen[idx] /= rep_penalty;
+                    } else {
+                        pen[idx] *= rep_penalty;
+                    }
+                }
+            }
+        }
+        if ras_penalty != 1.0 && history.len() >= 2 {
+            let ws = history.len().saturating_sub(ras_window);
+            let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &t in &history[ws..] {
+                *counts.entry(t).or_insert(0) += 1;
+            }
+            for (&t, &c) in &counts {
+                if c > 1 {
+                    let idx = t as usize;
+                    if idx < pen.len() {
+                        pen[idx] -= ras_penalty * (c - 1) as f32;
+                    }
+                }
+            }
+        }
+        for i in 0..pen.len().min(bv.len()) {
+            pen[i] += bv[i];
+        }
+        if temperature != 1.0 {
+            for l in pen.iter_mut() {
+                *l /= temperature;
+            }
+        }
+        let max = pen.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_vals: Vec<f32> = pen.iter().map(|&l| (l - max).exp()).collect();
+        let sum: f32 = exp_vals.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            // Reference fallback: uniform over the vocab (unreachable with
+            // the TTS temperature=1 path; kept for parity).
+            let p = 1.0 / v.max(1) as f32;
+            return Ok((0..k.min(v.max(1))).map(|i| (i as u32, p)).collect());
+        }
+        let mut indexed: Vec<(usize, f32)> = exp_vals
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| (i, e / sum))
+            .collect();
+        let kk = k.min(indexed.len());
+        if kk < indexed.len() {
+            let (head, pivot, _) =
+                indexed.select_nth_unstable_by(kk - 1, |a, b| b.1.total_cmp(&a.1));
+            let mut window: Vec<(usize, f32)> = head.to_vec();
+            window.push(*pivot);
+            window.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            Ok(window.into_iter().map(|(i, p)| (i as u32, p)).collect())
+        } else {
+            indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            Ok(indexed.into_iter().map(|(i, p)| (i as u32, p)).collect())
+        }
     }
     /// Flush the pending batch (one commit+wait) and leave batch mode.
     fn end_batch(&self) -> Result<(), BackendError> {

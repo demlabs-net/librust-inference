@@ -397,6 +397,19 @@ impl Qwen3Model {
             let mut li = 0usize;
             let (mut p_attn, mut p_ffn) = (0.0f64, 0.0f64);
             let prof = std::env::var("LLM_BENCH").is_ok();
+            // N (iter-10): one causal mask per forward — identical for every
+            // layer (each cache's pos is the same at its own update).
+            let mask = if t > 1 {
+                Some(crate::nn::build_causal_mask(
+                    backend,
+                    t,
+                    self.caches[0].pos + t,
+                    self.pos_rope,
+                    self.cfg.swa_window,
+                )?)
+            } else {
+                None
+            };
             for (i, layer) in self.layers.iter().enumerate() {
                 // фичи для DFlash-инжекта = ВХОД extract-слоя (llama.cpp
                 // llama_get_embeddings_layer_inp: выход предыдущего слоя)
@@ -421,6 +434,7 @@ impl Qwen3Model {
                     None,
                     true,
                     None,
+                    mask.as_ref(),
                 )?;
                 x = backend_add(backend, &x, &h)?;
                 if prof {
@@ -592,6 +606,24 @@ impl Qwen3Model {
                 }
             }
         }
+        // N (iter-10): one mask per forward (see the other loops).
+        let mask = if let Some(mrope) = mrope {
+            if t > 1 {
+                Some(build_mrope_mask(backend, t, self.caches[0].pos + t, mrope)?)
+            } else {
+                None
+            }
+        } else if t > 1 {
+            Some(crate::nn::build_causal_mask(
+                backend,
+                t,
+                self.caches[0].pos + t,
+                pos,
+                self.cfg.swa_window,
+            )?)
+        } else {
+            None
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(u) = upto {
                 if i >= u {
@@ -615,6 +647,7 @@ impl Qwen3Model {
                 mrope,
                 true,
                 None,
+                mask.as_ref(),
             )?;
             x = backend_add(backend, &x, &h)?;
             if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
@@ -735,6 +768,18 @@ impl Qwen3Model {
             let mut x = self.embed.forward(backend, ids, t)?;
             let mut out = Vec::with_capacity(layers.len());
             let mut li = 0usize;
+            // N (iter-10): one causal mask per forward (see the other loops).
+            let mask = if t > 1 {
+                Some(crate::nn::build_causal_mask(
+                    backend,
+                    t,
+                    self.caches[0].pos + t,
+                    self.pos_rope,
+                    self.cfg.swa_window,
+                )?)
+            } else {
+                None
+            };
             for (i, layer) in self.layers.iter().enumerate() {
                 // фичи для DFlash-инжекта = ВХОД extract-слоя (llama.cpp
                 // llama_get_embeddings_layer_inp: выход предыдущего слоя)
@@ -754,6 +799,7 @@ impl Qwen3Model {
                     None,
                     true,
                     None,
+                    mask.as_ref(),
                 )?;
                 x = backend_add(backend, &x, &h)?;
                 let h = layer.ffn_norm.forward(backend, &x)?;
@@ -941,6 +987,12 @@ impl Qwen3Model {
         mrope: Option<&[u32]>,
         causal: bool,
         cache_at: Option<usize>,
+        // N (iter-10): the causal/mrope mask is IDENTICAL for every layer
+        // (each layer's cache.pos equals the same value at its own update),
+        // so the caller builds it ONCE per forward — the old per-layer build
+        // re-filled and re-uploaded the same mask 36× (a 2048-token prefill
+        // = 36 × 16 MB H2D).
+        mask: Option<&Tensor>,
     ) -> Result<Tensor, BackendError> {
         // q/k из h через Attention — но Attention применяет interleaved-RoPE
         // сам. Делаем pre-rotation стандартным RoPE и передаём identity-таблицы:
@@ -1072,23 +1124,10 @@ impl Qwen3Model {
             None => cache.update(backend, &k, &v)?,
         }
         let t_upd_d = t_upd.elapsed().as_secs_f64();
-        let mask = if let Some(mrope) = mrope {
-            if t > 1 {
-                Some(build_mrope_mask(backend, t, cache.pos, mrope)?)
-            } else {
-                None
-            }
-        } else if causal && t > 1 {
-            Some(crate::nn::build_causal_mask(
-                backend,
-                t,
-                cache.pos,
-                pos,
-                cfg.swa_window,
-            )?)
-        } else {
-            None
-        };
+        // N (iter-10): mask passed in from the caller (built once per
+        // forward); the `causal`/`mrope` arguments are kept for the call
+        // sites' None-vs-Some decision, but the build itself moved out.
+        let mask = mask.map(|m| m.clone());
         let ck = cache.view();
         let cv = cache.view_v();
         let attn_out = backend.zeros(vec![b, tq, q_size])?;

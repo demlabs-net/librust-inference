@@ -39,6 +39,22 @@ impl<'a> WeightTensor<'a> {
     pub fn raw(&self) -> &'a [u8] {
         self.data
     }
+    /// N (iter-10): публичный конструктор — тесты (gguf_packed_gemm) строят
+    /// CPU-оракул из GGUF-байтов без доступа к приватным полям.
+    pub fn from_parts(
+        name: impl Into<String>,
+        shape: Vec<u64>,
+        format: WeightFormat,
+        data: &'a [u8],
+    ) -> Self {
+        Self {
+            name: name.into(),
+            shape,
+            format,
+            offset: 0,
+            data,
+        }
+    }
 }
 
 /// Карта весов модели: тензоры по именам + tied-алиасы.

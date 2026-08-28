@@ -624,6 +624,88 @@ impl Backend for CudaBackend {
         Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
     }
 
+    /// N (iter-10): GGUF Q6_K/Q4_K tensors now upload PACKED (kb-major, one
+    /// host-side block transpose — no dequant) and run through the fused
+    /// dequant-in-kernel GEMMs instead of the trait default (dequant→f32:
+    /// 32 B/weight VRAM and DRAM traffic vs 6.56/4.5 bits — ~5-7x). Q4_0 and
+    /// Q8_0 keep the f32 path (the speech-dialect pairing / scale-format
+    /// mismatches would silently misdecode; documented).
+    fn from_quantized(
+        &self,
+        data: &[u8],
+        shape: Vec<usize>,
+        format: crate::dtype::WeightFormat,
+    ) -> Result<Tensor, BackendError> {
+        let blk_bytes = match format {
+            crate::dtype::WeightFormat::Q6_K => 210usize,
+            crate::dtype::WeightFormat::Q4_K => 144usize,
+            _ => {
+                // Fall back to the reference path (dequant → f32).
+                let tmp = crate::weights_map::WeightTensor {
+                    name: "q".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format,
+                    offset: 0,
+                    data,
+                };
+                if matches!(
+                    format,
+                    crate::dtype::WeightFormat::Int4 | crate::dtype::WeightFormat::Nf4
+                ) {
+                    return Err(BackendError::UnsupportedFormat(format!(
+                        "from_quantized: {format:?} dequant not implemented"
+                    )));
+                }
+                let f = crate::weights_map::dequant_f32(&tmp);
+                return self.from_cpu_f32(&f, shape);
+            }
+        };
+        // 2D GEMM weights (incl. fused qkv/w13 — the concatenated sub-tensors
+        // are row-major over the fused rows, so a single transpose holds).
+        if shape.len() != 2 {
+            return Err(BackendError::Shape(format!(
+                "from_quantized packed: shape {shape:?} must be 2D"
+            )));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if cols % 256 != 0 {
+            // Not super-block aligned — dequant fallback.
+            let tmp = crate::weights_map::WeightTensor {
+                name: "q".into(),
+                shape: shape.iter().map(|&d| d as u64).collect(),
+                format,
+                offset: 0,
+                data,
+            };
+            let f = crate::weights_map::dequant_f32(&tmp);
+            return self.from_cpu_f32(&f, shape);
+        }
+        let nsuper = cols / 256;
+        let expect = rows * nsuper * blk_bytes;
+        if data.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "from_quantized: {} bytes for shape {shape:?} (expected {expect})",
+                data.len()
+            )));
+        }
+        // GGUF row-major super-blocks (r·nsuper + kb) → kb-major
+        // (kb·rows + r) — the packed kernels' layout.
+        let mut kb_major = vec![0u8; data.len()];
+        for r in 0..rows {
+            for kb in 0..nsuper {
+                let src = (r * nsuper + kb) * blk_bytes;
+                let dst = (kb * rows + r) * blk_bytes;
+                kb_major[dst..dst + blk_bytes].copy_from_slice(&data[src..src + blk_bytes]);
+            }
+        }
+        match format {
+            crate::dtype::WeightFormat::Q6_K => self.from_cpu_q6k(&kb_major, shape),
+            crate::dtype::WeightFormat::Q4_K => self.from_cpu_q4kc(&kb_major, shape),
+            _ => unreachable!(),
+        }
+    }
+
+
     fn from_cpu_f16(&self, data: &[half::f16], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let n: usize = shape.iter().product();
         if data.len() != n {
@@ -754,6 +836,26 @@ impl Backend for CudaBackend {
         self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
         Ok(Tensor::from_cuda_q4k(s, shape))
     }
+
+    fn from_cpu_q4kc(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        let per: usize = shape[1..].iter().product();
+        if per % 256 != 0 {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q4kc: per-dim {per} not a multiple of 256 (Q4_K super-blocks)"
+            )));
+        }
+        let expect = shape[0] * (per / 256) * 144;
+        if data.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "from_cpu_q4kc: {} packed bytes for shape {shape:?} (expected {expect})",
+                data.len()
+            )));
+        }
+        let mut s = unsafe { self.stream.alloc::<u8>(data.len()) }.map_err(map_err)?;
+        self.stream.memcpy_htod(data, &mut s).map_err(map_err)?;
+        Ok(Tensor::from_cuda_q4kc(s, shape))
+    }
+
     fn from_cpu_q5k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
         if per % 256 != 0 {
@@ -1071,6 +1173,11 @@ impl Backend for CudaBackend {
         }
         if let crate::backend::TensorInner::CudaQ3K(bpack) = &b.inner {
             return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 110, 32, "gemm_q3k");
+        }
+        if let crate::backend::TensorInner::CudaQ4KC(bpack) = &b.inner {
+            // N (iter-10): canonical Q4_K (GGUF) — v2 dequant-amortized
+            // kernels, same structure as q6k.
+            return self.gemm_packed_nt(a, bpack, c, m, k, n, 8, 144, 32, "gemm_q4kc");
         }
         if let crate::backend::TensorInner::CudaQ4K(bpack) = &b.inner {
             return self.gemm_packed_nt(a, bpack, c, m, k, n, 5, 18, 256, "gemm_q4k");
@@ -2045,6 +2152,282 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 
+    // N (iter-10): GPU implementations of rope/rmsnorm_head_rope — the trait
+    // defaults ran to_cpu_f32 → host sin/cos → from_cpu_f32 (2 full device
+    // syncs × 2 per layer per decode token = 72 syncs/token for 36 layers,
+    // the loop's dominant host cost). The kernels compute theta/cos/sin
+    // inline with the EXACT CPU-reference semantics (halves pairing, e-
+    // section skip, per-token 4D positions).
+
+    fn rope_standard(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_standard: hd={hd} does not divide d={d} (and must be even)"
+            )));
+        }
+        let y = self.zeros(vec![1, tq, d])?;
+        let n = tq * (d / hd) * (hd / 2);
+        let f = self.function("rope_std_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda());
+        let (tq, d, hd, pos) = (tq as i32, d as i32, hd as i32, pos as i32);
+        la.arg(&tq);
+        la.arg(&d);
+        la.arg(&hd);
+        la.arg(&pos);
+        la.arg(&theta);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
+    fn rmsnorm_head_rope(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        h: usize,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if h == 0 || d != h * hd || hd % 2 != 0 {
+            return Err(BackendError::Shape(format!(
+                "rmsnorm_head_rope: h={h}, hd={hd} vs d={d}"
+            )));
+        }
+        let y = self.zeros(vec![1, tq, d])?;
+        let n = tq * h * (hd / 2);
+        let f = self.function("rmsnorm_head_rope_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(y.as_cuda());
+        let (tq, h, hd, pos) = (tq as i32, h as i32, hd as i32, pos as i32);
+        la.arg(&tq);
+        la.arg(&h);
+        la.arg(&hd);
+        la.arg(&eps);
+        la.arg(&pos);
+        la.arg(&theta);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
+    fn rope_mrope_text(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_mrope_text: hd={hd} does not divide d={d}"
+            )));
+        }
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let y = self.zeros(vec![1, tq, d])?;
+        let n = tq * (d / hd) * (hd / 2);
+        let f = self.function("rope_mrope_text_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda());
+        let (tq, d, hd, pos) = (tq as i32, d as i32, hd as i32, pos as i32);
+        let (s0, s1, s2) = (sections[0] as i32, sections[1] as i32, sections[2] as i32);
+        let sd = sect_dims as i32;
+        la.arg(&tq);
+        la.arg(&d);
+        la.arg(&hd);
+        la.arg(&pos);
+        la.arg(&theta);
+        la.arg(&s0);
+        la.arg(&s1);
+        la.arg(&s2);
+        la.arg(&sd);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
+    fn rope_mrope(
+        &self,
+        x: &Tensor,
+        pos4d: &[u32],
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if pos4d.len() != tq * 4 {
+            return Err(BackendError::Shape(format!(
+                "rope_mrope: pos4d {} != tq·4 {}",
+                pos4d.len(),
+                tq * 4
+            )));
+        }
+        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_mrope: hd={hd} does not divide d={d}"
+            )));
+        }
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let y = self.zeros(vec![1, tq, d])?;
+        // Positions as f32 (exact below 2^24) — avoids a u32 buffer type.
+        let pos_f32: Vec<f32> = pos4d.iter().map(|&v| v as f32).collect();
+        let pos_gpu = self.from_cpu_f32(&pos_f32, vec![tq * 4])?;
+        let n = tq * (d / hd) * (hd / 2);
+        let f = self.function("rope_mrope_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(pos_gpu.as_cuda());
+        la.arg(y.as_cuda());
+        let (tq, d, hd) = (tq as i32, d as i32, hd as i32);
+        let (s0, s1, s2) = (sections[0] as i32, sections[1] as i32, sections[2] as i32);
+        let sd = sect_dims as i32;
+        la.arg(&tq);
+        la.arg(&d);
+        la.arg(&hd);
+        la.arg(&theta);
+        la.arg(&s0);
+        la.arg(&s1);
+        la.arg(&s2);
+        la.arg(&sd);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
+    fn penalized_topk(
+        &self,
+        logits: &Tensor,
+        bias: &Tensor,
+        history: &[u32],
+        rep_penalty: f32,
+        ras_penalty: f32,
+        ras_window: usize,
+        temperature: f32,
+        k: usize,
+    ) -> Result<Vec<(u32, f32)>, BackendError> {
+        // N (iter-10): the full penalty pipeline + softmax denominator + top-k
+        // run on the GPU (hist_counts_u32 + tts_topk_penalized_f32 +
+        // tts_topk_merge_f32); only k candidates and the denominator come
+        // back. The old path downloaded the whole vocab row and did 4 host
+        // passes per token (the TTS sampler's dominant cost).
+        let v = logits.shape()[logits.shape().len() - 1];
+        let kk = k.clamp(1, 32);
+        if v == 0 {
+            return Err(BackendError::Shape("penalized_topk: empty logits row".into()));
+        }
+        let h = history.len();
+        // History + histogram counts (u32).
+        let mut hist_g: Option<cudarc::driver::CudaSlice<u32>> = None;
+        if h > 0 {
+            let mut hg = unsafe { self.stream.alloc::<u32>(h) }.map_err(map_err)?;
+            self.stream.memcpy_htod(history, &mut hg).map_err(map_err)?;
+            hist_g = Some(hg);
+        }
+        let mut counts = unsafe { self.stream.alloc::<u32>(v) }.map_err(map_err)?;
+        self.stream.memset_zeros(&mut counts).map_err(map_err)?;
+        if let Some(hg) = &hist_g {
+            let f = self.function("hist_counts_u32")?;
+            let cfg = LaunchConfig::for_num_elems(h as u32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(hg);
+            la.arg(&counts);
+            let hi = h as i32;
+            la.arg(&hi);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        }
+        // Scratch: per-thread heaps (256 × kk), max, sum.
+        let mut heap_val = unsafe { self.stream.alloc::<f32>(256 * kk) }.map_err(map_err)?;
+        let mut heap_idx = unsafe { self.stream.alloc::<u32>(256 * kk) }.map_err(map_err)?;
+        let mut out_max = unsafe { self.stream.alloc::<f32>(1) }.map_err(map_err)?;
+        let mut out_sum = unsafe { self.stream.alloc::<f32>(1) }.map_err(map_err)?;
+        {
+            let f = self.function("tts_topk_penalized_f32")?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(logits.as_cuda());
+            la.arg(bias.as_cuda());
+            la.arg(&counts);
+            // The kernel only dereferences the history pointer when
+            // ras_penalty applies AND h >= 2; pass a dummy when empty.
+            let empty_hist: cudarc::driver::CudaSlice<u32> =
+                unsafe { self.stream.alloc::<u32>(1) }.map_err(map_err)?;
+            la.arg(hist_g.as_ref().unwrap_or(&empty_hist));
+            let (vi, ki) = (v as i32, kk as i32);
+            let hi = h as i32;
+            let rw = ras_window as i32;
+            la.arg(&hi);
+            la.arg(&vi);
+            la.arg(&ki);
+            la.arg(&rep_penalty);
+            la.arg(&ras_penalty);
+            la.arg(&rw);
+            la.arg(&temperature);
+            la.arg(&mut heap_val);
+            la.arg(&mut heap_idx);
+            la.arg(&mut out_max);
+            la.arg(&mut out_sum);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        }
+        {
+            let f = self.function("tts_topk_merge_f32")?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let n = 256 * kk;
+            let mut topk_val = unsafe { self.stream.alloc::<f32>(kk) }.map_err(map_err)?;
+            let mut topk_idx = unsafe { self.stream.alloc::<u32>(kk) }.map_err(map_err)?;
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(&heap_val);
+            la.arg(&heap_idx);
+            let ni = n as i32;
+            la.arg(&ni);
+            let ki = kk as i32;
+            la.arg(&ki);
+            la.arg(&mut topk_val);
+            la.arg(&mut topk_idx);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            let vals = self.stream.clone_dtoh(&topk_val).map_err(map_err)?;
+            let idxs = self.stream.clone_dtoh(&topk_idx).map_err(map_err)?;
+            let max = self.stream.clone_dtoh(&out_max).map_err(map_err)?[0];
+            let sum = self.stream.clone_dtoh(&out_sum).map_err(map_err)?[0];
+            let mut out: Vec<(u32, f32)> = Vec::with_capacity(kk);
+            if !sum.is_finite() || sum <= 0.0 {
+                let p = 1.0 / v as f32;
+                for i in 0..kk.min(v) {
+                    out.push((i as u32, p));
+                }
+                return Ok(out);
+            }
+            for i in 0..kk {
+                let p = ((vals[i] - max).exp() / sum).max(0.0);
+                out.push((idxs[i], p));
+            }
+            Ok(out)
+        }
+    }
+
     fn layernorm_head(
         &self,
         x: &Tensor,
@@ -2273,9 +2656,14 @@ impl Backend for CudaBackend {
             _ => unreachable!(),
         };
         let f = self.function(fname)?;
+        // N (iter-10): size the block to the ACTIVE warps (nwarps = hd/32) —
+        // the old fixed 256-thread block left 4 of 8 warps idle at hd=128
+        // (the real qwen3/DFlash dim) — half the issue slots wasted on a
+        // latency-bound kernel.
+        let block_w = (nwarps * 32).max(32) as u32;
         let cfg = LaunchConfig {
             grid_dim: (tq as u32, n_heads as u32, (b * nchunks) as u32),
-            block_dim: (256, 1, 1),
+            block_dim: (block_w, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut la = self.stream.launch_builder(&f);
@@ -2831,7 +3219,7 @@ impl CudaBackend {
         let act = self.activation_dtype();
         let a_arg: KernA = if m == 1 {
             match name {
-                "gemm_q6k" | "gemm_q4k" => match act {
+                "gemm_q6k" | "gemm_q4k" | "gemm_q4kc" => match act {
                     crate::dtype::Dtype::F16 => KernA::F16(self.cast_f16(a)?),
                     crate::dtype::Dtype::BF16 => KernA::BF16(self.cast_bf16(a)?),
                     _ => KernA::F32(a),
@@ -2846,10 +3234,13 @@ impl CudaBackend {
             (KernA::BF16(_), "gemm_q6k") => ("gemm_q6k_splitk_v2_bf16", "gemm_q6k_tiled_v3"),
             (KernA::F16(_), "gemm_q4k") => ("gemm_q4k_f16_splitk", "gemm_q4k_f16_tiled"),
             (KernA::BF16(_), "gemm_q4k") => ("gemm_q4k_bf16_splitk", "gemm_q4k_bf16_tiled"),
+            (KernA::F16(_), "gemm_q4kc") => ("gemm_q4kc_splitk_v2_f16", "gemm_q4kc_tiled_v3"),
+            (KernA::BF16(_), "gemm_q4kc") => ("gemm_q4kc_splitk_v2_bf16", "gemm_q4kc_tiled_v3"),
             (_, "gemm_q6k") => ("gemm_q6k_splitk_v2_f32", "gemm_q6k_tiled_v3"),
             (_, "gemm_q5k") => ("gemm_q5k_splitk_v2_f32", "gemm_q5k_tiled_v3"),
             (_, "gemm_q3k") => ("gemm_q3k_splitk_v2_f32", "gemm_q3k_tiled_v3"),
             (_, "gemm_q4k") => ("gemm_q4k_splitk", "gemm_q4k_tiled"),
+            (_, "gemm_q4kc") => ("gemm_q4kc_splitk_v2_f32", "gemm_q4kc_tiled_v3"),
             _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };
         if m == 1 {

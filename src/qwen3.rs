@@ -897,14 +897,11 @@ impl Qwen3Model {
                 &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]
             );
         }
-        let (q, k) = if attn.q_norm.is_some() && attn.k_norm.is_some() {
-            (
-                qk_norm(backend, &q, attn.q_norm.as_ref().unwrap(), attn.n_heads)?,
-                qk_norm(backend, &k, attn.k_norm.as_ref().unwrap(), attn.n_kv_heads)?,
-            )
-        } else {
-            (q, k)
-        };
+        // НОРМАЛИЗАЦИЯ — ТОЛЬКО ОДНА, В ВЕТКАХ НИЖЕ. Раньше здесь стоял
+        // пред-норм qk_norm, а затем fused rmsnorm_head_rope / qk_norm_pub
+        // нормировали q/k ВТОРОЙ раз: 2× норм на реальном GGUF (Qwen3
+        // 0.6B/8B) давал вырожденный вывод (повтор «|وووو…»). Ветки
+        // сами нормируют: else — rmsnorm_head_rope, mrope — qk_norm_pub.
         let (q, k) = if let Some(mrope) = mrope {
             let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
             let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
@@ -1032,17 +1029,6 @@ pub fn qk_norm_pub(
         Some(w) => backend.rmsnorm_head(x, w, &y, heads, eps)?,
         None => return Ok(x.clone()),
     }
-    Ok(y)
-}
-
-fn qk_norm(
-    backend: &dyn Backend,
-    x: &Tensor,
-    w: &Tensor,
-    heads: usize,
-) -> Result<Tensor, BackendError> {
-    let y = backend.zeros(x.shape().to_vec())?;
-    backend.rmsnorm_head(x, w, &y, heads, 1e-6)?;
     Ok(y)
 }
 

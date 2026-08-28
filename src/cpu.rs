@@ -491,8 +491,15 @@ impl Backend for CpuBackend {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (cout, cin_g, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
         // Q22: groups==0 or groups>cout would divide by zero at
-        // `co / (cout / groups)` — validate up front.
-        if groups == 0 || cout % groups != 0 || cin % groups != 0 || cin_g != cin / groups {
+        // `co / (cout / groups)` — validate up front. groups > cin is the
+        // CUDA guard mirror (it diverges only when cin == 0: for cin > 0
+        // the cin % groups check already rejects it).
+        if groups == 0
+            || groups > cin
+            || cout % groups != 0
+            || cin % groups != 0
+            || cin_g != cin / groups
+        {
             return Err(BackendError::Shape(format!(
                 "conv1d_groups: group mismatch (cout={cout}, cin={cin}, groups={groups}, cin_g={cin_g})"
             )));
@@ -1544,7 +1551,10 @@ impl Backend for CpuBackend {
         // dst (B, cap, D), src (B, Tq, D): write at [pos, pos+Tq).
         let (b, tq, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
         let cap = dst.shape()[1];
-        if dst.shape()[2] != d || pos + tq > cap {
+        // dst batch must match src: the writes index dst by bi·cap — a
+        // mismatched dst batch would slice OOB (panic) instead of failing
+        // loudly like the capacity guard.
+        if dst.shape()[0] != b || dst.shape()[2] != d || pos + tq > cap {
             return Err(BackendError::Shape("kv_update: capacity exceeded".into()));
         }
         let s = data(src);

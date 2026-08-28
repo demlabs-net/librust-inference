@@ -72,6 +72,10 @@ metal = "0.31"
 
 [dev-dependencies]
 half = "2"
+# Packed-K-quant parity tests (tests/quant_kquants_parity.rs) reuse the
+# speech crate's upload_quant + reference decoders (q5k_decode/q3k_decode)
+# as the oracle for the CUDA packed upload/dequant path.
+rust-inference-speech = { path = "../librust-inference-speech" }
 
 [profile.release]
 lto = "thin"

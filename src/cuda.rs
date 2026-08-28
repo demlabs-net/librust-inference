@@ -270,6 +270,13 @@ impl CudaBackend {
     /// STT engine (gigaam/t-one: k=768 → only 12 of 16 slices written).
     fn tiled_used_slices(k: usize, block_shift: u32) -> usize {
         let nsup = k >> block_shift;
+        if nsup == 0 {
+            // k < 256 (Q6_K/Q5_K/Q3_K) or k < 32 (Q4_0/halfw): no k-block at
+            // all — the tiled kernels exit immediately for nsup==0, so the
+            // reduce of a single (stale-data) slice is harmless. Returning
+            // early also avoids the 0/0 in div_ceil below.
+            return 1;
+        }
         let nkz = (nsup + 15) / 16;
         nsup.div_ceil(nkz).max(1)
     }
@@ -1430,6 +1437,13 @@ impl Backend for CudaBackend {
             )));
         }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
+        if tout == 0 {
+            // Window larger than the padded input: the CPU reference returns
+            // Ok with a zero-filled output — mirror it here (a 0-element
+            // launch would build an invalid 0-block grid).
+            self.stream.memset_zeros(y.as_cuda_mut()).map_err(map_err)?;
+            return Ok(());
+        }
         let n = b * tout * cout;
         let f = self.function("conv1d_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
@@ -2464,8 +2478,11 @@ impl Backend for CudaBackend {
         let cap = dst.shape()[1];
         // Mirror of the CPU reference guard: dst (B, cap, D), src (B, Tq, D)
         // — pos + tq must fit within the capacity (the kernel writes rows
-        // [pos, pos+tq) of dst; past-cap rows would be OOB).
-        if dst.shape()[2] != d || pos + tq > cap {
+        // [pos, pos+tq) of dst; past-cap rows would be OOB) and the batches
+        // must match: a mismatched dst batch would let the kernel write past
+        // the dst buffer (silent OOB on the GPU, where the CPU slice-copy
+        // would panic).
+        if dst.shape()[0] != b || dst.shape()[2] != d || pos + tq > cap {
             return Err(BackendError::Shape("kv_update: capacity exceeded".into()));
         }
         let n = b * tq * d;
@@ -2793,5 +2810,10 @@ mod tests {
         assert_eq!(CudaBackend::tiled_used_slices(2048, 8), 8);
         // Q4_0 block (64 elems): k=768 → nsup=12, nkz=1 → 12.
         assert_eq!(CudaBackend::tiled_used_slices(768, 6), 12);
+        // nsup == 0 (k below one super-block): must return 1, not divide
+        // by zero (the tiled kernels exit immediately; reduce is harmless).
+        assert_eq!(CudaBackend::tiled_used_slices(128, 8), 1);
+        assert_eq!(CudaBackend::tiled_used_slices(16, 5), 1);
+        assert_eq!(CudaBackend::tiled_used_slices(0, 5), 1);
     }
 }

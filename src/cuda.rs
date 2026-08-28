@@ -283,6 +283,7 @@ impl CudaBackend {
         m: usize,
         n: usize,
         s: usize,
+        pool_cap: usize,
     ) -> Result<(), BackendError> {
         let n32 = n as i32;
         let m32 = m as i32;
@@ -302,13 +303,15 @@ impl CudaBackend {
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // J7: poison-resilient pool lock (a panic while the pool mutex was
         // held must not abort the next take()).
-        // T5-8: the caller allocates cpart with 16 z-slices and takes it
-        // back by 16·m·n — pushing under the used-slice size s·m·n stranded
-        // every tiled cpart in an unreachable bucket (one 16·m·n allocation
-        // leaked per tiled GEMM). Slices ≥ s are stale but never reduced.
-        let cap = 16 * m * n;
+        // T5-8/R: the bucket key MUST be the cpart ALLOCATION size — the
+        // tiled paths take 16·m·n (grid.z=16, only `used` slices reduced),
+        // the m==1 splitk paths take s·m·n (s = split factor, usually < 16).
+        // The wave-6 blanket 16·m·n key made every splitk buffer land in
+        // the tiled bucket: the tiled take could then pop an s·m·n buffer
+        // and write 16 slices into it (OOB), and every splitk call stranded
+        // its buffer (the bucket grows unbounded).
         lock_poison_resilient(&self.pool)
-            .entry(cap)
+            .entry(pool_cap)
             .or_default()
             .push(cpart);
         Ok(())
@@ -431,7 +434,7 @@ impl CudaBackend {
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             let used = Self::tiled_used_slices(k, 5);
-            self.reduce_and_pool(cpart, c, m, n, used)?;
+            self.reduce_and_pool(cpart, c, m, n, used, 16 * m * n)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -465,7 +468,7 @@ impl CudaBackend {
         la.arg(&m32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
         // Combine the S partials (stream-ordered after splitk).
-        self.reduce_and_pool(cpart, c, m, n, s)?;
+        self.reduce_and_pool(cpart, c, m, n, s, s * m * n)?;
         self.pool_a_scratch(a_arg);
         Ok(())
     }
@@ -893,7 +896,11 @@ impl Backend for CudaBackend {
                         for j in 0..256 {
                             let b = j >> 5;
                             let l = j & 31;
-                            let is = (b >> 1) * 2;
+                            // Per-32-block scales — the odd block of a pair
+                            // has its OWN scale (kernel parity; the old
+                            // (b>>1)*2 applied the even block's scale to
+                            // both halves).
+                            let is = b;
                             let (sc, m) = if is < 4 {
                                 (blk[4 + is] & 63, blk[4 + is + 4] & 63)
                             } else {
@@ -905,7 +912,11 @@ impl Backend for CudaBackend {
                             let dl = d * sc as f32;
                             let ml = mn * m as f32;
                             let half = b & 1;
-                            let mut q = if half == 0 { blk[16 + l] & 0xF } else { blk[16 + l] >> 4 };
+                            // qs is chunk-major (16 + 32·c + l); the old
+                            // `blk[16 + l]` read chunk 0's bytes for blocks
+                            // 2..7 (kernel-parity fix).
+                            let qsb = 32 * (b >> 1);
+                            let mut q = if half == 0 { blk[16 + qsb + l] & 0xF } else { blk[16 + qsb + l] >> 4 };
                             let u = 1 << (2 * (b >> 1) + half);
                             if blk[144 + l] & u != 0 {
                                 q += 16;
@@ -950,7 +961,10 @@ impl Backend for CudaBackend {
                             let qbase = (s % 2) * 16 + (s / 8) * 32;
                             let shift = ((s / 2) % 4) * 2;
                             let hbase = (s % 2) * 16;
-                            let mbit = 1 << ((s / 2) % 4);
+                            // Canonical hmask bit s/2 (kernel + encoder
+                            // parity — the old (s/2)%4 collided sub-blocks
+                            // s and s+8 on the same bit).
+                            let mbit = 1 << (s / 2);
                             let q2 = ((blk[32 + qbase + l] >> shift) & 3) as i32;
                             let h = if blk[hbase + l] & mbit != 0 { 0 } else { 4 };
                             out[r * per + sb * 256 + j] = dl * (q2 - h) as f32;
@@ -1098,7 +1112,7 @@ impl Backend for CudaBackend {
                 la.arg(&n32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
                 let used = Self::tiled_used_slices(k, 5);
-                self.reduce_and_pool(cpart, c, m, n, used)?;
+                self.reduce_and_pool(cpart, c, m, n, used, 16 * m * n)?;
                 self.pool_a_scratch(a_arg);
                 return Ok(());
             }
@@ -1127,7 +1141,7 @@ impl Backend for CudaBackend {
             la.arg(&m32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             // Combine the S partials (stream-ordered after splitk).
-            self.reduce_and_pool(cpart, c, m, n, s)?;
+            self.reduce_and_pool(cpart, c, m, n, s, s * m * n)?;
             self.pool_a_scratch(a_arg);
             return Ok(());
         }
@@ -2702,7 +2716,7 @@ impl CudaBackend {
                 la.arg(&s32);
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
-                self.reduce_and_pool(cpart, c, m, n, s)?;
+                self.reduce_and_pool(cpart, c, m, n, s, s * m * n)?;
             } else {
                 let f = self.function(splitk)?;
                 let cfg = LaunchConfig {
@@ -2747,7 +2761,7 @@ impl CudaBackend {
             la.arg(&n32);
             unsafe { la.launch(cfg) }.map_err(map_err)?;
             let used = Self::tiled_used_slices(k, nsup_shift);
-            self.reduce_and_pool(cpart, c, m, n, used)?;
+            self.reduce_and_pool(cpart, c, m, n, used, 16 * m * n)?;
         }
         self.pool_a_scratch(a_arg);
         let _ = blk_bytes; // layout constant — kept for the kernel contract

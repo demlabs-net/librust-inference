@@ -1411,7 +1411,12 @@ __device__ inline float q5k_weight(const unsigned char* blk, int j) {
     int b = j >> 5;          // 0..7 (32-weight blocks)
     int l = j & 31;
     int pair = b >> 1;       // 0..3 (64-weight groups)
-    int is = pair * 2;
+    // Per-32-block scales: the odd block of a pair has its OWN scale/min
+    // (the encoder packs 8 per-block entries; the CPU decoder reads
+    // scale_min_k4(block)). The old `is = pair*2` applied the EVEN block's
+    // scale to both halves — blocks 1, 3, 5, 7 dequantized wrong (the
+    // q5k fused path only became reachable in wave 6).
+    int is = b;
     // get_scale_min_k4(is, scales)
     int sc, m;
     if (is < 4) {

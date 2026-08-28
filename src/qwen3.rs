@@ -327,13 +327,26 @@ impl Qwen3Model {
                 ffn_norm,
                 ffn,
             });
+            // N (iter-10): KV in f16 by default — halves the attention
+            // DRAM traffic (the decode bottleneck) and the cache VRAM; the
+            // f16 kv_update + attn_ar_v4_f16f16 kernels are tested
+            // (kv_f16.rs). F32 stays available via KvFormat for reference
+            // runs.
             caches.push(KvCache::new(
                 backend,
                 cfg.n_kv_heads,
                 cfg.head_dim,
-                crate::dtype::KvFormat::F32,
-                crate::dtype::KvFormat::F32,
+                crate::dtype::KvFormat::F16,
+                crate::dtype::KvFormat::F16,
             )?);
+        }
+        // N (iter-10): bound the KV to the model's context window — the
+        // default (None) grew without limit on long conversations (or
+        // errored mid-reply when an operator set max_cap manually). The
+        // cap errors LOUDLY at the window edge (compaction would corrupt
+        // absolute RoPE positions — documented in set_max_cap).
+        for c in &mut caches {
+            c.set_max_cap(Some(cfg.rope_max_seq));
         }
 
         let out_norm = RmsNorm::from_weights(backend, t("output_norm.weight")?, cfg.norm_eps)?;

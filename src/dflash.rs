@@ -166,9 +166,13 @@ impl DFlashModel {
                 backend,
                 cfg.n_kv_heads,
                 cfg.head_dim,
-                crate::dtype::KvFormat::F32,
-                crate::dtype::KvFormat::F32,
+                crate::dtype::KvFormat::F16,
+                crate::dtype::KvFormat::F16,
             )?);
+        }
+        // N (iter-10): bound the KV to the context window (see qwen3).
+        for c in &mut caches {
+            c.set_max_cap(Some(cfg.rope_max_seq));
         }
         let selector = if w.get("selector_predecessor").is_some() {
             // rank/top_k — из метаданных драфтера (GGUF KV

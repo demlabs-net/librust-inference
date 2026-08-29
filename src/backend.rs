@@ -864,9 +864,14 @@ pub trait Backend: Send + Sync {
         k: usize,
     ) -> Result<Vec<(u32, f32)>, BackendError> {
         let v = logits.shape()[logits.shape().len() - 1];
-        let lg = self.to_cpu_f32(logits)?;
+        // N (plan 7.3): fused host path — the penalties mutate the
+        // downloaded row IN PLACE (the old code cloned it into `pen`), and
+        // the exp/sum/candidates build is ONE pass (the old code
+        // materialized exp_vals, summed it, then built indexed). Same float
+        // ops in the same order — bit-identical results, ~2 fewer full
+        // passes and ~2 fewer 4·v allocations per token.
+        let mut pen = self.to_cpu_f32(logits)?;
         let bv = self.to_cpu_f32(bias)?;
-        let mut pen = lg.clone();
         if rep_penalty != 1.0 {
             for &t in history {
                 let idx = t as usize;
@@ -903,19 +908,24 @@ pub trait Backend: Send + Sync {
             }
         }
         let max = pen.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_vals: Vec<f32> = pen.iter().map(|&l| (l - max).exp()).collect();
-        let sum: f32 = exp_vals.iter().sum();
+        let mut sum = 0.0f32;
+        // Sequential exp + running sum (identical summation order to the old
+        // exp_vals-then-sum, so the fallback trigger and probs are unchanged).
+        let mut indexed: Vec<(usize, f32)> = Vec::with_capacity(v);
+        indexed.extend(pen.iter().enumerate().map(|(i, &l)| {
+            let e = (l - max).exp();
+            sum += e;
+            (i, e)
+        }));
         if !sum.is_finite() || sum <= 0.0 {
             // Reference fallback: uniform over the vocab (unreachable with
             // the TTS temperature=1 path; kept for parity).
             let p = 1.0 / v.max(1) as f32;
             return Ok((0..k.min(v.max(1))).map(|i| (i as u32, p)).collect());
         }
-        let mut indexed: Vec<(usize, f32)> = exp_vals
-            .iter()
-            .enumerate()
-            .map(|(i, &e)| (i, e / sum))
-            .collect();
+        for (_, e) in indexed.iter_mut() {
+            *e /= sum;
+        }
         let kk = k.min(indexed.len());
         if kk < indexed.len() {
             let (head, pivot, _) =

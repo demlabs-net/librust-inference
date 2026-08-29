@@ -594,7 +594,7 @@ impl Qwen3Model {
         deepstack: Option<&[Tensor]>,
     ) -> Result<Tensor, BackendError> {
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
-        if std::env::var("INFER_LLM_DEBUG").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
             let xv = backend.to_cpu_f32(&x)?;
             eprintln!("INFER_DEBUG embed[0,:8]={:?}", &xv[..8]);
         }
@@ -1021,14 +1021,14 @@ impl Qwen3Model {
         .forward(backend, h)?;
         let qkv = if let Some(bias) = &attn.qkv_bias {
             // Qwen2.5-Omni thinker: q/k/v проекции с bias (fused [3D']).
-            if std::env::var("OMNI_REF").is_ok() {
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
                 let bv = backend.to_cpu_f32(bias)?;
                 eprintln!("OMNI_REF our_q_bias[:8]={:?}", &bv[..8.min(bv.len())]);
                 let qv = backend.to_cpu_f32(&qkv)?;
                 eprintln!("OMNI_REF qkv_before_bias[:8]={:?}", &qv[..8.min(qv.len())]);
             }
             backend.add_bias(&qkv, bias, &qkv)?;
-            if std::env::var("OMNI_REF").is_ok() {
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
                 let qv = backend.to_cpu_f32(&qkv)?;
                 let qs = q_size + 2 * kv_size;
                 let last = qv.len() - qs;
@@ -1036,7 +1036,7 @@ impl Qwen3Model {
             }
             qkv
         } else {
-            if std::env::var("OMNI_REF").is_ok() {
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
                 eprintln!("OMNI_REF qkv_bias=None!!!");
             }
             qkv
@@ -1044,13 +1044,13 @@ impl Qwen3Model {
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
-        if std::env::var("INFER_LLM_DEBUG").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
             for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
                 let tv = backend.to_cpu_f32(t)?;
                 eprintln!("INFER_DEBUG {tag}_slice[:8]={:?}", &tv[..8.min(tv.len())]);
             }
         }
-        if std::env::var("OMNI_REF").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
             let qv = backend.to_cpu_f32(&q)?;
             let kvv = backend.to_cpu_f32(&k)?;
             let hv = backend.to_cpu_f32(h)?;
@@ -1093,21 +1093,16 @@ impl Qwen3Model {
             // (CPU/CUDA) — два шага
             let q = match &attn.q_norm {
                 Some(w) => {
-                    let q = if std::env::var("SKIP_QK_NORM").is_ok() {
-                        // ДИАГНОСТИКА: вход, вероятно, уже нормирован
-                        q
-                    } else {
-                        backend.rmsnorm_head_rope(
-                            &q,
-                            w,
-                            pos,
-                            attn.head_dim,
-                            cfg.rope_theta,
-                            attn.n_heads,
-                            1e-6,
-                        )?
-                    };
-                    if std::env::var("INFER_LLM_DEBUG").is_ok() {
+                    let q = backend.rmsnorm_head_rope(
+                        &q,
+                        w,
+                        pos,
+                        attn.head_dim,
+                        cfg.rope_theta,
+                        attn.n_heads,
+                        1e-6,
+                    )?;
+                    if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
                         let qv = backend.to_cpu_f32(&q)?;
                         eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
                     }
@@ -1145,8 +1140,7 @@ impl Qwen3Model {
         let cv = cache.view_v();
         let attn_out = backend.zeros(vec![b, tq, q_size])?;
         let t_at = std::time::Instant::now();
-        if std::env::var("Q3_SKIP_ATTN").is_err() {
-            backend.attn_ar(
+        backend.attn_ar(
                 &q,
                 &ck,
                 &cv,
@@ -1156,8 +1150,7 @@ impl Qwen3Model {
                 attn.n_kv_heads,
                 attn.head_dim,
             )?;
-        }
-        if std::env::var("LLM_BENCH").is_ok() && tq == 1 {
+        if cfg!(debug_assertions) && std::env::var("LLM_BENCH").is_ok() && tq == 1 {
             eprintln!(
                 "  attn_ar {:.2}ms kv_update {:.2}ms",
                 t_at.elapsed().as_secs_f64() * 1e3,

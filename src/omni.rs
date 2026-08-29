@@ -316,7 +316,7 @@ impl OmniAudioTower {
         // conv1 (stride 1) → GELU
         let h1 = backend.zeros(vec![1, len, d])?;
         backend.conv1d(x, &self.conv1_w, Some(&self.conv1_b), 1, 1, 1, 1, &h1)?;
-        if std::env::var("OMNI_REF").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
             let h1v = backend.to_cpu_f32(&h1)?;
             eprintln!(
                 "OMNI_REF our_conv1_raw[0,:8]={:?}",
@@ -328,7 +328,7 @@ impl OmniAudioTower {
         let mut h = backend.zeros(vec![1, l2, d])?;
         backend.conv1d(&h1, &self.conv2_w, Some(&self.conv2_b), 2, 1, 1, 1, &h)?;
         backend.gelu_erf(&h, &h)?;
-        if std::env::var("OMNI_REF").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
             let h1v = backend.to_cpu_f32(&h1)?;
             let h2v = backend.to_cpu_f32(&h)?;
             eprintln!("OMNI_REF our_conv1[0,:8]={:?}", &h1v[..8.min(h1v.len())]);
@@ -341,7 +341,7 @@ impl OmniAudioTower {
             backend.add(&h, &pos, &mut y)?;
             y
         };
-        if std::env::var("OMNI_REF").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
             let hv = backend.to_cpu_f32(&h)?;
             eprintln!("OMNI_REF our_pos[0,:8]={:?}", &hv[..8.min(hv.len())]);
         }
@@ -372,21 +372,21 @@ impl OmniAudioTower {
                 backend.add(&h, &o, &mut y)?;
                 y
             };
-            if std::env::var("OMNI_REF").is_ok() {
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
                 let hv = backend.to_cpu_f32(&h)?;
                 eprintln!("OMNI_REF t_after_attn[0,:8]={:?}", &hv[..8.min(hv.len())]);
             }
             // FFN
             let hn2 = backend.zeros(vec![1, l2, d])?;
             backend.layernorm(&h, &layer.ffn_ln_w, &layer.ffn_ln_b, &hn2, 1e-5)?;
-            if std::env::var("OMNI_REF").is_ok() {
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
                 let hv = backend.to_cpu_f32(&hn2)?;
                 eprintln!("OMNI_REF t_hn2[0,:4]={:?}", &hv[..4.min(hv.len())]);
             }
             let f = layer.fc1.forward(backend, &hn2)?;
             backend.gelu_erf(&f, &f)?;
             let f = layer.fc2.forward(backend, &f)?;
-            if std::env::var("OMNI_REF").is_ok() {
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
                 let hv = backend.to_cpu_f32(&f)?;
                 eprintln!("OMNI_REF t_after_ffn[0,:8]={:?}", &hv[..8.min(hv.len())]);
             }
@@ -400,7 +400,7 @@ impl OmniAudioTower {
         // ln_post → avg-pool парами → proj
         let hp = backend.zeros(vec![1, l2, d])?;
         backend.layernorm(&h, &self.ln_post_w, &self.ln_post_b, &hp, 1e-5)?;
-        if std::env::var("OMNI_REF").is_ok() {
+        if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
             let hv = backend.to_cpu_f32(&hp)?;
             eprintln!("OMNI_REF t_ln_post[0,:8]={:?}", &hv[..8.min(hv.len())]);
         }

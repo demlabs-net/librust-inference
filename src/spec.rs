@@ -69,7 +69,10 @@ pub trait Drafter {
 
 /// Суффиксный n-граммовый драфтер: самый длинный суффикс истории с
 /// предыдущим вхождением → продолжение (максимальный порядок — 4).
-/// q=0.5: консервативная честная оценка (принимается при p >= 0.5).
+/// N (plan 1.5): q больше НЕ хардкод 0.5 — это эмпирическая частота
+/// выбранного продолжения среди всех вхождений суффикса (честная оценка
+/// для rejection sampling: при q=1 драфтер уверен, при редких суффиксах
+/// q низкое → принятие по p/q ≥ 1 — целевое распределение сохраняется).
 #[derive(Debug, Default)]
 pub struct NGramDrafter {
     max_order: usize,
@@ -91,31 +94,42 @@ impl Drafter for NGramDrafter {
         gamma: usize,
     ) -> (Vec<u32>, Vec<f32>) {
         let mut drafts: Vec<u32> = Vec::new();
+        let mut probs: Vec<f32> = Vec::new();
         let mut hist: Vec<u32> = history.to_vec();
         for _ in 0..gamma {
-            let mut next = None;
+            let mut next: Option<(u32, f32)> = None;
             let mut order = hist.len().min(self.max_order);
             while order >= 1 && next.is_none() {
                 if hist.len() > order {
                     let suffix = &hist[hist.len() - order..];
+                    // N (plan 1.5): count ALL suffix occurrences and the
+                    // continuation frequencies — the most common
+                    // continuation wins with q = its empirical frequency.
+                    let mut counts: std::collections::HashMap<u32, u32> =
+                        std::collections::HashMap::new();
+                    let mut total = 0u32;
                     for i in (0..hist.len() - order).rev() {
                         if &hist[i..i + order] == suffix {
-                            next = Some(hist[i + order]);
-                            break;
+                            *counts.entry(hist[i + order]).or_insert(0) += 1;
+                            total += 1;
                         }
+                    }
+                    if total > 0 {
+                        let (tok, cnt) = counts.iter().max_by_key(|(_, c)| **c).unwrap();
+                        next = Some((*tok, *cnt as f32 / total as f32));
                     }
                 }
                 order -= 1;
             }
             match next {
-                Some(t) => {
+                Some((t, q)) => {
                     drafts.push(t);
+                    probs.push(q);
                     hist.push(t); // симулируем принятие для следующей позиции
                 }
                 None => break,
             }
         }
-        let probs = vec![0.5f32; drafts.len()];
         (drafts, probs)
     }
 }

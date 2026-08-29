@@ -3110,6 +3110,163 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 
+    fn kv_shifted(&self, buf: &Tensor, shift: usize, pos: usize) -> Result<Tensor, BackendError> {
+        let (b, cap, d) = (buf.shape()[0], buf.shape()[1], buf.shape()[2]);
+        let shape = buf.shape().to_vec();
+        let (bi, si, pi, di, ci) = (b as i32, shift as i32, pos as i32, d as i32, cap as i32);
+        // In-place shift on the same buffer (the regions are disjoint;
+        // the kernels write through the handle — the returned tensor is a
+        // shallow clone of the mutated buffer).
+        match &buf.inner {
+            crate::backend::TensorInner::Cuda(_) => {
+                let f = self.function("kv_shift_f32")?;
+                let cfg = LaunchConfig::for_num_elems((b * (pos - shift) * d) as u32);
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(buf.as_cuda());
+                la.arg(&bi);
+                la.arg(&si);
+                la.arg(&pi);
+                la.arg(&di);
+                la.arg(&ci);
+                unsafe { la.launch(cfg).map_err(map_err)? };
+                return Ok(buf.clone());
+            }
+            crate::backend::TensorInner::CudaF16(s) => {
+                let f = self.function("kv_shift_f16")?;
+                let cfg = LaunchConfig::for_num_elems((b * (pos - shift) * d) as u32);
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(s);
+                la.arg(&bi);
+                la.arg(&si);
+                la.arg(&pi);
+                la.arg(&di);
+                la.arg(&ci);
+                unsafe { la.launch(cfg).map_err(map_err)? };
+                return Ok(buf.clone());
+            }
+            crate::backend::TensorInner::CudaI8 { data, scale } => {
+                let f = self.function("kv_shift_q8")?;
+                let cfg = LaunchConfig::for_num_elems((b * (pos - shift) * d) as u32);
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(data);
+                la.arg(scale);
+                la.arg(&bi);
+                la.arg(&si);
+                la.arg(&pi);
+                la.arg(&di);
+                la.arg(&ci);
+                unsafe { la.launch(cfg).map_err(map_err)? };
+                return Ok(buf.clone());
+            }
+            _ => Err(BackendError::Shape(format!(
+                "kv_shifted: unsupported storage {:?}",
+                buf.dtype
+            ))),
+        }
+    }
+
+    fn kv_rerotated(
+        &self,
+        k: &Tensor,
+        shift: usize,
+        head_dim: usize,
+        theta: f32,
+        mrope_sections: Option<[usize; 4]>,
+    ) -> Result<Tensor, BackendError> {
+        let (b, cap, d) = (k.shape()[0], k.shape()[1], k.shape()[2]);
+        let nheads = d / head_dim;
+        let pairs = head_dim / 2;
+        let shape = k.shape().to_vec();
+        // The rotation table (hd/2 entries): angle_i = −shift·theta^(−2i/hd).
+        let mut cos_tab = vec![0.0f32; pairs];
+        let mut sin_tab = vec![0.0f32; pairs];
+        for pi in 0..pairs {
+            let ang = -(shift as f32) * theta.powf(-2.0 * pi as f32 / head_dim as f32);
+            cos_tab[pi] = ang.cos();
+            sin_tab[pi] = ang.sin();
+        }
+        let cos_g = self.from_cpu_f32(&cos_tab, vec![pairs])?;
+        let sin_g = self.from_cpu_f32(&sin_tab, vec![pairs])?;
+        let total = b * cap * nheads * pairs;
+        let (bi, ci, hdi, nhi, si, pai) = (
+            b as i32,
+            cap as i32,
+            head_dim as i32,
+            nheads as i32,
+            shift as i32,
+            pairs as i32,
+        );
+        let (s0, s1, s2, sect_dims) = mrope_sections
+            .map(|s| (s[0] as i32, s[1] as i32, s[2] as i32, (s[0] + s[1] + s[2]) as i32))
+            .unwrap_or((0, 0, 0, 0));
+        match &k.inner {
+            crate::backend::TensorInner::Cuda(_) => {
+                let f = self.function("kv_rerotate_f32")?;
+                let cfg = LaunchConfig::for_num_elems(total as u32);
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(k.as_cuda());
+                la.arg(cos_g.as_cuda());
+                la.arg(sin_g.as_cuda());
+                la.arg(&bi);
+                la.arg(&ci);
+                la.arg(&hdi);
+                la.arg(&nhi);
+                la.arg(&si);
+                la.arg(&pai);
+                la.arg(&s0);
+                la.arg(&s1);
+                la.arg(&s2);
+                la.arg(&sect_dims);
+                unsafe { la.launch(cfg).map_err(map_err)? };
+                return Ok(k.clone());
+            }
+            crate::backend::TensorInner::CudaF16(s) => {
+                let f = self.function("kv_rerotate_f16")?;
+                let cfg = LaunchConfig::for_num_elems(total as u32);
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(s);
+                la.arg(cos_g.as_cuda());
+                la.arg(sin_g.as_cuda());
+                la.arg(&bi);
+                la.arg(&ci);
+                la.arg(&hdi);
+                la.arg(&nhi);
+                la.arg(&si);
+                la.arg(&pai);
+                la.arg(&s0);
+                la.arg(&s1);
+                la.arg(&s2);
+                la.arg(&sect_dims);
+                unsafe { la.launch(cfg).map_err(map_err)? };
+                return Ok(k.clone());
+            }
+            crate::backend::TensorInner::CudaI8 { data, scale } => {
+                let f = self.function("kv_rerotate_q8")?;
+                let cfg = LaunchConfig::for_num_elems((b * cap * nheads) as u32);
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(data);
+                la.arg(scale);
+                la.arg(cos_g.as_cuda());
+                la.arg(sin_g.as_cuda());
+                la.arg(&bi);
+                la.arg(&ci);
+                la.arg(&hdi);
+                la.arg(&nhi);
+                la.arg(&si);
+                la.arg(&s0);
+                la.arg(&s1);
+                la.arg(&s2);
+                la.arg(&sect_dims);
+                unsafe { la.launch(cfg).map_err(map_err)? };
+                return Ok(k.clone());
+            }
+            _ => Err(BackendError::Shape(format!(
+                "kv_rerotated: unsupported storage {:?}",
+                k.dtype
+            ))),
+        }
+    }
+
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError> {
         let (b, tq, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
         // K44: the q8_0 KV format stores one f32 scale per 32-element

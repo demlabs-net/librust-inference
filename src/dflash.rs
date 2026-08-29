@@ -168,6 +168,8 @@ impl DFlashModel {
                 cfg.head_dim,
                 crate::dtype::KvFormat::F16,
                 crate::dtype::KvFormat::F16,
+                cfg.rope_theta,
+                None,
             )?);
         }
         // N (iter-10): bound the KV to the context window (see qwen3).

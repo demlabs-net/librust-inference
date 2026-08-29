@@ -261,6 +261,173 @@ extern "C" __global__ void lstm_cell_f32(
     }
 }
 
+// KV compaction shift (plan 1.6): rows [shift..pos) of the (B, cap, D)
+// buffer move down to [0..pos-shift) in place. The regions are disjoint by
+// construction (shift = pos/2), so the parallel copy is safe.
+extern "C" __global__ void kv_shift_f32(
+    float* __restrict__ buf,
+    int b, int shift, int pos, int d, int cap)
+{
+    int n = (pos - shift) * d;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= b * n) return;
+    int bi = i / n;
+    int rem = i % n;
+    buf[bi * cap * d + rem] = buf[bi * cap * d + rem + shift * d];
+}
+
+extern "C" __global__ void kv_shift_f16(
+    __half* __restrict__ buf,
+    int b, int shift, int pos, int d, int cap)
+{
+    int n = (pos - shift) * d;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= b * n) return;
+    int bi = i / n;
+    int rem = i % n;
+    buf[bi * cap * d + rem] = buf[bi * cap * d + rem + shift * d];
+}
+
+// q8_0 shift: the i8 data AND the per-32-block f32 scales (d % 32 == 0
+// enforced by make_kv_tensor, so shift*d is block-aligned).
+extern "C" __global__ void kv_shift_q8(
+    signed char* __restrict__ data,
+    float* __restrict__ scales,
+    int b, int shift, int pos, int d, int cap)
+{
+    int n = (pos - shift) * d;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= b * n) return;
+    int bi = i / n;
+    int rem = i % n;
+    int base = bi * cap * d;
+    data[base + rem] = data[base + rem + shift * d];
+    int ns = (pos - shift) * (d / 32);
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < b * ns) {
+        int bj = j / ns;
+        int rj = j % ns;
+        int sbase = bj * cap * (d / 32);
+        scales[sbase + rj] = scales[sbase + rj + shift * (d / 32)];
+    }
+}
+
+// KV re-rotation (plan 1.6): the kept keys were stored rotated for their
+// ORIGINAL absolute positions [shift..pos); after the compaction shift they
+// must carry the rotations of [0..pos-shift). Every pair (2i, 2i+1) of
+// every head rotates by -shift * theta^(-2i/hd). The cos/sin table (hd/2
+// entries) is passed in.
+// The mrope-text pair filter (mirror of rope_mrope_text_f32): with
+// sections the pairs in the "empty" (t) sector carry NO position rotation
+// and must not be re-rotated; sect_dims == 0 means the plain rope (all
+// pairs rotate).
+__device__ inline bool mrope_pair_rotates(int pair, int s0, int s1, int s2, int sect_dims)
+{
+    if (sect_dims == 0) return true;
+    int sector = pair % sect_dims;
+    return (sector % 3 == 0 && sector < 3 * s0)
+        || (sector % 3 == 1 && sector < 3 * s1)
+        || (sector % 3 == 2 && sector < 3 * s2);
+}
+
+// The rope pair layout is INTERLEAVED HALVES (mirror of rmsnorm_head_rope
+// / rope_mrope_text): pair pi of a head = (k[pi], k[pi + hd/2]) — the
+// first hd/2 elements hold the first members, the second half the second.
+extern "C" __global__ void kv_rerotate_f32(
+    float* __restrict__ k,
+    const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab,
+    int b, int cap, int hd, int nheads, int shift, int pairs_per_head,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int total = b * cap * nheads * pairs_per_head;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int row = i / (nheads * pairs_per_head);
+    int rem = i % (nheads * pairs_per_head);
+    int hh = rem / pairs_per_head;
+    int pi = rem % pairs_per_head;
+    if (!mrope_pair_rotates(pi, s0, s1, s2, sect_dims)) return;
+    float c = cos_tab[pi];
+    float s = sin_tab[pi];
+    int hbase = row * (nheads * hd) + hh * hd;
+    float x = k[hbase + pi];
+    float y = k[hbase + pi + pairs_per_head];
+    k[hbase + pi] = x * c - y * s;
+    k[hbase + pi + pairs_per_head] = x * s + y * c;
+}
+
+extern "C" __global__ void kv_rerotate_f16(
+    __half* __restrict__ k,
+    const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab,
+    int b, int cap, int hd, int nheads, int shift, int pairs_per_head,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int total = b * cap * nheads * pairs_per_head;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int row = i / (nheads * pairs_per_head);
+    int rem = i % (nheads * pairs_per_head);
+    int hh = rem / pairs_per_head;
+    int pi = rem % pairs_per_head;
+    if (!mrope_pair_rotates(pi, s0, s1, s2, sect_dims)) return;
+    float c = cos_tab[pi];
+    float s = sin_tab[pi];
+    int hbase = row * (nheads * hd) + hh * hd;
+    float x = __half2float(k[hbase + pi]);
+    float y = __half2float(k[hbase + pi + pairs_per_head]);
+    k[hbase + pi] = __float2half_rn(x * c - y * s);
+    k[hbase + pi + pairs_per_head] = __float2half_rn(x * s + y * c);
+}
+
+// q8_0 re-rotation: one thread per HEAD (the rope pairs cross the 32-block
+// halves — the pair pi = (elem pi, elem pi + hd/2)), dequant, rotate,
+// re-quantize per 32-block with recomputed scales.
+extern "C" __global__ void kv_rerotate_q8(
+    signed char* __restrict__ data,
+    float* __restrict__ scales,
+    const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab,
+    int b, int cap, int hd, int nheads, int shift,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int blocks_per_row = hd / 32;
+    int total = b * cap * nheads;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int row = i / nheads;
+    int hh = i % nheads;
+    int hbase = row * (nheads * hd) + hh * hd;
+    // hd <= 256 for the fixed local array (all LLM head dims are 64/128).
+    if (hd > 256) return;
+    float tmp[256];
+    for (int j = 0; j < hd; ++j) {
+        tmp[j] = data[hbase + j]
+            * scales[row * (nheads * blocks_per_row) + hh * blocks_per_row + j / 32];
+    }
+    int pairs = hd / 2;
+    for (int pi = 0; pi < pairs; ++pi) {
+        if (!mrope_pair_rotates(pi, s0, s1, s2, sect_dims)) continue;
+        float c = cos_tab[pi];
+        float sn = sin_tab[pi];
+        float x = tmp[pi];
+        float y = tmp[pi + pairs];
+        tmp[pi] = x * c - y * sn;
+        tmp[pi + pairs] = x * sn + y * c;
+    }
+    for (int blk = 0; blk < blocks_per_row; ++blk) {
+        float mx = 0.0f;
+        for (int j = 0; j < 32; ++j) mx = fmaxf(mx, fabsf(tmp[blk * 32 + j]));
+        float ns = mx / 127.0f;
+        if (ns < 1e-8f) ns = 1e-8f;
+        for (int j = 0; j < 32; ++j) {
+            data[hbase + blk * 32 + j] = (signed char)__float2int_rn(tmp[blk * 32 + j] / ns);
+        }
+        scales[row * (nheads * blocks_per_row) + hh * blocks_per_row + blk] = ns;
+    }
+}
+
 extern "C" __global__ void rmsnorm_head_f32(
     const float* __restrict__ x,
     const float* __restrict__ w,

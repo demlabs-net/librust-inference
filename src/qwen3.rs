@@ -338,6 +338,8 @@ impl Qwen3Model {
                 cfg.head_dim,
                 crate::dtype::KvFormat::F16,
                 crate::dtype::KvFormat::F16,
+                cfg.rope_theta,
+                cfg.mrope_sections,
             )?);
         }
         // N (iter-10): bound the KV to the model's context window — the
@@ -412,6 +414,13 @@ impl Qwen3Model {
             let prof = std::env::var("LLM_BENCH").is_ok();
             // N (iter-10): one causal mask per forward — identical for every
             // layer (each cache's pos is the same at its own update).
+            // N (plan 1.6): roll the window BEFORE the current token's rope
+            // and the mask — the compact resets the absolute positions, and
+            // the current token must be roped at its NEW position (the
+            // update-time roll would rope it at the pre-roll position).
+            if self.caches[0].roll_if_needed(backend, t)? {
+                self.pos_rope = self.caches[0].pos;
+            }
             let mask = if t > 1 {
                 Some(crate::nn::build_causal_mask(
                     backend,
@@ -782,6 +791,13 @@ impl Qwen3Model {
             let mut out = Vec::with_capacity(layers.len());
             let mut li = 0usize;
             // N (iter-10): one causal mask per forward (see the other loops).
+            // N (plan 1.6): roll the window BEFORE the current token's rope
+            // and the mask — the compact resets the absolute positions, and
+            // the current token must be roped at its NEW position (the
+            // update-time roll would rope it at the pre-roll position).
+            if self.caches[0].roll_if_needed(backend, t)? {
+                self.pos_rope = self.caches[0].pos;
+            }
             let mask = if t > 1 {
                 Some(crate::nn::build_causal_mask(
                     backend,

@@ -558,6 +558,58 @@ pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
 /// `&dyn Backend`, а реализации аллоцируют в своём рантайме (входной массив
 /// не конвертируется в Self). Отключаем педантичный wrong_self_convention.
 #[allow(clippy::wrong_self_convention)]
+
+/// Re-upload host f32 data into the SAME storage dtype as `src` (the
+/// kv_shifted/kv_rerotated defaults must preserve the KV storage format).
+/// Generic over `B: ?Sized` so the trait defaults can pass `&Self`.
+fn reupload_in_dtype<B: Backend + ?Sized>(
+    backend: &B,
+    src: &Tensor,
+    data: &[f32],
+) -> Result<Tensor, BackendError> {
+    use crate::dtype::Dtype;
+    match src.dtype {
+        Dtype::F32 => backend.from_cpu_f32(data, src.shape().to_vec()),
+        Dtype::F16 => {
+            let h: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            backend.from_cpu_f16(&h, src.shape().to_vec())
+        }
+        // q8_0 KV: re-quantize per 32-element block (the format make_kv_tensor
+        // creates: i8 data + one f32 scale per 32-block).
+        Dtype::I8 => {
+            let d = src.shape()[2];
+            if d % 32 != 0 {
+                return Err(BackendError::Shape(format!(
+                    "reupload_same_dtype: q8_0 requires d % 32 == 0, got d={d}"
+                )));
+            }
+            let blocks = d / 32;
+            let rows = src.shape()[0] * src.shape()[1];
+            let mut i8 = vec![0i8; data.len()];
+            let mut sc = vec![1.0f32; rows * blocks];
+            for r in 0..rows {
+                for blk in 0..blocks {
+                    let base = r * d + blk * 32;
+                    let mut mx = 0.0f32;
+                    for j in 0..32 {
+                        mx = mx.max(data[base + j].abs());
+                    }
+                    let s = (mx / 127.0).max(1e-8);
+                    sc[r * blocks + blk] = s;
+                    for j in 0..32 {
+                        i8[base + j] = (data[base + j] / s).round() as i8;
+                    }
+                }
+            }
+            backend.from_cpu_i8(&i8, &sc, src.shape().to_vec())
+        }
+        _ => Err(BackendError::Shape(format!(
+            "reupload_same_dtype: unsupported storage dtype {:?}",
+            src.dtype
+        ))),
+    }
+}
+
 pub trait Backend: Send + Sync {
     /// Allocate a zero-initialized tensor of `shape`.
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;
@@ -1550,6 +1602,76 @@ pub trait Backend: Send + Sync {
     /// Quantized KV formats quantize on write here; fused attention
     /// dequantizes inline on read (per-component KV config).
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError>;
+
+    /// KV compaction shift (plan 1.6): rows [shift..pos) of the (B, cap, D)
+    /// buffer → a NEW tensor with them at [0..pos−shift) (the rest zeroed),
+    /// storage-dtype-preserving (f32 / f16 / q8_0 with the per-32-block
+    /// scales). The source/destination regions are disjoint by construction
+    /// (shift = pos/2). Returns a new tensor (a write-into-`buf` default is
+    /// impossible — no storage access); CUDA shifts in place.
+    fn kv_shifted(&self, buf: &Tensor, shift: usize, pos: usize) -> Result<Tensor, BackendError> {
+        let (b, cap, d) = (buf.shape()[0], buf.shape()[1], buf.shape()[2]);
+        let xh = self.to_cpu_f32(buf)?;
+        let n = (pos - shift) * d;
+        let mut yh = vec![0.0f32; b * cap * d];
+        for bi in 0..b {
+            let src = bi * cap * d + shift * d;
+            yh[bi * cap * d..bi * cap * d + n].copy_from_slice(&xh[src..src + n]);
+        }
+        reupload_in_dtype(self, buf, &yh)
+    }
+
+    /// KV re-rotation after a compaction shift (plan 1.6): the kept keys
+    /// were stored rotated for their ORIGINAL absolute positions
+    /// [shift..pos); after the shift they must carry the rotations of
+    /// [0..pos−shift). Rotates every pair (2i, 2i+1) of every head by
+    /// −shift·theta^(−2i/hd). Returns a new tensor; CUDA rotates in place.
+    fn kv_rerotated(
+        &self,
+        k: &Tensor,
+        shift: usize,
+        head_dim: usize,
+        theta: f32,
+        // M-RoPE sections (mirror of rope_mrope_text): the pairs in the
+        // "empty" (t) sector carry no position rotation; None = the plain
+        // rope (all pairs rotate).
+        mrope_sections: Option<[usize; 4]>,
+    ) -> Result<Tensor, BackendError> {
+        let (b, cap, d) = (k.shape()[0], k.shape()[1], k.shape()[2]);
+        let nheads = d / head_dim;
+        let pairs = head_dim / 2;
+        let mut xh = self.to_cpu_f32(k)?;
+        let sect_dims = mrope_sections.map(|s| s[0] + s[1] + s[2]).unwrap_or(0);
+        let rotates = |pi: usize| -> bool {
+            if sect_dims == 0 {
+                return true;
+            }
+            let (s0, s1, s2) = {
+                let s = mrope_sections.unwrap();
+                (s[0], s[1], s[2])
+            };
+            let sector = pi % sect_dims;
+            (sector % 3 == 0 && sector < 3 * s0)
+                || (sector % 3 == 1 && sector < 3 * s1)
+                || (sector % 3 == 2 && sector < 3 * s2)
+        };
+        for row in 0..b * cap {
+            for hh in 0..nheads {
+                let hbase = row * d + hh * head_dim;
+                for pi in 0..pairs {
+                    if !rotates(pi) {
+                        continue;
+                    }
+                    let ang = -(shift as f32) * theta.powf(-2.0 * pi as f32 / head_dim as f32);
+                    let (c, s) = (ang.cos(), ang.sin());
+                    let (x, y) = (xh[hbase + 2 * pi], xh[hbase + 2 * pi + 1]);
+                    xh[hbase + 2 * pi] = x * c - y * s;
+                    xh[hbase + 2 * pi + 1] = x * s + y * c;
+                }
+            }
+        }
+        reupload_in_dtype(self, k, &xh)
+    }
 
     // ── codebook search (DAC) ──
     /// For every row of X (B·T, D) find the nearest row of `table` (V, D)

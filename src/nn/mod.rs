@@ -377,6 +377,12 @@ pub struct KvCache {
     v_format: crate::dtype::KvFormat,
     /// Context-window limit; None = grow without bound.
     max_cap: Option<usize>,
+    /// N (plan 1.6): the compact re-rotates the kept keys for their new
+    /// absolute positions — it needs the head structure and the rope base
+    /// (and the mrope sections to skip the un-rotated t-sector pairs).
+    head_dim: usize,
+    rope_theta: f32,
+    mrope_sections: Option<[usize; 4]>,
 }
 
 const KV_CACHE_INIT_CAPACITY: usize = 256;
@@ -420,6 +426,10 @@ impl KvCache {
         head_dim: usize,
         k_format: crate::dtype::KvFormat,
         v_format: crate::dtype::KvFormat,
+        // N (plan 1.6): rope base (+ mrope sections) for the compaction
+        // re-rotation; the sections are None for the plain-rope caches.
+        rope_theta: f32,
+        mrope_sections: Option<[usize; 4]>,
     ) -> Result<Self, BackendError> {
         let cap = KV_CACHE_INIT_CAPACITY;
         let d = n_kv_heads * head_dim;
@@ -431,7 +441,29 @@ impl KvCache {
             k_format,
             v_format,
             max_cap: None,
+            head_dim,
+            rope_theta,
+            mrope_sections,
         })
+    }
+
+    /// Roll the window NOW if `pos + tq` would exceed the cap (plan 1.6):
+    /// the caller must do this BEFORE computing the current token's rope
+    /// and the causal mask — the compact resets the absolute positions,
+    /// and a token roped at the pre-roll position would land in the wrong
+    /// rotation (the update()'s internal roll stays as the safety net).
+    pub fn roll_if_needed(
+        &mut self,
+        backend: &dyn Backend,
+        tq: usize,
+    ) -> Result<bool, BackendError> {
+        if let Some(max) = self.max_cap {
+            if self.pos + tq > max {
+                self.compact(backend)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Context-window limit (n_ctx). When `update` would exceed it, the
@@ -449,26 +481,32 @@ impl KvCache {
         self.max_cap = max.map(|m| m.max(2));
     }
 
-    /// Drop the oldest half of the window — REFUSED: the data move itself
-    /// would need an offset view (`view_offset` at shift != 0 panics on
-    /// CUDA and mis-slices elsewhere), and even a correct move halves
-    /// `pos`, breaking the invariant that cache slot j ↔ absolute position
-    /// j (absolute RoPE positions and the causal mask are computed by the
-    /// caller from `pos`). Compaction requires the caller to remap absolute
-    /// positions for the kept tokens — not implemented; return an error
-    /// instead of silently corrupting attention.
-    fn compact(&mut self, _backend: &dyn Backend) -> Result<(), BackendError> {
+    /// Drop the oldest half of the window (plan 1.6 — REAL compaction):
+    /// rows [shift..pos) move down to [0..pos−shift) (backend kv_shifted,
+    /// format-preserving incl. the q8_0 block scales) and the kept KEYS are
+    /// re-rotated for their NEW absolute positions — they were stored
+    /// rotated for [shift..pos), and the caller continues from pos−shift
+    /// (the causal mask / query rope are rebuilt from the reset pos). The
+    /// position offset is thereby REMAPPED, so the absolute RoPE positions
+    /// and the causal mask stay consistent.
+    fn compact(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
         let pos = self.pos;
         let shift = pos / 2;
         if shift == 0 {
             // Нечего сдвигать — фактического compaction нет.
             return Ok(());
         }
-        Err(BackendError::Shape(format!(
-            "kv compact refused: dropping the oldest half (pos={pos}, shift={shift}) \
-             breaks absolute rope positions/causal mask; \
-             caller must reset absolute positions after compaction (not implemented)"
-        )))
+        self.k = backend.kv_shifted(&self.k, shift, pos)?;
+        self.v = backend.kv_shifted(&self.v, shift, pos)?;
+        self.k = backend.kv_rerotated(
+            &self.k,
+            shift,
+            self.head_dim,
+            self.rope_theta,
+            self.mrope_sections,
+        )?;
+        self.pos = pos - shift;
+        Ok(())
     }
 
     fn ensure(&mut self, backend: &dyn Backend, needed: usize) -> Result<(), BackendError> {
@@ -857,6 +895,8 @@ mod tests {
             2,
             crate::dtype::KvFormat::F32,
             crate::dtype::KvFormat::F32,
+            1e4,
+            None,
         )
         .unwrap();
         // step 1: x=[1,0] → attention over itself → y = x
@@ -890,6 +930,8 @@ mod tests {
             2,
             crate::dtype::KvFormat::F32,
             crate::dtype::KvFormat::F32,
+            1e4,
+            None,
         )
         .unwrap();
         for i in 0..300u32 {

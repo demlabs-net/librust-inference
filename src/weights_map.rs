@@ -332,15 +332,11 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Q8_0 => dequant_q8_0(t.data),
         WeightFormat::Q4_K => dequant_q4_k(t.data),
         WeightFormat::Q6_K => dequant_q6_k(t.data),
+        // N (plan 1.1): a stub that returned EMPTY weights (with an
+        // eprintln) silently corrupted any model reaching this path —
+        // fail loudly instead.
         WeightFormat::Int4 | WeightFormat::Nf4 => {
-            eprintln!(
-                "dequant_f32: {} dequant not implemented — returning EMPTY weights (caller must reject the format)",
-                match t.format {
-                    WeightFormat::Int4 => "Int4",
-                    _ => "Nf4",
-                }
-            );
-            Vec::new()
+            unreachable!("dequant_f32: Int4/Nf4 is rejected by from_quantized before upload")
         }
         WeightFormat::Plain(_) => unreachable!("I8 weights not produced by GGUF normalization"),
     }

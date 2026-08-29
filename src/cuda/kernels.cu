@@ -74,6 +74,19 @@ extern "C" __global__ void elementwise_f32(
             r = 0.5f * a * (1.0f + erff(a * 0.70710678118654752440f));
             break;
         }
+        case 16: {                                    // swoosh_l (zipformer icefall):
+            // log1p(exp(z)) - 0.08x - 0.035 with z = x-4, stable for z>0.
+            float z = a - 4.0f;
+            float sp = z > 0.0f ? z + log1pf(expf(-z)) : logf(expf(z) + 1.0f);
+            r = sp - 0.08f * a - 0.035f;
+            break;
+        }
+        case 17: {                                    // swoosh_r: x + swoosh_l(x)
+            float z = a - 4.0f;
+            float sp = z > 0.0f ? z + log1pf(expf(-z)) : logf(expf(z) + 1.0f);
+            r = a + sp - 0.08f * a - 0.035f;
+            break;
+        }
         default: r = a; break;
     }
     out[i] = r;
@@ -163,6 +176,91 @@ extern "C" __global__ void layernorm_f32(
 }
 
 /// Per-head RMSNorm: x (rows, h·hd), w (hd); each head normalized separately.
+// Zipformer BiasNorm (icefall): y[r,j] = x[r,j] * exp(log_scale) /
+// sqrt(mean_j (x[r,j] - bias[j])^2), floor 1e-5 on the mean. One thread per
+// row: the host oracle sums the row sequentially, and this keeps the CUDA
+// result bit-identical (d <= 640, t ~1500 rows — launch-bound, not
+// compute-bound).
+extern "C" __global__ void bias_norm_zipformer_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ bias,
+    float log_scale,
+    float* __restrict__ y,
+    int t,
+    int d)
+{
+    int row = blockIdx.x;
+    if (row >= t) return;
+    const float* xr = x + row * d;
+    float s = 0.0f;
+    for (int j = 0; j < d; ++j) {
+        float v = xr[j] - bias[j];
+        s += v * v;
+    }
+    float sc = expf(log_scale) / fmaxf(sqrtf(s / (float)d), 1e-5f);
+    float* yr = y + row * d;
+    for (int j = 0; j < d; ++j) yr[j] = xr[j] * sc;
+}
+
+// Silero VAD complex magnitude: X [..., 2n] (re | im halves) →
+// Y [..., n]: y[i] = sqrt(x[i]^2 + x[i+n]^2) (the re/im interleave is
+// row-major with the im half immediately after the re half).
+extern "C" __global__ void magnitude_sqrt_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float re = x[i];
+    float im = x[i + n];
+    y[i] = sqrtf(re * re + im * im);
+}
+
+// Silero LSTM cell, fused (plan 7.7): gates = (x·W_ih + b_ih) + (h·W_hh +
+// b_hh) with PyTorch i/f/g/o order, then c' = σ(f)·c + σ(i)·tanh(g),
+// h' = σ(o)·tanh(c'). One 4·hidden-thread block; the gates land in shared
+// memory, the first `hidden` threads do the cell. The host default keeps
+// the op-composition (bit-identical to the old path); this kernel only
+// changes the summation order (~1 ulp).
+extern "C" __global__ void lstm_cell_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ h,
+    const float* __restrict__ c,
+    const float* __restrict__ w_ih,
+    const float* __restrict__ w_hh,
+    const float* __restrict__ b_ih,
+    const float* __restrict__ b_hh,
+    float* __restrict__ h_new,
+    float* __restrict__ c_new,
+    int hidden)
+{
+    extern __shared__ float gates[];
+    int gi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi < 4 * hidden) {
+        const float* row_ih = w_ih + gi * hidden;
+        const float* row_hh = w_hh + gi * hidden;
+        float acc = b_ih[gi] + b_hh[gi];
+        for (int j = 0; j < hidden; ++j) {
+            acc += x[j] * row_ih[j] + h[j] * row_hh[j];
+        }
+        gates[gi] = acc;
+    }
+    __syncthreads();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < hidden) {
+        float gi_ = gates[i];
+        float gf = gates[hidden + i];
+        float gg = gates[2 * hidden + i];
+        float go = gates[3 * hidden + i];
+        float c2 = (1.0f / (1.0f + expf(-gf))) * c[i]
+            + (1.0f / (1.0f + expf(-gi_))) * tanhf(gg);
+        float h2 = (1.0f / (1.0f + expf(-go))) * tanhf(c2);
+        c_new[i] = c2;
+        h_new[i] = h2;
+    }
+}
+
 extern "C" __global__ void rmsnorm_head_f32(
     const float* __restrict__ x,
     const float* __restrict__ w,

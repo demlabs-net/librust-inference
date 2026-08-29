@@ -48,6 +48,8 @@ enum ElemOp {
     Silu = 13,
     GeluTanh = 14,
     GeluErf = 15,
+    SwooshL = 16,
+    SwooshR = 17,
 }
 
 /// The GEMM A-operand for the quantized-int8 kernels (the activation
@@ -1382,6 +1384,132 @@ impl Backend for CudaBackend {
     }
     fn silu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         self.elementwise(ElemOp::Silu, x, None, y, 0.0)
+    }
+    fn swoosh_l(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        let shape = x.shape().to_vec();
+        let mut s = self.take_pooled(x.numel())?;
+        let f = self.function("elementwise_f32")?;
+        let cfg = LaunchConfig::for_num_elems(x.numel() as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(x.as_cuda());
+        la.arg(&mut s);
+        let n = x.numel() as i32;
+        la.arg(&n);
+        let op = ElemOp::SwooshL as i32;
+        la.arg(&op);
+        la.arg(&0.0f32);
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
+    }
+    fn swoosh_r(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        let shape = x.shape().to_vec();
+        let mut s = self.take_pooled(x.numel())?;
+        let f = self.function("elementwise_f32")?;
+        let cfg = LaunchConfig::for_num_elems(x.numel() as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(x.as_cuda());
+        la.arg(&mut s);
+        let n = x.numel() as i32;
+        la.arg(&n);
+        let op = ElemOp::SwooshR as i32;
+        la.arg(&op);
+        la.arg(&0.0f32);
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
+    }
+    fn magnitude_sqrt(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        let mut shape = x.shape().to_vec();
+        let n = x.numel() / 2;
+        let mut s = self.take_pooled(n)?;
+        let f = self.function("magnitude_sqrt_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(&mut s);
+        let ni = n as i32;
+        la.arg(&ni);
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        *shape.last_mut().unwrap() /= 2;
+        Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
+    }
+
+    fn lstm_cell(
+        &self,
+        x: &Tensor,
+        h: &Tensor,
+        c: &Tensor,
+        w_ih: &Tensor,
+        w_hh: &Tensor,
+        b_ih: &Tensor,
+        b_hh: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let hidden = x.shape()[x.shape().len() - 1];
+        let n = 4 * hidden;
+        let mut h_new = self.take_pooled(hidden)?;
+        let mut c_new = self.take_pooled(hidden)?;
+        let f = self.function("lstm_cell_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (n as u32, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(h.as_cuda());
+        la.arg(c.as_cuda());
+        la.arg(w_ih.as_cuda());
+        la.arg(w_hh.as_cuda());
+        la.arg(b_ih.as_cuda());
+        la.arg(b_hh.as_cuda());
+        la.arg(&mut h_new);
+        la.arg(&mut c_new);
+        let hi = hidden as i32;
+        la.arg(&hi);
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        let shape = vec![1, hidden];
+        Ok((
+            Tensor::from_cuda(self.wrap_pooled(h_new), shape.clone()),
+            Tensor::from_cuda(self.wrap_pooled(c_new), shape),
+        ))
+    }
+
+    fn bias_norm_zipformer(
+        &self,
+        x: &Tensor,
+        bias: &Tensor,
+        log_scale: f32,
+    ) -> Result<Tensor, BackendError> {
+        let shape = x.shape().to_vec();
+        // (1, t, d) or (t, d) — one row per (t) slice.
+        let (t, d) = if shape.len() == 3 {
+            (shape[1], shape[2])
+        } else if shape.len() == 2 {
+            (shape[0], shape[1])
+        } else {
+            return Err(BackendError::Shape(format!(
+                "bias_norm_zipformer: x shape {shape:?} must be 2D or 3D"
+            )));
+        };
+        let n: usize = shape.iter().product();
+        let mut s = self.take_pooled(n)?;
+        let f = self.function("bias_norm_zipformer_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (t as u32, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(bias.as_cuda());
+        la.arg(&log_scale);
+        la.arg(&mut s);
+        let (ti, di) = (t as i32, d as i32);
+        la.arg(&ti);
+        la.arg(&di);
+        unsafe { la.launch(cfg).map_err(map_err)? };
+        Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
     }
     fn silu_mul_fused(&self, x: &Tensor, y: &Tensor, ffn: usize) -> Result<(), BackendError> {
         let numel = y.numel();

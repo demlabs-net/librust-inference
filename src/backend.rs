@@ -1047,6 +1047,144 @@ pub trait Backend: Send + Sync {
     /// к стораджу) — см. историю мёртвого `let _ = &yt`.
     fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// Complex magnitude: X [..., 2n] (re | im row-major halves) → new
+    /// Y [..., n] with y[i] = sqrt(x[i]² + x[i+n]²) (silero STFT). The
+    /// default is the exact host math (Metal/CPU parity); CUDA fuses it
+    /// into one kernel.
+    fn magnitude_sqrt(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        let mut shape = x.shape().to_vec();
+        let n = x.numel() / 2;
+        let xh = self.to_cpu_f32(x)?;
+        let mut yh = Vec::with_capacity(n);
+        for i in 0..n {
+            let (re, im) = (xh[i], xh[i + n]);
+            yh.push((re * re + im * im).sqrt());
+        }
+        *shape.last_mut().unwrap() /= 2;
+        self.from_cpu_f32(&yh, shape)
+    }
+
+    /// Fused LSTM cell (silero, PyTorch i/f/g/o gate order):
+    /// gates = (x·W_ih + b_ih) + (h·W_hh + b_hh);
+    /// c' = σ(f)·c + σ(i)·tanh(g); h' = σ(o)·tanh(c').
+    /// The default composes existing ops (bit-identical to the old silero
+    /// path — Metal/CPU parity); CUDA runs one fused kernel (plan 7.7).
+    fn lstm_cell(
+        &self,
+        x: &Tensor,
+        h: &Tensor,
+        c: &Tensor,
+        w_ih: &Tensor,
+        w_hh: &Tensor,
+        b_ih: &Tensor,
+        b_hh: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let hidden = x.shape()[x.shape().len() - 1];
+        let gates = self.zeros(vec![1, 4 * hidden])?;
+        self.gemm_nt(x, w_ih, &gates)?;
+        self.add_bias(&gates, b_ih, &gates)?;
+        let hg = self.zeros(vec![1, 4 * hidden])?;
+        self.gemm_nt(h, w_hh, &hg)?;
+        self.add_bias(&hg, b_hh, &hg)?;
+        self.add(&gates, &hg, &gates)?;
+        let slice = |off: usize| -> Result<Tensor, BackendError> {
+            let s = self.zeros(vec![1, hidden])?;
+            self.slice_last(&gates, &s, off)?;
+            Ok(s)
+        };
+        let i = slice(0)?;
+        let f = slice(hidden)?;
+        let g = slice(2 * hidden)?;
+        let o = slice(3 * hidden)?;
+        let (i_sig, f_sig, o_sig, g_tanh) = (
+            self.zeros(vec![1, hidden])?,
+            self.zeros(vec![1, hidden])?,
+            self.zeros(vec![1, hidden])?,
+            self.zeros(vec![1, hidden])?,
+        );
+        self.sigmoid(&i, &i_sig)?;
+        self.sigmoid(&f, &f_sig)?;
+        self.sigmoid(&o, &o_sig)?;
+        self.tanh(&g, &g_tanh)?;
+        let fc = self.zeros(vec![1, hidden])?;
+        let ig = self.zeros(vec![1, hidden])?;
+        self.mul(&f_sig, c, &fc)?;
+        self.mul(&i_sig, &g_tanh, &ig)?;
+        let c_new = self.zeros(vec![1, hidden])?;
+        self.add(&fc, &ig, &c_new)?;
+        let c_tanh = self.zeros(vec![1, hidden])?;
+        self.tanh(&c_new, &c_tanh)?;
+        let h_new = self.zeros(vec![1, hidden])?;
+        self.mul(&o_sig, &c_tanh, &h_new)?;
+        Ok((h_new, c_new))
+    }
+
+    /// Zipformer SwooshL: log1p(exp(x−4)) − 0.08·x − 0.035 (icefall).
+    /// Returns a NEW tensor (a write-into-`y` default is impossible — no
+    /// storage access, see gelu_erf): the default is the exact host math
+    /// (Metal/CPU parity), the CUDA backend fuses it into elementwise_f32.
+    fn swoosh_l(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        let xh = self.to_cpu_f32(x)?;
+        let mut yh = Vec::with_capacity(xh.len());
+        for &v in &xh {
+            let z = v - 4.0;
+            let sp = if z > 0.0 {
+                z + (-z).exp().ln_1p()
+            } else {
+                (z.exp() + 1.0).ln()
+            };
+            yh.push(sp - 0.08 * v - 0.035);
+        }
+        self.from_cpu_f32(&yh, x.shape().to_vec())
+    }
+
+    /// Zipformer SwooshR: x + SwooshL(x). See [`Backend::swoosh_l`].
+    fn swoosh_r(&self, x: &Tensor) -> Result<Tensor, BackendError> {
+        let xh = self.to_cpu_f32(x)?;
+        let mut yh = Vec::with_capacity(xh.len());
+        for &v in &xh {
+            let z = v - 4.0;
+            let sp = if z > 0.0 {
+                z + (-z).exp().ln_1p()
+            } else {
+                (z.exp() + 1.0).ln()
+            };
+            yh.push(v + sp - 0.08 * v - 0.035);
+        }
+        self.from_cpu_f32(&yh, x.shape().to_vec())
+    }
+
+    /// Zipformer BiasNorm: y[r,j] = x[r,j]·exp(log_scale) /
+    /// sqrt(mean_j (x[r,j]−bias[j])²) with a 1e-5 floor on the mean.
+    /// Returns a NEW tensor (see [`Backend::swoosh_l`]); the default is the
+    /// exact host math (Metal/CPU parity), CUDA runs a per-row kernel.
+    fn bias_norm_zipformer(
+        &self,
+        x: &Tensor,
+        bias: &Tensor,
+        log_scale: f32,
+    ) -> Result<Tensor, BackendError> {
+        let shape = x.shape().to_vec();
+        let d = *shape.last().unwrap();
+        let rows = shape.iter().take(shape.len() - 1).product::<usize>();
+        let xh = self.to_cpu_f32(x)?;
+        let bh = self.to_cpu_f32(bias)?;
+        let scale0 = log_scale.exp();
+        let mut yh = vec![0.0f32; xh.len()];
+        for r in 0..rows {
+            let mut s = 0.0f32;
+            for j in 0..d {
+                let v = xh[r * d + j] - bh[j];
+                s += v * v;
+            }
+            let sc = scale0 / (s / d as f32).sqrt().max(1e-5);
+            for j in 0..d {
+                yh[r * d + j] = xh[r * d + j] * sc;
+            }
+        }
+        self.from_cpu_f32(&yh, shape)
+    }
+
     fn snake(&self, x: &Tensor, a: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
     /// Vision patch merge 2×2 + patch_bias + position_embd (Qwen3-VL):

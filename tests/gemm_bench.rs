@@ -37,6 +37,7 @@ fn bench_nt(gpu: &CudaBackend, m: usize, k: usize, n: usize, reps: usize) {
 }
 
 #[test]
+#[ignore = "K28: GPU benchmark — run with --ignored on a GPU host"]
 fn gemm_bench_suite() {
     let gpu = CudaBackend::new(0).unwrap();
     println!(
@@ -129,6 +130,7 @@ fn bench_nt_i8(gpu: &CudaBackend, m: usize, k: usize, n: usize, reps: usize) {
 }
 
 #[test]
+#[ignore = "K28: GPU benchmark — run with --ignored on a GPU host"]
 fn gemm_bench_i8_suite() {
     let gpu = CudaBackend::new(0).unwrap();
     println!("\n=== gemm_nt int8 (Q8_0-style) ===");

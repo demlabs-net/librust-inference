@@ -18,6 +18,7 @@ fn bench<F: Fn(&CudaBackend)>(gpu: &CudaBackend, name: &str, reps: usize, f: F) 
 }
 
 #[test]
+#[ignore = "K28: GPU benchmark — run with --ignored on a GPU host"]
 fn ops_bench_suite() {
     let gpu = CudaBackend::new(0).unwrap();
     let w = gpu.from_cpu_f32(&vec![0.1f32; 2048], vec![2048]).unwrap();

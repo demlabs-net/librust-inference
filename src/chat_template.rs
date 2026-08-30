@@ -107,25 +107,77 @@ enum Tok {
     Tag(String),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum MarkerKind {
+    Expr,
+    Tag,
+    Comment,
+}
+
+/// Найти ближайший закрывающий маркер, ПРОПУСКАЯ строковые литералы
+/// ('...'/"...", с backslash-экранированием) — `{{ '}}' -}}` закрывается
+/// `-}}`, а не внутренним `}}` (план 2.8; раньше контент обрезался до `'`).
+fn find_close(after: &str, close_pats: &[&str]) -> Option<(usize, bool)> {
+    let mut quote: Option<char> = None;
+    let mut iter = after.char_indices().peekable();
+    while let Some((i, ch)) = iter.next() {
+        match quote {
+            Some(q) => {
+                if ch == '\\' {
+                    // escaped char inside the literal — skip it
+                    let _ = iter.next();
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    continue;
+                }
+                for cp in close_pats {
+                    if after[i..].starts_with(cp) {
+                        return Some((i, cp.starts_with('-')));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
     let mut toks = Vec::new();
     let mut text = String::new();
     let mut trim_next = false;
     let mut rest = src;
     loop {
-        // ближайший открывающий маркер ('{{-'/'{{'/'{%-'/'{%'; '-' = trim)
-        let mut best: Option<(usize, bool, bool)> = None;
-        for (pat, is_expr) in [("{{-", true), ("{{", true), ("{%-", false), ("{%", false)] {
+        // ближайший открывающий маркер ('{{-'/'{{'/'{%-'/'{%'/'{#-'/'{#';
+        // '-' = trim)
+        let mut best: Option<(usize, MarkerKind)> = None;
+        for (pat, kind) in [
+            ("{{-", MarkerKind::Expr),
+            ("{{", MarkerKind::Expr),
+            ("{%-", MarkerKind::Tag),
+            ("{%", MarkerKind::Tag),
+            // N (2.8): {# #} комментарии были задекларированы в доке, но
+            // не реализованы — контент комментария утекал в вывод как текст.
+            ("{#-", MarkerKind::Comment),
+            ("{#", MarkerKind::Comment),
+        ] {
             if let Some(p) = rest.find(pat) {
-                if best.map_or(true, |(bi, _, _)| p < bi) {
-                    best = Some((p, is_expr, pat.ends_with('-')));
+                if best.map_or(true, |(bi, _)| p < bi) {
+                    best = Some((p, kind));
                 }
             }
         }
-        let Some((idx, is_expr, trim_before)) = best else {
+        let Some((idx, kind)) = best else {
             text.push_str(rest);
             break;
         };
+        let trim_before = rest[idx..].starts_with("{{-")
+            || rest[idx..].starts_with("{%-")
+            || rest[idx..].starts_with("{#-");
         if trim_next {
             text = text.trim_start().to_string();
             trim_next = false;
@@ -134,41 +186,35 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
         if trim_before {
             text = text.trim_end().to_string();
         }
-        // закрытие: '-}}'/'}}' для expr, '-%}'/'%}' для tag
+        // закрытие: '-}}'/'}}' для expr, '-%}'/'%}' для tag, '-#}'/'#}'
+        // для комментария
         let after = &rest[idx + 2 + usize::from(trim_before)..];
-        // N (iter-9): take the EARLIEST match of any candidate — the old
-        // list-order `find` closed `{{ '}}' -}}` at the trailing `-}}`,
-        // swallowing the inner `}}` and misparsing the tag.
-        let mut end: Option<(usize, bool)> = None;
-        let close_pats: &[&str] = if is_expr {
-            &["-}}", "}}"]
-        } else {
-            &["-%}", "%}"]
+        let close_pats: &[&str] = match kind {
+            MarkerKind::Expr => &["-}}", "}}"],
+            MarkerKind::Tag => &["-%}", "%}"],
+            MarkerKind::Comment => &["-#}", "#}"],
         };
-        for cp in close_pats {
-            if let Some(p) = after.find(cp) {
-                let cand = (p, cp.starts_with('-'));
-                if end.map_or(true, |(best, _)| p < best) {
-                    end = Some(cand);
-                }
-            }
-        }
-        let Some((p, trim_after)) = end else {
-            return Err(TemplateError::UnclosedTag(if is_expr {
-                "{{"
-            } else {
-                "{%"
+        // N (iter-9 + 2.8): EARLIEST match, пропуская кавычки — старый
+        // list-order `find` закрывал `{{ '}}' -}}` на внутреннем `}}` и
+        // резал контент до `'`.
+        let Some((p, trim_after)) = find_close(after, close_pats) else {
+            return Err(TemplateError::UnclosedTag(match kind {
+                MarkerKind::Expr => "{{",
+                MarkerKind::Tag => "{%",
+                MarkerKind::Comment => "{#",
             }));
         };
         if !text.is_empty() {
             toks.push(Tok::Text(std::mem::take(&mut text)));
         }
-        let content = after[..p].trim();
-        toks.push(if is_expr {
-            Tok::Expr(content.to_string())
-        } else {
-            Tok::Tag(content.to_string())
-        });
+        if kind != MarkerKind::Comment {
+            let content = after[..p].trim();
+            toks.push(match kind {
+                MarkerKind::Expr => Tok::Expr(content.to_string()),
+                MarkerKind::Tag => Tok::Tag(content.to_string()),
+                MarkerKind::Comment => unreachable!(),
+            });
+        }
         trim_next = trim_after;
         rest = &after[p + 2 + usize::from(trim_after)..];
     }
@@ -613,6 +659,33 @@ mod tests {
     fn unsupported_construct_is_error_not_garbage() {
         let t = Template::compile("{% macro x() %}y{% endmacro %}", HashMap::new());
         assert!(t.is_err());
+    }
+
+    /// Nested-quote close markers (plan 2.8): `{{ '}}' -}}` closes at the
+    /// trailing `-}}`, not at the `}}` INSIDE the string literal (the old
+    /// tokenizer cut the content at the first `}}` → Expr("'")).
+    #[test]
+    fn quoted_close_marker_is_not_a_close() {
+        let t = Template::compile("{{ '}}' -}}", HashMap::new()).unwrap();
+        assert_eq!(t.render(&TemplateContext::default()).unwrap(), "}}");
+        let t = Template::compile("{{ 'a}}b' }}", HashMap::new()).unwrap();
+        assert_eq!(t.render(&TemplateContext::default()).unwrap(), "a}}b");
+        // double-quoted with the escaped quote inside the literal — the
+        // close scan must skip the escaped `'` too, and the eval unescapes.
+        let t = Template::compile("{{ \"it\\'s }} ok\" }}", HashMap::new()).unwrap();
+        assert_eq!(t.render(&TemplateContext::default()).unwrap(), "it's }} ok");
+    }
+
+    /// {# #} комментарии (задекларированы в доке токенизатора, но не
+    /// реализованы): контент отбрасывается, trim-маркеры работают.
+    #[test]
+    fn comment_markers_are_dropped() {
+        let t = Template::compile("a{# comment }} with 'quotes' #}b", HashMap::new()).unwrap();
+        assert_eq!(t.render(&TemplateContext::default()).unwrap(), "ab");
+        let t = Template::compile("a {#- c -#} b", HashMap::new()).unwrap();
+        assert_eq!(t.render(&TemplateContext::default()).unwrap(), "ab");
+        let t = Template::compile("{{ 'x' }}{# trailing #}", HashMap::new()).unwrap();
+        assert_eq!(t.render(&TemplateContext::default()).unwrap(), "x");
     }
 
     /// Апостроф и backslash в content не должны обрезать значение:

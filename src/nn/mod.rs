@@ -509,7 +509,10 @@ impl KvCache {
         Ok(())
     }
 
-    fn ensure(&mut self, backend: &dyn Backend, needed: usize) -> Result<(), BackendError> {
+    /// Grow the buffer so it holds at least `needed` rows (the KV prewarm
+    /// and the update path share this). Public — the TTS engine
+    /// pre-allocates the call KV at the engine build (TTS_PREWARM_KV).
+    pub fn ensure(&mut self, backend: &dyn Backend, needed: usize) -> Result<(), BackendError> {
         if needed <= self.cap {
             return Ok(());
         }

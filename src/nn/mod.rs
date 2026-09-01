@@ -633,6 +633,11 @@ impl KvCache {
             k_format: crate::dtype::KvFormat::F32,
             v_format: crate::dtype::KvFormat::F32,
             max_cap: None,
+            // Speech-мост: plain rope без mrope; стандартная база 10 000
+            // (компакт-реротация использует её, если max_cap зададут).
+            head_dim,
+            rope_theta: 10_000.0,
+            mrope_sections: None,
         })
     }
 

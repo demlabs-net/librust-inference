@@ -81,6 +81,11 @@ pub struct TrainJob {
     /// Этап 5.1: resume — восстанавливаться из чекпойнта (внутри output_dir).
     #[serde(default)]
     pub resume_from: Option<PathBuf>,
+    /// Этап 5.3: датасет (файл) и его формат (sharegpt/alpaca/chatml/raw/dpo).
+    #[serde(default)]
+    pub dataset_path: Option<PathBuf>,
+    #[serde(default)]
+    pub dataset_format: Option<String>,
 }
 
 impl TrainJob {
@@ -103,6 +108,8 @@ impl TrainJob {
             patience: None,
             checkpoint_every: 0,
             resume_from: None,
+            dataset_path: None,
+            dataset_format: None,
         }
     }
 
@@ -124,6 +131,16 @@ impl TrainJob {
         }
         if !self.lr.is_finite() || self.lr <= 0.0 {
             anyhow::bail!("lr must be finite and > 0 (got {})", self.lr);
+        }
+        if let Some(p) = &self.dataset_path {
+            if !p.is_file() {
+                anyhow::bail!("dataset file not found: {}", p.display());
+            }
+            if let Some(f) = &self.dataset_format {
+                if crate::datasets::DatasetFormat::parse(f).is_none() {
+                    anyhow::bail!("unknown dataset format: {f}");
+                }
+            }
         }
         Ok(())
     }

@@ -72,6 +72,15 @@ pub struct TrainJob {
     #[serde(default)]
     pub output_dir: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    /// Этап 5.1: early-stop — сколько шагов без улучшения (None = выкл).
+    #[serde(default)]
+    pub patience: Option<usize>,
+    /// Этап 5.1: период чекпойнтов (шагов); чекпойнты — в output_dir/.
+    #[serde(default)]
+    pub checkpoint_every: usize,
+    /// Этап 5.1: resume — восстанавливаться из чекпойнта (внутри output_dir).
+    #[serde(default)]
+    pub resume_from: Option<PathBuf>,
 }
 
 impl TrainJob {
@@ -91,6 +100,9 @@ impl TrainJob {
                 .unwrap_or(0.0),
             output_dir: None,
             output: None,
+            patience: None,
+            checkpoint_every: 0,
+            resume_from: None,
         }
     }
 
@@ -207,13 +219,26 @@ impl JobStore {
 /// Интерфейс тренера: `on_progress(step, total, loss)` может вызываться много
 /// раз из потока тренера; `stop` — флаг кооперативной отмены (проверяется
 /// между шагами). Возвращает путь к экспортированному адаптеру.
+/// Прогресс-событие тренера (Этап 5.1): шаг, потери, прошедшее время
+/// (tokens_per_sec/vram — когда бэкенд отдаёт, сейчас None).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TrainProgress {
+    pub step: usize,
+    pub total_steps: usize,
+    pub loss: Option<f64>,
+    pub elapsed_ms: f64,
+    /// Опционально: ток-с обучения и VRAM МБ (бэкенд-зависимые).
+    pub tokens_per_sec: Option<f64>,
+    pub vram_mb: Option<u64>,
+}
+
 pub trait Trainer: Send + Sync {
     fn name(&self) -> &str;
     fn run(
         &self,
         job: &TrainJob,
         stop: &std::sync::atomic::AtomicBool,
-        on_progress: &dyn Fn(usize, usize, Option<f64>),
+        on_progress: &dyn Fn(&TrainProgress),
     ) -> anyhow::Result<PathBuf>;
 }
 
@@ -473,11 +498,22 @@ impl Trainer for DemoLoraTrainer {
         &self,
         job: &TrainJob,
         stop: &std::sync::atomic::AtomicBool,
-        on_progress: &dyn Fn(usize, usize, Option<f64>),
+        on_progress: &dyn Fn(&TrainProgress),
     ) -> anyhow::Result<PathBuf> {
         let r = job.lora_rank;
         let backend = default_backend()?;
         tracing::info!(rank = r, "demo-lora training start");
+
+        let out_dir = job
+            .output_dir
+            .clone()
+            .or_else(|| job.output.clone())
+            .unwrap_or_else(|| std::env::temp_dir().join("vassista-train"));
+        std::fs::create_dir_all(&out_dir)?;
+        let checkpoint_path = job
+            .resume_from
+            .clone()
+            .unwrap_or_else(|| out_dir.join("checkpoint.json"));
 
         let (w1, b1, w2, b2) = base_weights();
         let w1 = backend.from_cpu_f32(&w1, vec![HID_DIM, IN_DIM])?;
@@ -485,24 +521,57 @@ impl Trainer for DemoLoraTrainer {
         let w2 = backend.from_cpu_f32(&w2, vec![OUT_DIM, HID_DIM])?;
         let b2 = backend.from_cpu_f32(&b2, vec![OUT_DIM])?;
 
-        let a_init: Vec<f32> = (0..r * IN_DIM)
+        // Этап 5.1: resume из чекпойнта (шаг + a/b) либо инициализация.
+        let mut start_step = 0usize;
+        let mut a_init: Vec<f32> = (0..r * IN_DIM)
             .map(|_| rand::Rng::random_range(&mut rng(), -0.1..0.1))
             .collect();
+        let mut b_init: Vec<f32> = vec![0.0f32; HID_DIM * r];
+        if checkpoint_path.exists() {
+            if let Some(cp) = load_checkpoint(&checkpoint_path) {
+                if cp.a.len() == a_init.len() && cp.b.len() == b_init.len() {
+                    a_init = cp.a;
+                    b_init = cp.b;
+                    start_step = cp.step;
+                    tracing::info!(step = cp.step, loss = ?cp.loss, "resume from checkpoint");
+                }
+            }
+        }
         let mut a = backend.from_cpu_f32(&a_init, vec![r, IN_DIM])?;
-        let mut b = backend.from_cpu_f32(&vec![0.0f32; HID_DIM * r], vec![HID_DIM, r])?;
+        let mut b = backend.from_cpu_f32(&b_init, vec![HID_DIM, r])?;
         let scale = 1.0f32; // alpha == rank
 
         let (x, y) = dataset(DATASET_N);
         let batch = job.batch_size;
-        let total_steps = (DATASET_N / batch) * job.epochs;
+        let steps_per_epoch = DATASET_N / batch;
+        let total_steps = steps_per_epoch * job.epochs;
+        let checkpoint_every = job.checkpoint_every.max(10);
+        let patience = job.patience;
         let mut adam = Adam::new(job.lr);
-        let mut last_loss = None;
+        let mut last_loss: Option<f64> = None;
+        let mut best_loss: Option<f64> = None;
+        let mut no_improve_steps = 0usize;
+        let started = std::time::Instant::now();
+        let mut progress = |step: usize, total_steps: usize, loss: Option<f64>| {
+            on_progress(&TrainProgress {
+                step,
+                total_steps,
+                loss,
+                elapsed_ms: started.elapsed().as_millis() as f64,
+                tokens_per_sec: None,
+                vram_mb: None,
+            });
+        };
 
         for epoch in 0..job.epochs {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 anyhow::bail!("cancelled by user");
             }
-            for bi in 0..DATASET_N / batch {
+            for bi in 0..steps_per_epoch {
+                let step = epoch * steps_per_epoch + bi + 1;
+                if step <= start_step {
+                    continue; // resume: шаги до чекпойнта уже выполнены
+                }
                 let start = bi * batch;
                 let xb = backend.from_cpu_f32(
                     &x[start * IN_DIM..(start + batch) * IN_DIM],
@@ -538,39 +607,103 @@ impl Trainer for DemoLoraTrainer {
                 adam.step(backend.as_ref(), "b", &mut b, &g_b)?;
                 last_loss = Some(loss);
 
-                let step = epoch * (DATASET_N / batch) + bi + 1;
+                // Чекпойнт: шаг + a/b — для resume/прерывания.
+                if step % checkpoint_every == 0 {
+                    let cp_a = backend.to_cpu_f32(&a)?;
+                    let cp_b = backend.to_cpu_f32(&b)?;
+                    save_checkpoint(&checkpoint_path, step, &cp_a, &cp_b, Some(loss))?;
+                }
+
+                // Early-stop по плато train-loss (val-loss — с 5.3/split).
+                if let Some(p) = patience {
+                    match best_loss {
+                        None => best_loss = Some(loss),
+                        Some(bl) if loss >= bl * 0.999 => {
+                            no_improve_steps += 1;
+                            if no_improve_steps >= p {
+                                tracing::info!(step, loss, "early-stop (no improvement)");
+                                progress(step, total_steps, last_loss);
+                                return export_adapter(job, &out_dir, backend.as_ref(), &a, &b, r, scale);
+                            }
+                        }
+                        Some(bl) => {
+                            if loss < bl {
+                                best_loss = Some(loss);
+                                no_improve_steps = 0;
+                            }
+                        }
+                    }
+                }
+
                 if step % 10 == 0 || step == total_steps {
-                    on_progress(step, total_steps, last_loss);
+                    progress(step, total_steps, last_loss);
                 }
             }
         }
-        on_progress(total_steps, total_steps, last_loss);
+        progress(total_steps, total_steps, last_loss);
         tracing::info!(loss = ?last_loss, "demo-lora training done");
-
-        let out_dir = job
-            .output_dir
-            .clone()
-            .or_else(|| job.output.clone())
-            .unwrap_or_else(|| std::env::temp_dir().join("vassista-train"));
-        std::fs::create_dir_all(&out_dir)?;
-        let export = AdapterExport {
-            model: job.model_id.clone(),
-            trainer: job.trainer.clone(),
-            rank: r,
-            in_dim: IN_DIM,
-            out_dim: HID_DIM,
-            scale: scale as f64,
-            a: backend.to_cpu_f32(&a)?,
-            b: backend.to_cpu_f32(&b)?,
-        };
-        // Атомарный экспорт: temp-файл + rename (обрыв не оставит
-        // обрезанный адаптер в кэше модели).
-        let path = out_dir.join("adapter.json");
-        let tmp = out_dir.join("adapter.json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&export)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(path)
+        export_adapter(job, &out_dir, backend.as_ref(), &a, &b, r, scale)
     }
+}
+
+/// Экспорт adapter.json (атомарно: tmp + rename).
+fn export_adapter(
+    job: &TrainJob,
+    out_dir: &Path,
+    backend: &dyn Backend,
+    a: &Tensor,
+    b: &Tensor,
+    r: usize,
+    scale: f32,
+) -> anyhow::Result<PathBuf> {
+    let export = AdapterExport {
+        model: job.model_id.clone(),
+        trainer: job.trainer.clone(),
+        rank: r,
+        in_dim: IN_DIM,
+        out_dim: HID_DIM,
+        scale: scale as f64,
+        a: backend.to_cpu_f32(a)?,
+        b: backend.to_cpu_f32(b)?,
+    };
+    let path = out_dir.join("adapter.json");
+    let tmp = out_dir.join("adapter.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&export)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Чекпойнт: JSON {step, a, b, loss} — ф32-векторы на CPU.
+#[derive(Serialize, Deserialize)]
+pub struct TrainCheckpoint {
+    pub step: usize,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub loss: Option<f64>,
+}
+
+fn save_checkpoint(
+    path: &Path,
+    step: usize,
+    a: &[f32],
+    b: &[f32],
+    loss: Option<f64>,
+) -> anyhow::Result<()> {
+    let cp = TrainCheckpoint {
+        step,
+        a: a.to_vec(),
+        b: b.to_vec(),
+        loss,
+    };
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&cp)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn load_checkpoint(path: &Path) -> Option<TrainCheckpoint> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 #[cfg(test)]
@@ -640,6 +773,30 @@ mod tests {
         assert!(job.validate().is_ok());
         job.batch_size = 0;
         assert!(job.validate().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tests51 {
+    use super::*;
+
+    #[test]
+    fn checkpoint_roundtrip_and_resume_path() {
+        let dir = std::env::temp_dir().join(format!("tr51-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("checkpoint.json");
+        save_checkpoint(&path, 42, &[1.0, 2.0, 3.0], &[4.0, 5.0], Some(0.123)).unwrap();
+        let cp = load_checkpoint(&path).unwrap();
+        assert_eq!(cp.step, 42);
+        assert_eq!(cp.a, vec![1.0, 2.0, 3.0]);
+        assert_eq!(cp.b, vec![4.0, 5.0]);
+        assert_eq!(cp.loss, Some(0.123));
+        // resume_from: джоба с чекпойнтом читает его (путь существует)
+        let mut job = TrainJob::new("j", "m");
+        job.resume_from = Some(path.clone());
+        assert!(job.resume_from.as_ref().unwrap().exists());
+        assert!(load_checkpoint(&path).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

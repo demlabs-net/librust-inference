@@ -37,6 +37,7 @@ fn real_qwen_cpu_generation_is_sane() {
             if let GenerateEvent::Delta(t) = ev {
                 out.push_str(&t);
             }
+            true
         },
     )
     .unwrap();

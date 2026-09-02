@@ -20,6 +20,8 @@ pub enum FinishReason {
     MaxTokens,
     /// Найден один из `stop_strings` в накопленном тексте.
     StopString,
+    /// Останов по запросу (отмена генерации, Этап 2.2): клиент запросил стоп.
+    Cancelled,
 }
 
 /// Событие стриминга.
@@ -84,7 +86,7 @@ pub fn generate(
     tok: &Tokenizer,
     ids: &[u32],
     params: &GenerateParams,
-    mut on_event: impl FnMut(GenerateEvent),
+    mut on_event: impl FnMut(GenerateEvent) -> bool,
 ) -> Result<Vec<u32>, BackendError> {
     // Prefill: батч-префилл, если промпт длиннее одного токена.
     let mut logits = if ids.len() > 1 {
@@ -148,9 +150,13 @@ pub fn generate(
         let delta = decoder.push(piece.as_bytes());
         if !delta.is_empty() {
             acc.push_str(&delta);
-            on_event(GenerateEvent::Delta(delta));
+            if !on_event(GenerateEvent::Delta(delta)) {
+                return Ok(generated);
+            }
         }
-        on_event(GenerateEvent::Token(next));
+        if !on_event(GenerateEvent::Token(next)) {
+            return Ok(generated);
+        }
         generated.push(next);
         history.push(next);
 
@@ -161,7 +167,9 @@ pub fn generate(
     }
     let tail = decoder.finish();
     if !tail.is_empty() {
-        on_event(GenerateEvent::Delta(tail));
+        if !on_event(GenerateEvent::Delta(tail)) {
+            return Ok(generated);
+        }
     }
     on_event(GenerateEvent::Done(finish.unwrap()));
     Ok(generated)
@@ -280,10 +288,13 @@ mod tests {
             &tiny_tokenizer(),
             &[1, 2],
             &params,
-            |ev| match ev {
-                GenerateEvent::Delta(_) => deltas += 1,
-                GenerateEvent::Done(r) => done = Some(r),
-                _ => {}
+            |ev| {
+                match ev {
+                    GenerateEvent::Delta(_) => deltas += 1,
+                    GenerateEvent::Done(r) => done = Some(r),
+                    _ => {}
+                }
+                true
             },
         )
         .unwrap();
@@ -320,6 +331,7 @@ mod tests {
             &params,
             |ev| {
                 events.push(ev);
+                true
             },
         )
         .unwrap();

@@ -607,3 +607,232 @@ mod tests {
         }
     }
 }
+
+
+// ── Painter (1.6b): минимальный GGUF v2 writer ─────────────────────────────
+
+/// Тензор для записи: имя, размеры, тип, сырые данные (ggml-порядок).
+pub struct GgufWriteTensor {
+    pub name: String,
+    pub dims: Vec<u32>,
+    pub ggml_type: GgmlType,
+    pub data: Vec<u8>,
+}
+
+fn w_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn w_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn w_str(out: &mut Vec<u8>, v: &str) {
+    w_u64(out, v.len() as u64);
+    out.extend_from_slice(v.as_bytes());
+}
+
+fn write_value(out: &mut Vec<u8>, v: &GgufValue) -> Result<(), GgufError> {
+    match v {
+        GgufValue::String(s) => w_str(out, s),
+        GgufValue::U32(x) => w_u32(out, *x),
+        GgufValue::F32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        GgufValue::Bool(b) => out.push(u8::from(*b)),
+        GgufValue::U64(x) => w_u64(out, *x),
+        GgufValue::I32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        GgufValue::I64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        GgufValue::F64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        GgufValue::Array(items) => {
+            w_u32(out, items.first().map(gguf_type_of).unwrap_or(0));
+            w_u64(out, items.len() as u64);
+            for it in items {
+                write_value(out, it)?;
+            }
+        }
+        GgufValue::U8(x) => out.push(*x),
+        GgufValue::I8(x) => out.push(*x as u8),
+        GgufValue::U16(x) => out.extend_from_slice(&x.to_le_bytes()),
+        GgufValue::I16(x) => out.extend_from_slice(&x.to_le_bytes()),
+    }
+    Ok(())
+}
+
+fn gguf_type_of(v: &GgufValue) -> u32 {
+    match v {
+        GgufValue::U8(_) => 0,
+        GgufValue::I8(_) => 1,
+        GgufValue::U16(_) => 2,
+        GgufValue::I16(_) => 3,
+        GgufValue::U32(_) => 4,
+        GgufValue::I32(_) => 5,
+        GgufValue::F32(_) => 6,
+        GgufValue::Bool(_) => 7,
+        GgufValue::String(_) => 8,
+        GgufValue::Array(_) => 9,
+        GgufValue::U64(_) => 10,
+        GgufValue::I64(_) => 11,
+        GgufValue::F64(_) => 12,
+    }
+}
+
+/// Записать GGUF v2: [magic, version, counts, KV, тензоры-таблица, данные].
+pub fn write_gguf(
+    out: &mut Vec<u8>,
+    metadata: &[(String, GgufValue)],
+    tensors: &[GgufWriteTensor],
+) -> Result<(), GgufError> {
+    out.clear();
+    w_u32(out, GGUF_MAGIC);
+    w_u32(out, V2);
+    w_u64(out, tensors.len() as u64);
+    w_u64(out, metadata.len() as u64);
+    for (k, v) in metadata {
+        w_str(out, k);
+        w_u32(out, gguf_type_of(v));
+        write_value(out, v)?;
+    }
+    // Таблица тензоров. Offsets заполним после (патчинг по сохранённым
+    // позициям), т.к. данные идут ПОСЛЕ таблицы.
+    let mut patch_pos = Vec::with_capacity(tensors.len());
+    for t in tensors {
+        w_str(out, &t.name);
+        w_u32(out, t.dims.len() as u32);
+        for d in &t.dims {
+            w_u64(out, *d as u64);
+        }
+        w_u32(out, t.ggml_type.raw());
+        patch_pos.push(out.len());
+        w_u64(out, 0); // offset-плейсхолдер (RELATIVE к началу данных)
+    }
+    // Данные: выравнивание 32; оффсеты в таблице — относительно начала
+    // секции данных (как в llama.cpp), не абсолютные.
+    const ALIGN: usize = 32;
+    let mut pos = (out.len() + ALIGN - 1) & !(ALIGN - 1);
+    let data_base = pos;
+    for (i, t) in tensors.iter().enumerate() {
+        let aligned = (pos + ALIGN - 1) & !(ALIGN - 1);
+        let off_bytes = ((aligned - data_base) as u64).to_le_bytes();
+        let pp = patch_pos[i];
+        out[pp..pp + 8].copy_from_slice(&off_bytes);
+        // выравнивание + данные
+        out.resize(aligned, 0);
+        out.extend_from_slice(&t.data);
+        pos = aligned + t.data.len();
+    }
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod tests51 {
+    use super::*;
+
+    #[test]
+    fn writer_roundtrip_v2() {
+        let mut buf = Vec::new();
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        write_gguf(
+            &mut buf,
+            &vec![
+                ("general.architecture".to_string(), GgufValue::String("qwen3".into())),
+                ("qwen3.vocab_size".to_string(), GgufValue::U32(151936)),
+                ("misc.array".to_string(), GgufValue::Array(vec![
+                    GgufValue::U32(1), GgufValue::U32(2),
+                ])),
+            ],
+            &[GgufWriteTensor {
+                name: "token_embd.weight".into(),
+                dims: vec![2, 2],
+                ggml_type: GgmlType::F32,
+                data: bytes,
+            }],
+        )
+        .unwrap();
+        // read-back
+        let f = parse(&buf).unwrap();
+        assert_eq!(f.architecture(), Some("qwen3"));
+        assert_eq!(f.get("qwen3.vocab_size").and_then(GgufValue::as_u32), Some(151936));
+        assert_eq!(f.tensors.len(), 1);
+        let t = &f.tensors[0];
+        assert_eq!(t.name, "token_embd.weight");
+        assert_eq!(t.numel(), 4);
+        let raw = t.data;
+        assert_eq!(raw.len(), 16);
+        let back: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        assert_eq!(back, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Мульти-тензор: проверка патчинга оффсетов при невыровненных данных,
+    /// массивы строк и все скалярные типы значений метаданных.
+    #[test]
+    fn writer_roundtrip_multi_and_value_types() {
+        let mut buf = Vec::new();
+        let f16_bytes: Vec<u8> = (0u16..6).flat_map(|x| x.to_le_bytes()).collect();
+        let f32_bytes: Vec<u8> = vec![1.0f32, -2.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        write_gguf(
+            &mut buf,
+            &[
+                ("a.u8".into(), GgufValue::U8(7)),
+                ("a.i8".into(), GgufValue::I8(-3)),
+                ("a.u16".into(), GgufValue::U16(513)),
+                ("a.i16".into(), GgufValue::I16(-513)),
+                ("a.i32".into(), GgufValue::I32(-42)),
+                ("a.f32".into(), GgufValue::F32(0.25)),
+                ("a.bool".into(), GgufValue::Bool(true)),
+                ("a.u64".into(), GgufValue::U64(u64::MAX / 3)),
+                ("a.i64".into(), GgufValue::I64(-(i64::MAX / 3))),
+                ("a.f64".into(), GgufValue::F64(1.5)),
+                ("a.strs".into(), GgufValue::Array(vec![
+                    GgufValue::String("x".into()),
+                    GgufValue::String("yz".into()),
+                ])),
+            ],
+            &[
+                GgufWriteTensor {
+                    name: "first.weight".into(),
+                    // 3 элемента f16 — 6 байт: первый тензор невыровнен по 32
+                    dims: vec![3],
+                    ggml_type: GgmlType::F16,
+                    data: f16_bytes,
+                },
+                GgufWriteTensor {
+                    name: "second.bias".into(),
+                    dims: vec![2],
+                    ggml_type: GgmlType::F32,
+                    data: f32_bytes,
+                },
+            ],
+        )
+        .unwrap();
+
+        let f = parse(&buf).unwrap();
+        assert_eq!(f.get("a.u8"), Some(&GgufValue::U8(7)));
+        assert_eq!(f.get("a.i8"), Some(&GgufValue::I8(-3)));
+        assert_eq!(f.get("a.u16"), Some(&GgufValue::U16(513)));
+        assert_eq!(f.get("a.i16"), Some(&GgufValue::I16(-513)));
+        assert_eq!(f.get("a.i32"), Some(&GgufValue::I32(-42)));
+        assert_eq!(f.get("a.f32"), Some(&GgufValue::F32(0.25)));
+        assert_eq!(f.get("a.bool"), Some(&GgufValue::Bool(true)));
+        assert_eq!(f.get("a.u64"), Some(&GgufValue::U64(u64::MAX / 3)));
+        assert_eq!(f.get("a.i64"), Some(&GgufValue::I64(-(i64::MAX / 3))));
+        assert_eq!(f.get("a.f64"), Some(&GgufValue::F64(1.5)));
+        assert!(matches!(
+            f.get("a.strs"),
+            Some(GgufValue::Array(items)) if items.len() == 2
+        ));
+
+        assert_eq!(f.tensors.len(), 2);
+        let t0 = &f.tensors[0];
+        assert_eq!(t0.name, "first.weight");
+        assert_eq!(t0.numel(), 3);
+        assert_eq!(t0.data.len(), 6);
+        // выравнивание: данные тензоров лежат на границах 32
+        assert_eq!(t0.offset % 32, 0);
+        assert_eq!(f.tensors[1].offset % 32, 0);
+        let b: Vec<f32> = f.tensors[1]
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(b, vec![1.0, -2.0]);
+    }
+}

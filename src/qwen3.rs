@@ -577,9 +577,18 @@ impl Qwen3Model {
             ));
         }
         let n_img = img_rows.len();
+        eprintln!("deepstack: img_rows={} t={} vt={}", img_rows.len(), t, vision_token);
         let mut out = Vec::with_capacity(deepstack.len());
         for (il, block) in deepstack.iter().enumerate() {
-            let (b, n, d) = (block.shape()[0], block.shape()[1], block.shape()[2]);
+            // Блоки приходят 2D [nq, dim] либо 3D [1, nq, dim].
+            let sh = block.shape();
+            let (b, n, d) = match sh.len() {
+                2 => (1usize, sh[0], sh[1]),
+                3 => (sh[0], sh[1], sh[2]),
+                _ => return Err(BackendError::Shape(format!(
+                    "deepstack[{il}]: неожиданная форма {sh:?}"
+                ))),
+            };
             if d != dim {
                 return Err(BackendError::Shape(format!(
                     "deepstack[{il}]: dim {d} != {dim}"

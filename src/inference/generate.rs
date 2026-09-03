@@ -52,6 +52,17 @@ impl SpecStats {
     }
 }
 
+/// Мультимодальный промпт (2.4b): ids с image_pad + фичи картинки.
+pub struct VisionPrompt {
+    pub ids: Vec<u32>,
+    pub vemb: crate::backend::Tensor,
+    pub vds: Vec<crate::backend::Tensor>,
+    pub pad_token: u32,
+    pub vision_token: u32,
+    pub pos4d: Vec<u32>,
+    pub pos_after: usize,
+}
+
 pub struct GenerateParams {
     pub max_tokens: usize,
     pub temperature: f32,
@@ -63,6 +74,8 @@ pub struct GenerateParams {
     /// Спек-декодинг (4.2b): драфтер + число драфт-токенов (0 = выкл).
     pub drafter: Option<std::sync::Arc<std::sync::Mutex<dyn crate::spec::Drafter>>>,
     pub spec_gamma: usize,
+    /// Vision (2.4b): картинка в промпте — prefill_with_vision вместо prefill.
+    pub vision: Option<VisionPrompt>,
 }
 
 impl Default for GenerateParams {
@@ -76,6 +89,7 @@ impl Default for GenerateParams {
             stop_strings: Vec::new(),
             drafter: None,
             spec_gamma: 0,
+            vision: None,
         }
     }
 }
@@ -109,8 +123,18 @@ pub fn generate(
     mut on_event: impl FnMut(GenerateEvent) -> bool,
 ) -> Result<Vec<u32>, BackendError> {
     let mut spec_stats = SpecStats::default();
-    // Prefill: батч-префилл, если промпт длиннее одного токена.
-    let mut logits = if ids.len() > 1 {
+    // Vision-префилл (2.4b): картинка уже посчитана — идём через M-RoPE.
+    let mut logits = if let Some(v) = &params.vision {
+        model.prefill_with_vision(
+            backend,
+            &v.ids,
+            &v.vemb,
+            &v.vds,
+            v.vision_token,
+            &v.pos4d,
+            v.pos_after,
+        )?
+    } else if ids.len() > 1 {
         model.prefill(backend, ids)?
     } else {
         model.decode(backend, ids[0])?

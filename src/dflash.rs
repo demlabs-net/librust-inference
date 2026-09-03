@@ -753,7 +753,14 @@ impl DFlashModel {
                     let d = fc.shape()[0];
                     let y = backend.zeros(vec![f.shape()[0], d])?;
                     backend.gemm_nt(f, fc, &y)?;
-                    Some(norm.forward(backend, &y.view(vec![1, f.shape()[0], d]))?)
+                    let enc = norm.forward(backend, &y.view(vec![1, f.shape()[0], d]))?;
+                    if std::env::var("LLM_DBG_SPEC").is_ok() {
+                        eprintln!(
+                            "diffuse-enc: f={:?} fc={:?} y={:?} enc={:?}",
+                            f.shape(), fc.shape(), y.shape(), enc.shape()
+                        );
+                    }
+                    Some(enc)
                 }
                 _ => None,
             };
@@ -764,6 +771,9 @@ impl DFlashModel {
             let past_len = self.caches[0].pos;
             let kctx_pos = pos;
             for (i, layer) in self.layers.iter().enumerate() {
+                if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
+                    eprintln!("diffuse: layer0 x={:?} enc={:?}", x.shape(), enc.as_ref().map(|e| e.shape().to_vec()));
+                }
                 // ── attn-часть (свой путь: прямая инъекция k_ctx) ──
                 let mut h = layer.dense.attn_norm.forward(backend, &x)?;
                 let attn_dyn = match (&layer.attn_conv.proj, &layer.attn_conv.base) {
@@ -774,6 +784,9 @@ impl DFlashModel {
                     h = conv_side(backend, &h, b, d, 0, self.block_size)?;
                 }
                 let attn = &layer.dense.attn;
+                if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
+                    eprintln!("diffuse: layer0 h={:?} wqkv={:?}", h.shape(), attn.wqkv.shape());
+                }
                 let q_size = attn.n_heads * attn.head_dim;
                 let kv_size = attn.n_kv_heads * attn.head_dim;
                 let qkv = crate::nn::Linear {
@@ -1103,17 +1116,28 @@ impl crate::spec::Drafter for DFlashDrafter {
         if extract.is_empty() || self.model.extract_layers.is_empty() {
             return Ok(());
         }
-        let d = extract[0].shape()[1];
+        if std::env::var("LLM_DBG_SPEC").is_ok() {
+            eprintln!(
+                "after_extract: n={} shapes={:?}",
+                extract.len(),
+                extract.iter().map(|t| t.shape().to_vec()).collect::<Vec<_>>()
+            );
+        }
+        // extract-тензоры — [1, T, D] (batch=1): берём ПОСЛЕДНЮЮ позицию T,
+        // конкат по слоям: [1, n_layers·D] (спека: llama_encode).
+        let d = extract[0].shape()[2];
         let mut feat = Vec::with_capacity(extract.len() * d);
         for t in extract {
-            let last = t.shape()[0] - 1;
+            let last = t.shape()[1] - 1;
             let rows = _backend.to_cpu_f32(t)?;
             feat.extend_from_slice(&rows[last * d..(last + 1) * d]);
         }
         let features = _backend.from_cpu_f32(&feat, vec![1, extract.len() * d])?;
-        self.features = Some(features.clone());
-        // инжект k/v (позиция якоря — последнего принятого токена)
-        self.model.inject_features(_backend, &features, pos.saturating_sub(1))
+        // только фичи: инжект k/v делает сам diffuse (line ~833) на past_len;
+        // вторая запись (inject_features) смещала контекст — приёмка 0%.
+        self.features = Some(features);
+        let _ = pos;
+        Ok(())
     }
 
     fn draft(
@@ -1148,6 +1172,14 @@ impl crate::spec::Drafter for DFlashDrafter {
                 "DFlashDrafter: cache={} pos={pos} block={block} ctx={:?}",
                 self.model.caches[0].pos,
                 self.features.as_ref().map(|f| f.shape()[0])
+            );
+        }
+        if std::env::var("LLM_DBG_SPEC").is_ok() {
+            eprintln!(
+                "draft: ids={} block={} pos={pos} features={:?}",
+                ids.len(),
+                block,
+                self.features.as_ref().map(|f| f.shape().to_vec())
             );
         }
         let res =

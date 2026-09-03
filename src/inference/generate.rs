@@ -205,22 +205,67 @@ pub fn generate(
         generated.push(next);
         history.push(next);
 
-        // Спек-счётчик (4.2b): предложили gamma драфт-токенов, реальный
-        // токен совпал с первым — принят (батч-верификация — след. подблок).
+        // Спек-декодинг (4.2b): проверка черновиков ОДНИМ forward'ом
+        // (decode_spec: rejection sampling по Leviathan). Раньше здесь был
+        // только счётчик с off-by-one (сравнение черновика следующей
+        // позиции с уже выпущенным токеном) — 0% приёмки на любом драфтере.
         if let (Some(drafter), true) = (&params.drafter, params.spec_gamma > 0) {
-            let (draft_tokens, _q) = {
+            let (draft_tokens, draft_probs) = {
                 let mut dr = drafter.lock().unwrap();
                 dr.draft(backend, &history, params.spec_gamma)
             };
-            spec_stats.drafts += params.spec_gamma as u64;
-            if draft_tokens.first() == Some(&next) {
-                spec_stats.accepted += 1;
+            if !draft_tokens.is_empty() {
+                let tlayers: Vec<usize> = {
+                    let mut dr = drafter.lock().unwrap();
+                    dr.target_layers().to_vec()
+                };
+                let out = model.decode_spec(
+                    backend,
+                    next,
+                    &draft_tokens,
+                    &draft_probs,
+                    &mut rng_state,
+                    &tlayers,
+                )?;
+                if !tlayers.is_empty() {
+                    let pos = model.caches[0].pos;
+                    let mut dr = drafter.lock().unwrap();
+                    let _ = dr.after_extract(backend, &out.extract, pos);
+                }
+                spec_stats.drafts += params.spec_gamma as u64;
+                let nv = out.n_draft_verified;
+                spec_stats.accepted += nv as u64;
+                spec_stats.rejected += (params.spec_gamma - nv) as u64;
+                // Проверенные черновики — настоящие токены: стримим их.
+                for &t in &out.accepted[1..] {
+                    if let Some(r) = check_stop(t, tok.eos, &acc, &params.stop_strings) {
+                        finish = Some(r);
+                        break;
+                    }
+                    let piece = tok.decode_piece(t);
+                    let delta = decoder.push(piece.as_bytes());
+                    if !delta.is_empty() {
+                        acc.push_str(&delta);
+                        if !on_event(GenerateEvent::Delta(delta)) {
+                            return Ok(generated);
+                        }
+                    }
+                    if !on_event(GenerateEvent::Token(t)) {
+                        return Ok(generated);
+                    }
+                    generated.push(t);
+                    history.push(t);
+                }
+                logits = out.logits;
+                if finish.is_some() {
+                    break;
+                }
             } else {
-                spec_stats.rejected += 1;
+                logits = model.decode(backend, next)?;
             }
+        } else {
+            logits = model.decode(backend, next)?;
         }
-
-        logits = model.decode(backend, next)?;
     }
     if finish.is_none() {
         finish = Some(FinishReason::MaxTokens);

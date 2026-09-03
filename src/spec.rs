@@ -65,6 +65,24 @@ pub trait Drafter {
         history: &[u32],
         gamma: usize,
     ) -> (Vec<u32>, Vec<f32>);
+
+    /// Слои таргета, скрытые которых нужны для инжекта (DFlash: 5 слоёв;
+    /// N-грам — пусто).
+    fn target_layers(&self) -> &[usize] {
+        &[]
+    }
+
+    /// Скрытые таргета по extract-слоям (после prefill_extract/DECODE_spec),
+    /// позиция последнего принятого токена. DFlash-инжект: фичи таргета
+    /// → fc+enc_norm → k/v кэша драфтера (иначе драфтер «слеп» — 2% приёмка).
+    fn after_extract(
+        &mut self,
+        _backend: &dyn crate::backend::Backend,
+        _extract: &[crate::backend::Tensor],
+        _pos: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        Ok(())
+    }
 }
 
 /// Суффиксный n-граммовый драфтер: самый длинный суффикс истории с

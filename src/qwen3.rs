@@ -176,6 +176,10 @@ pub struct SpecOutcome {
     /// < draft.len() — последний элемент accepted — ПЕРЕСЭМПЛ (его фич
     /// в extract нет: строка соответствует draft, а не токену).
     pub n_draft_accepted: usize,
+    /// Строгое число ВЕРИФИЦИРОВАННЫХ черновиков (без пересэмпла) —
+    /// для честной метрики приёмки (4.2b): n_draft_accepted при отказе
+    /// считал пересэмпл как принятый.
+    pub n_draft_verified: usize,
 }
 
 impl Qwen3Model {
@@ -958,6 +962,7 @@ impl Qwen3Model {
         // было детерминированным (q <= p → принять) — не сэмплирование.
         let mut accepted: Vec<u32> = Vec::new();
         let mut accepted_len = 1usize;
+        let mut n_verified = 0usize;
         for i in 0..draft.len() {
             let row = &ld[i * v..(i + 1) * v];
             let p = Self::softmax_prob(row, draft[i]);
@@ -966,6 +971,7 @@ impl Qwen3Model {
             if q <= 0.0 || u * q <= p {
                 accepted.push(draft[i]);
                 accepted_len += 1;
+                n_verified += 1;
             } else {
                 accepted.push(Self::sample_modified(row, draft[i], q, rng));
                 break;
@@ -991,6 +997,7 @@ impl Qwen3Model {
             logits,
             extract,
             n_draft_accepted,
+            n_draft_verified: n_verified,
         })
     }
 

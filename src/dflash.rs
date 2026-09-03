@@ -1088,6 +1088,34 @@ impl DFlashDrafter {
 }
 
 impl crate::spec::Drafter for DFlashDrafter {
+    fn target_layers(&self) -> &[usize] {
+        &self.model.extract_layers
+    }
+
+    fn after_extract(
+        &mut self,
+        _backend: &dyn Backend,
+        extract: &[Tensor],
+        pos: usize,
+    ) -> Result<(), BackendError> {
+        // фичи: последняя строка каждого extract-слоя (токен-якорь),
+        // конкат → [1, n_layers·D] — как в спеке (llama_encode).
+        if extract.is_empty() || self.model.extract_layers.is_empty() {
+            return Ok(());
+        }
+        let d = extract[0].shape()[1];
+        let mut feat = Vec::with_capacity(extract.len() * d);
+        for t in extract {
+            let last = t.shape()[0] - 1;
+            let rows = _backend.to_cpu_f32(t)?;
+            feat.extend_from_slice(&rows[last * d..(last + 1) * d]);
+        }
+        let features = _backend.from_cpu_f32(&feat, vec![1, extract.len() * d])?;
+        self.features = Some(features.clone());
+        // инжект k/v (позиция якоря — последнего принятого токена)
+        self.model.inject_features(_backend, &features, pos.saturating_sub(1))
+    }
+
     fn draft(
         &mut self,
         backend: &dyn Backend,

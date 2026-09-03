@@ -42,6 +42,7 @@ pub mod qwen3;
 pub mod spec;
 pub mod tokenizer;
 pub mod datasets;
+pub mod export;
 pub mod train;
 pub mod train_qwen3;
 pub mod vision;

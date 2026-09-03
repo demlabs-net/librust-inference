@@ -86,6 +86,12 @@ pub struct TrainJob {
     pub dataset_path: Option<PathBuf>,
     #[serde(default)]
     pub dataset_format: Option<String>,
+    /// 5.2b: путь к базовой модели (GGUF); None — тренер сам резолвит.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
+    /// 5.2b: макс. длина последовательности (токенов) для обучения.
+    #[serde(default)]
+    pub max_seq_len: usize,
 }
 
 impl TrainJob {
@@ -110,6 +116,8 @@ impl TrainJob {
             resume_from: None,
             dataset_path: None,
             dataset_format: None,
+            model_path: None,
+            max_seq_len: 0,
         }
     }
 
@@ -742,8 +750,8 @@ mod tests {
         let trainer = DemoLoraTrainer;
         let stop = std::sync::atomic::AtomicBool::new(false);
         let path = trainer
-            .run(&job, &stop, &|_step, _total, loss| {
-                if let Some(l) = loss {
+            .run(&job, &stop, &|p: &TrainProgress| {
+                if let Some(l) = p.loss {
                     losses.lock().unwrap().push(l);
                 }
             })

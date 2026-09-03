@@ -148,6 +148,18 @@ pub struct Qwen3Model {
     pos_rope: usize,
 }
 
+impl Qwen3Model {
+    /// Таблица эмбеддингов (для DFlash-драфтера, 4.2b).
+    pub fn token_embed_table(&self) -> &Tensor {
+        &self.embed.table
+    }
+
+    /// Выходная проекция [V, D] (для DFlash-драфтера).
+    pub fn output_projection(&self) -> &Tensor {
+        &self.output
+    }
+}
+
 /// Результат спекулятивного шага (Ф2.1).
 pub struct SpecOutcome {
     /// Принятые токены (первый — гарантированно; остальные — draft).

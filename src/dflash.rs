@@ -2074,3 +2074,25 @@ mod tests {
         );
     }
 }
+
+
+/// Загрузить DFlash-драфтер из GGUF (паттерн dflash_probe): веса модели,
+/// target_embed и lm_head — от таргета. Ошибка — понятная (нет/не GGUF).
+pub fn load_drafter_gguf(
+    backend: &dyn crate::backend::Backend,
+    path: &std::path::Path,
+    target_embed: Tensor,
+    lm_head: Tensor,
+    vocab_size: usize,
+) -> Result<DFlashDrafter, BackendError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| BackendError::Shape(format!("open drafter {}: {e}", path.display())))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| BackendError::Shape(format!("mmap drafter: {e}")))?;
+    let gf = crate::gguf::parse(&mmap)
+        .map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
+    let wm = crate::weights_map::WeightsMap::from_gguf(&gf)
+        .map_err(|e| BackendError::Shape(format!("weights: {e}")))?;
+    let model = DFlashModel::load_gguf(backend, &gf, &wm, vocab_size)?;
+    Ok(DFlashDrafter::new(model, target_embed, lm_head))
+}

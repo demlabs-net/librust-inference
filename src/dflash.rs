@@ -1214,6 +1214,8 @@ impl crate::spec::Drafter for DFlashDrafter {
             };
             let mut tokens = Vec::with_capacity(t - 1);
             let mut probs = Vec::with_capacity(t - 1);
+            // LM-конвенция: row i предсказывает токен i+1, якорь на позиции 0,
+            // черновики = строки 1..t (проверено: direct-вариант хуже — 0.7%).
             for pos in 1..t {
                 let row = &lg[pos * vocab..(pos + 1) * vocab];
                 let tok = self.sample_row(row);

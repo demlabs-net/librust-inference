@@ -651,6 +651,8 @@ pub struct LayerCache {
 pub struct FwdState {
     pub t: usize,
     pub loss: f64,
+    /// Логиты [t, V] — для метрик/паритета с движком.
+    pub logits: Tensor,
     pub layers: Vec<LayerCache>,
     /// dlogits = softmax − onehot (валидные строки) [t, V] на хосте.
     pub dlogits_h: Vec<f32>,
@@ -825,6 +827,7 @@ pub fn forward_seq(
     Ok(FwdState {
         t,
         loss,
+        logits,
         layers,
         dlogits_h: dlogits,
         h,
@@ -1543,6 +1546,70 @@ mod tests {
         rebuild(bk, &snap2, rank)
     }
 
+
+    /// 5.7-срез: ppl до/после на 0.6B + обученный адаптер (held-out).
+    #[test]
+    #[ignore]
+    fn metal_ppl_before_after() {
+        unsafe { std::env::set_var("BACKEND", "metal") };
+        let model = std::path::PathBuf::from(concat!(
+            env!("HOME"),
+            "/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf"
+        ));
+        if !model.is_file() {
+            eprintln!("skip: нет модели");
+            return;
+        }
+        let adapter_path = std::path::PathBuf::from(
+            "/var/folders/rv/bqlf76k9399fmf15c1yq21940000gn/T/qwen3-lora-e2e/adapter.json",
+        );
+        if !adapter_path.is_file() {
+            eprintln!("skip: нет адаптера {}", adapter_path.display());
+            return;
+        }
+        // held-out текст: НЕ входит в обучающие 6 примеров
+        let held = "Обучение языковой модели — это процесс минимизации потерь на большом корпусе текста:         каждая последовательность токенов становится примером, а обратное распространение ошибки         подстраивает параметры так, чтобы следующее слово угадывалось всё лучше. Ключевой момент —         качество данных: мусор в корпусе означает мусор в знаниях модели, поэтому фильтрация и         балансировка длин — обязательная часть пайплайна.";
+        let bk = crate::train::default_backend().unwrap();
+        let bytes = std::fs::read(&model).unwrap();
+        let file = crate::gguf::parse(&bytes).unwrap();
+        let wm = crate::weights_map::WeightsMap::from_gguf(&file).unwrap();
+        let tok = Tokenizer::from_gguf(&file).unwrap();
+        let cfg = Qwen3Config::from_gguf(&file, tok.vocab_size()).unwrap();
+        let base = load_base(bk.as_ref(), &wm, &cfg).unwrap();
+        let ids = tok.encode(held);
+        eprintln!("held tokens: {}", ids.len());
+
+        let states0 = param_states(bk.as_ref(), &init_lora(bk.as_ref(), &cfg, 8).unwrap()).unwrap();
+        let ppl0 = perplexity(bk.as_ref(), &base, &states0, &ids).unwrap();
+
+        // обученный адаптер → состояния из adapter.json
+        let txt = std::fs::read_to_string(&adapter_path).unwrap();
+        let ad: AdapterFile = serde_json::from_str(&txt).unwrap();
+        let names = target_names(&cfg);
+        let mut states1 = Vec::new();
+        for n in names {
+            let pair = ad.adapters.get(&n).expect("адаптер для всех целей");
+            let rank = ad.rank;
+            let inp = pair.a.len() / rank;
+            let outn = pair.b.len() / rank;
+            states1.push(ParamState {
+                name: n.clone(),
+                out: outn,
+                inp,
+                a: bk.from_cpu_f32(&pair.a, vec![rank, inp]).unwrap(),
+                b: bk.from_cpu_f32(&pair.b, vec![outn, rank]).unwrap(),
+                g_a: bk.zeros(vec![rank, inp]).unwrap(),
+                g_b: bk.zeros(vec![outn, rank]).unwrap(),
+            });
+        }
+        let ppl1 = perplexity(bk.as_ref(), &base, &states1, &ids).unwrap();
+        eprintln!(
+            "ppl до={ppl0:.2} после={ppl1:.2} ({} / {:.0}%)",
+            if ppl1 < ppl0 { "лучше" } else { "хуже" },
+            100.0 * (ppl1 - ppl0) / ppl0.max(1e-9)
+        );
+    }
+
     /// Реальный прогон 5.2b-приёмки: Qwen3-0.6B-Q8_0 на Metal, 6 примеров.
     /// Запускается вручную: `cargo test --features metal --lib
     /// train_qwen3::tests::metal_train_0_6b -- --ignored --nocapture`.
@@ -1700,6 +1767,28 @@ mod tests {
         assert!(checked > 20);
     }
 
+    /// 5.7-срез: perplexity конечна и падает на обученной модели.
+    #[test]
+    fn perplexity_finite_and_drops_after_fit() {
+        unsafe { std::env::set_var("BACKEND", "cpu") };
+        let bk = crate::backend::default_backend().unwrap();
+        let cfg = tiny_cfg();
+        let base = tiny_base(bk.as_ref());
+        let mut states = param_states(bk.as_ref(), &init_lora(bk.as_ref(), &cfg, 4).unwrap()).unwrap();
+        let (ids, _) = seq(true);
+        let ppl0 = perplexity(bk.as_ref(), &base, &states, &ids).unwrap();
+        assert!(ppl0.is_finite() && ppl0 > 0.0, "ppl0={ppl0}");
+        // 60 шагов по той же последовательности — ppl должна упасть
+        let seqs = vec![seq(true)];
+        let stop = AtomicBool::new(false);
+        fit(bk.as_ref(), &base, &mut states, &seqs, 60, 1, 5e-3, &stop, &|_| {}).unwrap();
+        let ppl1 = perplexity(bk.as_ref(), &base, &states, &ids).unwrap();
+        assert!(
+            ppl1 < ppl0,
+            "ppl must drop after fit: ppl0={ppl0:.2} ppl1={ppl1:.2}"
+        );
+    }
+
     #[test]
     fn fit_overfits_tiny_dataset() {
         // cpu-сборка по умолчанию: явный opt-in через BACKEND
@@ -1733,4 +1822,26 @@ mod tests {
             "loss must drop: first={first:.4} last={last:.4}"
         );
     }
+}
+
+// ── Оценка (5.7 срез): perplexity последовательности ───────────────────────
+
+/// Perplexity текста: forward с заданными состояниями адаптеров (для
+/// необученной модели — init_lora с B=0: вклад LoRA ровно нулевой).
+pub fn perplexity(
+    bk: &dyn Backend,
+    base: &BaseModel,
+    states: &[ParamState],
+    ids: &[u32],
+) -> Result<f64, BackendError> {
+    if ids.len() < 2 {
+        return Err(BackendError::Shape("ppl: слишком короткий текст".into()));
+    }
+    let labels: Vec<i32> = {
+        let mut l = ids[1..].iter().map(|&x| x as i32).collect::<Vec<_>>();
+        l.push(-1);
+        l
+    };
+    let fwd = forward_seq(bk, base, states, ids, &labels)?;
+    Ok(fwd.loss.exp())
 }

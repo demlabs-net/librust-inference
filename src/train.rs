@@ -92,6 +92,9 @@ pub struct TrainJob {
     /// 5.2b: макс. длина последовательности (токенов) для обучения.
     #[serde(default)]
     pub max_seq_len: usize,
+    /// 5.5: история потерь (для loss-кривой в UI; кап 500 точек).
+    #[serde(default)]
+    pub losses: Vec<f64>,
 }
 
 impl TrainJob {
@@ -118,6 +121,7 @@ impl TrainJob {
             dataset_format: None,
             model_path: None,
             max_seq_len: 0,
+            losses: Vec::new(),
         }
     }
 

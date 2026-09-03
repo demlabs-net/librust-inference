@@ -31,12 +31,27 @@ pub enum GenerateEvent {
     Delta(String),
     /// Сырой токен (для метрик/логов).
     Token(u32),
+    /// Спек-статистика (4.2b) — при включённом драфтере.
+    SpecStats(SpecStats),
     /// Генерация завершена.
     Done(FinishReason),
 }
 
-/// Параметры генерации (дефолты — Qwen3-совместимые).
-#[derive(Debug, Clone)]
+/// Статистика спек-декодирования (Этап 4.2b).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct SpecStats {
+    pub drafts: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+}
+
+impl SpecStats {
+    pub fn acceptance(&self) -> Option<f64> {
+        let total = self.accepted + self.rejected;
+        if total == 0 { None } else { Some(self.accepted as f64 / total as f64 * 100.0) }
+    }
+}
+
 pub struct GenerateParams {
     pub max_tokens: usize,
     pub temperature: f32,
@@ -45,6 +60,9 @@ pub struct GenerateParams {
     pub repeat_penalty: f32,
     /// Текстовые стоп-строки (проверяются по накопленному выводу).
     pub stop_strings: Vec<String>,
+    /// Спек-декодинг (4.2b): драфтер + число драфт-токенов (0 = выкл).
+    pub drafter: Option<std::sync::Arc<std::sync::Mutex<dyn crate::spec::Drafter>>>,
+    pub spec_gamma: usize,
 }
 
 impl Default for GenerateParams {
@@ -56,6 +74,8 @@ impl Default for GenerateParams {
             top_k: 0,
             repeat_penalty: 1.0,
             stop_strings: Vec::new(),
+            drafter: None,
+            spec_gamma: 0,
         }
     }
 }
@@ -88,6 +108,7 @@ pub fn generate(
     params: &GenerateParams,
     mut on_event: impl FnMut(GenerateEvent) -> bool,
 ) -> Result<Vec<u32>, BackendError> {
+    let mut spec_stats = SpecStats::default();
     // Prefill: батч-префилл, если промпт длиннее одного токена.
     let mut logits = if ids.len() > 1 {
         model.prefill(backend, ids)?
@@ -160,6 +181,21 @@ pub fn generate(
         generated.push(next);
         history.push(next);
 
+        // Спек-счётчик (4.2b): предложили gamma драфт-токенов, реальный
+        // токен совпал с первым — принят (батч-верификация — след. подблок).
+        if let (Some(drafter), true) = (&params.drafter, params.spec_gamma > 0) {
+            let (draft_tokens, _q) = {
+                let mut dr = drafter.lock().unwrap();
+                dr.draft(backend, &history, params.spec_gamma)
+            };
+            spec_stats.drafts += params.spec_gamma as u64;
+            if draft_tokens.first() == Some(&next) {
+                spec_stats.accepted += 1;
+            } else {
+                spec_stats.rejected += 1;
+            }
+        }
+
         logits = model.decode(backend, next)?;
     }
     if finish.is_none() {
@@ -170,6 +206,9 @@ pub fn generate(
         if !on_event(GenerateEvent::Delta(tail)) {
             return Ok(generated);
         }
+    }
+    if params.spec_gamma > 0 && params.drafter.is_some() {
+        on_event(GenerateEvent::SpecStats(spec_stats));
     }
     on_event(GenerateEvent::Done(finish.unwrap()));
     Ok(generated)

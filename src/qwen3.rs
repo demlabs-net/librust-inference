@@ -804,6 +804,79 @@ impl Qwen3Model {
     /// Скрытые после указанных слоёв (для DFlash-инжекта, Ф2.4): h_i — выход
     /// слоя i (attn+ffn+residual, БЕЗ out_norm), по порядку `layers`.
     /// Кэши пополняются как при обычном префилле.
+    /// Отладка NaN (6.4b): слой `li` — вернуть (после attn+residual,
+    /// после ffn+residual) для поиска оператора, порождающего NaN.
+    pub fn debug_layer_split(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        li: usize,
+    ) -> Result<(Tensor, Tensor, Tensor), BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let mut x = self.embed.forward(backend, ids, t)?;
+            if self.caches[0].roll_if_needed(backend, t)? {
+                self.pos_rope = self.caches[0].pos;
+            }
+            let mask = if t > 1 {
+                Some(crate::nn::build_causal_mask(
+                    backend,
+                    t,
+                    self.caches[0].pos + t,
+                    self.pos_rope,
+                    self.cfg.swa_window,
+                )?)
+            } else {
+                None
+            };
+            for (i, layer) in self.layers.iter().enumerate() {
+                if i == li {
+                    let normed = layer.attn_norm.forward(backend, &x)?;
+                    let h = Self::rope_and_attn(
+                        &self.cfg,
+                        backend,
+                        &normed,
+                        &layer.attn,
+                        &mut self.caches[i],
+                        self.pos_rope,
+                        t,
+                        None,
+                        true,
+                        None,
+                        mask.as_ref(),
+                    )?;
+                    let after_attn = backend_add(backend, &x, &h)?;
+                    let h2 = layer.ffn_norm.forward(backend, &after_attn)?;
+                    let f = ffn_forward(backend, &h2, &layer.ffn)?;
+                    let after_ffn = backend_add(backend, &after_attn, &f)?;
+                    return Ok((normed, after_attn, after_ffn));
+                }
+                let h = layer.attn_norm.forward(backend, &x)?;
+                let h = Self::rope_and_attn(
+                    &self.cfg,
+                    backend,
+                    &h,
+                    &layer.attn,
+                    &mut self.caches[i],
+                    self.pos_rope,
+                    t,
+                    None,
+                    true,
+                    None,
+                    mask.as_ref(),
+                )?;
+                x = backend_add(backend, &x, &h)?;
+                let h = layer.ffn_norm.forward(backend, &x)?;
+                let f = ffn_forward(backend, &h, &layer.ffn)?;
+                x = backend_add(backend, &x, &f)?;
+            }
+            Err(BackendError::Shape("layer out of range".into()))
+        })();
+        backend.end_batch()?;
+        r
+    }
+
     pub fn forward_extract(
         &mut self,
         backend: &dyn Backend,

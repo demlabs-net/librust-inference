@@ -1147,16 +1147,24 @@ impl crate::spec::Drafter for DFlashDrafter {
         }
         // extract-тензоры — [1, T, D] (batch=1): строки 0..n_accepted —
         // принятые токены; их позиции [pos+1-n_accepted .. pos+1).
+        // ВАЖНО (4.2c): z-lab конкат по ПОСЛЕДНЕЙ оси (dim=-1) — фичи
+        // строки t = [l0[t]; l1[t]; …; l4[t]] (токен-мажор!). Раньше
+        // клали слой-мажор ([L0-все строки, L1-все…]) — fc получал
+        // перепутанный вход и драфтер выдавал мусор (приёмка 0%).
         let d = extract[0].shape()[2];
         let t = extract[0].shape()[1];
-        let rows = n_accepted.min(t);
-        let mut feat = Vec::with_capacity(extract.len() * rows * d);
-        for t_ in extract {
+        let rows = n_accepted.min(t).min(t);
+        let n_layers = extract.len();
+        let mut feat = vec![0f32; n_layers * rows * d];
+        for (li, t_) in extract.iter().enumerate() {
             let td = t_.shape()[1];
             let rows_ = _backend.to_cpu_f32(t_)?;
             let n = rows.min(td);
-            let n_ = n;
-            feat.extend_from_slice(&rows_[..n_ * d]);
+            for r in 0..n {
+                let src = r * d;
+                let dst = r * n_layers * d + li * d;
+                feat[dst..dst + d].copy_from_slice(&rows_[src..src + d]);
+            }
         }
         let features = _backend.from_cpu_f32(&feat, vec![rows, extract.len() * d])?;
         self.features = Some(features);
@@ -1230,7 +1238,15 @@ impl crate::spec::Drafter for DFlashDrafter {
             }
         } else {
             // v1: сэмпл каждой MASK-позиции (спека: "sample every block
-            // position on the backend") + честные q (softmax-вероятность)
+            // position on the backend") + честные q (softmax-вероятность).
+            // z-lab model.py: при temperature=0 черновики = ARGMAX строк
+            // (dflash_generate: block_output_ids[:, 1:] = argmax(draft_logits));
+            // случайный LCG-сэмпл из полного ряда даёт q≈0 и приёмку 0%
+            // независимо от качества драфтера. LLM_DRAFT_ARGMX=1 включает
+            // argmax-режим (жёсткая генерация бенча).
+            let argmx = std::env::var("LLM_DRAFT_ARGMX")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let (t, vocab) = (res.logits.shape()[1], res.logits.shape()[2]);
             let lg = match backend.to_cpu_f32(&res.logits) {
                 Ok(l) => l,
@@ -1245,7 +1261,17 @@ impl crate::spec::Drafter for DFlashDrafter {
             // черновики = строки 1..t (проверено: direct-вариант хуже — 0.7%).
             for pos in 1..t {
                 let row = &lg[pos * vocab..(pos + 1) * vocab];
-                let tok = self.sample_row(row);
+                let tok = if argmx {
+                    let mut best = (0usize, f32::NEG_INFINITY);
+                    for (i, &l) in row.iter().enumerate() {
+                        if l.is_finite() && l > best.1 {
+                            best = (i, l);
+                        }
+                    }
+                    best.0 as u32
+                } else {
+                    self.sample_row(row)
+                };
                 tokens.push(tok);
                 probs.push(softmax_row_prob(&lg, pos, vocab, tok));
             }
@@ -1438,7 +1464,7 @@ fn upload_f16(
 
 /// N1 (build fix): the tests need both the Metal backend AND the CPU harness —
 /// bare `#[cfg(test)]` broke `cargo test` on Linux (E0432).
-#[cfg(all(test, feature = "metal", feature = "cpu"))]
+#[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::*;
     use crate::metal::MetalBackend;
@@ -1566,6 +1592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn dflash_load_shapes() {
         let backend = MetalBackend::new().unwrap();
         let c = cfg();
@@ -2032,6 +2059,7 @@ mod tests {
     /// Диагностика: диффузия различает позиции (маска-патч, без инжекта).
     /// Не топ-1-равенство, а именно РАЗЛИЧИЕ логитов по позициям.
     #[test]
+    #[cfg(feature = "cpu")]
     fn diffuse_positions_differ() {
         use crate::nn::Embedding;
         let backend = MetalBackend::new().unwrap();
@@ -2164,8 +2192,11 @@ mod tests {
     }
 }
 
-/// Загрузить DFlash-драфтер из GGUF (паттерн dflash_probe): веса модели,
-/// target_embed и lm_head — от таргета. Ошибка — понятная (нет/не GGUF).
+/// Загрузить DFlash-драфтер (паттерн dflash_probe): веса модели,
+/// target_embed и lm_head — от таргета. `.safetensors` — оригинал z-lab
+/// (config.json рядом); `.gguf` — сконвертированный квант (ВНИМАНИЕ: файлы
+/// Q8_0.gguf в ~/models/dflash старше zlab-версии — другие веса, приёмка
+/// на них не показательна). Ошибка — понятная (нет/не GGUF).
 pub fn load_drafter_gguf(
     backend: &dyn crate::backend::Backend,
     path: &std::path::Path,
@@ -2173,14 +2204,199 @@ pub fn load_drafter_gguf(
     lm_head: Tensor,
     vocab_size: usize,
 ) -> Result<DFlashDrafter, BackendError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| BackendError::Shape(format!("open drafter {}: {e}", path.display())))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| BackendError::Shape(format!("mmap drafter: {e}")))?;
-    let gf =
-        crate::gguf::parse(&mmap).map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
-    let wm = crate::weights_map::WeightsMap::from_gguf(&gf)
-        .map_err(|e| BackendError::Shape(format!("weights: {e}")))?;
-    let model = DFlashModel::load_gguf(backend, &gf, &wm, vocab_size)?;
+    let model = if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "safetensors")
+        .unwrap_or(false)
+    {
+        DFlashModel::load_safetensors(backend, path, vocab_size)?
+    } else {
+        let file = std::fs::File::open(path)
+            .map_err(|e| BackendError::Shape(format!("open drafter {}: {e}", path.display())))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| BackendError::Shape(format!("mmap drafter: {e}")))?;
+        let gf =
+            crate::gguf::parse(&mmap).map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
+        let wm = crate::weights_map::WeightsMap::from_gguf(&gf)
+            .map_err(|e| BackendError::Shape(format!("weights: {e}")))?;
+        DFlashModel::load_gguf(backend, &gf, &wm, vocab_size)?
+    };
     Ok(DFlashDrafter::new(model, target_embed, lm_head))
+}
+
+#[cfg(all(test, feature = "metal", feature = "cpu"))]
+mod real_dump_tests {
+    use super::*;
+    use crate::dflash::DFlashDrafter;
+    use crate::metal::MetalBackend;
+
+    /// 4.2c-verify: первый блок диффузии на РЕАЛЬНЫХ моделях (8B-драфтер +
+    /// Qwen3-8B-Base) — дампы features/embeds/logits для числового сравнения
+    /// с эталоном dflash/model.py (numpy). Запуск:
+    /// cargo test --features metal,cpu dflash_real_block_dump -- --ignored
+    #[test]
+    #[ignore = "реальные GGUF (~10 ГБ на GPU)"]
+    fn dflash_real_block_dump() {
+        use crate::gguf;
+        use crate::gguf::GgufValue;
+        let backend = MetalBackend::new().unwrap();
+        let home = std::env::var("HOME").unwrap();
+        // Модели переехали в метарепу: models/ (реестр + gguf). Инф-переменная
+        // для кастомного пути.
+        let mdir = std::env::var("INFER_MODELS_DIR")
+            .unwrap_or_else(|_| format!("{home}/work/ai/inference/models"));
+        let tp = format!("{mdir}/llm/Qwen3-8B-Base-Q8_0.gguf");
+        // ОРИГИНАЛ z-lab (Q8_0.gguf старше — другие веса, приёмка 0 в
+        // принципе). Требует config.json рядом в ~/models/dflash/.
+        let dp = format!("{mdir}/dflash/qwen3-8b-dflash-zlab.safetensors");
+        let tb = std::fs::read(&tp).unwrap();
+        let tgf = gguf::parse(&tb).unwrap();
+        let twm = crate::weights_map::WeightsMap::from_gguf(&tgf).unwrap();
+        let voc = crate::tokenizer::Tokenizer::from_gguf(&tgf).unwrap();
+        let vocab = voc.vocab_size();
+        let tc = crate::qwen3::Qwen3Config::from_gguf(&tgf, vocab).unwrap();
+        let mut target = crate::qwen3::Qwen3Model::load(&backend, &twm, tc.clone()).unwrap();
+        // осмысленный промпт (tg-мусор из 'a' вырождал модель в
+        // детерминированную петлю [220,170,222,107,...] — приёмка на нём
+        // бессмысленна); фичи = ВСЕ строки префилла (z-lab первый блок).
+        let ids: Vec<u32> = voc.encode(
+            "Расскажи подробно, как работает спекулятивное декодирование в трансформерах: какие есть методы и в чём их отличия?",
+        );
+        let tlayers = vec![1, 9, 17, 25, 33];
+        let (logits, extract) = target.prefill_extract(&backend, &ids, &tlayers).unwrap();
+        let lv = backend.to_cpu_f32(&logits).unwrap();
+        let v = tc.vocab_size;
+        let t_prompt = ids.len();
+        let anchor = lv
+            .chunks(v)
+            .last()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap()
+                    .0 as u32
+            })
+            .unwrap();
+        eprintln!("anchor={anchor} vocab={v} t_prompt={t_prompt}");
+        let mut dr = crate::dflash::load_drafter_gguf(
+            &backend,
+            std::path::Path::new(&dp),
+            target.token_embed_table().clone(),
+            target.output_projection().clone(),
+            vocab,
+        )
+        .expect("drafter load");
+        // фичи (t_prompt строк × 5 слоёв, выходы слоёв) — ТОКЕН-МАЖОР
+        // (z-lab: cat по последней оси): строка t = [l0[t]; l1[t]; …; l4[t]].
+        let d = tc.dim;
+        let n_layers = extract.len();
+        let mut feat: Vec<f32> = vec![0f32; n_layers * t_prompt * d];
+        for (li, t) in extract.iter().enumerate() {
+            let rows = backend.to_cpu_f32(t).unwrap();
+            for r in 0..t_prompt {
+                let src = r * d;
+                let dst = r * n_layers * d + li * d;
+                feat[dst..dst + d].copy_from_slice(&rows[src..src + d]);
+            }
+        }
+        let ft = backend.from_cpu_f32(&feat, vec![t_prompt, 5 * d]).unwrap();
+        dr.features = Some(ft.clone());
+        // блок: [anchor, MASK×15], anchor на позиции t_prompt
+        let block = dr.model.block_size;
+        let mask = dr.model.mask_token;
+        let mut bids = vec![anchor];
+        bids.resize(block, mask);
+        let pos = t_prompt;
+        let res = dr
+            .model
+            .diffuse(&backend, &bids, &dr.lm_head.clone(), pos, dr.features.as_ref())
+            .expect("diffuse");
+        // дампы
+        let write_f32 = |path: &str, data: &[f32]| {
+            let mut b: Vec<u8> = Vec::with_capacity(data.len() * 4);
+            for x in data {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            std::fs::write(path, b).unwrap();
+        };
+        write_f32("/tmp/dump_features.bin", &feat);
+        // эмбеддинги блока (строки target_embed)
+        let emb = backend.to_cpu_f32(target.token_embed_table()).unwrap();
+        let mut bte = Vec::with_capacity(block * d);
+        for &id in &bids {
+            bte.extend_from_slice(&emb[id as usize * d..(id as usize + 1) * d]);
+        }
+        write_f32("/tmp/dump_embeds.bin", &bte);
+        let lg = backend.to_cpu_f32(&res.logits).unwrap();
+        write_f32("/tmp/dump_logits.bin", &lg);
+        // lm_head таргета в f32 — для python-эталона приёмки (top-K IOU):
+        // dequant из GGUF (тот же путь, что и загрузка движка).
+        if let Some(t) = twm.get("output.weight") {
+            let hd = crate::weights_map::dequant_f32(t);
+            if !hd.is_empty() {
+                write_f32("/tmp/dump_head.bin", &hd);
+                eprintln!("head dumped: {} f32", hd.len());
+            }
+        }
+        // Веса драфтера Q8-деквант (слой 0 q/k + fc) — сверка против bf16.
+        if let Some(t) = twm.get("blk.0.attn_q.weight") {
+            write_f32("/tmp/dump_q_attn_q.bin", &crate::weights_map::dequant_f32(t));
+        }
+        if let Some(t) = twm.get("blk.0.attn_k.weight") {
+            write_f32("/tmp/dump_q_attn_k.bin", &crate::weights_map::dequant_f32(t));
+        }
+        if let Some(t) = twm.get("fc.weight") {
+            write_f32("/tmp/dump_q_fc.bin", &crate::weights_map::dequant_f32(t));
+        }
+        eprintln!("q8 weight dumps written");
+        let hd = backend.to_cpu_f32(&res.hidden).unwrap();
+        write_f32("/tmp/dump_hidden.bin", &hd);
+        let meta = format!(
+            "{{\"vocab\":{v},\"dim\":{d},\"block\":{block},\"pos\":{pos},\"mask\":{mask},\"anchor\":{anchor},\"n_layers\":5,\"tlayers\":[1,9,17,25,33],\"t_prompt\":{t_prompt}}}"
+        );
+        std::fs::write("/tmp/dump_meta.json", meta).unwrap();
+        eprintln!("dumps written");
+        // ── приёмка первого блока: черновик vs фактические токены таргета ──
+        use crate::spec::Drafter;
+        let mut lg = logits.clone();
+        let mut actual = Vec::with_capacity(12);
+        for _ in 0..12 {
+            let rv = backend.to_cpu_f32(&lg).unwrap();
+            let row = &rv[..v];
+            let tok = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32;
+            actual.push(tok);
+            lg = target.decode(&backend, tok).unwrap();
+        }
+        eprintln!("anchor={anchor} actual(1..)={:?}", &actual[..7]);
+        // свежий драфтер, тот же контекст: draft() работает по history
+        let mut dr2 = crate::dflash::load_drafter_gguf(
+            &backend,
+            std::path::Path::new(&dp),
+            target.token_embed_table().clone(),
+            target.output_projection().clone(),
+            vocab,
+        )
+        .expect("drafter2");
+        dr2.features = Some(ft.clone());
+        dr2.commit(&[anchor]);
+        let mut history = ids.clone();
+        history.push(anchor);
+        let (tokens, probs) = dr2.draft(&backend, &history, 6);
+        eprintln!("actual  = {:?}", &actual[..7]);
+        eprintln!("draft   = {:?}", tokens);
+        eprintln!("probs   = {:?}", probs.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>());
+        let matched = tokens
+            .iter()
+            .zip(actual.iter().skip(1))
+            .filter(|(a, b)| a == b)
+            .count();
+        eprintln!("first-block acceptance: {matched}/{} (с лагом 1, как z-lab)", tokens.len());
+    }
 }

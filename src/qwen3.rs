@@ -449,12 +449,6 @@ impl Qwen3Model {
                 None
             };
             for (i, layer) in self.layers.iter().enumerate() {
-                // фичи для DFlash-инжекта = ВХОД extract-слоя (llama.cpp
-                // llama_get_embeddings_layer_inp: выход предыдущего слоя)
-                if li < layers.len() && layers[li] == i {
-                    out.push(x.clone());
-                    li += 1;
-                }
                 let t0 = std::time::Instant::now();
                 if prof {
                     backend.end_batch()?;
@@ -486,6 +480,13 @@ impl Qwen3Model {
                 let h = layer.ffn_norm.forward(backend, &x)?;
                 let f = ffn_forward(backend, &h, &layer.ffn)?;
                 x = backend_add(backend, &x, &f)?;
+                // фичи для DFlash-инжекта = ВЫХОД extract-слоя (z-lab
+                // model.py: hidden_states[layer_id+1] = выход слоя layer_id
+                // после attn+ffn; fc обучался на выходах, не на входах).
+                if li < layers.len() && layers[li] == i {
+                    out.push(x.clone());
+                    li += 1;
+                }
                 if prof {
                     backend.end_batch()?;
                     backend.begin_batch()?;

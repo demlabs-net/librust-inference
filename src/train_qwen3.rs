@@ -1547,6 +1547,59 @@ mod tests {
     }
 
 
+    /// 5.7: eval-набор с чат-шаблоном — ppl до/после (0.6B + адаптер).
+    #[test]
+    #[ignore]
+    fn metal_eval_set_before_after() {
+        unsafe { std::env::set_var("BACKEND", "metal") };
+        let model = std::path::PathBuf::from(concat!(
+            env!("HOME"),
+            "/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf"
+        ));
+        if !model.is_file() {
+            eprintln!("skip");
+            return;
+        }
+        let merged_path = std::path::PathBuf::from(concat!(
+            env!("HOME"),
+            "/.inferd/train-jobs/out/metal-e2e-Qwen3-0.6B-Instruct-Q8_0-f16.gguf"
+        ));
+        if !merged_path.is_file() {
+            eprintln!("skip: нет merged-файла");
+            return;
+        }
+        let bk = crate::train::default_backend().unwrap();
+        let bytes = std::fs::read(&model).unwrap();
+        let file = crate::gguf::parse(&bytes).unwrap();
+        let wm = crate::weights_map::WeightsMap::from_gguf(&file).unwrap();
+        let tok = Tokenizer::from_gguf(&file).unwrap();
+        let cfg = Qwen3Config::from_gguf(&file, tok.vocab_size()).unwrap();
+        let base = load_base(bk.as_ref(), &wm, &cfg).unwrap();
+        let items = vec![
+            ("Что такое машинное обучение?".into(),
+             "Машинное обучение — поиск функции по данным: модель учится предсказывать ответы на примерах.".into()),
+            ("Опиши квантование одним предложением.".into(),
+             "Квантование — сжатие весов за счёт меньшей точности чисел, ради размера и скорости.".into()),
+            ("Что делает VAD?".into(),
+             "VAD определяет, есть ли в аудио речь, чтобы обрабатывать только активные фрагменты.".into()),
+            ("Что такое градиентный спуск?".into(),
+             "Градиентный спуск — итеративная минимизация потерь: шаг в сторону уменьшения градиента.".into()),
+        ];
+        let states0 = param_states(bk.as_ref(), &init_lora(bk.as_ref(), &cfg, 8).unwrap()).unwrap();
+        let ppl0 = eval_set_ppl(bk.as_ref(), &base, &states0, &tok, &file, &items).unwrap();
+        // «после»: merged-файл (база+адаптер) как новая база
+        let mbytes = std::fs::read(&merged_path).unwrap();
+        let mfile = crate::gguf::parse(&mbytes).unwrap();
+        let mwm = crate::weights_map::WeightsMap::from_gguf(&mfile).unwrap();
+        let mbase = load_base(bk.as_ref(), &mwm, &cfg).unwrap();
+        let states1 = param_states(bk.as_ref(), &init_lora(bk.as_ref(), &cfg, 8).unwrap()).unwrap();
+        let ppl1 = eval_set_ppl(bk.as_ref(), &mbase, &states1, &tok, &mfile, &items).unwrap();
+        eprintln!(
+            "5.7 eval-set ppl: до={ppl0:.1} после={ppl1:.1} ({})",
+            if ppl1 < ppl0 { "лучше" } else { "хуже" }
+        );
+    }
+
     /// 5.7-срез: ppl до/после на 0.6B + обученный адаптер (held-out).
     #[test]
     #[ignore]
@@ -1828,6 +1881,104 @@ mod tests {
 
 /// Perplexity текста: forward с заданными состояниями адаптеров (для
 /// необученной модели — init_lora с B=0: вклад LoRA ровно нулевой).
+/// Похоже на perplexity, но с маской: обучение только на CE позиций
+/// >= mask_from; раньше — без лосса (5.7: ответы при чат-шаблоне).
+pub fn perplexity_masked(
+    bk: &dyn Backend,
+    base: &BaseModel,
+    states: &[ParamState],
+    ids: &[u32],
+    mask_from: usize,
+) -> Result<f64, BackendError> {
+    let mut labels = vec![-1i32; ids.len()];
+    for (j, &x) in ids.iter().enumerate().skip(mask_from) {
+        labels[j] = x as i32;
+    }
+    let fwd = forward_seq(bk, base, states, ids, &labels)?;
+    Ok(fwd.loss.exp())
+}
+
+/// 5.7: чат-шаблон из GGUF → промпт-токены.
+pub fn chat_prompt_ids(
+    tok: &Tokenizer,
+    file: &crate::gguf::GgufFile<'_>,
+    user: &str,
+    system: Option<&str>,
+) -> Result<Vec<u32>, BackendError> {
+    let tpl = file
+        .get("tokenizer.chat_template")
+        .and_then(crate::gguf::GgufValue::as_str)
+        .ok_or_else(|| BackendError::Shape("qwen3-lora: нет chat_template в GGUF".into()))?;
+    let mut specials = std::collections::HashMap::new();
+    if let Some(bos) = tok.bos {
+        specials.insert("bos_token".into(), format!("<|bos|>").replace("<|bos|>", &tok.decode_piece(bos)));
+    }
+    if let Some(eos) = tok.eos {
+        specials.insert("eos_token".into(), tok.decode_piece(eos));
+    }
+    if let Some(pad) = tok.pad {
+        specials.insert("pad_token".into(), tok.decode_piece(pad));
+    }
+    let template = match crate::chat_template::Template::compile(tpl, specials) {
+        Ok(t) => Some(t),
+        Err(_) => None, // сложные конструкции (namespace/tools) — классический фоллбэк
+    };
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(std::collections::HashMap::from([(
+            "role".to_string(),
+            "system".to_string(),
+        ), ("content".to_string(), sys.to_string())]));
+    }
+    messages.push(std::collections::HashMap::from([
+        ("role".to_string(), "user".to_string()),
+        ("content".to_string(), user.to_string()),
+    ]));
+    let mut ctx = crate::chat_template::TemplateContext { messages, extra: Default::default() };
+    ctx.extra.insert("add_generation_prompt".into(), "true".into());
+    let prompt = match template.and_then(|t| t.render(&ctx).ok()) {
+        Some(p) => p,
+        // Qwen3-шаблон использует namespace/tools — неподдерживаемые
+        // конструкции; классический формат эквивалентен для простых чатов.
+        None => {
+            let mut p = String::new();
+            if let Some(sys) = system {
+                p.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+            }
+            p.push_str(&format!("<|im_start|>user\n{user}<|im_end|>\n"));
+            p.push_str("<|im_start|>assistant\n");
+            p
+        }
+    };
+    Ok(tok.encode(&prompt))
+}
+
+/// 5.7: ppl по eval-набору — чат-промпт + ответ (маска на промпте).
+pub fn eval_set_ppl(
+    bk: &dyn Backend,
+    base: &BaseModel,
+    states: &[ParamState],
+    tok: &Tokenizer,
+    file: &crate::gguf::GgufFile<'_>,
+    items: &[(String, String)],
+) -> Result<f64, BackendError> {
+    let mut total = 0.0f64;
+    let mut n = 0usize;
+    for (q, a) in items {
+        let p = chat_prompt_ids(tok, file, q, None)?;
+        let mut ids = p.clone();
+        ids.extend(tok.encode(a));
+        ids.push(tok.eos.unwrap_or_else(|| ids[0]));
+        let ppl = perplexity_masked(bk, base, states, &ids, p.len())?;
+        total += ppl.ln();
+        n += 1;
+    }
+    if n == 0 {
+        return Err(BackendError::Shape("eval: пустой набор".into()));
+    }
+    Ok((total / n as f64).exp())
+}
+
 pub fn perplexity(
     bk: &dyn Backend,
     base: &BaseModel,

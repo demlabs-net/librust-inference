@@ -16,8 +16,107 @@ fn top5(row: &[f32]) -> Vec<(usize, f32)> {
     v.into_iter().take(5).collect()
 }
 
+// Дополнительно: --convert-zlab-q8 — переквантование актуального zlab
+// драфтера (safetensors) в Q8_0 GGUF (старый Q8_0.gguf — ДРУГИЕ веса).
+
+#[allow(dead_code)]
+pub fn convert_zlab_q8() -> Result<(), Box<dyn Error>> {
+    use rust_inference::gguf::{self, GgufValue, GgufWriteTensor, GgmlType, write_gguf};
+    use rust_inference::quant::quant_q8_0;
+    let home = std::env::var("HOME").unwrap();
+    let old = format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-Q8_0.gguf");
+    let st = format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-zlab.safetensors");
+    let out = format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-zlab-Q8_0.gguf");
+    let buf = std::fs::read(&old)?;
+    let gf = gguf::parse(&buf)?;
+    let metadata: Vec<(String, GgufValue)> = gf
+        .metadata
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let st_w = rust_inference::weights::read_safetensors_f32(std::path::Path::new(&st))?;
+    // та же карта имён, что в DFlashModel::load_safetensors
+    let map = |name: &str| -> Option<String> {
+        if name == "fc.weight" {
+            return Some("fc.weight".into());
+        }
+        if name == "norm.weight" {
+            return Some("output_norm.weight".into());
+        }
+        if name == "hidden_norm.weight" {
+            return Some("enc.output_norm.weight".into());
+        }
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() >= 4 && parts[0] == "layers" {
+            let rest = parts[2..].join(".");
+            let m = match rest.as_str() {
+                "input_layernorm.weight" => "attn_norm.weight",
+                "post_attention_layernorm.weight" => "ffn_norm.weight",
+                "self_attn.q_proj.weight" => "attn_q.weight",
+                "self_attn.k_proj.weight" => "attn_k.weight",
+                "self_attn.v_proj.weight" => "attn_v.weight",
+                "self_attn.o_proj.weight" => "attn_output.weight",
+                "self_attn.q_norm.weight" => "attn_q_norm.weight",
+                "self_attn.k_norm.weight" => "attn_k_norm.weight",
+                "mlp.gate_proj.weight" => "ffn_gate.weight",
+                "mlp.up_proj.weight" => "ffn_up.weight",
+                "mlp.down_proj.weight" => "ffn_down.weight",
+                _ => return None,
+            };
+            return Some(format!("blk.{}.{}", parts[1], m));
+        }
+        None
+    };
+    let mut tensors = Vec::new();
+    for (name, (data, shape)) in &st_w {
+        let mapped = map(name).ok_or_else(|| format!("незнакомый тензор {name}"))?;
+        tensors.push(GgufWriteTensor {
+            name: mapped,
+            dims: shape.iter().map(|&d| d as u32).collect(),
+            ggml_type: GgmlType::Q8_0,
+            data: quant_q8_0(data),
+        });
+    }
+    let mut outbuf = Vec::new();
+    write_gguf(&mut outbuf, &metadata, &tensors)?;
+    std::fs::write(&out, &outbuf)?;
+    eprintln!("записан {out} ({} байт, {} тензоров)", outbuf.len(), tensors.len());
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn verify_zlab_q8() -> Result<(), Box<dyn Error>> {
+    use rust_inference::weights_map::{WeightsMap, dequant_f32};
+    let home = std::env::var("HOME").unwrap();
+    let p = format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-zlab-Q8_0.gguf");
+    let buf = std::fs::read(&p)?;
+    let gf = gguf::parse(&buf)?;
+    let wm = WeightsMap::from_gguf(&gf)?;
+    let qk = dequant_f32(wm.get("blk.0.attn_k.weight").unwrap());
+    let st = rust_inference::weights::read_safetensors_f32(
+        &std::path::PathBuf::from(format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-zlab.safetensors")),
+    )?;
+    let ref_data = &st["layers.0.self_attn.k_proj.weight"];
+    let mean_sq = ref_data.0.iter().map(|x| x * x).sum::<f32>() / ref_data.0.len() as f32;
+    let mut max_d = 0.0f32;
+    let mut sum_d = 0.0f32;
+    for (a, b) in qk.iter().zip(ref_data.0.iter()) {
+        let d = (a - b).abs();
+        max_d = max_d.max(d);
+        sum_d += d;
+    }
+    eprintln!("Q8-vs-zlab: max {max_d:.4} mean {} ref-rms {}", sum_d / ref_data.0.len() as f32, mean_sq.sqrt());
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|a| a == "--convert-zlab-q8").unwrap_or(false) {
+        return convert_zlab_q8();
+    }
+    if args.get(1).map(|a| a == "--verify-zlab-q8").unwrap_or(false) {
+        return verify_zlab_q8();
+    }
     let (tgt, drf) = (&args[1], &args[2]);
     let backend = MetalBackend::new()?;
     let mmap_t = unsafe { memmap2::Mmap::map(&File::open(tgt)?)? };

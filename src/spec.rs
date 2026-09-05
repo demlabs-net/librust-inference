@@ -72,7 +72,9 @@ pub trait Drafter {
         &[]
     }
 
-    /// Скрытые таргета по extract-слоям (после prefill_extract/DECODE_spec),
+    /// Скрытые таргета по extract-слоям (после prefill_extract/DECODE_spec);
+    /// `n_accepted` — число ПРИНЯТЫХ строк окна верификации (якорь +
+    /// проверенные черновики; z-lab: context = только принятые, rows [0..n)),
     /// позиция последнего принятого токена. DFlash-инжект: фичи таргета
     /// → fc+enc_norm → k/v кэша драфтера (иначе драфтер «слеп» — 2% приёмка).
     fn after_extract(
@@ -80,6 +82,7 @@ pub trait Drafter {
         _backend: &dyn crate::backend::Backend,
         _extract: &[crate::backend::Tensor],
         _pos: usize,
+        _n_accepted: usize,
     ) -> Result<(), crate::error::BackendError> {
         Ok(())
     }

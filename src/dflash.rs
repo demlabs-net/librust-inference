@@ -284,9 +284,9 @@ impl DFlashModel {
         let n_layers = u(&p("block_count"))?;
         let n_heads = u(&p("attention.head_count"))?;
         if n_heads == 0 {
-            return Err(BackendError::Shape(
-                format!("{arch}.attention.head_count must be >= 1, got 0"),
-            ));
+            return Err(BackendError::Shape(format!(
+                "{arch}.attention.head_count must be >= 1, got 0"
+            )));
         }
         let cfg = Qwen3Config {
             dim,
@@ -311,16 +311,16 @@ impl DFlashModel {
         // panicked later (Vec::with_capacity(t - 1) underflow at decode,
         // div-by-zero in dim / head_count).
         if block_size == 0 {
-            return Err(BackendError::Shape(
-                format!("{arch}.block_size must be >= 1, got 0"),
-            ));
+            return Err(BackendError::Shape(format!(
+                "{arch}.block_size must be >= 1, got 0"
+            )));
         }
         let conv_kernel = u(&p("conv_kernel_size")).unwrap_or(0);
         let conv_group = u(&p("conv_group_size")).unwrap_or(1);
         if conv_group == 0 {
-            return Err(BackendError::Shape(
-                format!("{arch}.conv_group_size must be >= 1, got 0"),
-            ));
+            return Err(BackendError::Shape(format!(
+                "{arch}.conv_group_size must be >= 1, got 0"
+            )));
         }
         let extract = gf
             .get(&p("target_layers"))
@@ -757,7 +757,10 @@ impl DFlashModel {
                     if std::env::var("LLM_DBG_SPEC").is_ok() {
                         eprintln!(
                             "diffuse-enc: f={:?} fc={:?} y={:?} enc={:?}",
-                            f.shape(), fc.shape(), y.shape(), enc.shape()
+                            f.shape(),
+                            fc.shape(),
+                            y.shape(),
+                            enc.shape()
                         );
                     }
                     Some(enc)
@@ -769,10 +772,19 @@ impl DFlashModel {
             // z-lab: cache_position = position_ids от get_seq_length()); на
             // первом шаге past_len=0 — запись с нуля, БЕЗ дыр.
             let past_len = self.caches[0].pos;
-            let kctx_pos = pos;
+            // z-lab: position_ids окна = [start−ctx .. start+q); k_ctx — при
+            // ФАКТИЧЕСКИХ позициях принятых токенов [pos−ctx .. pos), k_noise
+            // и q при [pos .. pos+t). Раньше k_ctx крутили на [pos..pos+ctx)
+            // — сдвиг rope на ctx поворачивал инжект (только хвост маски
+            // видел контекст) — приёмка деградировала.
+            let kctx_pos = pos.saturating_sub(ctx);
             for (i, layer) in self.layers.iter().enumerate() {
                 if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
-                    eprintln!("diffuse: layer0 x={:?} enc={:?}", x.shape(), enc.as_ref().map(|e| e.shape().to_vec()));
+                    eprintln!(
+                        "diffuse: layer0 x={:?} enc={:?}",
+                        x.shape(),
+                        enc.as_ref().map(|e| e.shape().to_vec())
+                    );
                 }
                 // ── attn-часть (свой путь: прямая инъекция k_ctx) ──
                 let mut h = layer.dense.attn_norm.forward(backend, &x)?;
@@ -785,7 +797,11 @@ impl DFlashModel {
                 }
                 let attn = &layer.dense.attn;
                 if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
-                    eprintln!("diffuse: layer0 h={:?} wqkv={:?}", h.shape(), attn.wqkv.shape());
+                    eprintln!(
+                        "diffuse: layer0 h={:?} wqkv={:?}",
+                        h.shape(),
+                        attn.wqkv.shape()
+                    );
                 }
                 let q_size = attn.n_heads * attn.head_dim;
                 let kv_size = attn.n_kv_heads * attn.head_dim;
@@ -1110,31 +1126,39 @@ impl crate::spec::Drafter for DFlashDrafter {
         _backend: &dyn Backend,
         extract: &[Tensor],
         pos: usize,
+        n_accepted: usize,
     ) -> Result<(), BackendError> {
-        // фичи: последняя строка каждого extract-слоя (токен-якорь),
-        // конкат → [1, n_layers·D] — как в спеке (llama_encode).
+        // z-lab (dflash-ref model.py): context = ПРИНЯТЫЕ строки верификации —
+        // target_hidden = extract(...)[:, :produced, :]; конкат слоёв по
+        // последней оси. Принятые = якорь + n_accepted-1 проверенных.
         if extract.is_empty() || self.model.extract_layers.is_empty() {
             return Ok(());
         }
         if std::env::var("LLM_DBG_SPEC").is_ok() {
             eprintln!(
-                "after_extract: n={} shapes={:?}",
+                "after_extract: n={} shapes={:?} accepted={}",
                 extract.len(),
-                extract.iter().map(|t| t.shape().to_vec()).collect::<Vec<_>>()
+                extract
+                    .iter()
+                    .map(|t| t.shape().to_vec())
+                    .collect::<Vec<_>>(),
+                n_accepted
             );
         }
-        // extract-тензоры — [1, T, D] (batch=1): берём ПОСЛЕДНЮЮ позицию T,
-        // конкат по слоям: [1, n_layers·D] (спека: llama_encode).
+        // extract-тензоры — [1, T, D] (batch=1): строки 0..n_accepted —
+        // принятые токены; их позиции [pos+1-n_accepted .. pos+1).
         let d = extract[0].shape()[2];
-        let mut feat = Vec::with_capacity(extract.len() * d);
-        for t in extract {
-            let last = t.shape()[1] - 1;
-            let rows = _backend.to_cpu_f32(t)?;
-            feat.extend_from_slice(&rows[last * d..(last + 1) * d]);
+        let t = extract[0].shape()[1];
+        let rows = n_accepted.min(t);
+        let mut feat = Vec::with_capacity(extract.len() * rows * d);
+        for t_ in extract {
+            let td = t_.shape()[1];
+            let rows_ = _backend.to_cpu_f32(t_)?;
+            let n = rows.min(td);
+            let n_ = n;
+            feat.extend_from_slice(&rows_[..n_ * d]);
         }
-        let features = _backend.from_cpu_f32(&feat, vec![1, extract.len() * d])?;
-        // только фичи: инжект k/v делает сам diffuse (line ~833) на past_len;
-        // вторая запись (inject_features) смещала контекст — приёмка 0%.
+        let features = _backend.from_cpu_f32(&feat, vec![rows, extract.len() * d])?;
         self.features = Some(features);
         let _ = pos;
         Ok(())
@@ -1159,10 +1183,13 @@ impl crate::spec::Drafter for DFlashDrafter {
         };
         // блок: [anchor, MASK × (block−1)]; MASK-позиции диффундируются.
         // rope-позиции — по спеке (draft_dflash): batch.pos = n + i — блок
-        // идёт на позициях [n..n+block) — anchor пересчитывается на НОВОЙ
-        // позиции n (его инжект-копия остаётся на n−1 в кэше).
+        // идёт на позициях [n..n+block). n = АБСОЛЮТНАЯ позиция якоря
+        // (history.len()−1): target-verify (decode_spec) обрабатывает те же
+        // строки на тех же позициях. Раньше pos = history.len() были все
+        // строки блока сдвинуты на 1 — row0 (якорь) крутился на позиции
+        // num+1 вместо num (у неё и verify).
         let block = self.model.block_size;
-        let pos = history.len();
+        let pos = history.len().saturating_sub(1);
         let mut ids = vec![anchor];
         ids.resize(block, self.model.mask_token);
         // кэш содержит только noise-копии [0..pos); после диффузии —
@@ -2137,7 +2164,6 @@ mod tests {
     }
 }
 
-
 /// Загрузить DFlash-драфтер из GGUF (паттерн dflash_probe): веса модели,
 /// target_embed и lm_head — от таргета. Ошибка — понятная (нет/не GGUF).
 pub fn load_drafter_gguf(
@@ -2151,8 +2177,8 @@ pub fn load_drafter_gguf(
         .map_err(|e| BackendError::Shape(format!("open drafter {}: {e}", path.display())))?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| BackendError::Shape(format!("mmap drafter: {e}")))?;
-    let gf = crate::gguf::parse(&mmap)
-        .map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
+    let gf =
+        crate::gguf::parse(&mmap).map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
     let wm = crate::weights_map::WeightsMap::from_gguf(&gf)
         .map_err(|e| BackendError::Shape(format!("weights: {e}")))?;
     let model = DFlashModel::load_gguf(backend, &gf, &wm, vocab_size)?;

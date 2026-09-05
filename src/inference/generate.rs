@@ -6,7 +6,7 @@
 use crate::backend::Backend;
 use crate::error::BackendError;
 use crate::inference::sampling::{
-    apply_repetition_penalty_vec_unique, SamplingParams, top_p_sample_vec_history,
+    SamplingParams, apply_repetition_penalty_vec_unique, top_p_sample_vec_history,
 };
 use crate::qwen3::Qwen3Model;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -48,7 +48,11 @@ pub struct SpecStats {
 impl SpecStats {
     pub fn acceptance(&self) -> Option<f64> {
         let total = self.accepted + self.rejected;
-        if total == 0 { None } else { Some(self.accepted as f64 / total as f64 * 100.0) }
+        if total == 0 {
+            None
+        } else {
+            Some(self.accepted as f64 / total as f64 * 100.0)
+        }
     }
 }
 
@@ -135,7 +139,25 @@ pub fn generate(
             v.pos_after,
         )?
     } else if ids.len() > 1 {
-        model.prefill(backend, ids)?
+        // DFlash (4.2.c, z-lab): первый блок контекстуализируется НА ВСЁМ
+        // промпте — extract префилла отдаём драфтеру сразу (иначе первый
+        // block только «видит» past_len=0 и не принимает ничего).
+        let tlayers: Option<Vec<usize>> = params
+            .drafter
+            .as_ref()
+            .map(|d| d.lock().unwrap().target_layers().to_vec());
+        match tlayers {
+            Some(tl) if !tl.is_empty() => {
+                let (lg, extract) = model.prefill_extract(backend, ids, &tl)?;
+                let n = ids.len();
+                if let Some(dr) = params.drafter.as_ref() {
+                    let mut dr = dr.lock().unwrap();
+                    let _ = dr.after_extract(backend, &extract, n, n);
+                }
+                lg
+            }
+            _ => model.prefill(backend, ids)?,
+        }
     } else {
         model.decode(backend, ids[0])?
     };
@@ -158,11 +180,7 @@ pub fn generate(
             // (раньше greedy игнорировал history-штраф). Копия — last
             // остаётся нетронутым для следующих итераций.
             let mut penalized = last.to_vec();
-            apply_repetition_penalty_vec_unique(
-                &mut penalized,
-                &history,
-                params.repeat_penalty,
-            );
+            apply_repetition_penalty_vec_unique(&mut penalized, &history, params.repeat_penalty);
             // P18c: a NaN logit used to PANIC in partial_cmp().unwrap().
             // N (iter-9): the claim "treat non-finite as -inf" is now real —
             // the old max_by kept a NaN at index 0 as the running max
@@ -229,8 +247,9 @@ pub fn generate(
                 )?;
                 if !tlayers.is_empty() {
                     let pos = model.caches[0].pos;
+                    let n_ok = out.n_draft_accepted + 1; // якорь + проверенные
                     let mut dr = drafter.lock().unwrap();
-                    let _ = dr.after_extract(backend, &out.extract, pos);
+                    let _ = dr.after_extract(backend, &out.extract, pos, n_ok);
                 }
                 spec_stats.drafts += params.spec_gamma as u64;
                 let nv = out.n_draft_verified;

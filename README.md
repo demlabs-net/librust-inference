@@ -1,6 +1,15 @@
 # Librust Inference
 
+Собственный стек инференса (замена candle): Metal-движок (свои MSL-кернелы),
+нативные NN-слои, квантованные веса (Q4_0/Q8_0/Q4_K/Q6_K, GEMM+MMV),
+токенайзер/чат-шаблоны, Qwen3-архитектура (GQA, QK-norm, RoPE, M-RoPE,
+vision, аудио), спекулятивный декодинг с DFlash v1/v2 драфтерами
+(диффузия блоков, прямая инъекция фич, селектор), LoRA-обучение
+([`train`]: Adam на Backend, Trainer-трейт, TrainJob/JobStore, эталон
+demo-lora).
 
+Ключевые модули: [`backend`] (контракт, GPU-only), [`metal`] (движок),
+[`qwen3`] (модель+spec-decode), [`dflash`] (драфтеры), [`train`] (LoRA).
 
 ## Getting started
 
@@ -91,3 +100,21 @@ For open source projects, say how it is licensed.
 
 ## Project status
 If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+
+## Performance (dev: M3 Max, Metal)
+
+decode batch=1, greedy, Qwen3-0.6B-Instruct (24 слоя, dim 1024):
+
+| формат | веса | decode, tok/s | bandwidth-потолок | % потолка |
+|---|---|---|---|---|
+| F16 (dequant из GGUF-Q8_0) | 1.2 GB | 29.5 | ~250 tok/s | 12% |
+| Q8_0 (нативный, 283caa1) | 0.6 GB | 44.3 | ~500 tok/s | 9% |
+
+TTFT (28 токенов): 0.60s. Omni3b аудио-e2e (safetensors→f16): 9.8 tok/s.
+
+Узкое место decode — НЕ bandwidth: ~219 command buffers/шаг (CB-объекты +
+ObjC-dispatch ~17мс/шаг) против GPU-кернелов ~5мс. Дальнейшие шаги:
+rmsnorm+gemm fusion (−24 кернела), решение view-бага q/k/v (−72 кернела),
+Q4_0/Q4_K/Q6_K e2e (путь и кернелы готовы — нужны GGUF-модели, иначе Ф9).
+
+Замер: `cargo run --release --features metal --example llm_chat -- <model.gguf> "<prompt>"`

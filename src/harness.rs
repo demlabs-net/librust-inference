@@ -24,16 +24,20 @@ impl Lcg {
     pub fn new(seed: u64) -> Self {
         Self(seed)
     }
+    /// Advance the shared LCG step; see [`crate::inference::sampling`].
     pub fn next_u32(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
+        self.0 = crate::inference::sampling::lcg_next(self.0);
+        (self.0 >> 32) as u32
     }
     /// Uniform in [0, 1).
+    ///
+    /// Fixtures must span both signs: the previous version mixed the top 31
+    /// bits down to 23 and divided by 2^24, so it returned [0, 0.5) and
+    /// `next_signed` never produced a positive value — every generated weight,
+    /// activation and golden input was negative.
     pub fn next_f32(&mut self) -> f32 {
-        (self.next_u32() >> 8) as f32 / (1u32 << 24) as f32
+        self.0 = crate::inference::sampling::lcg_next(self.0);
+        crate::inference::sampling::lcg_unit_f32(self.0)
     }
     /// Uniform in [-1, 1).
     pub fn next_signed(&mut self) -> f32 {

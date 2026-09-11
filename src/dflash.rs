@@ -1090,11 +1090,8 @@ impl DFlashDrafter {
             }
         }
         let total: f32 = w.iter().sum();
-        self.rng = self
-            .rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let mut r = (self.rng >> 33) as f32 / (1u64 << 33) as f32 * total;
+        self.rng = crate::inference::sampling::lcg_next(self.rng);
+        let mut r = crate::inference::sampling::lcg_unit_f32(self.rng) * total;
         for (i, v) in w.iter_mut().enumerate() {
             r -= *v;
             if r <= 0.0 {
@@ -2216,8 +2213,8 @@ pub fn load_drafter_gguf(
             .map_err(|e| BackendError::Shape(format!("open drafter {}: {e}", path.display())))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| BackendError::Shape(format!("mmap drafter: {e}")))?;
-        let gf =
-            crate::gguf::parse(&mmap).map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
+        let gf = crate::gguf::parse(&mmap)
+            .map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
         let wm = crate::weights_map::WeightsMap::from_gguf(&gf)
             .map_err(|e| BackendError::Shape(format!("weights: {e}")))?;
         DFlashModel::load_gguf(backend, &gf, &wm, vocab_size)?
@@ -2311,7 +2308,13 @@ mod real_dump_tests {
         let pos = t_prompt;
         let res = dr
             .model
-            .diffuse(&backend, &bids, &dr.lm_head.clone(), pos, dr.features.as_ref())
+            .diffuse(
+                &backend,
+                &bids,
+                &dr.lm_head.clone(),
+                pos,
+                dr.features.as_ref(),
+            )
             .expect("diffuse");
         // дампы
         let write_f32 = |path: &str, data: &[f32]| {
@@ -2342,10 +2345,16 @@ mod real_dump_tests {
         }
         // Веса драфтера Q8-деквант (слой 0 q/k + fc) — сверка против bf16.
         if let Some(t) = twm.get("blk.0.attn_q.weight") {
-            write_f32("/tmp/dump_q_attn_q.bin", &crate::weights_map::dequant_f32(t));
+            write_f32(
+                "/tmp/dump_q_attn_q.bin",
+                &crate::weights_map::dequant_f32(t),
+            );
         }
         if let Some(t) = twm.get("blk.0.attn_k.weight") {
-            write_f32("/tmp/dump_q_attn_k.bin", &crate::weights_map::dequant_f32(t));
+            write_f32(
+                "/tmp/dump_q_attn_k.bin",
+                &crate::weights_map::dequant_f32(t),
+            );
         }
         if let Some(t) = twm.get("fc.weight") {
             write_f32("/tmp/dump_q_fc.bin", &crate::weights_map::dequant_f32(t));
@@ -2391,12 +2400,18 @@ mod real_dump_tests {
         let (tokens, probs) = dr2.draft(&backend, &history, 6);
         eprintln!("actual  = {:?}", &actual[..7]);
         eprintln!("draft   = {:?}", tokens);
-        eprintln!("probs   = {:?}", probs.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>());
+        eprintln!(
+            "probs   = {:?}",
+            probs.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>()
+        );
         let matched = tokens
             .iter()
             .zip(actual.iter().skip(1))
             .filter(|(a, b)| a == b)
             .count();
-        eprintln!("first-block acceptance: {matched}/{} (с лагом 1, как z-lab)", tokens.len());
+        eprintln!(
+            "first-block acceptance: {matched}/{} (с лагом 1, как z-lab)",
+            tokens.len()
+        );
     }
 }

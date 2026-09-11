@@ -402,7 +402,7 @@ fn make_kv_tensor(
             backend.from_cpu_f16(&zeros, vec![1, cap, d])
         }
         crate::dtype::KvFormat::Q8_0 => {
-            if d % 32 != 0 {
+            if !d.is_multiple_of(32) {
                 return Err(BackendError::Shape(format!(
                     "KV q8_0 requires d % 32 == 0, got d={d}"
                 )));
@@ -457,11 +457,11 @@ impl KvCache {
         backend: &dyn Backend,
         tq: usize,
     ) -> Result<bool, BackendError> {
-        if let Some(max) = self.max_cap {
-            if self.pos + tq > max {
-                self.compact(backend)?;
-                return Ok(true);
-            }
+        if let Some(max) = self.max_cap
+            && self.pos + tq > max
+        {
+            self.compact(backend)?;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -550,10 +550,10 @@ impl KvCache {
     ) -> Result<(), BackendError> {
         let tq = k.shape()[1];
         // Context-window roll: drop the oldest half before it overflows.
-        if let Some(max) = self.max_cap {
-            if self.pos + tq > max {
-                self.compact(backend)?;
-            }
+        if let Some(max) = self.max_cap
+            && self.pos + tq > max
+        {
+            self.compact(backend)?;
         }
         self.ensure(backend, self.pos + tq)?;
         backend.kv_update(&self.k, k, self.pos)?;

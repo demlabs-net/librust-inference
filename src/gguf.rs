@@ -428,7 +428,7 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
         });
     }
     let mut data_base = pos as u64;
-    while data_base % align != 0 {
+    while !data_base.is_multiple_of(align) {
         data_base += 1;
     }
 
@@ -763,7 +763,7 @@ mod tests51 {
         w_u64(&mut b, 1);
         w_u32(&mut b, GgmlType::F32.raw());
         w_u64(&mut b, 0); // relative offset
-        while b.len() as u64 % align != 0 {
+        while !(b.len() as u64).is_multiple_of(align) {
             b.push(0);
         }
         b.extend_from_slice(payload);
@@ -828,7 +828,7 @@ mod tests51 {
         let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
         write_gguf(
             &mut buf,
-            &vec![
+            &[
                 (
                     "general.architecture".to_string(),
                     GgufValue::String("qwen3".into()),
@@ -873,7 +873,7 @@ mod tests51 {
     fn writer_roundtrip_multi_and_value_types() {
         let mut buf = Vec::new();
         let f16_bytes: Vec<u8> = (0u16..6).flat_map(|x| x.to_le_bytes()).collect();
-        let f32_bytes: Vec<u8> = vec![1.0f32, -2.0]
+        let f32_bytes: Vec<u8> = [1.0f32, -2.0]
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect();

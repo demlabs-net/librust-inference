@@ -316,7 +316,8 @@ pub fn quant_q6_k(weights: &[f32]) -> Vec<u8> {
                 out[base + 128 + half * 32 + k] = (((l[b + k] >> 4) & 0x3)
                     | (((l[b + k + 32] >> 4) & 0x3) << 2)
                     | (((l[b + k + 64] >> 4) & 0x3) << 4)
-                    | (((l[b + k + 96] >> 4) & 0x3) << 6)) as u8;
+                    | (((l[b + k + 96] >> 4) & 0x3) << 6))
+                    as u8;
             }
         }
     }
@@ -706,7 +707,7 @@ mod tests {
     fn dequant_q4_0(data: &[u8], n: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; n];
         for (bi, blk) in data.chunks_exact(18).enumerate() {
-            let d = f32::from(f16::from_le_bytes([blk[0], blk[1]]));
+            let d = f16::from_le_bytes([blk[0], blk[1]]);
             // Canonical ggml pairing: byte j = w[j] (low) | w[j+16] << 4.
             for (j, byte) in blk[2..].iter().enumerate() {
                 let base = bi * 32 + j;
@@ -753,7 +754,7 @@ mod tests {
         // Q8_0: f16 d + 32 i8
         let mut out = Vec::new();
         for blk in enc.chunks_exact(34) {
-            let d = f32::from(f16::from_le_bytes([blk[0], blk[1]]));
+            let d = f16::from_le_bytes([blk[0], blk[1]]);
             for q in &blk[2..] {
                 out.push((*q as i8) as f32 * d);
             }
@@ -810,7 +811,7 @@ mod tests {
         let enc = quant_q6_k(&w);
         // Канонический блок: 128+64+16+2 = 210 байт, d в хвосте.
         assert_eq!(enc.len(), 210);
-        let d = f32::from(f16::from_le_bytes([enc[208], enc[209]]));
+        let d = f16::from_le_bytes([enc[208], enc[209]]);
         assert!(d != 0.0, "super-block scale must sit at bytes 208..210");
         // Roundtrip через канонический декодер (weights_map).
         let dec = crate::weights_map::dequant_q6_k(&enc);
@@ -850,7 +851,7 @@ mod tests {
         assert_eq!(file.tensors[0].dims, vec![32, 2]);
         assert_eq!(file.tensors[0].data.len(), 68); // 64/32*34
         let w2 = dequant_gguf(file.tensors[0].ggml_type, file.tensors[0].data).unwrap();
-        let _ = approx(&w2, &w, 0.3);
+        approx(&w2, &w, 0.3);
     }
 
     #[test]

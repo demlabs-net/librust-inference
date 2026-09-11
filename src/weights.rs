@@ -213,7 +213,8 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
         let raw = offsets
             .first()
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))? as usize;
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))?
+            as usize;
         let start = raw
             .checked_add(8)
             .and_then(|s| s.checked_add(header_len))
@@ -224,7 +225,8 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
         let raw_end = offsets
             .get(1)
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("bad data_offsets[1] for {name}"))? as usize;
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets[1] for {name}"))?
+            as usize;
         let end = raw_end
             .checked_add(8)
             .and_then(|e| e.checked_add(header_len))

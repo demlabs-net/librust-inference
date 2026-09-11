@@ -325,7 +325,7 @@ impl OmniAudioTower {
         }
         backend.gelu_erf(&h1, &h1)?;
         // conv2 (stride 2) → GELU (l2 вычислен и проверен выше)
-        let mut h = backend.zeros(vec![1, l2, d])?;
+        let h = backend.zeros(vec![1, l2, d])?;
         backend.conv1d(&h1, &self.conv2_w, Some(&self.conv2_b), 2, 1, 1, 1, &h)?;
         backend.gelu_erf(&h, &h)?;
         if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
@@ -337,8 +337,8 @@ impl OmniAudioTower {
         // + синусоидальные позиции [0..l2)
         let pos = self.pos_emb.view_offset(vec![1, l2, d], 0);
         let mut h = {
-            let mut y = backend.zeros(vec![1, l2, d])?;
-            backend.add(&h, &pos, &mut y)?;
+            let y = backend.zeros(vec![1, l2, d])?;
+            backend.add(&h, &pos, &y)?;
             y
         };
         if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
@@ -346,7 +346,7 @@ impl OmniAudioTower {
             eprintln!("OMNI_REF our_pos[0,:8]={:?}", &hv[..8.min(hv.len())]);
         }
 
-        for (li, layer) in self.layers.iter().enumerate() {
+        for layer in self.layers.iter() {
             // self-attn (полный, mask=None)
             let hn = backend.zeros(vec![1, l2, d])?;
             backend.layernorm(&h, &layer.attn_ln_w, &layer.attn_ln_b, &hn, 1e-5)?;
@@ -368,8 +368,8 @@ impl OmniAudioTower {
             // attn-выход: h = h + o (переприсваивание ВНЕШНЕЙ mut h —
             // `let h =` в цикле создал бы тень и ПОТЕРЯЛ результат между итерациями)
             h = {
-                let mut y = backend.zeros(vec![1, l2, d])?;
-                backend.add(&h, &o, &mut y)?;
+                let y = backend.zeros(vec![1, l2, d])?;
+                backend.add(&h, &o, &y)?;
                 y
             };
             if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
@@ -391,8 +391,8 @@ impl OmniAudioTower {
                 eprintln!("OMNI_REF t_after_ffn[0,:8]={:?}", &hv[..8.min(hv.len())]);
             }
             h = {
-                let mut y = backend.zeros(vec![1, l2, d])?;
-                backend.add(&h, &f, &mut y)?;
+                let y = backend.zeros(vec![1, l2, d])?;
+                backend.add(&h, &f, &y)?;
                 y
             };
         }
@@ -599,7 +599,7 @@ impl OmniModel {
                  <|im_start|>user\n",
             );
             ids.push(self.cfg.thinker.audio_bos_id);
-            ids.extend(std::iter::repeat(self.cfg.thinker.audio_token_id).take(n));
+            ids.extend(std::iter::repeat_n(self.cfg.thinker.audio_token_id, n));
             ids.push(self.cfg.thinker.audio_eos_id);
             ids.extend(
                 tokenizer.encode(&format!("{text_after}<|im_end|>\n<|im_start|>assistant\n")),
@@ -626,10 +626,14 @@ pub fn tokenizer_from_json(dir: &Path) -> Result<crate::tokenizer::Tokenizer, Ba
     let norm = |s: &str| -> Vec<u8> {
         // HF byte_fallback: «<0xXX>» → сырой байт
         let b = s.as_bytes();
-        if b.len() == 6 && b[0] == b'<' && b[1] == b'0' && b[2] == b'x' && b[5] == b'>' {
-            if let Ok(n) = u8::from_str_radix(&s[3..5], 16) {
-                return vec![n];
-            }
+        if b.len() == 6
+            && b[0] == b'<'
+            && b[1] == b'0'
+            && b[2] == b'x'
+            && b[5] == b'>'
+            && let Ok(n) = u8::from_str_radix(&s[3..5], 16)
+        {
+            return vec![n];
         }
         s.as_bytes().to_vec()
     };

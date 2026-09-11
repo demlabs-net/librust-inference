@@ -1,9 +1,11 @@
 //! DFlash-драфтер (Ф2.3/Ф2.4/Ф2.5) — по спеке llama.cpp PR #27342
 //! (см. БЗ SLC: dflash-speka-llama-pr-27342).
 //!
-//! Структура: dense-слои (Qwen3-архитектура, эмбеддинги ОБЩИЕ с таргетом!)
-//! + two-tap dynamic conv (attn/ffn_conv_base + conv_proj) + селектор (v2:
-//! predecessor/successor codebooks, top-k лэттис). Два режима:
+//! Структура: dense-слои (Qwen3-архитектура, эмбеддинги ОБЩИЕ с таргетом!),
+//! two-tap dynamic conv (attn/ffn_conv_base + conv_proj) и селектор
+//! (v2: predecessor/successor codebooks, top-k лэттис).
+//!
+//! Два режима:
 //! - инжект (embd): фичи таргета → K/V-проекции каждого слоя → кэш;
 //! - диффузия (token): [committed, MASK...] → dense+conv → логиты/скрытые.
 
@@ -746,7 +748,7 @@ impl DFlashModel {
                 })?
                 .clone();
             let mut x = backend.zeros(vec![1, t, self.cfg.dim])?;
-            backend.embedding(ids, &embed, &mut x)?;
+            backend.embedding(ids, &embed, &x)?;
             // фичи → fc → hidden_norm (z-lab: target_hidden = hidden_norm(fc(...)))
             let enc = match (features, &self.fc, &self.enc_norm) {
                 (Some(f), Some(fc), Some(norm)) => {

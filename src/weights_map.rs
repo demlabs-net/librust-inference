@@ -465,5 +465,4 @@ mod tests {
         assert_eq!(m.tied_aliases("output.weight"), vec!["token_embd.weight"]);
         assert_eq!(dequant_f32(t0), dequant_f32(t1));
     }
-
 }

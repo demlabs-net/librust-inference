@@ -103,7 +103,7 @@ impl CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if let (Some(s), Some(pool)) = (self.slice.take(), &self.pool) {
-            let mut pool = lock_poison_resilient(&pool);
+            let mut pool = lock_poison_resilient(pool);
             let bucket = pool.entry(s.len()).or_default();
             // Cap the pool per bucket AND by byte size: without the byte
             // cap, grown KV buffers (~16 MB+ per cache row) returned by
@@ -131,7 +131,7 @@ fn push_capped<T>(
 ) {
     const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
     const MAX_PER_BUCKET: usize = 8;
-    let mut pool = lock_poison_resilient(&pool);
+    let mut pool = lock_poison_resilient(pool);
     let bucket = pool.entry(sl.len()).or_default();
     if bucket.len() < MAX_PER_BUCKET && sl.len() * elem_bytes <= MAX_POOL_BYTES {
         bucket.push(sl);
@@ -198,10 +198,10 @@ impl CudaBackend {
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<half::f16>, BackendError> {
         let mut pool = lock_poison_resilient(&self.pool_f16);
-        if let Some(bucket) = pool.get_mut(&n) {
-            if let Some(s) = bucket.pop() {
-                return Ok(s);
-            }
+        if let Some(bucket) = pool.get_mut(&n)
+            && let Some(s) = bucket.pop()
+        {
+            return Ok(s);
         }
         unsafe { self.stream.alloc::<half::f16>(n) }.map_err(map_err)
     }
@@ -211,10 +211,10 @@ impl CudaBackend {
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<half::bf16>, BackendError> {
         let mut pool = lock_poison_resilient(&self.pool_bf16);
-        if let Some(bucket) = pool.get_mut(&n) {
-            if let Some(s) = bucket.pop() {
-                return Ok(s);
-            }
+        if let Some(bucket) = pool.get_mut(&n)
+            && let Some(s) = bucket.pop()
+        {
+            return Ok(s);
         }
         unsafe { self.stream.alloc::<half::bf16>(n) }.map_err(map_err)
     }
@@ -259,7 +259,9 @@ impl CudaBackend {
         let cap_grid = 8192;
         (1..=nblk / 2)
             .rev()
-            .find(|&s| nblk % s == 0 && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid)
+            .find(|&s| {
+                nblk.is_multiple_of(s) && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid
+            })
             .unwrap_or(1)
     }
 
@@ -282,7 +284,7 @@ impl CudaBackend {
             // "reducing stale data is fine" license.
             return 1;
         }
-        let nkz = (nsup + 15) / 16;
+        let nkz = nsup.div_ceil(16);
         nsup.div_ceil(nkz).max(1)
     }
 
@@ -307,7 +309,7 @@ impl CudaBackend {
         let s32 = s as i32;
         let f = self.function("gemm_i8_reduce")?;
         let cfg = LaunchConfig {
-            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+            grid_dim: ((m * n).div_ceil(256) as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -368,7 +370,7 @@ impl CudaBackend {
         n: usize,
         b_suf: &'static str,
     ) -> Result<(), BackendError> {
-        if k % 32 != 0 {
+        if !k.is_multiple_of(32) {
             // Shapes like the DAC codec's (1, 8, 1024) carry raw row-major
             // half weights (k%32!=0 tensors are not kb-major packed) — the
             // naive elementwise kernel covers any k (the split-k/tiled paths
@@ -398,7 +400,7 @@ impl CudaBackend {
         let n32 = n as i32;
         let m32 = m as i32;
         let c = c.as_cuda_mut();
-        let grid_x = (n + 255) / 256;
+        let grid_x = n.div_ceil(256);
         let act = self.activation_dtype();
         let (tiled_name, splitk_name): (&'static str, &'static str) = match (b_suf, act) {
             ("bf16", crate::dtype::Dtype::F16) => {
@@ -437,7 +439,7 @@ impl CudaBackend {
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled_name)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                grid_dim: (grid_x as u32, m.div_ceil(32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -464,7 +466,7 @@ impl CudaBackend {
         // already hides the latency).
         let s = [32usize, 16, 8, 4, 2, 1]
             .into_iter()
-            .find(|&s| nblk % s == 0)
+            .find(|&s| nblk.is_multiple_of(s))
             .unwrap_or(1);
         let cpart = self.take_pooled(s * m * n)?;
         let f = self.function(splitk_name)?;
@@ -555,10 +557,10 @@ impl CudaBackend {
 
     fn take_pooled(&self, n: usize) -> Result<CudaSlice<f32>, BackendError> {
         let mut pool = lock_poison_resilient(&self.pool);
-        if let Some(bucket) = pool.get_mut(&n) {
-            if let Some(s) = bucket.pop() {
-                return Ok(s);
-            }
+        if let Some(bucket) = pool.get_mut(&n)
+            && let Some(s) = bucket.pop()
+        {
+            return Ok(s);
         }
         self.stream.alloc_zeros::<f32>(n).map_err(map_err)
     }
@@ -594,13 +596,13 @@ impl CudaBackend {
                 out.numel()
             )));
         }
-        if let Some(y) = y {
-            if y.numel() != n {
-                return Err(BackendError::Shape(format!(
-                    "elementwise: second operand has {} elements, first has {n}",
-                    y.numel()
-                )));
-            }
+        if let Some(y) = y
+            && y.numel() != n
+        {
+            return Err(BackendError::Shape(format!(
+                "elementwise: second operand has {} elements, first has {n}",
+                y.numel()
+            )));
         }
         let xd = x.as_cuda();
         let yd = y.map(|t| t.as_cuda()).unwrap_or(xd);
@@ -750,7 +752,7 @@ impl Backend for CudaBackend {
         // Non-2D tensors and k%32!=0 shapes (biases, non-GEMM uses) stay
         // raw row-major — consumers must agree on the layout.
         let packed: std::borrow::Cow<[half::f16]> =
-            if shape.len() == 2 && n > 0 && shape[1] % 32 == 0 {
+            if shape.len() == 2 && n > 0 && shape[1].is_multiple_of(32) {
                 let (rows, per) = (shape[0], shape[1]);
                 let nblk = per / 32;
                 let mut p = vec![half::f16::default(); n];
@@ -785,7 +787,7 @@ impl Backend for CudaBackend {
             )));
         }
         let packed: std::borrow::Cow<[half::bf16]> =
-            if shape.len() == 2 && n > 0 && shape[1] % 32 == 0 {
+            if shape.len() == 2 && n > 0 && shape[1].is_multiple_of(32) {
                 let (rows, per) = (shape[0], shape[1]);
                 let nblk = per / 32;
                 let mut p = vec![half::bf16::default(); n];
@@ -829,7 +831,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q6k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q6k: per-dim {per} not a multiple of 256 (Q6_K super-blocks)"
             )));
@@ -848,7 +850,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q4k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 32 != 0 {
+        if !per.is_multiple_of(32) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q4k: per-dim {per} not a multiple of 32 (Q4_0 blocks)"
             )));
@@ -867,7 +869,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q4kc(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q4kc: per-dim {per} not a multiple of 256 (Q4_K super-blocks)"
             )));
@@ -886,7 +888,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q5k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q5k: per-dim {per} not a multiple of 256 (Q5_K super-blocks)"
             )));
@@ -905,7 +907,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q3k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q3k: per-dim {per} not a multiple of 256 (Q3_K super-blocks)"
             )));
@@ -932,7 +934,7 @@ impl Backend for CudaBackend {
             crate::backend::TensorInner::CudaF16(b) => {
                 let raw: Vec<half::f16> = self.stream.clone_dtoh(b).map_err(map_err)?;
                 let shape = t.shape();
-                if shape.len() == 2 && !raw.is_empty() && shape[1] % 32 == 0 {
+                if shape.len() == 2 && !raw.is_empty() && shape[1].is_multiple_of(32) {
                     let (rows, per) = (shape[0], shape[1]);
                     let nblk = per / 32;
                     let mut out = vec![0f32; raw.len()];
@@ -945,13 +947,13 @@ impl Backend for CudaBackend {
                     }
                     Ok(out)
                 } else {
-                    Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                    Ok(raw.into_iter().map(f32::from).collect())
                 }
             }
             crate::backend::TensorInner::CudaBF16(b) => {
                 let raw: Vec<half::bf16> = self.stream.clone_dtoh(b).map_err(map_err)?;
                 let shape = t.shape();
-                if shape.len() == 2 && !raw.is_empty() && shape[1] % 32 == 0 {
+                if shape.len() == 2 && !raw.is_empty() && shape[1].is_multiple_of(32) {
                     let (rows, per) = (shape[0], shape[1]);
                     let nblk = per / 32;
                     let mut out = vec![0f32; raw.len()];
@@ -964,7 +966,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(out)
                 } else {
-                    Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                    Ok(raw.into_iter().map(f32::from).collect())
                 }
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
@@ -1010,15 +1012,14 @@ impl Backend for CudaBackend {
                                 let sc1 = blk[192 + nchunk * 8 + (lane >> 4) + 2] as i8 as f32;
                                 let sc2 = blk[192 + nchunk * 8 + (lane >> 4) + 4] as i8 as f32;
                                 let sc3 = blk[192 + nchunk * 8 + (lane >> 4) + 6] as i8 as f32;
-                                let q1 =
-                                    (((ql0 & 0xF) | (((qh >> 0) & 3) << 4)) as i32 - 32) as f32;
+                                let q1 = (((ql0 & 0xF) | ((qh & 3) << 4)) as i32 - 32) as f32;
                                 let q2 =
                                     (((ql1 & 0xF) | (((qh >> 2) & 3) << 4)) as i32 - 32) as f32;
                                 let q3 = ((((ql0 >> 4) & 0xF) | (((qh >> 4) & 3) << 4)) as i32 - 32)
                                     as f32;
                                 let q4 = ((((ql1 >> 4) & 0xF) | (((qh >> 6) & 3) << 4)) as i32 - 32)
                                     as f32;
-                                out[base + 0] = d * sc0 * q1;
+                                out[base] = d * sc0 * q1;
                                 out[base + 32] = d * sc1 * q2;
                                 out[base + 64] = d * sc2 * q3;
                                 out[base + 96] = d * sc3 * q4;
@@ -1099,7 +1100,7 @@ impl Backend for CudaBackend {
                         let tmp = u32::from_le_bytes([blk[104], blk[105], blk[106], blk[107]]);
                         let k1 = 0x03030303u32;
                         let k2 = 0x0f0f0f0fu32;
-                        let b0 = (a0 & k2) | (((tmp >> 0) & k1) << 4);
+                        let b0 = (a0 & k2) | ((tmp & k1) << 4);
                         let b1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
                         let b2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
                         let b3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
@@ -1254,7 +1255,7 @@ impl Backend for CudaBackend {
             let n32 = n as i32;
             let m32 = m as i32;
             let c = c.as_cuda_mut();
-            let grid_x = (n + 255) / 256;
+            let grid_x = n.div_ceil(256);
             let act = self.activation_dtype();
             let (tiled_name, splitk_name): (&'static str, &'static str) = match act {
                 crate::dtype::Dtype::F16 => ("gemm_q8k_tiled_f16", "gemm_q8k_splitk_f16"),
@@ -1271,7 +1272,7 @@ impl Backend for CudaBackend {
                 let cpart = self.take_pooled(s16 * m * n)?;
                 let f = self.function(tiled_name)?;
                 let cfg = LaunchConfig {
-                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                    grid_dim: (grid_x as u32, m.div_ceil(32) as u32, 16),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
@@ -1388,7 +1389,7 @@ impl Backend for CudaBackend {
         // Mirror of the CPU oracle's guard: cols == 0 divides by zero in the
         // kernel (i % cols) and a non-multiple n would bias the wrong
         // columns / run off the tail.
-        if cols == 0 || n % cols as usize != 0 {
+        if cols == 0 || !n.is_multiple_of(cols as usize) {
             return Err(BackendError::Shape(format!(
                 "add_bias: bias {} does not divide x {n}",
                 cols
@@ -1561,7 +1562,7 @@ impl Backend for CudaBackend {
         // Mirror of the CPU oracle's guard: the row-major kernel computes
         // row = i / ffn, col = i % ffn — ffn == 0 divides by zero and a
         // non-multiple numel would mis-slice the last row.
-        if ffn == 0 || numel % ffn != 0 {
+        if ffn == 0 || !numel.is_multiple_of(ffn) {
             return Err(BackendError::Shape(format!(
                 "silu_mul_fused: ffn={ffn} does not divide y numel {numel}"
             )));
@@ -1637,7 +1638,7 @@ impl Backend for CudaBackend {
         // (x.numel() / c — host and kernel); c not dividing x.numel() would
         // truncate the tail. (a == 0 is fine — the kernel treats it as the
         // sin²(ax)/a → 0 limit.)
-        if c == 0 || x.numel() % c as usize != 0 {
+        if c == 0 || !x.numel().is_multiple_of(c as usize) {
             return Err(BackendError::Shape(format!(
                 "snake: channel count {c} does not divide x ({})",
                 x.numel()
@@ -1650,7 +1651,7 @@ impl Backend for CudaBackend {
         la.arg(x.as_cuda());
         la.arg(a.as_cuda());
         la.arg(y.as_cuda());
-        let __a1 = n as i32;
+        let __a1 = n;
         la.arg(&__a1);
         la.arg(&c);
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
@@ -2057,7 +2058,7 @@ impl Backend for CudaBackend {
         // Mirror of the CPU oracle's guard: off + d0 past D (or a mismatched
         // y) would read/write OOB device memory — the GPU has no panic to
         // catch it.
-        if off + d0 > d || y.shape() != &[rows, d0] {
+        if off + d0 > d || y.shape() != [rows, d0] {
             return Err(BackendError::Shape(format!(
                 "slice_last: x {:?} y {:?} off {off}",
                 x.shape(),
@@ -2089,7 +2090,7 @@ impl Backend for CudaBackend {
         if u > t {
             return Err(BackendError::Shape(format!("slice_time: u={u} > t={t}")));
         }
-        if y.shape() != &[b, t - u, c] {
+        if y.shape() != [b, t - u, c] {
             return Err(BackendError::Shape(
                 "slice_time: output shape mismatch".into(),
             ));
@@ -2297,7 +2298,7 @@ impl Backend for CudaBackend {
         // degenerate (rows, 0) grid; a non-multiple x dim silently truncates
         // hd and mis-addresses rows — strict divisibility, same as the CPU
         // reference.
-        if h == 0 || x.shape()[1] % h != 0 {
+        if h == 0 || !x.shape()[1].is_multiple_of(h) {
             return Err(BackendError::Shape(format!(
                 "rmsnorm_head: head count h={h} does not divide x dim {}",
                 x.shape()[1]
@@ -2340,7 +2341,7 @@ impl Backend for CudaBackend {
         theta: f32,
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+        if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
                 "rope_standard: hd={hd} does not divide d={d} (and must be even)"
             )));
@@ -2373,7 +2374,7 @@ impl Backend for CudaBackend {
         eps: f32,
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        if h == 0 || d != h * hd || hd % 2 != 0 {
+        if h == 0 || d != h * hd || !hd.is_multiple_of(2) {
             return Err(BackendError::Shape(format!(
                 "rmsnorm_head_rope: h={h}, hd={hd} vs d={d}"
             )));
@@ -2406,7 +2407,7 @@ impl Backend for CudaBackend {
         sections: [usize; 4],
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+        if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
                 "rope_mrope_text: hd={hd} does not divide d={d}"
             )));
@@ -2451,7 +2452,7 @@ impl Backend for CudaBackend {
                 tq * 4
             )));
         }
-        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+        if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
                 "rope_mrope: hd={hd} does not divide d={d}"
             )));
@@ -2753,13 +2754,13 @@ impl Backend for CudaBackend {
         // D8 (mirror of the CPU oracle): the mask is indexed as [tq, tkv] —
         // a too-small mask would read OOB device memory (garbage bias, no
         // panic to catch it on the GPU).
-        if let Some(m) = mask {
-            if m.numel() < tq * tkv {
-                return Err(BackendError::Shape(format!(
-                    "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
-                    m.numel()
-                )));
-            }
+        if let Some(m) = mask
+            && m.numel() < tq * tkv
+        {
+            return Err(BackendError::Shape(format!(
+                "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
+                m.numel()
+            )));
         }
         // Q20: the v4 kernel stages one warp per 32 columns in an 8-warp
         // block — hd > 256 would overflow sh_p[8][64] (and nwarps > 8).
@@ -2777,7 +2778,7 @@ impl Backend for CudaBackend {
         // Two-kernel warp-chunked attention (attn_ar_v4): each (chunk, warp)
         // writes a 34-f32 partial (max, sum-exp, weighted-V[32]) with ZERO
         // block-level syncs in the hot loop; attn_ar_v4_combine merges them.
-        let nwarps = (hd + 31) / 32;
+        let nwarps = hd.div_ceil(32);
         let nchunks = tkv.div_ceil(64).max(1);
         // CUDA grid.z is limited to 65535 — a huge batch × chunk product
         // would fail the launch with CUDA_ERROR_INVALID_VALUE (or be
@@ -2969,13 +2970,13 @@ impl Backend for CudaBackend {
         let hd = d / h;
         // D8 (mirror of the CPU oracle): the mask is indexed as [t, t] — a
         // too-small mask would read OOB device memory.
-        if let Some(m) = mask {
-            if m.numel() < t * t {
-                return Err(BackendError::Shape(format!(
-                    "mhsa: mask numel {} < t·t {t}·{t}",
-                    m.numel()
-                )));
-            }
+        if let Some(m) = mask
+            && m.numel() < t * t
+        {
+            return Err(BackendError::Shape(format!(
+                "mhsa: mask numel {} < t·t {t}·{t}",
+                m.numel()
+            )));
         }
         let f = self.function("mhsa_f32")?;
         // 3D grid: (b, h, t) — one block per (batch, head, query).
@@ -3074,7 +3075,7 @@ impl Backend for CudaBackend {
         }
         let f = self.function("mhsa_rel_pos_f32")?;
         let cfg = LaunchConfig {
-            grid_dim: (((t + 3) / 4) as u32, h as u32, 1),
+            grid_dim: (t.div_ceil(4) as u32, h as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -3159,7 +3160,7 @@ impl Backend for CudaBackend {
 
     fn kv_shifted(&self, buf: &Tensor, shift: usize, pos: usize) -> Result<Tensor, BackendError> {
         let (b, cap, d) = (buf.shape()[0], buf.shape()[1], buf.shape()[2]);
-        let shape = buf.shape().to_vec();
+        let _shape = buf.shape().to_vec();
         let (bi, si, pi, di, ci) = (b as i32, shift as i32, pos as i32, d as i32, cap as i32);
         // In-place shift on the same buffer (the regions are disjoint;
         // the kernels write through the handle — the returned tensor is a
@@ -3176,7 +3177,7 @@ impl Backend for CudaBackend {
                 la.arg(&di);
                 la.arg(&ci);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(buf.clone());
+                Ok(buf.clone())
             }
             crate::backend::TensorInner::CudaF16(s) => {
                 let f = self.function("kv_shift_f16")?;
@@ -3189,7 +3190,7 @@ impl Backend for CudaBackend {
                 la.arg(&di);
                 la.arg(&ci);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(buf.clone());
+                Ok(buf.clone())
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
                 let f = self.function("kv_shift_q8")?;
@@ -3203,7 +3204,7 @@ impl Backend for CudaBackend {
                 la.arg(&di);
                 la.arg(&ci);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(buf.clone());
+                Ok(buf.clone())
             }
             _ => Err(BackendError::Shape(format!(
                 "kv_shifted: unsupported storage {:?}",
@@ -3223,7 +3224,7 @@ impl Backend for CudaBackend {
         let (b, cap, d) = (k.shape()[0], k.shape()[1], k.shape()[2]);
         let nheads = d / head_dim;
         let pairs = head_dim / 2;
-        let shape = k.shape().to_vec();
+        let _shape = k.shape().to_vec();
         // The rotation table (hd/2 entries): angle_i = −shift·theta^(−2i/hd).
         let mut cos_tab = vec![0.0f32; pairs];
         let mut sin_tab = vec![0.0f32; pairs];
@@ -3272,7 +3273,7 @@ impl Backend for CudaBackend {
                 la.arg(&s2);
                 la.arg(&sect_dims);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(k.clone());
+                Ok(k.clone())
             }
             crate::backend::TensorInner::CudaF16(s) => {
                 let f = self.function("kv_rerotate_f16")?;
@@ -3292,7 +3293,7 @@ impl Backend for CudaBackend {
                 la.arg(&s2);
                 la.arg(&sect_dims);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(k.clone());
+                Ok(k.clone())
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
                 let f = self.function("kv_rerotate_q8")?;
@@ -3312,7 +3313,7 @@ impl Backend for CudaBackend {
                 la.arg(&s2);
                 la.arg(&sect_dims);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(k.clone());
+                Ok(k.clone())
             }
             _ => Err(BackendError::Shape(format!(
                 "kv_rerotated: unsupported storage {:?}",
@@ -3455,9 +3456,9 @@ impl Backend for CudaBackend {
                 la.arg(&c32);
                 unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
             }
-            _ => Err(BackendError::Shape(format!(
-                "kv_update: unsupported format pair"
-            ))),
+            _ => Err(BackendError::Shape(
+                "kv_update: unsupported format pair".to_string(),
+            )),
         }
     }
 
@@ -3536,7 +3537,7 @@ impl CudaBackend {
         let m32 = m as i32;
         let c = c.as_cuda_mut();
         let nblk = k >> nsup_shift;
-        let grid_x = (n + bn - 1) / bn;
+        let grid_x = n.div_ceil(bn);
         // Split-k for m == 1 (decode): the dequant-amortized f32-tile kernel.
         // For m > 1 the tiled kernel stages B once per 32-row chunk and the
         // activation tile in shared (the split-k re-reads B per row AND
@@ -3633,7 +3634,7 @@ impl CudaBackend {
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                grid_dim: (grid_x as u32, m.div_ceil(32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };

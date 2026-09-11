@@ -166,7 +166,7 @@ mod tests {
         let mut d = NGramDrafter::new(4);
         // история ... 7 8 9 — суффикс [7,8,9] встречался ранее → продолжение 10
         let history: Vec<u32> = vec![1, 2, 3, 7, 8, 9, 4, 5, 6, 7, 8, 9];
-        let (drafts, probs) = d.draft(&crate::cpu::CpuBackend::default(), &history, 3);
+        let (drafts, probs) = d.draft(&crate::cpu::CpuBackend, &history, 3);
         assert_eq!(drafts[0], 4, "продолжение [7,8,9] → 4");
         assert_eq!(probs.len(), drafts.len());
     }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn ngram_short_history() {
         let mut d = NGramDrafter::new(4);
-        let (drafts, _) = d.draft(&crate::cpu::CpuBackend::default(), &[1, 2], 4);
+        let (drafts, _) = d.draft(&crate::cpu::CpuBackend, &[1, 2], 4);
         assert!(drafts.is_empty(), "нет повторений — пустой draft");
     }
 }

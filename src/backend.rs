@@ -260,7 +260,11 @@ impl Tensor {
         }
     }
 
+    // Доступ к GPU-слоям K-квантов: ядро уже держит эти тензоры, а кернелы
+    // (fused dequant-GEMM) подключаются отдельно, поэтому в lib-сборке
+    // геттеры пока не вызываются. Осознанный задел, не мёртвый код.
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q6k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ6K(b) => b,
@@ -309,6 +313,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q4k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ4K(b) => b,
@@ -317,6 +322,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q5k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ5K(b) => b,
@@ -325,6 +331,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q3k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ3K(b) => b,
@@ -352,6 +359,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_f16(&self) -> &cudarc::driver::CudaSlice<half::f16> {
         match &self.inner {
             TensorInner::CudaF16(b) => b,
@@ -360,6 +368,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_bf16(&self) -> &cudarc::driver::CudaSlice<half::bf16> {
         match &self.inner {
             TensorInner::CudaBF16(b) => b,
@@ -475,8 +484,12 @@ impl Tensor {
                 };
             }
         }
+        // Только CPU-тензор: раньше блок стоял безусловно, и при сборке с
+        // cpu+cuda view_offset ЛЮБОГО тензора уходил сюда — на CUDA-тензоре
+        // это паника cpu_read() («non-CPU tensor»), а CUDA-хвост ниже был
+        // недостижим (clippy: unreachable statement).
         #[cfg(feature = "cpu")]
-        {
+        if matches!(self.inner, TensorInner::Cpu(_)) {
             let data = self.cpu_read();
             let mut v = Vec::with_capacity(n);
             v.extend_from_slice(&data[elem_offset..elem_offset + n]);
@@ -495,7 +508,6 @@ impl Tensor {
                  (the old code silently returned data from element 0)"
             );
         }
-        #[allow(unreachable_code)]
         self.view_restricted(shape)
     }
 
@@ -526,19 +538,19 @@ impl Tensor {
     }
 }
 
-/// Compute-surface operations. Every method dispatches its kernels through
-/// the backend; implementations are responsible for allocation and
-/// synchronization semantics. Errors cross the boundary as [`BackendError`].
+// Compute-surface operations. Every method dispatches its kernels through
+// the backend; implementations are responsible for allocation and
+// synchronization semantics. Errors cross the boundary as [`BackendError`].
 
 /// erf(x) — аппроксимация Abramowitz & Stegun 7.1.26 (max |ε| ≈ 1.5e-7),
 /// та же формула, что в Metal-кернеле gelu_erf (CPU=Metal согласованы).
 pub fn erf_approx(x: f32) -> f32 {
     const P: f32 = 0.3275911;
-    const A1: f32 = 0.254829592;
-    const A2: f32 = -0.284496736;
-    const A3: f32 = 1.421413741;
-    const A4: f32 = -1.453152027;
-    const A5: f32 = 1.061405429;
+    const A1: f32 = 0.254_829_6;
+    const A2: f32 = -0.284_496_72;
+    const A3: f32 = 1.421_413_8;
+    const A4: f32 = -1.453_152_1;
+    const A5: f32 = 1.061_405_4;
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let ax = x.abs();
     let t = 1.0 / (1.0 + P * ax);
@@ -585,7 +597,6 @@ pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
 /// `&dyn Backend`, а реализации аллоцируют в своём рантайме (входной массив
 /// не конвертируется в Self). Отключаем педантичный wrong_self_convention.
 #[allow(clippy::wrong_self_convention)]
-
 /// Re-upload host f32 data into the SAME storage dtype as `src` (the
 /// kv_shifted/kv_rerotated defaults must preserve the KV storage format).
 /// Generic over `B: ?Sized` so the trait defaults can pass `&Self`.
@@ -605,7 +616,7 @@ fn reupload_in_dtype<B: Backend + ?Sized>(
         // creates: i8 data + one f32 scale per 32-block).
         Dtype::I8 => {
             let d = src.shape()[2];
-            if d % 32 != 0 {
+            if !d.is_multiple_of(32) {
                 return Err(BackendError::Shape(format!(
                     "reupload_same_dtype: q8_0 requires d % 32 == 0, got d={d}"
                 )));
@@ -757,7 +768,7 @@ pub trait Backend: Send + Sync {
                     let c = (p * inv).cos();
                     let s = (p * inv).sin();
                     // NEOX/halves (HF rotate-half): пары (i, i + hd/2)
-                    let idx = (tt * d + h * hd + i) as usize;
+                    let idx = tt * d + h * hd + i;
                     let (x0, x1) = (xd[idx], xd[idx + hd / 2]);
                     yd[idx] = x0 * c - x1 * s;
                     yd[idx + hd / 2] = x1 * c + x0 * s;
@@ -798,7 +809,7 @@ pub trait Backend: Send + Sync {
                         || (sector % 3 == 1 && sector < 3 * s1)
                         || (sector % 3 == 2 && sector < 3 * s2));
                     let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let idx = (tt * d + h * hd + i) as usize;
+                    let idx = tt * d + h * hd + i;
                     if is_e {
                         yd[idx] = xd[idx];
                         yd[idx + half] = xd[idx + half];
@@ -861,7 +872,7 @@ pub trait Backend: Send + Sync {
                         (true, 0.0)
                     };
                     let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let idx = (tt * d + h * hd + i) as usize;
+                    let idx = tt * d + h * hd + i;
                     if is_e {
                         yd[idx] = xd[idx];
                         yd[idx + half] = xd[idx + half];
@@ -1680,7 +1691,7 @@ pub trait Backend: Send + Sync {
                 (s[0], s[1], s[2])
             };
             let sector = pi % sect_dims;
-            (sector % 3 == 0 && sector < 3 * s0)
+            (sector.is_multiple_of(3) && sector < 3 * s0)
                 || (sector % 3 == 1 && sector < 3 * s1)
                 || (sector % 3 == 2 && sector < 3 * s2)
         };

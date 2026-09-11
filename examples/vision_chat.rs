@@ -175,15 +175,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut model = Qwen3Model::load(&backend, &wm, cfg.clone())?;
     let t0 = Instant::now();
     let mut logits = if let Some((_, vemb, vds)) = &vision {
-        model.prefill_with_vision(
-            &backend,
-            &ids,
-            vemb,
-            vds,
-            IMAGE_PAD,
-            &pos4d,
-            pos_after,
-        )?
+        model.prefill_with_vision(&backend, &ids, vemb, vds, IMAGE_PAD, &pos4d, pos_after)?
     } else {
         model.prefill(&backend, &ids)?
     };

@@ -17,6 +17,21 @@
 //!   serialization; no-op on other backends).
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
 
+// Осознанные исключения для педантичных линтов (не «глушение под ноль», а
+// контрактные особенности этого крейта):
+// - from_* принимают &self НАМЕРЕННО: методы диспатчатся через &dyn Backend и
+//   аллоцируют буфер в рантайме реализации (см. комментарий в backend.rs);
+// - too_many_arguments/type_complexity: сигнатуры обёрток повторяют раскладку
+//   GPU-операций (gemm/attn/kv) — группировка в структуру добавила бы слой
+//   без пользы для читателя;
+// - needless_range_loop: циклы индексируют несколько массивов одновременно.
+#![allow(
+    clippy::wrong_self_convention,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::needless_range_loop
+)]
+
 pub mod audio;
 pub mod backend;
 pub mod bert;
@@ -26,9 +41,11 @@ pub mod concurrency;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod datasets;
 pub mod dflash;
 pub mod dtype;
 pub mod error;
+pub mod export;
 pub mod gguf;
 #[cfg(feature = "cpu")]
 pub mod harness;
@@ -41,8 +58,6 @@ pub mod quant;
 pub mod qwen3;
 pub mod spec;
 pub mod tokenizer;
-pub mod datasets;
-pub mod export;
 pub mod train;
 pub mod train_qwen3;
 pub mod vision;

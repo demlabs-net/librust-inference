@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rand::SeedableRng;
 
 use crate::backend::{Backend, Tensor};
-use crate::datasets::{parse_dataset, DatasetFormat};
+use crate::datasets::{DatasetFormat, parse_dataset};
 use crate::error::BackendError;
 use crate::qwen3::Qwen3Config;
 use crate::tokenizer::Tokenizer;
 use crate::train::{Adam, TrainJob, TrainProgress, Trainer};
-use crate::weights_map::{dequant_f32, WeightsMap};
+use crate::weights_map::{WeightsMap, dequant_f32};
 
 /// Имя тренера («trainer» в джобах/UI).
 pub const TRAINER_NAME: &str = "qwen3-lora";
@@ -98,9 +98,11 @@ fn check_trainable(cfg: &Qwen3Config) -> Result<(), BackendError> {
         ));
     }
     if cfg.dim == 0 || cfg.n_layers == 0 || cfg.vocab_size == 0 {
-        return Err(BackendError::Shape("qwen3-lora: пустой конфиг модели".into()));
+        return Err(BackendError::Shape(
+            "qwen3-lora: пустой конфиг модели".into(),
+        ));
     }
-    if cfg.head_dim % 2 != 0 {
+    if !cfg.head_dim.is_multiple_of(2) {
         return Err(BackendError::Shape(
             "qwen3-lora: head_dim должен быть чётным".into(),
         ));
@@ -282,14 +284,7 @@ fn rmsnorm_fwd(x: &[f32], w: &[f32], n: usize, d: usize, eps: f32) -> (Vec<f32>,
 }
 
 /// RMSNorm backward: dx = s·(g − x̂·mean(g⊙x̂)), g = w ⊙ dy.
-fn rmsnorm_bwd(
-    x: &[f32],
-    w: &[f32],
-    inv_r: &[f32],
-    dy: &[f32],
-    n: usize,
-    d: usize,
-) -> Vec<f32> {
+fn rmsnorm_bwd(x: &[f32], w: &[f32], inv_r: &[f32], dy: &[f32], n: usize, d: usize) -> Vec<f32> {
     let mut dx = vec![0.0f32; x.len()];
     for i in 0..n {
         let s = inv_r[i] as f64;
@@ -307,29 +302,6 @@ fn rmsnorm_bwd(
         }
     }
     dx
-}
-
-/// Head-wise RMSNorm (как rmsnorm_head): [t, heads, hd] по (t, h).
-fn head_norm_fwd(x: &[f32], w: &[f32], t: usize, n_heads: usize, hd: usize, eps: f32) -> Vec<f32> {
-    // В GGUF Qwen3 вес head-norm — ОДИН [hd] на все головы (не [heads×hd]).
-    let wrow = &w[..hd];
-    let mut y = x.to_vec();
-    for k in 0..t {
-        for h in 0..n_heads {
-            let off = (k * n_heads + h) * hd;
-            let row = &x[off..off + hd];
-            let mut ss = 0.0f64;
-            for &v in row {
-                ss += (v as f64) * (v as f64);
-            }
-            let s = (1.0 / (ss / hd as f64 + eps as f64).sqrt()) as f32;
-            let yi = &mut y[off..off + hd];
-            for j in 0..hd {
-                yi[j] = row[j] * s * wrow[j];
-            }
-        }
-    }
-    y
 }
 
 fn head_norm_bwd(
@@ -351,7 +323,7 @@ fn head_norm_bwd(
             for &v in row {
                 ss += (v as f64) * (v as f64);
             }
-            let s = (1.0 / (ss / hd as f64 + eps as f64).sqrt()) as f64;
+            let s = 1.0 / (ss / hd as f64 + eps as f64).sqrt();
             let mut mean = 0.0f64;
             for j in 0..hd {
                 mean += (row[j] as f64 * s) * wrow[j] as f64 * dy[off + j] as f64;
@@ -577,8 +549,7 @@ fn attention_bwd(
             for dd in 0..hd {
                 let mut acc = 0.0f64;
                 for j in 0..=i {
-                    acc += (ds[i * t + j] as f64)
-                        * (kr[(j * n_kv_heads + kh) * hd + dd] as f64);
+                    acc += (ds[i * t + j] as f64) * (kr[(j * n_kv_heads + kh) * hd + dd] as f64);
                 }
                 d_qr[(i * n_heads + h) * hd + dd] = (acc * scale as f64) as f32;
             }
@@ -596,8 +567,8 @@ fn attention_bwd(
             for dd in 0..hd {
                 let mut acc = 0.0f64;
                 for i in j..t {
-                    acc += (p[(h * t + i) * t + j] as f64)
-                        * (d_o[(i * n_heads + h) * hd + dd] as f64);
+                    acc +=
+                        (p[(h * t + i) * t + j] as f64) * (d_o[(i * n_heads + h) * hd + dd] as f64);
                 }
                 d_v[(j * n_kv_heads + kh) * hd + dd] = acc as f32;
             }
@@ -699,10 +670,24 @@ pub fn forward_seq(
         let (q_full, mq) = lora_add(bk, &x_n, &states[i0].a, &states[i0].b, &q_base, LORA_ALPHA)?;
         let k_base = bk.zeros(vec![t, kv_dim(cfg)])?;
         bk.gemm_nt(&x_n, &bl.k, &k_base)?;
-        let (k_full, mk) = lora_add(bk, &x_n, &states[i0 + 1].a, &states[i0 + 1].b, &k_base, LORA_ALPHA)?;
+        let (k_full, mk) = lora_add(
+            bk,
+            &x_n,
+            &states[i0 + 1].a,
+            &states[i0 + 1].b,
+            &k_base,
+            LORA_ALPHA,
+        )?;
         let v_base = bk.zeros(vec![t, kv_dim(cfg)])?;
         bk.gemm_nt(&x_n, &bl.v, &v_base)?;
-        let (v_full, mv) = lora_add(bk, &x_n, &states[i0 + 2].a, &states[i0 + 2].b, &v_base, LORA_ALPHA)?;
+        let (v_full, mv) = lora_add(
+            bk,
+            &x_n,
+            &states[i0 + 2].a,
+            &states[i0 + 2].b,
+            &v_base,
+            LORA_ALPHA,
+        )?;
         let (q_h, k_h, v_h) = (
             bk.to_cpu_f32(&q_full)?,
             bk.to_cpu_f32(&k_full)?,
@@ -710,13 +695,30 @@ pub fn forward_seq(
         );
         let (q_norm_w, k_norm_w) = (bk.to_cpu_f32(&bl.q_norm)?, bk.to_cpu_f32(&bl.k_norm)?);
         let (o_h, p_h, qn_h, kn_h, qr_h, kr_h) = attention_fwd(
-            &q_h, &k_h, &v_h, &q_norm_w, &k_norm_w, &cos, &sin, t, cfg.n_heads,
-            cfg.n_kv_heads, cfg.head_dim, cfg.norm_eps,
+            &q_h,
+            &k_h,
+            &v_h,
+            &q_norm_w,
+            &k_norm_w,
+            &cos,
+            &sin,
+            t,
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            cfg.norm_eps,
         );
         let o = bk.from_cpu_f32(&o_h, vec![t, q_dim(cfg)])?;
         let o_base = bk.zeros(vec![t, cfg.dim])?;
         bk.gemm_nt(&o, &bl.o, &o_base)?;
-        let (y_attn, mo) = lora_add(bk, &o, &states[i0 + 3].a, &states[i0 + 3].b, &o_base, LORA_ALPHA)?;
+        let (y_attn, mo) = lora_add(
+            bk,
+            &o,
+            &states[i0 + 3].a,
+            &states[i0 + 3].b,
+            &o_base,
+            LORA_ALPHA,
+        )?;
         let y1 = bk.zeros(vec![t, cfg.dim])?;
         bk.add(&y_attn, &x, &y1)?;
         // ffn_norm
@@ -727,10 +729,24 @@ pub fn forward_seq(
         // gate/up
         let gate_base = bk.zeros(vec![t, cfg.ffn_dim])?;
         bk.gemm_nt(&x2, &bl.gate, &gate_base)?;
-        let (gate_full, mg) = lora_add(bk, &x2, &states[i0 + 4].a, &states[i0 + 4].b, &gate_base, LORA_ALPHA)?;
+        let (gate_full, mg) = lora_add(
+            bk,
+            &x2,
+            &states[i0 + 4].a,
+            &states[i0 + 4].b,
+            &gate_base,
+            LORA_ALPHA,
+        )?;
         let up_base = bk.zeros(vec![t, cfg.ffn_dim])?;
         bk.gemm_nt(&x2, &bl.up, &up_base)?;
-        let (up_full, mu) = lora_add(bk, &x2, &states[i0 + 5].a, &states[i0 + 5].b, &up_base, LORA_ALPHA)?;
+        let (up_full, mu) = lora_add(
+            bk,
+            &x2,
+            &states[i0 + 5].a,
+            &states[i0 + 5].b,
+            &up_base,
+            LORA_ALPHA,
+        )?;
         let gate_h = bk.to_cpu_f32(&gate_full)?;
         let up_h = bk.to_cpu_f32(&up_full)?;
         let act_h: Vec<f32> = gate_h
@@ -745,7 +761,14 @@ pub fn forward_seq(
         bk.mul(&act, &up_full, &gm)?;
         let down_base = bk.zeros(vec![t, cfg.dim])?;
         bk.gemm_nt(&gm, &bl.down, &down_base)?;
-        let (y_ffn, md) = lora_add(bk, &gm, &states[i0 + 6].a, &states[i0 + 6].b, &down_base, LORA_ALPHA)?;
+        let (y_ffn, md) = lora_add(
+            bk,
+            &gm,
+            &states[i0 + 6].a,
+            &states[i0 + 6].b,
+            &down_base,
+            LORA_ALPHA,
+        )?;
         let y2 = bk.zeros(vec![t, cfg.dim])?;
         bk.add(&y_ffn, &y1, &y2)?;
 
@@ -869,13 +892,13 @@ fn linear_bwd(
     let xt = bk.transpose(x)?;
     let gat = bk.zeros(vec![inp, r])?;
     bk.gemm(&xt, &dm, &gat)?;
-    let dA = bk.transpose(&gat)?;
-    // dB = (mᵀ·α·dy) транспонированная: [r, out] → [out, r]
+    let d_a = bk.transpose(&gat)?;
+    // d_b = (mᵀ·α·dy) транспонированная: [r, out] → [out, r]
     let mt = bk.transpose(m)?;
     let gbt = bk.zeros(vec![r, outn])?;
     bk.gemm(&mt, &dn, &gbt)?;
-    let dB = bk.transpose(&gbt)?;
-    Ok((dx2, dA, dB))
+    let d_b = bk.transpose(&gbt)?;
+    Ok((dx2, d_a, d_b))
 }
 
 /// backward всего прохода: градиенты A/B всех адаптеров (свежие тензоры).
@@ -890,14 +913,14 @@ pub fn backward_seq(
     let (cos, sin) = rope_tables(t, cfg.head_dim, cfg.rope_theta);
     let kd = kv_dim(cfg);
     let mut grads: Vec<(String, Tensor, Tensor)> = Vec::new();
-    let mut push = |name: &str, dA: Tensor, dB: Tensor| {
-        grads.push((name.to_string(), dA, dB));
+    let mut push = |name: &str, d_a: Tensor, d_b: Tensor| {
+        grads.push((name.to_string(), d_a, d_b));
     };
 
     // dlogits [t, V] (хост) → dh: dlogits·output [t, D]
     let dlogits = bk.from_cpu_f32(&fwd.dlogits_h, vec![t, cfg.vocab_size])?;
-    let mut d_h = bk.zeros(vec![t, cfg.dim])?;
-    bk.gemm(&dlogits, &base.output, &mut d_h)?;
+    let d_h = bk.zeros(vec![t, cfg.dim])?;
+    bk.gemm(&dlogits, &base.output, &d_h)?;
     let onw = bk.to_cpu_f32(&base.out_norm)?;
     let d_hn = rmsnorm_bwd(
         &fwd.x_out_h,
@@ -916,7 +939,13 @@ pub fn backward_seq(
         // ── FFN
         let d_y_ffn = d_x.clone();
         let (d_gm, g_down_a, g_down_b) = linear_bwd(
-            bk, &lc.gm, &bl.down, &states[i0 + 6], &lc.lora_m[6], &d_y_ffn, LORA_ALPHA,
+            bk,
+            &lc.gm,
+            &bl.down,
+            &states[i0 + 6],
+            &lc.lora_m[6],
+            &d_y_ffn,
+            LORA_ALPHA,
         )?;
         push(&states[i0 + 6].name, g_down_a, g_down_b);
         // silu_mul bwd (на хосте)
@@ -931,17 +960,27 @@ pub fn backward_seq(
             d_up[i] = d_gm_h[i] * lc.act_h[i];
         }
         let (d_x2_1, g_gate_a, g_gate_b) = linear_bwd(
-            bk, &lc.x2, &bl.gate, &states[i0 + 4], &lc.lora_m[4],
-            &bk.from_cpu_f32(&d_gate, vec![t, cfg.ffn_dim])?, LORA_ALPHA,
+            bk,
+            &lc.x2,
+            &bl.gate,
+            &states[i0 + 4],
+            &lc.lora_m[4],
+            &bk.from_cpu_f32(&d_gate, vec![t, cfg.ffn_dim])?,
+            LORA_ALPHA,
         )?;
         push(&states[i0 + 4].name, g_gate_a, g_gate_b);
         let (d_x2_2, g_up_a, g_up_b) = linear_bwd(
-            bk, &lc.x2, &bl.up, &states[i0 + 5], &lc.lora_m[5],
-            &bk.from_cpu_f32(&d_up, vec![t, cfg.ffn_dim])?, LORA_ALPHA,
+            bk,
+            &lc.x2,
+            &bl.up,
+            &states[i0 + 5],
+            &lc.lora_m[5],
+            &bk.from_cpu_f32(&d_up, vec![t, cfg.ffn_dim])?,
+            LORA_ALPHA,
         )?;
         push(&states[i0 + 5].name, g_up_a, g_up_b);
-        let mut d_x2 = bk.zeros(vec![t, cfg.dim])?;
-        bk.add(&d_x2_1, &d_x2_2, &mut d_x2)?;
+        let d_x2 = bk.zeros(vec![t, cfg.dim])?;
+        bk.add(&d_x2_1, &d_x2_2, &d_x2)?;
         // ffn_norm bwd → d_y1 (вклад norm-пути)
         let fw = bk.to_cpu_f32(&bl.ffn_norm)?;
         let dy1_norm = rmsnorm_bwd(
@@ -956,7 +995,13 @@ pub fn backward_seq(
         // ── attention
         let d_y_attn = d_y1.clone();
         let (d_o, g_wo_a, g_wo_b) = linear_bwd(
-            bk, &lc.o, &bl.o, &states[i0 + 3], &lc.lora_m[3], &d_y_attn, LORA_ALPHA,
+            bk,
+            &lc.o,
+            &bl.o,
+            &states[i0 + 3],
+            &lc.lora_m[3],
+            &d_y_attn,
+            LORA_ALPHA,
         )?;
         push(&states[i0 + 3].name, g_wo_a, g_wo_b);
         let d_o_h = bk.to_cpu_f32(&d_o)?;
@@ -976,33 +1021,71 @@ pub fn backward_seq(
         let d_kn = rope_bwd(&d_kr, &cos, &sin, t, kd, cfg.head_dim);
         let qw = bk.to_cpu_f32(&bl.q_norm)?;
         let kw = bk.to_cpu_f32(&bl.k_norm)?;
-        let dq = head_norm_bwd(&lc.qn_h, &qw, &d_qn, t, cfg.n_heads, cfg.head_dim, cfg.norm_eps);
-        let dk = head_norm_bwd(&lc.kn_h, &kw, &d_kn, t, cfg.n_kv_heads, cfg.head_dim, cfg.norm_eps);
+        let dq = head_norm_bwd(
+            &lc.qn_h,
+            &qw,
+            &d_qn,
+            t,
+            cfg.n_heads,
+            cfg.head_dim,
+            cfg.norm_eps,
+        );
+        let dk = head_norm_bwd(
+            &lc.kn_h,
+            &kw,
+            &d_kn,
+            t,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            cfg.norm_eps,
+        );
         // q/k/v lines
         let (d_xn_1, g_q_a, g_q_b) = linear_bwd(
-            bk, &lc.x_n, &bl.q, &states[i0], &lc.lora_m[0],
-            &bk.from_cpu_f32(&dq, vec![t, q_dim(cfg)])?, LORA_ALPHA,
+            bk,
+            &lc.x_n,
+            &bl.q,
+            &states[i0],
+            &lc.lora_m[0],
+            &bk.from_cpu_f32(&dq, vec![t, q_dim(cfg)])?,
+            LORA_ALPHA,
         )?;
         push(&states[i0].name, g_q_a, g_q_b);
         let (d_xn_2, g_k_a, g_k_b) = linear_bwd(
-            bk, &lc.x_n, &bl.k, &states[i0 + 1], &lc.lora_m[1],
-            &bk.from_cpu_f32(&dk, vec![t, kd])?, LORA_ALPHA,
+            bk,
+            &lc.x_n,
+            &bl.k,
+            &states[i0 + 1],
+            &lc.lora_m[1],
+            &bk.from_cpu_f32(&dk, vec![t, kd])?,
+            LORA_ALPHA,
         )?;
         push(&states[i0 + 1].name, g_k_a, g_k_b);
         let (d_xn_3, g_v_a, g_v_b) = linear_bwd(
-            bk, &lc.x_n, &bl.v, &states[i0 + 2], &lc.lora_m[2],
-            &bk.from_cpu_f32(&d_v, vec![t, kd])?, LORA_ALPHA,
+            bk,
+            &lc.x_n,
+            &bl.v,
+            &states[i0 + 2],
+            &lc.lora_m[2],
+            &bk.from_cpu_f32(&d_v, vec![t, kd])?,
+            LORA_ALPHA,
         )?;
         push(&states[i0 + 2].name, g_v_a, g_v_b);
-        let mut d_xn = bk.zeros(vec![t, cfg.dim])?;
+        let d_xn = bk.zeros(vec![t, cfg.dim])?;
         bk.add(&d_xn_1, &d_xn_2, &d_xn)?;
-        let mut d_xn_sum = bk.zeros(vec![t, cfg.dim])?;
+        let d_xn_sum = bk.zeros(vec![t, cfg.dim])?;
         bk.add(&d_xn, &d_xn_3, &d_xn_sum)?;
         // attn_norm bwd → d_x входа слоя + residual d_y1
         let aw = bk.to_cpu_f32(&bl.attn_norm)?;
-        let dxn = rmsnorm_bwd(&lc.x_h, &aw, &lc.inv_r1, &bk.to_cpu_f32(&d_xn_sum)?, t, cfg.dim);
-        let mut d_x_in = bk.from_cpu_f32(&dxn, vec![t, cfg.dim])?;
-        let mut d_x_in_sum = bk.zeros(vec![t, cfg.dim])?;
+        let dxn = rmsnorm_bwd(
+            &lc.x_h,
+            &aw,
+            &lc.inv_r1,
+            &bk.to_cpu_f32(&d_xn_sum)?,
+            t,
+            cfg.dim,
+        );
+        let d_x_in = bk.from_cpu_f32(&dxn, vec![t, cfg.dim])?;
+        let d_x_in_sum = bk.zeros(vec![t, cfg.dim])?;
         bk.add(&d_x_in, &d_y1, &d_x_in_sum)?;
         d_x = d_x_in_sum;
     }
@@ -1049,7 +1132,7 @@ pub fn fit(
     let mut adam = Adam::new(lr);
     let mut step = 0usize;
     let started = std::time::Instant::now();
-    let mut report_step = |step: usize, loss: f64, tokens: usize| {
+    let report_step = |step: usize, loss: f64, tokens: usize| {
         on_step(&StepReport {
             step,
             total_steps,
@@ -1059,7 +1142,7 @@ pub fn fit(
         });
     };
 
-        for _epoch in 0..epochs {
+    for _epoch in 0..epochs {
         rand::seq::SliceRandom::shuffle(order.as_mut_slice(), &mut rng);
         for bi in 0..steps_per_epoch {
             step += 1;
@@ -1079,14 +1162,12 @@ pub fn fit(
                 for (name, d_a, d_b) in grads {
                     let st = states.iter_mut().find(|s| s.name == name).unwrap();
                     let next = bk.zeros(st.g_a.shape().to_vec())?;
-                    bk.add(&st.g_a, &d_a, &next).map_err(|e| {
-                        BackendError::Shape(format!("accum g_a {name}: {e}"))
-                    })?;
+                    bk.add(&st.g_a, &d_a, &next)
+                        .map_err(|e| BackendError::Shape(format!("accum g_a {name}: {e}")))?;
                     st.g_a = next;
                     let next = bk.zeros(st.g_b.shape().to_vec())?;
-                    bk.add(&st.g_b, &d_b, &next).map_err(|e| {
-                        BackendError::Shape(format!("accum g_b {name}: {e}"))
-                    })?;
+                    bk.add(&st.g_b, &d_b, &next)
+                        .map_err(|e| BackendError::Shape(format!("accum g_b {name}: {e}")))?;
                     st.g_b = next;
                 }
             }
@@ -1127,10 +1208,10 @@ pub fn tokenize_seqs(
     for ex in exs {
         let prompt_ids = tok.encode(&ex.prompt);
         let mut comp = tok.encode(&ex.completion);
-        if let Some(eos) = tok.eos {
-            if comp.last() != Some(&eos) {
-                comp.push(eos);
-            }
+        if let Some(eos) = tok.eos
+            && comp.last() != Some(&eos)
+        {
+            comp.push(eos);
         }
         // кладём сначала завершение целиком, если влезает
         if comp.len() >= max {
@@ -1215,10 +1296,8 @@ pub fn export_adapter(
     let text = serde_json::to_string_pretty(&file)
         .map_err(|e| BackendError::Native(format!("adapter.json: {e}")))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)
-        .map_err(|e| BackendError::Native(format!("adapter.json: {e}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| BackendError::Native(format!("adapter.json: {e}")))?;
+    std::fs::write(&tmp, text).map_err(|e| BackendError::Native(format!("adapter.json: {e}")))?;
+    std::fs::rename(&tmp, path).map_err(|e| BackendError::Native(format!("adapter.json: {e}")))?;
     Ok(())
 }
 
@@ -1249,13 +1328,16 @@ impl Trainer for Qwen3LoraTrainer {
         }
         let bytes = std::fs::read(&path)?;
         let file = crate::gguf::parse(&bytes)?;
-        let wm = crate::weights_map::WeightsMap::from_gguf(&file).map_err(|e| anyhow::anyhow!(e))?;
+        let wm =
+            crate::weights_map::WeightsMap::from_gguf(&file).map_err(|e| anyhow::anyhow!(e))?;
         let tok = Tokenizer::from_gguf(&file).map_err(|e| anyhow::anyhow!(e))?;
         let cfg = crate::qwen3::Qwen3Config::from_gguf(&file, tok.vocab_size())?;
         check_trainable(&cfg).map_err(|e| anyhow::anyhow!(e))?;
         let base = load_base(backend.as_ref(), &wm, &cfg)?;
-        let mut states =
-            param_states(backend.as_ref(), &init_lora(backend.as_ref(), &cfg, job.lora_rank)?)?;
+        let mut states = param_states(
+            backend.as_ref(),
+            &init_lora(backend.as_ref(), &cfg, job.lora_rank)?,
+        )?;
 
         // данные 5.3
         let ds_path = job
@@ -1265,19 +1347,23 @@ impl Trainer for Qwen3LoraTrainer {
         let fmt = job
             .dataset_format
             .as_deref()
-            .map(DatasetFormat::parse)
-            .flatten()
+            .and_then(DatasetFormat::parse)
             .unwrap_or(DatasetFormat::Raw);
         let exs = parse_dataset(&ds_path, fmt)?;
-        let max_len = if job.max_seq_len > 0 { job.max_seq_len } else { 256 };
+        let max_len = if job.max_seq_len > 0 {
+            job.max_seq_len
+        } else {
+            256
+        };
         let seqs = tokenize_seqs(&tok, &exs, max_len)?;
         if seqs.is_empty() {
             anyhow::bail!("qwen3-lora: нет примеров после фильтрации");
         }
 
-        let out_dir = job.output_dir.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("qwen3-lora-{}", job.id))
-        });
+        let out_dir = job
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("qwen3-lora-{}", job.id)));
         std::fs::create_dir_all(&out_dir)?;
 
         let total_tokens: usize = seqs.iter().map(|(ids, _)| ids.len()).sum();
@@ -1289,7 +1375,7 @@ impl Trainer for Qwen3LoraTrainer {
             epochs = job.epochs,
             "qwen3-lora training start"
         );
-        let mut last_loss = std::cell::Cell::new(0.0f64);
+        let last_loss = std::cell::Cell::new(0.0f64);
         fit(
             backend.as_ref(),
             &base,
@@ -1319,10 +1405,144 @@ impl Trainer for Qwen3LoraTrainer {
         )?;
 
         let adapter_path = out_dir.join("adapter.json");
-        export_adapter(&adapter_path, backend.as_ref(), &job.model_id, &states, &cfg, job.lora_rank)?;
+        export_adapter(
+            &adapter_path,
+            backend.as_ref(),
+            &job.model_id,
+            &states,
+            &cfg,
+            job.lora_rank,
+        )?;
         tracing::info!(loss = last_loss.get(), "qwen3-lora done");
         Ok(adapter_path)
     }
+}
+
+// ── Оценка (5.7 срез): perplexity последовательности ───────────────────────
+
+/// Perplexity текста: forward с заданными состояниями адаптеров (для
+/// необученной модели — init_lora с B=0: вклад LoRA ровно нулевой).
+/// Похоже на perplexity, но с маской: обучение только на CE позиций
+/// >= mask_from; раньше — без лосса (5.7: ответы при чат-шаблоне).
+pub fn perplexity_masked(
+    bk: &dyn Backend,
+    base: &BaseModel,
+    states: &[ParamState],
+    ids: &[u32],
+    mask_from: usize,
+) -> Result<f64, BackendError> {
+    let mut labels = vec![-1i32; ids.len()];
+    for (j, &x) in ids.iter().enumerate().skip(mask_from) {
+        labels[j] = x as i32;
+    }
+    let fwd = forward_seq(bk, base, states, ids, &labels)?;
+    Ok(fwd.loss.exp())
+}
+
+/// 5.7: чат-шаблон из GGUF → промпт-токены.
+pub fn chat_prompt_ids(
+    tok: &Tokenizer,
+    file: &crate::gguf::GgufFile<'_>,
+    user: &str,
+    system: Option<&str>,
+) -> Result<Vec<u32>, BackendError> {
+    let tpl = file
+        .get("tokenizer.chat_template")
+        .and_then(crate::gguf::GgufValue::as_str)
+        .ok_or_else(|| BackendError::Shape("qwen3-lora: нет chat_template в GGUF".into()))?;
+    let mut specials = std::collections::HashMap::new();
+    if let Some(bos) = tok.bos {
+        specials.insert(
+            "bos_token".into(),
+            "<|bos|>"
+                .to_string()
+                .replace("<|bos|>", &tok.decode_piece(bos)),
+        );
+    }
+    if let Some(eos) = tok.eos {
+        specials.insert("eos_token".into(), tok.decode_piece(eos));
+    }
+    if let Some(pad) = tok.pad {
+        specials.insert("pad_token".into(), tok.decode_piece(pad));
+    }
+    // сложные конструкции (namespace/tools) — классический фоллбэк
+    let template = crate::chat_template::Template::compile(tpl, specials).ok();
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(std::collections::HashMap::from([
+            ("role".to_string(), "system".to_string()),
+            ("content".to_string(), sys.to_string()),
+        ]));
+    }
+    messages.push(std::collections::HashMap::from([
+        ("role".to_string(), "user".to_string()),
+        ("content".to_string(), user.to_string()),
+    ]));
+    let mut ctx = crate::chat_template::TemplateContext {
+        messages,
+        extra: Default::default(),
+    };
+    ctx.extra
+        .insert("add_generation_prompt".into(), "true".into());
+    let prompt = match template.and_then(|t| t.render(&ctx).ok()) {
+        Some(p) => p,
+        // Qwen3-шаблон использует namespace/tools — неподдерживаемые
+        // конструкции; классический формат эквивалентен для простых чатов.
+        None => {
+            let mut p = String::new();
+            if let Some(sys) = system {
+                p.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+            }
+            p.push_str(&format!("<|im_start|>user\n{user}<|im_end|>\n"));
+            p.push_str("<|im_start|>assistant\n");
+            p
+        }
+    };
+    Ok(tok.encode(&prompt))
+}
+
+/// 5.7: ppl по eval-набору — чат-промпт + ответ (маска на промпте).
+pub fn eval_set_ppl(
+    bk: &dyn Backend,
+    base: &BaseModel,
+    states: &[ParamState],
+    tok: &Tokenizer,
+    file: &crate::gguf::GgufFile<'_>,
+    items: &[(String, String)],
+) -> Result<f64, BackendError> {
+    let mut total = 0.0f64;
+    let mut n = 0usize;
+    for (q, a) in items {
+        let p = chat_prompt_ids(tok, file, q, None)?;
+        let mut ids = p.clone();
+        ids.extend(tok.encode(a));
+        ids.push(tok.eos.unwrap_or_else(|| ids[0]));
+        let ppl = perplexity_masked(bk, base, states, &ids, p.len())?;
+        total += ppl.ln();
+        n += 1;
+    }
+    if n == 0 {
+        return Err(BackendError::Shape("eval: пустой набор".into()));
+    }
+    Ok((total / n as f64).exp())
+}
+
+pub fn perplexity(
+    bk: &dyn Backend,
+    base: &BaseModel,
+    states: &[ParamState],
+    ids: &[u32],
+) -> Result<f64, BackendError> {
+    if ids.len() < 2 {
+        return Err(BackendError::Shape("ppl: слишком короткий текст".into()));
+    }
+    let labels: Vec<i32> = {
+        let mut l = ids[1..].iter().map(|&x| x as i32).collect::<Vec<_>>();
+        l.push(-1);
+        l
+    };
+    let fwd = forward_seq(bk, base, states, ids, &labels)?;
+    Ok(fwd.loss.exp())
 }
 
 // ── Тесты: числовые градиенты + свойство обучения ──────────────────────────
@@ -1351,7 +1571,9 @@ mod tests {
 
     fn rnd(seed: u64, n: usize, amp: f32) -> Vec<f32> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..n).map(|_| amp * rand::Rng::random_range(&mut rng, -1.0f32..1.0f32)).collect()
+        (0..n)
+            .map(|_| amp * rand::Rng::random_range(&mut rng, -1.0f32..1.0f32))
+            .collect()
     }
 
     fn tiny_base(bk: &dyn Backend) -> BaseModel {
@@ -1362,7 +1584,7 @@ mod tests {
         let mut s = 1u64;
         let mut v = |n: usize, amp: f32| {
             s += 1;
-            rnd(((s * 691) as u64) ^ 0xabcd, n, amp)
+            rnd((s * 691) ^ 0xabcd, n, amp)
         };
         let mk = |vec: Vec<f32>, out_n: usize, inp: usize| {
             bk.from_cpu_f32(&vec, vec![out_n, inp]).unwrap()
@@ -1412,8 +1634,12 @@ mod tests {
                 name,
                 out: on,
                 inp,
-                a: bk.from_cpu_f32(&rnd(700 + i as u64, rank * inp, 0.1), vec![rank, inp]).unwrap(),
-                b: bk.from_cpu_f32(&rnd(800 + i as u64, on * rank, 0.1), vec![on, rank]).unwrap(),
+                a: bk
+                    .from_cpu_f32(&rnd(700 + i as u64, rank * inp, 0.1), vec![rank, inp])
+                    .unwrap(),
+                b: bk
+                    .from_cpu_f32(&rnd(800 + i as u64, on * rank, 0.1), vec![on, rank])
+                    .unwrap(),
             });
         }
         out
@@ -1434,7 +1660,13 @@ mod tests {
     fn snapshot(bk: &dyn Backend, states: &[ParamState]) -> Vec<(String, Vec<f32>, Vec<f32>)> {
         states
             .iter()
-            .map(|s| (s.name.clone(), bk.to_cpu_f32(&s.a).unwrap(), bk.to_cpu_f32(&s.b).unwrap()))
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    bk.to_cpu_f32(&s.a).unwrap(),
+                    bk.to_cpu_f32(&s.b).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -1511,8 +1743,12 @@ mod tests {
             }
             let st_pos = rebuild_perturbed(bk.as_ref(), &snap, name, *ab, idx, eps, 4);
             let st_neg = rebuild_perturbed(bk.as_ref(), &snap, name, *ab, idx, -eps, 4);
-            let l_pos = forward_seq(bk.as_ref(), &base, &st_pos, &ids, &labels).unwrap().loss;
-            let l_neg = forward_seq(bk.as_ref(), &base, &st_neg, &ids, &labels).unwrap().loss;
+            let l_pos = forward_seq(bk.as_ref(), &base, &st_pos, &ids, &labels)
+                .unwrap()
+                .loss;
+            let l_neg = forward_seq(bk.as_ref(), &base, &st_neg, &ids, &labels)
+                .unwrap()
+                .loss;
             let numeric = (l_pos - l_neg) / (2.0 * eps as f64);
             let analytic = if *ab == 'a' { ga[idx] } else { gb[idx] } as f64;
             let tol = 0.2 * analytic.abs().max(numeric.abs()) + 1e-5;
@@ -1532,8 +1768,10 @@ mod tests {
         delta: f32,
         rank: usize,
     ) -> Vec<ParamState> {
-        let mut snap2: Vec<(String, Vec<f32>, Vec<f32>)> =
-            snap.iter().map(|(n, a, b)| (n.clone(), a.clone(), b.clone())).collect();
+        let mut snap2: Vec<(String, Vec<f32>, Vec<f32>)> = snap
+            .iter()
+            .map(|(n, a, b)| (n.clone(), a.clone(), b.clone()))
+            .collect();
         for (n, a, b) in snap2.iter_mut() {
             if n == name {
                 if ab == 'a' {
@@ -1545,7 +1783,6 @@ mod tests {
         }
         rebuild(bk, &snap2, rank)
     }
-
 
     /// 5.7: eval-набор с чат-шаблоном — ppl до/после (0.6B + адаптер).
     #[test]
@@ -1596,7 +1833,11 @@ mod tests {
         let ppl1 = eval_set_ppl(bk.as_ref(), &mbase, &states1, &tok, &mfile, &items).unwrap();
         eprintln!(
             "5.7 eval-set ppl: до={ppl0:.1} после={ppl1:.1} ({})",
-            if ppl1 < ppl0 { "лучше" } else { "хуже" }
+            if ppl1 < ppl0 {
+                "лучше"
+            } else {
+                "хуже"
+            }
         );
     }
 
@@ -1658,7 +1899,11 @@ mod tests {
         let ppl1 = perplexity(bk.as_ref(), &base, &states1, &ids).unwrap();
         eprintln!(
             "ppl до={ppl0:.2} после={ppl1:.2} ({} / {:.0}%)",
-            if ppl1 < ppl0 { "лучше" } else { "хуже" },
+            if ppl1 < ppl0 {
+                "лучше"
+            } else {
+                "хуже"
+            },
             100.0 * (ppl1 - ppl0) / ppl0.max(1e-9)
         );
     }
@@ -1670,17 +1915,29 @@ mod tests {
     #[ignore]
     fn metal_train_0_6b() {
         unsafe { std::env::set_var("BACKEND", "metal") };
-        let model = std::path::PathBuf::from(
-            std::env::var("QWEN3_LORA_MODEL").unwrap_or_else(|_| {
-                format!("{}/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf", home())
-            }),
-        );
+        let model =
+            std::path::PathBuf::from(std::env::var("QWEN3_LORA_MODEL").unwrap_or_else(|_| {
+                format!(
+                    "{}/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf",
+                    home()
+                )
+            }));
         if !model.is_file() {
             eprintln!("skip: модель не найдена {}", model.display());
             return;
         }
-        let dataset = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/qwen3-lora-fixture.jsonl");
-        let mut job = TrainJob::new("metal-e2e", model.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+        let dataset = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/qwen3-lora-fixture.jsonl"
+        );
+        let mut job = TrainJob::new(
+            "metal-e2e",
+            model
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        );
         job.trainer = TRAINER_NAME.into();
         job.lora_rank = 8;
         job.epochs = 10;
@@ -1698,10 +1955,12 @@ mod tests {
             .run(&job, &stop, &|p: &TrainProgress| {
                 if let Some(l) = p.loss {
                     let mut ls = losses.lock().unwrap();
-                    if ls.len() < 20 || ls.len() % 5 == 0 {
+                    if ls.len() < 20 || ls.len().is_multiple_of(5) {
                         eprintln!(
                             "step {}/{} loss {:.4} tps {:.1}",
-                            p.step, p.total_steps, l,
+                            p.step,
+                            p.total_steps,
+                            l,
                             p.tokens_per_sec.unwrap_or(0.0)
                         );
                     }
@@ -1719,7 +1978,10 @@ mod tests {
         );
         assert!(path.exists(), "adapter.json: {}", path.display());
         let meta = std::fs::read_to_string(&path).unwrap();
-        assert!(meta.contains("\"trainer\": \"qwen3-lora\""), "trainer в адаптере");
+        assert!(
+            meta.contains("\"trainer\": \"qwen3-lora\""),
+            "trainer в адаптере"
+        );
         eprintln!("DONE adapter at {}", path.display());
     }
 
@@ -1788,9 +2050,14 @@ mod tests {
         // прямого прохода (проверка корректности формул, не ультра-точности).
         let eps = 5e-2f32;
         let mut checked = 0usize;
-        for (name, ab) in [("blk.0.ffn_gate.weight", 'a'), ("blk.0.ffn_gate.weight", 'b'),
-                           ("blk.0.ffn_up.weight", 'a'), ("blk.0.ffn_up.weight", 'b'),
-                           ("blk.0.ffn_down.weight", 'a'), ("blk.0.ffn_down.weight", 'b')] {
+        for (name, ab) in [
+            ("blk.0.ffn_gate.weight", 'a'),
+            ("blk.0.ffn_gate.weight", 'b'),
+            ("blk.0.ffn_up.weight", 'a'),
+            ("blk.0.ffn_up.weight", 'b'),
+            ("blk.0.ffn_down.weight", 'a'),
+            ("blk.0.ffn_down.weight", 'b'),
+        ] {
             let (ga, gb) = &gmap[name];
             let vec = if ab == 'a' { ga } else { gb };
             let mut max_rel = 0.0f32;
@@ -1801,8 +2068,12 @@ mod tests {
                 }
                 let st_pos = rebuild_perturbed(bk.as_ref(), &snap, name, ab, idx, eps, 2);
                 let st_neg = rebuild_perturbed(bk.as_ref(), &snap, name, ab, idx, -eps, 2);
-                let l_pos = forward_seq(bk.as_ref(), &base, &st_pos, &ids, &labels).unwrap().loss;
-                let l_neg = forward_seq(bk.as_ref(), &base, &st_neg, &ids, &labels).unwrap().loss;
+                let l_pos = forward_seq(bk.as_ref(), &base, &st_pos, &ids, &labels)
+                    .unwrap()
+                    .loss;
+                let l_neg = forward_seq(bk.as_ref(), &base, &st_neg, &ids, &labels)
+                    .unwrap()
+                    .loss;
                 let numeric = ((l_pos - l_neg) / (2.0 * eps as f64)) as f32;
                 let rel = ((g - numeric) / g.abs().max(1e-9)).abs();
                 if rel > max_rel {
@@ -1811,10 +2082,7 @@ mod tests {
                 }
                 checked += 1;
             }
-            eprintln!(
-                "{name} {ab}: max_rel={max_rel:.3} at {:?}",
-                max_entry
-            );
+            eprintln!("{name} {ab}: max_rel={max_rel:.3} at {:?}", max_entry);
         }
         eprintln!("checked={checked}");
         assert!(checked > 20);
@@ -1827,14 +2095,26 @@ mod tests {
         let bk = crate::backend::default_backend().unwrap();
         let cfg = tiny_cfg();
         let base = tiny_base(bk.as_ref());
-        let mut states = param_states(bk.as_ref(), &init_lora(bk.as_ref(), &cfg, 4).unwrap()).unwrap();
+        let mut states =
+            param_states(bk.as_ref(), &init_lora(bk.as_ref(), &cfg, 4).unwrap()).unwrap();
         let (ids, _) = seq(true);
         let ppl0 = perplexity(bk.as_ref(), &base, &states, &ids).unwrap();
         assert!(ppl0.is_finite() && ppl0 > 0.0, "ppl0={ppl0}");
         // 60 шагов по той же последовательности — ppl должна упасть
         let seqs = vec![seq(true)];
         let stop = AtomicBool::new(false);
-        fit(bk.as_ref(), &base, &mut states, &seqs, 60, 1, 5e-3, &stop, &|_| {}).unwrap();
+        fit(
+            bk.as_ref(),
+            &base,
+            &mut states,
+            &seqs,
+            60,
+            1,
+            5e-3,
+            &stop,
+            &|_| {},
+        )
+        .unwrap();
         let ppl1 = perplexity(bk.as_ref(), &base, &states, &ids).unwrap();
         assert!(
             ppl1 < ppl0,
@@ -1875,124 +2155,4 @@ mod tests {
             "loss must drop: first={first:.4} last={last:.4}"
         );
     }
-}
-
-// ── Оценка (5.7 срез): perplexity последовательности ───────────────────────
-
-/// Perplexity текста: forward с заданными состояниями адаптеров (для
-/// необученной модели — init_lora с B=0: вклад LoRA ровно нулевой).
-/// Похоже на perplexity, но с маской: обучение только на CE позиций
-/// >= mask_from; раньше — без лосса (5.7: ответы при чат-шаблоне).
-pub fn perplexity_masked(
-    bk: &dyn Backend,
-    base: &BaseModel,
-    states: &[ParamState],
-    ids: &[u32],
-    mask_from: usize,
-) -> Result<f64, BackendError> {
-    let mut labels = vec![-1i32; ids.len()];
-    for (j, &x) in ids.iter().enumerate().skip(mask_from) {
-        labels[j] = x as i32;
-    }
-    let fwd = forward_seq(bk, base, states, ids, &labels)?;
-    Ok(fwd.loss.exp())
-}
-
-/// 5.7: чат-шаблон из GGUF → промпт-токены.
-pub fn chat_prompt_ids(
-    tok: &Tokenizer,
-    file: &crate::gguf::GgufFile<'_>,
-    user: &str,
-    system: Option<&str>,
-) -> Result<Vec<u32>, BackendError> {
-    let tpl = file
-        .get("tokenizer.chat_template")
-        .and_then(crate::gguf::GgufValue::as_str)
-        .ok_or_else(|| BackendError::Shape("qwen3-lora: нет chat_template в GGUF".into()))?;
-    let mut specials = std::collections::HashMap::new();
-    if let Some(bos) = tok.bos {
-        specials.insert("bos_token".into(), format!("<|bos|>").replace("<|bos|>", &tok.decode_piece(bos)));
-    }
-    if let Some(eos) = tok.eos {
-        specials.insert("eos_token".into(), tok.decode_piece(eos));
-    }
-    if let Some(pad) = tok.pad {
-        specials.insert("pad_token".into(), tok.decode_piece(pad));
-    }
-    let template = match crate::chat_template::Template::compile(tpl, specials) {
-        Ok(t) => Some(t),
-        Err(_) => None, // сложные конструкции (namespace/tools) — классический фоллбэк
-    };
-    let mut messages = Vec::new();
-    if let Some(sys) = system {
-        messages.push(std::collections::HashMap::from([(
-            "role".to_string(),
-            "system".to_string(),
-        ), ("content".to_string(), sys.to_string())]));
-    }
-    messages.push(std::collections::HashMap::from([
-        ("role".to_string(), "user".to_string()),
-        ("content".to_string(), user.to_string()),
-    ]));
-    let mut ctx = crate::chat_template::TemplateContext { messages, extra: Default::default() };
-    ctx.extra.insert("add_generation_prompt".into(), "true".into());
-    let prompt = match template.and_then(|t| t.render(&ctx).ok()) {
-        Some(p) => p,
-        // Qwen3-шаблон использует namespace/tools — неподдерживаемые
-        // конструкции; классический формат эквивалентен для простых чатов.
-        None => {
-            let mut p = String::new();
-            if let Some(sys) = system {
-                p.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
-            }
-            p.push_str(&format!("<|im_start|>user\n{user}<|im_end|>\n"));
-            p.push_str("<|im_start|>assistant\n");
-            p
-        }
-    };
-    Ok(tok.encode(&prompt))
-}
-
-/// 5.7: ppl по eval-набору — чат-промпт + ответ (маска на промпте).
-pub fn eval_set_ppl(
-    bk: &dyn Backend,
-    base: &BaseModel,
-    states: &[ParamState],
-    tok: &Tokenizer,
-    file: &crate::gguf::GgufFile<'_>,
-    items: &[(String, String)],
-) -> Result<f64, BackendError> {
-    let mut total = 0.0f64;
-    let mut n = 0usize;
-    for (q, a) in items {
-        let p = chat_prompt_ids(tok, file, q, None)?;
-        let mut ids = p.clone();
-        ids.extend(tok.encode(a));
-        ids.push(tok.eos.unwrap_or_else(|| ids[0]));
-        let ppl = perplexity_masked(bk, base, states, &ids, p.len())?;
-        total += ppl.ln();
-        n += 1;
-    }
-    if n == 0 {
-        return Err(BackendError::Shape("eval: пустой набор".into()));
-    }
-    Ok((total / n as f64).exp())
-}
-
-pub fn perplexity(
-    bk: &dyn Backend,
-    base: &BaseModel,
-    states: &[ParamState],
-    ids: &[u32],
-) -> Result<f64, BackendError> {
-    if ids.len() < 2 {
-        return Err(BackendError::Shape("ppl: слишком короткий текст".into()));
-    }
-    let labels: Vec<i32> = {
-        let mut l = ids[1..].iter().map(|&x| x as i32).collect::<Vec<_>>();
-        l.push(-1);
-        l
-    };
-    let fwd = forward_seq(bk, base, states, ids, &labels)?;
-    Ok(fwd.loss.exp())
 }

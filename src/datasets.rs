@@ -184,11 +184,11 @@ fn json_to_example(v: &serde_json::Value, format: DatasetFormat) -> Option<Examp
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            if let Some(input) = v.get("input").and_then(|x| x.as_str()) {
-                if !input.is_empty() {
-                    prompt.push_str("\n");
-                    prompt.push_str(input);
-                }
+            if let Some(input) = v.get("input").and_then(|x| x.as_str())
+                && !input.is_empty()
+            {
+                prompt.push('\n');
+                prompt.push_str(input);
             }
             let completion = v.get("output").and_then(|x| x.as_str())?.to_string();
             Some(Example {
@@ -241,11 +241,23 @@ pub fn profile(examples: &[Example], format: DatasetFormat) -> DatasetProfile {
     DatasetProfile {
         format: format.as_str().to_string(),
         count: examples.len(),
-        avg_prompt_chars: if examples.is_empty() { 0.0 } else { sum_p / examples.len() as f64 },
+        avg_prompt_chars: if examples.is_empty() {
+            0.0
+        } else {
+            sum_p / examples.len() as f64
+        },
         max_prompt_chars: max_p,
-        avg_completion_chars: if examples.is_empty() { 0.0 } else { sum_c / examples.len() as f64 },
+        avg_completion_chars: if examples.is_empty() {
+            0.0
+        } else {
+            sum_c / examples.len() as f64
+        },
         exact_duplicates: dup,
-        cyrillic_share: if examples.is_empty() { 0.0 } else { cyrillic as f64 / examples.len() as f64 },
+        cyrillic_share: if examples.is_empty() {
+            0.0
+        } else {
+            cyrillic as f64 / examples.len() as f64
+        },
         total_chars,
     }
 }
@@ -265,16 +277,22 @@ pub fn split_examples(
     let mut idx: Vec<usize> = (0..total).collect();
     let mut rng = 0x9e3779b97f4a7c15u64 ^ seed;
     for i in (1..total).rev() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (rng % (i as u64 + 1)) as usize;
         idx.swap(i, j);
     }
     let mut n_train = ((total as f64) * train).round() as usize;
-    let mut n_val = ((total as f64) * val).round() as usize;
-    let mut n_test = ((total as f64) * test).round() as usize;
+    let n_val = ((total as f64) * val).round() as usize;
+    let n_test = ((total as f64) * test).round() as usize;
     let extra = total.saturating_sub(n_train + n_val + n_test);
     n_train += extra; // остаток — в train
-    let mut pick = |n: usize| idx.drain(0..n).map(|i| examples[i].clone()).collect::<Vec<_>>();
+    let mut pick = |n: usize| {
+        idx.drain(0..n)
+            .map(|i| examples[i].clone())
+            .collect::<Vec<_>>()
+    };
     (
         pick(n_train),
         if n_val > 0 { pick(n_val) } else { Vec::new() },
@@ -300,18 +318,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ds-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("a.json");
-        std::fs::write(&p, serde_json::json!([
-            {"instruction": "Скажи привет", "input": "", "output": "Привет!"},
-            {"instruction": "Сложи", "input": "2 и 2", "output": "4"},
-            {"instruction": "Дубль", "input": "", "output": "Ответ"}
-        ]).to_string()).unwrap();
+        std::fs::write(
+            &p,
+            serde_json::json!([
+                {"instruction": "Скажи привет", "input": "", "output": "Привет!"},
+                {"instruction": "Сложи", "input": "2 и 2", "output": "4"},
+                {"instruction": "Дубль", "input": "", "output": "Ответ"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
         let exs = parse_dataset(&p, DatasetFormat::Alpaca).unwrap();
         assert_eq!(exs.len(), 3);
         assert_eq!(exs[0].prompt, "Скажи привет");
         assert_eq!(exs[1].prompt, "Сложи\n2 и 2");
         let prof = profile(&exs, DatasetFormat::Alpaca);
         assert_eq!(prof.count, 3);
-        assert!(prof.cyrillic_share > 0.9, "кириллица: {}", prof.cyrillic_share);
+        assert!(
+            prof.cyrillic_share > 0.9,
+            "кириллица: {}",
+            prof.cyrillic_share
+        );
         let (tr, va, te) = split_examples(&exs, 0.8, 0.1, 0.1, 42);
         assert_eq!(tr.len() + va.len() + te.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
@@ -322,16 +349,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ds2-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("s.jsonl");
-        std::fs::write(&p, r#"{"conversations":[{"from":"user","value":"ча"}]}
+        std::fs::write(
+            &p,
+            r#"{"conversations":[{"from":"user","value":"ча"}]}
 {"conversations":[{"from":"user","value":"привет"},{"from":"gpt","value":"здравствуй"}]}
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let exs = parse_dataset(&p, DatasetFormat::Sharegpt).unwrap();
         assert_eq!(exs.len(), 1, "первая строка без ответа отбрасывается");
         assert_eq!(exs[0].completion, "здравствуй");
         let p2 = dir.join("d.json");
-        std::fs::write(&p2, serde_json::json!([
-            {"prompt": "вопрос", "chosen": "хороший", "rejected": "плохой"}
-        ]).to_string()).unwrap();
+        std::fs::write(
+            &p2,
+            serde_json::json!([
+                {"prompt": "вопрос", "chosen": "хороший", "rejected": "плохой"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
         let exs2 = parse_dataset(&p2, DatasetFormat::Dpo).unwrap();
         assert_eq!(exs2[0].completion, "хороший");
         assert_eq!(exs2[0].rejected.as_deref(), Some("плохой"));

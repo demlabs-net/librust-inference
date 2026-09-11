@@ -681,17 +681,15 @@ impl Qwen3Model {
         // раз на forward (Q3_NO_DS — осознанное отключение, без варнинга).
         if mrope.is_some()
             && std::env::var("Q3_NO_DS").is_err()
-            && deepstack.map_or(true, |d| d.is_empty())
+            && deepstack.is_none_or(|d| d.is_empty())
+            && let Some(n) = self.cfg.n_deepstack
+            && n > 0
         {
-            if let Some(n) = self.cfg.n_deepstack {
-                if n > 0 {
-                    tracing::warn!(
-                        n_deepstack = n,
-                        "mrope/vision forward: config expects {n} deepstack blocks, \
+            tracing::warn!(
+                n_deepstack = n,
+                "mrope/vision forward: config expects {n} deepstack blocks, \
                          none provided — vision hidden states will miss the deepstack adds"
-                    );
-                }
-            }
+            );
         }
         // N (iter-10): one mask per forward (see the other loops).
         let mask = if let Some(mrope) = mrope {
@@ -712,10 +710,10 @@ impl Qwen3Model {
             None
         };
         for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(u) = upto {
-                if i >= u {
-                    break;
-                }
+            if let Some(u) = upto
+                && i >= u
+            {
+                break;
             }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
@@ -780,14 +778,13 @@ impl Qwen3Model {
             // в prefill_with_vision (нули вне image-строк) — полное сложение.
             // Старый вариант `x[t] += embd_in[t + il + 1]` сдвигал на il+1
             // ТОКЕН эмбеддингов текста — не deepstack-фичи (ошибка).
-            if mrope.is_some() && std::env::var("Q3_NO_DS").is_err() {
-                if let Some(n_ds) = self.cfg.n_deepstack {
-                    if i < n_ds {
-                        if let Some(ds) = deepstack.and_then(|d| d.get(i)) {
-                            x = backend.deepstack(&x, ds, 0)?;
-                        }
-                    }
-                }
+            if mrope.is_some()
+                && std::env::var("Q3_NO_DS").is_err()
+                && let Some(n_ds) = self.cfg.n_deepstack
+                && i < n_ds
+                && let Some(ds) = deepstack.and_then(|d| d.get(i))
+            {
+                x = backend.deepstack(&x, ds, 0)?;
             }
         }
         if prof && t > 1 {
@@ -1137,7 +1134,7 @@ impl Qwen3Model {
         pos: usize,
         t: usize,
         mrope: Option<&[u32]>,
-        causal: bool,
+        _causal: bool,
         cache_at: Option<usize>,
         // N (iter-10): the causal/mrope mask is IDENTICAL for every layer
         // (each layer's cache.pos equals the same value at its own update),
@@ -1274,7 +1271,7 @@ impl Qwen3Model {
         // N (iter-10): mask passed in from the caller (built once per
         // forward); the `causal`/`mrope` arguments are kept for the call
         // sites' None-vs-Some decision, but the build itself moved out.
-        let mask = mask.map(|m| m.clone());
+        let mask = mask.cloned();
         let ck = cache.view();
         let cv = cache.view_v();
         let attn_out = backend.zeros(vec![b, tq, q_size])?;

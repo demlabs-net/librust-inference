@@ -165,10 +165,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
             ("{#-", MarkerKind::Comment),
             ("{#", MarkerKind::Comment),
         ] {
-            if let Some(p) = rest.find(pat) {
-                if best.map_or(true, |(bi, _)| p < bi) {
-                    best = Some((p, kind));
-                }
+            if let Some(p) = rest.find(pat)
+                && best.is_none_or(|(bi, _)| p < bi)
+            {
+                best = Some((p, kind));
             }
         }
         let Some((idx, kind)) = best else {
@@ -180,7 +180,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, TemplateError> {
             || rest[idx..].starts_with("{#-");
         if trim_next {
             text = text.trim_start().to_string();
-            trim_next = false;
+            // trim_next перезаписывается ниже (trim_after) — сброс не нужен.
         }
         text.push_str(&rest[..idx]);
         if trim_before {
@@ -429,13 +429,13 @@ fn eval_value(expr: &str, ctx: &TemplateContext, st: &HashMap<String, String>) -
         return Ok(unescape_literal(inner));
     }
     // индексация: expr['key']
-    if let Some(rest) = e.strip_suffix(']') {
-        if let Some((obj, key)) = rest.split_once("['") {
-            let key = key
-                .strip_suffix('\'')
-                .ok_or_else(|| TemplateError::Unsupported(e.into()))?;
-            return eval_index(obj.trim(), key, ctx, st);
-        }
+    if let Some(rest) = e.strip_suffix(']')
+        && let Some((obj, key)) = rest.split_once("['")
+    {
+        let key = key
+            .strip_suffix('\'')
+            .ok_or_else(|| TemplateError::Unsupported(e.into()))?;
+        return eval_index(obj.trim(), key, ctx, st);
     }
     // спец-токены и переменные контекста
     if let Some(v) = st.get(e) {
@@ -455,7 +455,7 @@ fn eval_index(
     obj: &str,
     key: &str,
     ctx: &TemplateContext,
-    st: &HashMap<String, String>,
+    _st: &HashMap<String, String>,
 ) -> VResult {
     match obj {
         "message" => {

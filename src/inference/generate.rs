@@ -188,7 +188,7 @@ pub fn generate(
             let mut best: Option<(usize, f32)> = None;
             for (i, l) in penalized.iter().enumerate() {
                 let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
-                if best.map_or(true, |(_, bl)| l > bl) {
+                if best.is_none_or(|(_, bl)| l > bl) {
                     best = Some((i, l));
                 }
             }
@@ -234,7 +234,7 @@ pub fn generate(
             };
             if !draft_tokens.is_empty() {
                 let tlayers: Vec<usize> = {
-                    let mut dr = drafter.lock().unwrap();
+                    let dr = drafter.lock().unwrap();
                     dr.target_layers().to_vec()
                 };
                 let out = model.decode_spec(
@@ -290,10 +290,8 @@ pub fn generate(
         finish = Some(FinishReason::MaxTokens);
     }
     let tail = decoder.finish();
-    if !tail.is_empty() {
-        if !on_event(GenerateEvent::Delta(tail)) {
-            return Ok(generated);
-        }
+    if !tail.is_empty() && !on_event(GenerateEvent::Delta(tail)) {
+        return Ok(generated);
     }
     if params.spec_gamma > 0 && params.drafter.is_some() {
         on_event(GenerateEvent::SpecStats(spec_stats));

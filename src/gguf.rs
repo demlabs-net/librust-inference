@@ -389,7 +389,16 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
 
     // Tensor infos: оффсеты в GGUF ОТНОСИТЕЛЬНЫ начала секции данных
     // (llama.cpp: data_offset + tensor.offset). Секция данных начинается
-    // сразу после таблицы тензоров, с выравниванием 32.
+    // сразу после таблицы тензоров, с выравниванием `general.alignment`
+    // (32 по умолчанию). Файл, собранный с 64, читался со смещением: парсер
+    // отдавал zero-padding вместо весов, и модель деградировала молча.
+    let align = metadata
+        .iter()
+        .find(|(k, _)| k == "general.alignment")
+        .and_then(|(_, v)| v.as_u32())
+        .map(u64::from)
+        .filter(|a| *a > 0 && a.is_power_of_two())
+        .unwrap_or(TENSOR_ALIGN);
     struct RawInfo {
         name: String,
         dims: Vec<u64>,
@@ -419,7 +428,7 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
         });
     }
     let mut data_base = pos as u64;
-    while data_base % TENSOR_ALIGN != 0 {
+    while data_base % align != 0 {
         data_base += 1;
     }
 
@@ -460,7 +469,9 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
                 offset,
                 size,
             })?;
-        if rel_offset % TENSOR_ALIGN != 0 {
+        // The RELATIVE offset must respect the SAME alignment the data section
+        // uses (it used to hard-code 32, so a 64-aligned file was rejected).
+        if rel_offset % align != 0 {
             return Err(GgufError::UnalignedTensor { name, offset });
         }
         tensors.push(GgufTensor {
@@ -608,7 +619,6 @@ mod tests {
     }
 }
 
-
 // ── Painter (1.6b): минимальный GGUF v2 writer ─────────────────────────────
 
 /// Тензор для записи: имя, размеры, тип, сырые данные (ggml-порядок).
@@ -702,13 +712,21 @@ pub fn write_gguf(
         patch_pos.push(out.len());
         w_u64(out, 0); // offset-плейсхолдер (RELATIVE к началу данных)
     }
-    // Данные: выравнивание 32; оффсеты в таблице — относительно начала
-    // секции данных (как в llama.cpp), не абсолютные.
-    const ALIGN: usize = 32;
-    let mut pos = (out.len() + ALIGN - 1) & !(ALIGN - 1);
+    // Данные: выравнивание берётся из `general.alignment` (32 по умолчанию) —
+    // ровно то, что использует парсер. Жёсткая 32 при ключе 64 в metadata
+    // делала файл нечитаемым собственным round-trip'ом. Оффсеты в таблице —
+    // относительно начала секции данных (как в llama.cpp), не абсолютные.
+    let align = metadata
+        .iter()
+        .find(|(k, _)| k == "general.alignment")
+        .and_then(|(_, v)| v.as_u32())
+        .map(|a| a as usize)
+        .filter(|a| *a > 0 && a.is_power_of_two())
+        .unwrap_or(32);
+    let mut pos = (out.len() + align - 1) & !(align - 1);
     let data_base = pos;
     for (i, t) in tensors.iter().enumerate() {
-        let aligned = (pos + ALIGN - 1) & !(ALIGN - 1);
+        let aligned = (pos + align - 1) & !(align - 1);
         let off_bytes = ((aligned - data_base) as u64).to_le_bytes();
         let pp = patch_pos[i];
         out[pp..pp + 8].copy_from_slice(&off_bytes);
@@ -720,10 +738,88 @@ pub fn write_gguf(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests51 {
     use super::*;
+
+    /// Builds a minimal GGUFv2 by hand so the data section can be aligned to an
+    /// arbitrary `general.alignment` (the writer's own default is 32).
+    fn hand_rolled_gguf(align: u64, payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        b.extend_from_slice(&V2.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&2u64.to_le_bytes()); // kv count
+        w_str(&mut b, "general.architecture");
+        w_u32(&mut b, gguf_type_of(&GgufValue::String(String::new())));
+        w_str(&mut b, "test");
+        w_str(&mut b, "general.alignment");
+        w_u32(&mut b, gguf_type_of(&GgufValue::U32(0)));
+        w_u32(&mut b, align as u32);
+        // tensor info
+        w_str(&mut b, "w");
+        w_u32(&mut b, 2);
+        w_u64(&mut b, 4);
+        w_u64(&mut b, 1);
+        w_u32(&mut b, GgmlType::F32.raw());
+        w_u64(&mut b, 0); // relative offset
+        while b.len() as u64 % align != 0 {
+            b.push(0);
+        }
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// A file whose data section is aligned to 64 must read back EXACTLY: the
+    /// parser hard-coded a 32-byte alignment, so it started reading 32 bytes of
+    /// zero padding early and every weight came out as zeros (silently).
+    #[test]
+    fn non_default_alignment_is_honoured() {
+        let data: Vec<f32> = vec![1.5, -2.25, 3.75, 0.5];
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let buf = hand_rolled_gguf(64, &bytes);
+        let f = parse(&buf).unwrap();
+        let t = &f.tensors[0];
+        let back: Vec<f32> = t
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(back, data, "weights must survive a 64-byte alignment");
+    }
+
+    /// The writer must agree with the parser: a file written with an explicit
+    /// `general.alignment` has to be readable by the same crate.
+    #[test]
+    fn writer_honours_declared_alignment() {
+        let data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0];
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut buf = Vec::new();
+        write_gguf(
+            &mut buf,
+            &[
+                (
+                    "general.architecture".to_string(),
+                    GgufValue::String("qwen3".into()),
+                ),
+                ("general.alignment".to_string(), GgufValue::U32(64)),
+            ],
+            &[GgufWriteTensor {
+                name: "w".into(),
+                dims: vec![2, 2],
+                ggml_type: GgmlType::F32,
+                data: bytes,
+            }],
+        )
+        .unwrap();
+        let f = parse(&buf).unwrap();
+        let back: Vec<f32> = f.tensors[0]
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(back, data);
+    }
 
     #[test]
     fn writer_roundtrip_v2() {
@@ -733,11 +829,15 @@ mod tests51 {
         write_gguf(
             &mut buf,
             &vec![
-                ("general.architecture".to_string(), GgufValue::String("qwen3".into())),
+                (
+                    "general.architecture".to_string(),
+                    GgufValue::String("qwen3".into()),
+                ),
                 ("qwen3.vocab_size".to_string(), GgufValue::U32(151936)),
-                ("misc.array".to_string(), GgufValue::Array(vec![
-                    GgufValue::U32(1), GgufValue::U32(2),
-                ])),
+                (
+                    "misc.array".to_string(),
+                    GgufValue::Array(vec![GgufValue::U32(1), GgufValue::U32(2)]),
+                ),
             ],
             &[GgufWriteTensor {
                 name: "token_embd.weight".into(),
@@ -750,14 +850,20 @@ mod tests51 {
         // read-back
         let f = parse(&buf).unwrap();
         assert_eq!(f.architecture(), Some("qwen3"));
-        assert_eq!(f.get("qwen3.vocab_size").and_then(GgufValue::as_u32), Some(151936));
+        assert_eq!(
+            f.get("qwen3.vocab_size").and_then(GgufValue::as_u32),
+            Some(151936)
+        );
         assert_eq!(f.tensors.len(), 1);
         let t = &f.tensors[0];
         assert_eq!(t.name, "token_embd.weight");
         assert_eq!(t.numel(), 4);
         let raw = t.data;
         assert_eq!(raw.len(), 16);
-        let back: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let back: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         assert_eq!(back, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
@@ -767,7 +873,10 @@ mod tests51 {
     fn writer_roundtrip_multi_and_value_types() {
         let mut buf = Vec::new();
         let f16_bytes: Vec<u8> = (0u16..6).flat_map(|x| x.to_le_bytes()).collect();
-        let f32_bytes: Vec<u8> = vec![1.0f32, -2.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let f32_bytes: Vec<u8> = vec![1.0f32, -2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
         write_gguf(
             &mut buf,
             &[
@@ -781,10 +890,13 @@ mod tests51 {
                 ("a.u64".into(), GgufValue::U64(u64::MAX / 3)),
                 ("a.i64".into(), GgufValue::I64(-(i64::MAX / 3))),
                 ("a.f64".into(), GgufValue::F64(1.5)),
-                ("a.strs".into(), GgufValue::Array(vec![
-                    GgufValue::String("x".into()),
-                    GgufValue::String("yz".into()),
-                ])),
+                (
+                    "a.strs".into(),
+                    GgufValue::Array(vec![
+                        GgufValue::String("x".into()),
+                        GgufValue::String("yz".into()),
+                    ]),
+                ),
             ],
             &[
                 GgufWriteTensor {

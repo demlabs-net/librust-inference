@@ -1406,11 +1406,11 @@ kernel void im2col_t1d_f32(
 
 // ── Quantized GEMM / MV: A fp32 × B quantized [N, K], fp32 accumulate ───────
 // Block layouts (ggml, reimplemented): Q4_0 18 B/32, Q8_0 34 B/32,
-// Q4_K 148 B/256, Q6_K 210 B/256. Activations read directly from the block
+// Q4_K 144 B/256, Q6_K 210 B/256. Activations read directly from the block
 // bytes; CPU reference: weights_map::dequant_f32 (tests).
 
 static inline half load_half_unaligned(device const uchar* p) {
-    // даже смещения блоков (18/34/148/210 кратны 2) — выравнивание ushort ок
+    // даже смещения блоков (18/34/144/210 кратны 2) — выравнивание ushort ок
     return as_type<half>(*(device const ushort*)p);
 }
 
@@ -1466,8 +1466,57 @@ kernel void gemm_nt_q8_0(
     C[m * N + n] = acc;
 }
 
-// Q4_K: суперблок 256: d(f16), dmin(f16), scales[16] (4-бит sc: байты 0..7,
-// 4-бит m: байты 8..15), qs[128]. y = d*dmin + d*sc*(q - 8).
+// Canonical Q4_K (GGUF/llama.cpp block_q4_K): 144 B per 256-weight super-block —
+// d (f16 @0..2), dmin (f16 @2..4), scales[12] (@4..16, the 6-bit
+// get_scale_min_k4 packing of 8 sub-blocks × (scale, min)), qs[128]
+// (@16..144, chunk-major). Dequant: w = d·sc·q − dmin·m.
+//
+// ВАЖНО: здесь была раскладка-«диалект» на 148 Б (qs на смещении 20) с
+// формулой min + d·sc·(q−8). Она не совпадала с GGUF: проверка размера в
+// from_quantized отвергала КОРРЕКТНЫЕ Q4_K-тензоры (144 Б), а при обходе
+// проверки веса читались бы мусором. CUDA-путь и weights_map уже перешли на
+// канонические 144 Б — Metal остался позади. Формула и распаковка нибблов
+// теперь совпадают с q4kc_weight (kernels.cu) и ggml dequantize_row_q4_K.
+static inline void q4k_scale_min(
+    device const uchar* scales, uint b, thread int& sc, thread int& mn)
+{
+    if (b < 4) {
+        sc = scales[b] & 63;
+        mn = scales[4 + b] & 63;
+    } else {
+        sc = (scales[b + 4] & 0xF) | ((scales[b - 4] >> 6) << 4);
+        mn = (scales[b + 4] >> 4) | ((scales[b] >> 6) << 4);
+    }
+}
+
+/// Скалярное произведение строки активаций на один Q4_K-суперблок.
+static inline float dot_q4_k(device const float* a, device const uchar* blk) {
+    float d = (float)load_half_unaligned(blk);
+    float dmin = (float)load_half_unaligned(blk + 2);
+    device const uchar* qs = blk + 16;
+    float acc = 0.0f;
+    for (uint b = 0; b < 8; ++b) {
+        int sc, mn;
+        q4k_scale_min(blk + 4, b, sc, mn);
+        float dd = d * (float)sc;
+        float mm = dmin * (float)mn;
+        // chunk-major: байт qs[32·(b/2) + l] держит w[64·(b/2) + l] в младшем
+        // ниббле и w[64·(b/2) + 32 + l] — в старшем.
+        device const uchar* qb = qs + 32 * (b >> 1);
+        uint base = b * 32;
+        if ((b & 1) == 0) {
+            for (uint l = 0; l < 32; ++l) {
+                acc += a[base + l] * (dd * (float)(qb[l] & 0xF) - mm);
+            }
+        } else {
+            for (uint l = 0; l < 32; ++l) {
+                acc += a[base + l] * (dd * (float)(qb[l] >> 4) - mm);
+            }
+        }
+    }
+    return acc;
+}
+
 kernel void gemm_nt_q4_k(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],
@@ -1482,22 +1531,8 @@ kernel void gemm_nt_q4_k(
     const uint superblocks = K / 256;
     float acc = 0.0f;
     for (uint sb = 0; sb < superblocks; ++sb) {
-        device const uchar* s = B + (n * superblocks + sb) * 148;
-        float d = (float)load_half_unaligned(s);
-        float dmin = (float)load_half_unaligned(s + 2);
-        float min = d * dmin;
-        device const uchar* qs = s + 20;
-        uint k0 = sb * 256;
-        for (uint b = 0; b < 8; ++b) {
-            uchar scn = s[4 + b / 2];
-            float sc = (float)((b % 2 == 0) ? (scn & 0xF) : (scn >> 4));
-            uint kb = k0 + b * 32;
-            for (uint j = 0; j < 16; ++j) {
-                uchar v = qs[b * 16 + j];
-                acc += A[m * K + kb + j * 2 + 0] * (min + d * sc * ((float)(v & 0xF) - 8.0f));
-                acc += A[m * K + kb + j * 2 + 1] * (min + d * sc * ((float)(v >> 4) - 8.0f));
-            }
-        }
+        device const uchar* s = B + (n * superblocks + sb) * 144;
+        acc += dot_q4_k(A + m * K + sb * 256, s);
     }
     C[m * N + n] = acc;
 }
@@ -1601,22 +1636,8 @@ kernel void mv_q4_k(
     const uint superblocks = K / 256;
     float acc = 0.0f;
     for (uint sb = 0; sb < superblocks; ++sb) {
-        device const uchar* s = B + (n * superblocks + sb) * 148;
-        float d = (float)load_half_unaligned(s);
-        float dmin = (float)load_half_unaligned(s + 2);
-        float min = d * dmin;
-        device const uchar* qs = s + 20;
-        uint k0 = sb * 256;
-        for (uint b = 0; b < 8; ++b) {
-            uchar scn = s[4 + b / 2];
-            float sc = (float)((b % 2 == 0) ? (scn & 0xF) : (scn >> 4));
-            uint kb = k0 + b * 32;
-            for (uint j = 0; j < 16; ++j) {
-                uchar v = qs[b * 16 + j];
-                acc += A[kb + j * 2 + 0] * (min + d * sc * ((float)(v & 0xF) - 8.0f));
-                acc += A[kb + j * 2 + 1] * (min + d * sc * ((float)(v >> 4) - 8.0f));
-            }
-        }
+        device const uchar* s = B + (n * superblocks + sb) * 144;
+        acc += dot_q4_k(A + sb * 256, s);
     }
     C[n] = acc;
 }

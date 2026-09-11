@@ -59,6 +59,12 @@ required-features = ["metal"]
 [[example]]
 name = "dflash_probe2"
 required-features = ["metal"]
+# nan_probe imports rust_inference::metal directly. Without this gate a plain
+# `cargo test` on a non-macOS host failed to COMPILE the example (E0432), so no
+# integration test in this crate ran at all on Linux/CUDA hosts.
+[[example]]
+name = "nan_probe"
+required-features = ["metal"]
 
 # The Metal engine (our own MSL kernels + buffers) — behind the `metal`
 # feature so a backend-less build (contract + CPU-test skeleton) compiles on

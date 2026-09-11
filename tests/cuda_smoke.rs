@@ -467,3 +467,48 @@ fn close(a: &[f32], b: &[f32]) -> bool {
     }
     ok
 }
+
+/// Length guards on the elementwise kernels: `n` is taken from the FIRST
+/// operand, so a short `out` (or short second operand) used to launch a kernel
+/// that wrote/read past the end of a device allocation — reachable from safe
+/// code, e.g. `scale(&x[4096], &out[1], 2.0)`. The call must now fail cleanly.
+#[test]
+fn elementwise_rejects_length_mismatch() {
+    let Some(gpu) = make_gpu() else { return };
+    let long = gpu.from_cpu_f32(&[1.0f32; 64], vec![64]).unwrap();
+    let short = gpu.from_cpu_f32(&[0.0f32; 1], vec![1]).unwrap();
+    let same = gpu.from_cpu_f32(&[2.0f32; 64], vec![64]).unwrap();
+
+    // out too short (the old code wrote 64 elements into a 1-element buffer)
+    assert!(
+        gpu.scale(&long, &short, 2.0).is_err(),
+        "scale into a short output must be rejected"
+    );
+    // second operand too short
+    assert!(
+        gpu.add(&long, &short, &same).is_err(),
+        "add with a short second operand must be rejected"
+    );
+    // matching lengths still work
+    assert!(gpu.scale(&long, &same, 2.0).is_ok());
+}
+
+/// GEMM with an output aliasing an input is not a valid GEMM: it used to build
+/// a `&mut` to storage that another live reference pointed at (UB). Now: error.
+#[test]
+fn gemm_rejects_aliased_output() {
+    let Some(gpu) = make_gpu() else { return };
+    let a = gpu.from_cpu_f32(&[1.0f32; 16], vec![4, 4]).unwrap();
+    let b = gpu.from_cpu_f32(&[1.0f32; 16], vec![4, 4]).unwrap();
+    let c = gpu.from_cpu_f32(&[0.0f32; 16], vec![4, 4]).unwrap();
+    assert!(gpu.gemm(&a, &b, &c).is_ok(), "distinct buffers must work");
+    let aliased = a.clone();
+    assert!(
+        gpu.gemm(&a, &b, &aliased).is_err(),
+        "gemm with c aliasing a must be rejected"
+    );
+    assert!(
+        gpu.gemm(&c, &b, &c).is_err(),
+        "gemm with c aliasing an input tensor must be rejected"
+    );
+}

@@ -509,6 +509,14 @@ impl CudaBackend {
         if std::env::var_os("CUDA_NO_CUBLAS").is_some() {
             return Ok(false);
         }
+        // Reject aliased operands BEFORE creating the &mut below: C = A·B with
+        // C sharing storage with A or B is not a valid GEMM, and the aliased
+        // mutable reference would be undefined behaviour.
+        if c.shares_buffer_with(x) || c.shares_buffer_with(y) {
+            return Err(BackendError::Shape(
+                "gemm: output buffer aliases an input; use a distinct output tensor".into(),
+            ));
+        }
         let mut guard = lock_poison_resilient(&self.cublas);
         if guard.is_none() {
             match CudaBlas::new(self.stream.clone()) {
@@ -575,6 +583,25 @@ impl CudaBackend {
         c: f32,
     ) -> Result<(), BackendError> {
         let n = x.numel();
+        // Length guards: the kernel indexes `x[i]`, `y[i]` and writes `out[i]`
+        // for i in 0..n, but `n` is taken from `x` alone. A short `out` (or a
+        // short `y`) therefore produced a device out-of-bounds write/read —
+        // reachable through the safe public API, e.g. scale(&x[4096], &out[1]).
+        // Sizes must agree exactly; aliasing `out` with `x` stays allowed.
+        if out.numel() != n {
+            return Err(BackendError::Shape(format!(
+                "elementwise: output has {} elements, input has {n}",
+                out.numel()
+            )));
+        }
+        if let Some(y) = y {
+            if y.numel() != n {
+                return Err(BackendError::Shape(format!(
+                    "elementwise: second operand has {} elements, first has {n}",
+                    y.numel()
+                )));
+            }
+        }
         let xd = x.as_cuda();
         let yd = y.map(|t| t.as_cuda()).unwrap_or(xd);
         let od = out.as_cuda();
@@ -706,7 +733,6 @@ impl Backend for CudaBackend {
             _ => unreachable!(),
         }
     }
-
 
     fn from_cpu_f16(&self, data: &[half::f16], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let n: usize = shape.iter().product();
@@ -896,7 +922,6 @@ impl Backend for CudaBackend {
         Ok(Tensor::from_cuda_q3k(s, shape))
     }
 
-
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
         // raw bits and widens on the CPU — same result as a device-side cast.
@@ -1013,8 +1038,10 @@ impl Backend for CudaBackend {
                     for sb in 0..nsuper {
                         // kb-major: block (sb, r) at (sb·rows + r)·176.
                         let blk = &raw[(sb * rows + r) * 176..(sb * rows + r + 1) * 176];
-                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
-                        let mn = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
+                        let d =
+                            f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+                        let mn =
+                            f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
                         for j in 0..256 {
                             let b = j >> 5;
                             let l = j & 31;
@@ -1038,7 +1065,11 @@ impl Backend for CudaBackend {
                             // `blk[16 + l]` read chunk 0's bytes for blocks
                             // 2..7 (kernel-parity fix).
                             let qsb = 32 * (b >> 1);
-                            let mut q = if half == 0 { blk[16 + qsb + l] & 0xF } else { blk[16 + qsb + l] >> 4 };
+                            let mut q = if half == 0 {
+                                blk[16 + qsb + l] & 0xF
+                            } else {
+                                blk[16 + qsb + l] >> 4
+                            };
                             let u = 1 << (2 * (b >> 1) + half);
                             if blk[144 + l] & u != 0 {
                                 q += 16;
@@ -1059,7 +1090,9 @@ impl Backend for CudaBackend {
                     for sb in 0..nsuper {
                         // kb-major: block (sb, r) at (sb·rows + r)·110.
                         let blk = &raw[(sb * rows + r) * 110..(sb * rows + r + 1) * 110];
-                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[108], blk[109]])));
+                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([
+                            blk[108], blk[109],
+                        ])));
                         // scales[12] → 16 int8 via the ggml aux permutation.
                         let a0 = u32::from_le_bytes([blk[96], blk[97], blk[98], blk[99]]);
                         let a1 = u32::from_le_bytes([blk[100], blk[101], blk[102], blk[103]]);
@@ -1071,10 +1104,22 @@ impl Backend for CudaBackend {
                         let b2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
                         let b3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
                         let scs: [i8; 16] = [
-                            b0 as i8, (b0 >> 8) as i8, (b0 >> 16) as i8, (b0 >> 24) as i8,
-                            b1 as i8, (b1 >> 8) as i8, (b1 >> 16) as i8, (b1 >> 24) as i8,
-                            b2 as i8, (b2 >> 8) as i8, (b2 >> 16) as i8, (b2 >> 24) as i8,
-                            b3 as i8, (b3 >> 8) as i8, (b3 >> 16) as i8, (b3 >> 24) as i8,
+                            b0 as i8,
+                            (b0 >> 8) as i8,
+                            (b0 >> 16) as i8,
+                            (b0 >> 24) as i8,
+                            b1 as i8,
+                            (b1 >> 8) as i8,
+                            (b1 >> 16) as i8,
+                            (b1 >> 24) as i8,
+                            b2 as i8,
+                            (b2 >> 8) as i8,
+                            (b2 >> 16) as i8,
+                            (b2 >> 24) as i8,
+                            b3 as i8,
+                            (b3 >> 8) as i8,
+                            (b3 >> 16) as i8,
+                            (b3 >> 24) as i8,
                         ];
                         for j in 0..256 {
                             let s = j >> 4;
@@ -2457,7 +2502,9 @@ impl Backend for CudaBackend {
         let v = logits.shape()[logits.shape().len() - 1];
         let kk = k.clamp(1, 32);
         if v == 0 {
-            return Err(BackendError::Shape("penalized_topk: empty logits row".into()));
+            return Err(BackendError::Shape(
+                "penalized_topk: empty logits row".into(),
+            ));
         }
         let h = history.len();
         // History + histogram counts (u32).
@@ -3197,7 +3244,14 @@ impl Backend for CudaBackend {
             pairs as i32,
         );
         let (s0, s1, s2, sect_dims) = mrope_sections
-            .map(|s| (s[0] as i32, s[1] as i32, s[2] as i32, (s[0] + s[1] + s[2]) as i32))
+            .map(|s| {
+                (
+                    s[0] as i32,
+                    s[1] as i32,
+                    s[2] as i32,
+                    (s[0] + s[1] + s[2]) as i32,
+                )
+            })
             .unwrap_or((0, 0, 0, 0));
         match &k.inner {
             crate::backend::TensorInner::Cuda(_) => {

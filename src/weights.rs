@@ -165,8 +165,10 @@ fn f16_to_f32(h: u16) -> f32 {
 
 // ─────────────────── по-тензорный доступ (конверсия Ф4.12) ───────────────────
 
-/// Строка заголовка safetensors: (имя, dtype, shape, смещение в data-секции).
-type StTensorInfo = (String, String, Vec<usize>, usize);
+/// Строка заголовка safetensors: (имя, dtype, shape, начало и КОНЕЦ диапазона
+/// в файле). Конец обязателен: без него читатель доверял только shape и мог
+/// молча выйти за пределы своего тензора.
+type StTensorInfo = (String, String, Vec<usize>, usize, usize);
 
 /// Парсинг заголовка safetensors (имена + оффсеты, без данных).
 fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
@@ -216,7 +218,21 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
             .checked_add(8)
             .and_then(|s| s.checked_add(header_len))
             .ok_or_else(|| anyhow::anyhow!("data offset overflow for {name}"))?;
-        out.push((name.clone(), dtype, shape, start));
+        // Конец диапазона тоже нужен: без него читатель брал размер из shape
+        // и не сверял его с заголовком, поэтому лживый/битый заголовок
+        // приводил к молчаливому чтению ЧУЖИХ байтов (соседнего тензора).
+        let raw_end = offsets
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets[1] for {name}"))? as usize;
+        let end = raw_end
+            .checked_add(8)
+            .and_then(|e| e.checked_add(header_len))
+            .ok_or_else(|| anyhow::anyhow!("data offset overflow for {name}"))?;
+        if end < start {
+            anyhow::bail!("tensor {name}: data_offsets[1] < data_offsets[0]");
+        }
+        out.push((name.clone(), dtype, shape, start, end));
     }
     Ok(out)
 }
@@ -225,7 +241,7 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
 pub fn safetensors_tensor_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(safetensors_header(path)?
         .into_iter()
-        .map(|(n, _, _, _)| n)
+        .map(|(n, _, _, _, _)| n)
         .collect())
 }
 
@@ -233,8 +249,8 @@ pub fn safetensors_tensor_names(path: &Path) -> anyhow::Result<Vec<String>> {
 pub fn safetensors_tensor_numel(path: &Path, name: &str) -> anyhow::Result<usize> {
     let h = safetensors_header(path)?;
     h.into_iter()
-        .find(|(n, _, _, _)| n == name)
-        .map(|(_, _, shape, _)| {
+        .find(|(n, _, _, _, _)| n == name)
+        .map(|(_, _, shape, _, _)| {
             shape
                 .iter()
                 .try_fold(1usize, |acc, &d| acc.checked_mul(d))
@@ -251,9 +267,9 @@ pub fn read_safetensors_tensor_f32(
     name: &str,
 ) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
     let h = safetensors_header(path)?;
-    let (_, dtype, shape, start) = h
+    let (_, dtype, shape, start, declared_end) = h
         .into_iter()
-        .find(|(n, _, _, _)| n == name)
+        .find(|(n, _, _, _, _)| n == name)
         .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))?;
     let bytes = std::fs::read(path)?;
     // checked product (битый shape в заголовке → чистый Err, не wrap).
@@ -274,6 +290,15 @@ pub fn read_safetensors_tensor_f32(
     let end = start
         .checked_add(nbytes)
         .ok_or_else(|| anyhow::anyhow!("overflow for {name}"))?;
+    // Сверяем вычисленный размер с границей из заголовка: shape/dtype могут
+    // не соответствовать data_offsets, и тогда чтение ушло бы в соседний
+    // тензор, не вызвав ни одной ошибки.
+    if end > declared_end {
+        anyhow::bail!(
+            "tensor {name}: {nbytes} B по shape/dtype не влезает в диапазон заголовка              ({} B)",
+            declared_end.saturating_sub(start)
+        );
+    }
     let data = bytes
         .get(start..end)
         .ok_or_else(|| anyhow::anyhow!("tensor {name}: byte range out of bounds"))?;

@@ -314,8 +314,8 @@ extern "C" __global__ void kv_shift_q8(
 
 // KV re-rotation (plan 1.6): the kept keys were stored rotated for their
 // ORIGINAL absolute positions [shift..pos); after the compaction shift they
-// must carry the rotations of [0..pos-shift). Every pair (2i, 2i+1) of
-// every head rotates by -shift * theta^(-2i/hd). The cos/sin table (hd/2
+// must carry the rotations of [0..pos-shift). Every HALVES pair pi of every
+// head rotates by -shift * theta^(-2pi/hd). The cos/sin table (hd/2
 // entries) is passed in.
 // The mrope-text pair filter (mirror of rope_mrope_text_f32): with
 // sections the pairs in the "empty" (t) sector carry NO position rotation

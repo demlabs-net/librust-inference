@@ -367,10 +367,27 @@ impl Tensor {
         }
     }
 
+    /// True when both tensors are the SAME CUDA allocation. Cloned tensors and
+    /// pool-reused buffers share their `Arc<CudaBuffer>`, so this catches the
+    /// aliasing that would otherwise turn a `&mut` built in
+    /// [`Tensor::as_cuda_mut`] into undefined behaviour (two live references,
+    /// one of them mutable, into the same slice).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn shares_buffer_with(&self, other: &Tensor) -> bool {
+        match (&self.inner, &other.inner) {
+            (TensorInner::Cuda(a), TensorInner::Cuda(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda_mut(&self) -> &mut cudarc::driver::CudaSlice<f32> {
         // &mut through &self: the caller is the only holder of the backend
         // during an op (no concurrent mutation of this tensor's storage).
+        // SAFETY: callers must also guarantee that no OTHER live reference to
+        // this allocation exists for the duration — see
+        // [`Tensor::shares_buffer_with`], which the GEMM path uses to reject
+        // aliased operands.
         match &self.inner {
             TensorInner::Cuda(b) => unsafe {
                 &mut *Arc::as_ptr(b).cast_mut().as_mut().unwrap().as_slice_mut()
@@ -424,7 +441,11 @@ impl Tensor {
         // R30: same as view — the debug_assert alone was a release-mode
         // silent-corruption hole.
         let n = shape.iter().product::<usize>();
-        assert!(n <= self.numel(), "view_restricted: {n} > numel {}", self.numel());
+        assert!(
+            n <= self.numel(),
+            "view_restricted: {n} > numel {}",
+            self.numel()
+        );
         self.view_inner(shape)
     }
 
@@ -545,7 +566,13 @@ pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
         return Ok(std::sync::Arc::new(crate::cuda::CudaBackend::new(0)?));
     }
     #[cfg(feature = "cpu")]
-    if requested.as_deref().map(|r| r == "cpu").unwrap_or(false) {
+    // K30 promised that `cpu` in the default feature set would run the CPU
+    // reference integration tests, but this branch required an explicit
+    // `BACKEND=cpu`: a bare `cargo test` fell through to BackendUnavailable and
+    // the tests that skip on `None` silently did not run (which is how the
+    // CPU re-rotation defect survived). GPU backends are still checked first,
+    // so a build that also enables metal/cuda keeps its priority.
+    if requested.as_deref().map(|r| r == "cpu").unwrap_or(true) {
         return Ok(std::sync::Arc::new(crate::cpu::CpuBackend));
     }
     #[allow(unreachable_code)]
@@ -615,7 +642,6 @@ pub trait Backend: Send + Sync {
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;
     /// Upload host data (row-major) into a new tensor.
     fn from_cpu_f32(&self, data: &[f32], shape: Vec<usize>) -> Result<Tensor, BackendError>;
-
 
     /// Upload fp16 data (GEMM weight storage; activations stay fp32).
     /// Default: convert to f32 and behave like `from_cpu_f32` (CPU reference,
@@ -1025,7 +1051,10 @@ pub trait Backend: Send + Sync {
         // Q26: reject unsupported formats HERE with an Err — the old path
         // fell into dequant_f32's `unimplemented!()` (a panic from a pub
         // path reachable with a malformed checkpoint).
-        if matches!(format, crate::dtype::WeightFormat::Int4 | crate::dtype::WeightFormat::Nf4) {
+        if matches!(
+            format,
+            crate::dtype::WeightFormat::Int4 | crate::dtype::WeightFormat::Nf4
+        ) {
             return Err(BackendError::UnsupportedFormat(format!(
                 "from_quantized: {format:?} dequant not implemented"
             )));
@@ -1664,9 +1693,15 @@ pub trait Backend: Send + Sync {
                     }
                     let ang = -(shift as f32) * theta.powf(-2.0 * pi as f32 / head_dim as f32);
                     let (c, s) = (ang.cos(), ang.sin());
-                    let (x, y) = (xh[hbase + 2 * pi], xh[hbase + 2 * pi + 1]);
-                    xh[hbase + 2 * pi] = x * c - y * s;
-                    xh[hbase + 2 * pi + 1] = x * s + y * c;
+                    // HALVES layout — mirror of `rope_standard`, `rope_mrope_text`
+                    // and the CUDA/Metal rerotate kernels: pair `pi` is
+                    // (elem pi, elem pi + hd/2). The previous adjacent-pair
+                    // access (2*pi, 2*pi+1) rotated a different pairing than
+                    // the forward rope, so it was not the inverse operation.
+                    let half = head_dim / 2;
+                    let (x, y) = (xh[hbase + pi], xh[hbase + pi + half]);
+                    xh[hbase + pi] = x * c - y * s;
+                    xh[hbase + pi + half] = x * s + y * c;
                 }
             }
         }

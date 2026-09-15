@@ -709,9 +709,13 @@ impl Qwen3Model {
             );
         }
         // N (iter-10): one mask per forward (see the other loops).
+        // 7.5 (PP): tkv берётся от кэша ПЕРВОГО слоя диапазона — при from>0
+        // кэши [0..from) могли быть наполнены предыдущей стадией/прогоном,
+        // и маска по caches[0] читала пустые/чужие ключи.
+        let mask_pos_src = self.caches[from.min(self.caches.len() - 1)].pos;
         let mask = if let Some(mrope) = mrope {
             if t > 1 {
-                Some(build_mrope_mask(backend, t, self.caches[0].pos + t, mrope)?)
+                Some(build_mrope_mask(backend, t, mask_pos_src + t, mrope)?)
             } else {
                 None
             }
@@ -719,7 +723,7 @@ impl Qwen3Model {
             Some(crate::nn::build_causal_mask(
                 backend,
                 t,
-                self.caches[0].pos + t,
+                mask_pos_src + t,
                 pos,
                 self.cfg.swa_window,
             )?)
@@ -2025,5 +2029,237 @@ mod attn_tests {
             );
         }
         eprintln!("attn_ar_matches_cpu_reference OK ({} elems)", yv.len());
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod pp_range_tests {
+    use super::*;
+    use crate::metal::MetalBackend;
+    use std::collections::BTreeMap;
+
+    /// 7.5: разбиение слоёв [0..1)+[1..N) на двух «нодах» (два экземпляра
+    /// модели на одном бэке) численно равно полному forward.
+    /// Второй экземпляр нужен, чтобы исключить совпадение через общий кэш.
+    #[test]
+    fn two_stage_range_equals_full_forward() {
+        let c = Qwen3Config {
+            dim: 64,
+            n_layers: 4,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 16,
+            ffn_dim: 96,
+            vocab_size: 32,
+            rope_theta: 10_000.0,
+            rope_max_seq: 256,
+            norm_eps: 1e-6,
+            swa_window: None,
+            mrope_sections: None,
+            n_deepstack: None,
+        };
+        let backend = MetalBackend::new().unwrap();
+        // weights: build_model детерминирован по cfg? нет — строим ОДИН
+        // weights-map и грузим дважды (одинаковые веса в двух экземплярах).
+        let (be, mut model_a, mut model_b) = {
+            // соберём синтетический weights-map как в generate.rs-тестах
+            use crate::weights_map::{WeightTensor, WeightsMap};
+            let mut rng = crate::harness::Lcg::new(777);
+            let mut t: BTreeMap<String, (Vec<f32>, Vec<usize>)> = BTreeMap::new();
+            let dim = c.dim;
+            t.insert("token_embd.weight".into(), {
+                let v: Vec<f32> = (0..c.vocab_size * dim).map(|_| rng.next_f32()).collect();
+                (v, vec![c.vocab_size, dim])
+            });
+            for i in 0..c.n_layers {
+                let p = format!("blk.{i}.");
+                t.insert(format!("{p}attn_norm.weight"), {
+                    let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
+                    (v, vec![dim])
+                });
+                t.insert(format!("{p}attn_q.weight"), {
+                    let v: Vec<f32> = (0..c.n_heads * c.head_dim * dim)
+                        .map(|_| rng.next_f32() * 0.2 - 0.1)
+                        .collect();
+                    (v, vec![c.n_heads * c.head_dim, dim])
+                });
+                t.insert(format!("{p}attn_k.weight"), {
+                    let v: Vec<f32> = (0..c.n_kv_heads * c.head_dim * dim)
+                        .map(|_| rng.next_f32() * 0.2 - 0.1)
+                        .collect();
+                    (v, vec![c.n_kv_heads * c.head_dim, dim])
+                });
+                t.insert(format!("{p}attn_v.weight"), {
+                    let v: Vec<f32> = (0..c.n_kv_heads * c.head_dim * dim)
+                        .map(|_| rng.next_f32() * 0.2 - 0.1)
+                        .collect();
+                    (v, vec![c.n_kv_heads * c.head_dim, dim])
+                });
+                t.insert(format!("{p}attn_output.weight"), {
+                    let v: Vec<f32> = (0..dim * c.n_heads * c.head_dim)
+                        .map(|_| rng.next_f32() * 0.2 - 0.1)
+                        .collect();
+                    (v, vec![dim, c.n_heads * c.head_dim])
+                });
+                t.insert(format!("{p}attn_q_norm.weight"), {
+                    let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
+                    (v, vec![c.head_dim])
+                });
+                t.insert(format!("{p}attn_k_norm.weight"), {
+                    let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
+                    (v, vec![c.head_dim])
+                });
+                t.insert(format!("{p}ffn_norm.weight"), {
+                    let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
+                    (v, vec![dim])
+                });
+                t.insert(format!("{p}ffn_gate.weight"), {
+                    let v: Vec<f32> = (0..c.ffn_dim * dim).map(|_| rng.next_f32() * 0.2 - 0.1).collect();
+                    (v, vec![c.ffn_dim, dim])
+                });
+                t.insert(format!("{p}ffn_up.weight"), {
+                    let v: Vec<f32> = (0..c.ffn_dim * dim).map(|_| rng.next_f32() * 0.2 - 0.1).collect();
+                    (v, vec![c.ffn_dim, dim])
+                });
+                t.insert(format!("{p}ffn_down.weight"), {
+                    let v: Vec<f32> = (0..dim * c.ffn_dim).map(|_| rng.next_f32() * 0.2 - 0.1).collect();
+                    (v, vec![dim, c.ffn_dim])
+                });
+            }
+            t.insert("output_norm.weight".into(), {
+                let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
+                (v, vec![dim])
+            });
+            t.insert("output.weight".into(), {
+                let v: Vec<f32> = (0..c.vocab_size * dim)
+                    .map(|_| rng.next_f32() * 0.1 - 0.05)
+                    .collect();
+                (v, vec![c.vocab_size, dim])
+            });
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut layout: Vec<(String, Vec<u64>, u64, usize)> = Vec::new();
+            for (name, (data, shape)) in &t {
+                let off = bytes.len();
+                for v in data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                layout.push((
+                    name.clone(),
+                    shape.iter().map(|&d| d as u64).collect(),
+                    off as u64,
+                    data.len() * 4,
+                ));
+            }
+            let tensors: Vec<WeightTensor> = layout
+                .into_iter()
+                .map(|(name, shape, off, len)| WeightTensor {
+                    name,
+                    shape,
+                    format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
+                    offset: off,
+                    data: &bytes[off as usize..off as usize + len],
+                })
+                .collect();
+            let wm = WeightsMap {
+                arch: "qwen3".into(),
+                tensors,
+                storage: vec![crate::weights_map::Storage {
+                    offset: 0,
+                    data: &bytes,
+                }],
+            };
+            let ma = Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
+            let mb = Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
+            (backend, ma, mb)
+        };
+        let ids = [3u32, 7, 11];
+        let t = ids.len();
+        // полный forward (stage A+B в одном экземпляре)
+        model_a.reset_cache(&be).unwrap();
+        let x = model_a.embed_forward_test(&be, &ids).unwrap();
+        let full = model_a.forward_layers_range(&be, x, t, None, None, 0, None).unwrap();
+        // две стадии
+        model_a.reset_cache(&be).unwrap();
+        model_b.reset_cache(&be).unwrap();
+        let x1 = model_a.embed_forward_test(&be, &ids).unwrap();
+        let mid = model_a
+            .forward_layers_range(&be, x1, t, None, Some(2), 0, None)
+            .unwrap();
+        // контроль: та же стадия [0..2) на model_b
+        model_b.reset_cache(&be).unwrap();
+        let x1b = model_b.embed_forward_test(&be, &ids).unwrap();
+        let mid_b = model_b
+            .forward_layers_range(&be, x1b, t, None, Some(2), 0, None)
+            .unwrap();
+        let mv = be.to_cpu_f32(&mid).unwrap();
+        let mbv = be.to_cpu_f32(&mid_b).unwrap();
+        let d12 = mv.iter().zip(mbv.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("stage1 a-vs-b diff = {d12}");
+        let mid_v = be.to_cpu_f32(&mid).unwrap();
+        let mid_b = be.from_cpu_f32(&mid_v, mid.shape().to_vec()).unwrap();
+        let tail = model_b
+            .forward_layers_range(&be, mid_b, t, None, None, 2, None)
+            .unwrap();
+        // контроль: model_b полный == model_a полный?
+        model_b.reset_cache(&be).unwrap();
+        let x_b = model_b.embed_forward_test(&be, &ids).unwrap();
+        let full_b = model_b
+            .forward_layers_range(&be, x_b, t, None, None, 0, None)
+            .unwrap();
+        let fa = be.to_cpu_f32(&full).unwrap();
+        let fb = be.to_cpu_f32(&full_b).unwrap();
+        let d_inst = fa.iter().zip(fb.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("instance diff = {d_inst}");
+        // mid vs forward_extract[2] (вход слоя 2 в полном прогоне)
+        model_a.reset_cache(&be).unwrap();
+        let ext = model_a.forward_extract(&be, &ids, &[2]).unwrap();
+        let ev = be.to_cpu_f32(&ext[0]).unwrap();
+        let mv = be.to_cpu_f32(&mid).unwrap();
+        let dex = ev.iter().zip(mv.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("mid-vs-extract[2] diff = {dex}");
+        eprintln!("mid   [0,:8] = {:?}", &mv[..8]);
+        eprintln!("ext[2][0,:8] = {:?}", &ev[..8]);
+        eprintln!("mid rms = {:.4}, ext rms = {:.4}",
+            (mv.iter().map(|x| x*x).sum::<f32>() / mv.len() as f32).sqrt(),
+            (ev.iter().map(|x| x*x).sum::<f32>() / ev.len() as f32).sqrt());
+        // исходный forward_layers_hidden(upto=2) с двойным сбросом
+        model_a.reset_cache(&be).unwrap();
+        let xi = model_a.embed_forward_test(&be, &ids).unwrap();
+        let hid = model_a.forward_layers_hidden(&be, xi, t, None, Some(2), None).unwrap();
+        let hv = be.to_cpu_f32(&hid).unwrap();
+        let dh = mv.iter().zip(hv.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("range-vs-hidden(upto2) diff = {dh}");
+        // детерминизм: mid повторно
+        model_a.reset_cache(&be).unwrap();
+        let x2 = model_a.embed_forward_test(&be, &ids).unwrap();
+        let mid2 = model_a.forward_layers_range(&be, x2, t, None, Some(2), 0, None).unwrap();
+        let m2 = be.to_cpu_f32(&mid2).unwrap();
+        let dm = mv.iter().zip(m2.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("mid determinism diff = {dm}");
+        // послойно: после слоя 2
+        model_a.reset_cache(&be).unwrap();
+        let xa = model_a.embed_forward_test(&be, &ids).unwrap();
+        let l2a = model_a.forward_layers_range(&be, xa, t, None, Some(3), 0, None).unwrap();
+        model_b.reset_cache(&be).unwrap();
+        let xb = model_b.embed_forward_test(&be, &ids).unwrap();
+        let mid1_b = model_b.forward_layers_range(&be, xb, t, None, Some(2), 0, None).unwrap();
+        model_b.reset_cache(&be).unwrap();
+        let l2b = model_b.forward_layers_range(&be, mid1_b, t, None, Some(3), 0, None).unwrap();
+        let la = be.to_cpu_f32(&l2a).unwrap();
+        let lb = be.to_cpu_f32(&l2b).unwrap();
+        let dl2 = la.iter().zip(lb.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("after-layer2 diff = {dl2}");
+        // сравнение
+        let a = fa.clone();
+        let b = be.to_cpu_f32(&tail).unwrap();
+        let max_d = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_d < 1e-4,
+            "двухстадийный forward разошёлся с полным: max_diff={max_d}"
+        );
     }
 }

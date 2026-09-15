@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn cpu_matches_gpu() {
         let (w, config) = mini_weights();
-        let b = default_backend().unwrap();
+        let b = crate::train::default_backend().unwrap();
         let out = run_on(b.as_ref(), &w, &config);
         assert_eq!(out.len(), 2);
         for (i, v) in out.iter().enumerate() {

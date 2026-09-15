@@ -19,35 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dim = cfg.dim;
     let mut model = Qwen3Model::load(&be, &wm, cfg.clone())?;
     use rust_inference::inference::generate::{GenerateEvent, GenerateParams, generate};
-    let agent = std::fs::read_to_string("/tmp/agent_prompt.txt").unwrap();
-    for text in ["Скажи", agent.as_str()] {
+    for text in ["<|im_start|>user\nмассив<|im_end|>\n<|im_start|>assistant\n", "<|im_start|>user\nСкажи<|im_end|>\n<|im_start|>assistant\n"] {
         let ids = tok.encode(text);
         model.reset_cache(&be)?;
-        // полный generate как в движке: greedy, тот же промпт
-        {
-            let mut out = String::new();
-            let r = generate(
-                &mut model,
-                &be,
-                &tok,
-                &ids,
-                &GenerateParams {
-                    max_tokens: 4,
-                    temperature: 0.0,
-                    top_p: 1.0,
-                    top_k: 0,
-                    repeat_penalty: 1.0,
-                    ..Default::default()
-                },
-                |ev| {
-                    if let GenerateEvent::Delta(t) = ev {
-                        out.push_str(&t);
-                    }
-                    true
-                },
-            );
-            eprintln!("generate(fresh) for {text:?}: {out:?} err={r:?}");
-        }
+
 
         let lg = model.prefill(&be, &ids)?;
         let lv = be.to_cpu_f32(&lg)?;

@@ -188,7 +188,7 @@ impl Backend for CpuBackend {
         let cols = bias.numel();
         let xd: Vec<f32> = data(x).to_vec();
         check_len(x, y.numel())?;
-        if cols == 0 || x.numel() % cols != 0 {
+        if cols == 0 || !x.numel().is_multiple_of(cols) {
             return Err(BackendError::Shape(format!(
                 "add_bias: bias {} does not divide x {}",
                 cols,
@@ -299,7 +299,7 @@ impl Backend for CpuBackend {
         // does) — the old `y.shape().last()` silently diverged when the two
         // disagreed. Also guards d==0 (div-by-zero panic).
         let d = ffn;
-        if d == 0 || n % d != 0 {
+        if d == 0 || !n.is_multiple_of(d) {
             return Err(BackendError::Shape(format!(
                 "silu_mul_fused: ffn={ffn} does not divide y numel {n}"
             )));
@@ -362,7 +362,7 @@ impl Backend for CpuBackend {
     fn gelu_tanh(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // tanh approximation (GPT-2 style), f32 compute.
         elemwise(x, y, |v| {
-            0.5 * v * (1.0 + (0.7978845608 * (v + 0.044715 * v * v * v)).tanh())
+            0.5 * v * (1.0 + (0.797_884_6 * (v + 0.044715 * v * v * v)).tanh())
         })
     }
     fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
@@ -378,7 +378,7 @@ impl Backend for CpuBackend {
         let c = a.numel();
         // Q21/R28: c==0 would divide by zero (panic); a==0 makes sin²(ax)/a
         // NaN — the mathematical limit is x (sin²(ax)/a → 0).
-        if c == 0 || x.numel() % c != 0 {
+        if c == 0 || !x.numel().is_multiple_of(c) {
             return Err(BackendError::Shape(format!(
                 "snake: channel count {c} does not divide x ({})",
                 x.numel()
@@ -403,7 +403,7 @@ impl Backend for CpuBackend {
         let cols = w.numel();
         let xd: Vec<f32> = data(x).to_vec();
         check_len(x, y.numel())?;
-        if cols == 0 || x.numel() % cols != 0 {
+        if cols == 0 || !x.numel().is_multiple_of(cols) {
             return Err(BackendError::Shape(
                 "rmsnorm: weight size does not divide x".into(),
             ));
@@ -435,7 +435,7 @@ impl Backend for CpuBackend {
         let cols = w.numel();
         let xd: Vec<f32> = data(x).to_vec();
         check_len(x, y.numel())?;
-        if cols == 0 || x.numel() % cols != 0 {
+        if cols == 0 || !x.numel().is_multiple_of(cols) {
             return Err(BackendError::Shape(
                 "layernorm: weight size does not divide x".into(),
             ));
@@ -521,7 +521,7 @@ impl Backend for CpuBackend {
             )));
         }
         let tout = (t + pad_l + pad_r - dil * (k - 1) - 1) / stride + 1;
-        if y.shape() != &[b, tout, cout] {
+        if y.shape() != [b, tout, cout] {
             return Err(BackendError::Shape(format!(
                 "conv1d: expected Y {:?}, got {:?}",
                 vec![b, tout, cout],
@@ -587,9 +587,7 @@ impl Backend for CpuBackend {
         // panic and a window larger than the padded input underflows usize
         // (the commit message claimed the CPU was guarded; only conv1d was).
         if stride_t == 0 || stride_f == 0 {
-            return Err(BackendError::Shape(
-                "conv2d: stride must be >= 1".into(),
-            ));
+            return Err(BackendError::Shape("conv2d: stride must be >= 1".into()));
         }
         if h + pad_h < kh || wdim + pad_w < kw {
             return Err(BackendError::Shape(
@@ -603,10 +601,10 @@ impl Backend for CpuBackend {
             (h + pad_h - kh) / stride_t + 1,
             (wdim + pad_w - kw) / stride_f + 1,
         );
-        if !time_major_out && y.shape() != &[n, co, oh, ow] {
+        if !time_major_out && y.shape() != [n, co, oh, ow] {
             return Err(BackendError::Shape("conv2d: output shape mismatch".into()));
         }
-        if time_major_out && y.shape() != &[n, oh, co * ow] {
+        if time_major_out && y.shape() != [n, oh, co * ow] {
             return Err(BackendError::Shape(
                 "conv2d: time-major output shape mismatch".into(),
             ));
@@ -658,7 +656,7 @@ impl Backend for CpuBackend {
             return Err(BackendError::Shape("maxpool2d: kernel 0".into()));
         }
         let (oh, ow) = (h / kh, w / kw);
-        if y.shape() != &[n, c, oh, ow] {
+        if y.shape() != [n, c, oh, ow] {
             return Err(BackendError::Shape(
                 "maxpool2d: output shape mismatch".into(),
             ));
@@ -701,7 +699,7 @@ impl Backend for CpuBackend {
             ));
         }
         let tout = (t - 1) * stride + k;
-        if y.shape() != &[b, tout, cout] {
+        if y.shape() != [b, tout, cout] {
             return Err(BackendError::Shape(
                 "conv_transpose1d: output shape mismatch".into(),
             ));
@@ -751,7 +749,7 @@ impl Backend for CpuBackend {
         tout: usize,
     ) -> Result<(), BackendError> {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-        if xc.shape() != &[b, tout, cin * k] {
+        if xc.shape() != [b, tout, cin * k] {
             return Err(BackendError::Shape(
                 "im2col1d: output shape mismatch".into(),
             ));
@@ -791,7 +789,7 @@ impl Backend for CpuBackend {
         tout: usize,
     ) -> Result<(), BackendError> {
         let (b, tin, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-        if xc.shape() != &[b, tout, cin * k] {
+        if xc.shape() != [b, tout, cin * k] {
             return Err(BackendError::Shape(
                 "im2col_t1d: output shape mismatch".into(),
             ));
@@ -824,7 +822,7 @@ impl Backend for CpuBackend {
         // X (rows, D) → Y (rows, d0): columns [off, off+d0); d0 comes from Y.
         let (rows, d) = (x.shape()[0], x.shape()[1]);
         let d0 = y.shape()[1];
-        if off + d0 > d || y.shape() != &[rows, d0] {
+        if off + d0 > d || y.shape() != [rows, d0] {
             return Err(BackendError::Shape(format!(
                 "slice_last: x {:?} y {:?} off {off}",
                 x.shape(),
@@ -845,11 +843,9 @@ impl Backend for CpuBackend {
         // Q22: u > t would underflow `t - u` (panic in debug, wrap in
         // release) — validate before the subtraction.
         if u > t {
-            return Err(BackendError::Shape(format!(
-                "slice_time: u={u} > t={t}"
-            )));
+            return Err(BackendError::Shape(format!("slice_time: u={u} > t={t}")));
         }
-        if y.shape() != &[b, t - u, c] {
+        if y.shape() != [b, t - u, c] {
             return Err(BackendError::Shape(
                 "slice_time: output shape mismatch".into(),
             ));
@@ -1101,7 +1097,7 @@ impl Backend for CpuBackend {
         // h == 0 divides by zero (x.shape()[last] / h); a non-multiple x dim
         // truncates hd and mis-addresses rows — mirror the CUDA backend's
         // strict divisibility check so both paths reject it.
-        if h == 0 || x.shape()[last] % h != 0 {
+        if h == 0 || !x.shape()[last].is_multiple_of(h) {
             return Err(BackendError::Shape(format!(
                 "rmsnorm_head: head count h={h} does not divide x dim {}",
                 x.shape()[last]
@@ -1209,7 +1205,7 @@ impl Backend for CpuBackend {
     fn repeat(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // ×2 time upsampling: y[b, 2t + {0,1}, d] = x[b, t, d].
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-        if y.shape() != &[b, 2 * t, d] {
+        if y.shape() != [b, 2 * t, d] {
             return Err(BackendError::Shape("repeat: expected Y (B, 2T, D)".into()));
         }
         let xd: Vec<f32> = data(x).to_vec();
@@ -1270,18 +1266,18 @@ impl Backend for CpuBackend {
         let (b, tq, d) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let tkv = k.shape()[1];
         let kv_d = k.shape()[2];
-        if y.shape() != &[b, tq, d] || kv_d != kv_heads * hd || v.shape()[2] != kv_d {
+        if y.shape() != [b, tq, d] || kv_d != kv_heads * hd || v.shape()[2] != kv_d {
             return Err(BackendError::Shape("attn_ar: shape mismatch".into()));
         }
         // D8: the mask is indexed as [tq, tkv] below (m[t * tkv + tk]) — a
         // too-small mask would read out of bounds (panic) or wrong values.
-        if let Some(m) = mask {
-            if m.numel() < tq * tkv {
-                return Err(BackendError::Shape(format!(
-                    "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
-                    m.numel()
-                )));
-            }
+        if let Some(m) = mask
+            && m.numel() < tq * tkv
+        {
+            return Err(BackendError::Shape(format!(
+                "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
+                m.numel()
+            )));
         }
         let n_rep = n_heads / kv_heads;
         let (qd, kd, vd) = (data(q).to_vec(), data(k).to_vec(), data(v).to_vec());
@@ -1345,18 +1341,18 @@ impl Backend for CpuBackend {
         let (b, t, d) = (q.shape()[0], q.shape()[1], q.shape()[2]);
         let h = sc.shape()[1];
         let hd = d / h;
-        if y.shape() != &[b, t, d] {
+        if y.shape() != [b, t, d] {
             return Err(BackendError::Shape("mhsa: output shape mismatch".into()));
         }
         // D8: the mask is indexed as [t, t] below (m[tq * t + tk]) — a
         // too-small mask would read out of bounds (panic) or wrong values.
-        if let Some(m) = mask {
-            if m.numel() < t * t {
-                return Err(BackendError::Shape(format!(
-                    "mhsa: mask numel {} < t·t {t}·{t}",
-                    m.numel()
-                )));
-            }
+        if let Some(m) = mask
+            && m.numel() < t * t
+        {
+            return Err(BackendError::Shape(format!(
+                "mhsa: mask numel {} < t·t {t}·{t}",
+                m.numel()
+            )));
         }
         if mode == 2 {
             // uniform: out = mean over time of V per head? The uniform kernel
@@ -1441,7 +1437,7 @@ impl Backend for CpuBackend {
                 "mhsa_rel_pos: T {t} exceeds the kernel's 2048-element shared-memory score limit"
             )));
         }
-        if y.shape() != &[t, d] || p.shape()[0] != 2 * t - 1 {
+        if y.shape() != [t, d] || p.shape()[0] != 2 * t - 1 {
             return Err(BackendError::Shape("mhsa_rel_pos: shape mismatch".into()));
         }
         let (qd, kd, vd, qpd, pd) = (
@@ -1455,8 +1451,7 @@ impl Backend for CpuBackend {
         let mut yd = data_mut(y);
         yd.fill(0.0);
         let mut wfd: Option<Vec<f32>> = wfull.map(|_| vec![0.0f32; h * t * t]);
-        // scale passed by the caller (NeMo √dk form, zipformer 1.0)
-        let scale = scale;
+        // scale приходит от вызывающего (NeMo √dk, zipformer 1.0)
         for hh in 0..h {
             let (qo, ko, vo, po) = (hh * dk, hh * dk, hh * dk, hh * dp);
             // pos_bias_u is (H, dk) (content side); pos_bias_v is (H, dp)
@@ -1565,7 +1560,7 @@ impl Backend for CpuBackend {
     fn uniform_attn(&self, v: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         // Y (B,C) = mean over time of V (B,T,C).
         let (b, t, c) = (v.shape()[0], v.shape()[1], v.shape()[2]);
-        if y.shape() != &[b, c] {
+        if y.shape() != [b, c] {
             return Err(BackendError::Shape(
                 "uniform_attn: output shape mismatch".into(),
             ));

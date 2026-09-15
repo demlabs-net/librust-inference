@@ -19,7 +19,9 @@ fn rope(b: &dyn Backend, x: &Tensor, pos: usize, hd: usize, theta: f32) -> Tenso
 }
 
 fn tok(b: &dyn Backend, i: usize, d: usize, base: f32) -> Tensor {
-    let data: Vec<f32> = (0..d).map(|j| base + (i * 13 + j * 7) as f32 * 0.03125).collect();
+    let data: Vec<f32> = (0..d)
+        .map(|j| base + (i * 13 + j * 7) as f32 * 0.03125)
+        .collect();
     b.from_cpu_f32(&data, vec![1, 1, d]).unwrap()
 }
 
@@ -34,9 +36,27 @@ fn compact_rolls_and_rerotates() {
     };
     let (kv_heads, hd, theta) = (2usize, 8usize, 10000.0f32);
     let d = kv_heads * hd;
-    let mut a = KvCache::new(b.as_ref(), kv_heads, hd, rust_inference::dtype::KvFormat::F32, rust_inference::dtype::KvFormat::F32, theta, None).expect("cache");
+    let mut a = KvCache::new(
+        b.as_ref(),
+        kv_heads,
+        hd,
+        rust_inference::dtype::KvFormat::F32,
+        rust_inference::dtype::KvFormat::F32,
+        theta,
+        None,
+    )
+    .expect("cache");
     a.set_max_cap(Some(8));
-    let mut r = KvCache::new(b.as_ref(), kv_heads, hd, rust_inference::dtype::KvFormat::F32, rust_inference::dtype::KvFormat::F32, theta, None).expect("cache");
+    let mut r = KvCache::new(
+        b.as_ref(),
+        kv_heads,
+        hd,
+        rust_inference::dtype::KvFormat::F32,
+        rust_inference::dtype::KvFormat::F32,
+        theta,
+        None,
+    )
+    .expect("cache");
 
     // 12 tokens: the windowed cache rolls at the 9th, the reference grows.
     // The windowed cache's absolute positions reset at the roll — its
@@ -101,9 +121,7 @@ fn compact_rolls_and_rerotates() {
     let qbase = tok(b.as_ref(), 99, d, 3.0);
     let qa = rope(b.as_ref(), &qbase, 8, hd, theta);
     let qb = rope(b.as_ref(), &qbase, 12, hd, theta);
-    let mask_a = b
-        .from_cpu_f32(&vec![0.0f32; 8], vec![1, 1, 8])
-        .unwrap();
+    let mask_a = b.from_cpu_f32(&[0.0f32; 8], vec![1, 1, 8]).unwrap();
     let mut mb = vec![f32::NEG_INFINITY; 12];
     for j in 4..12 {
         mb[j] = 0.0;
@@ -111,13 +129,35 @@ fn compact_rolls_and_rerotates() {
     let mask_b = b.from_cpu_f32(&mb, vec![1, 1, 12]).unwrap();
     let ya = b.zeros(vec![1, 1, d]).unwrap();
     let yb = b.zeros(vec![1, 1, d]).unwrap();
-    b.attn_ar(&qa, &a.view(), &a.view_v(), Some(&mask_a), &ya, kv_heads, kv_heads, hd)
-        .expect("attn a");
-    b.attn_ar(&qb, &r.view(), &r.view_v(), Some(&mask_b), &yb, kv_heads, kv_heads, hd)
-        .expect("attn b");
+    b.attn_ar(
+        &qa,
+        &a.view(),
+        &a.view_v(),
+        Some(&mask_a),
+        &ya,
+        kv_heads,
+        kv_heads,
+        hd,
+    )
+    .expect("attn a");
+    b.attn_ar(
+        &qb,
+        &r.view(),
+        &r.view_v(),
+        Some(&mask_b),
+        &yb,
+        kv_heads,
+        kv_heads,
+        hd,
+    )
+    .expect("attn b");
     let ga = b.to_cpu_f32(&ya).unwrap();
     let gb = b.to_cpu_f32(&yb).unwrap();
-    let max_d = ga.iter().zip(&gb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let max_d = ga
+        .iter()
+        .zip(&gb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
     assert!(
         max_d < 1e-5,
         "attention over the rolled window diverges: {max_d}"
@@ -140,8 +180,18 @@ fn compact_rolls_quantized_formats() {
     // q8_0 is lossy at write (i8 + per-block scale) — its value tolerance
     // covers the quantization error; the shift itself is an exact copy.
     for (name, kf, vf, vtol) in [
-        ("f16", rust_inference::dtype::KvFormat::F16, rust_inference::dtype::KvFormat::F16, 1e-2f32),
-        ("q8", rust_inference::dtype::KvFormat::Q8_0, rust_inference::dtype::KvFormat::Q8_0, 0.2f32),
+        (
+            "f16",
+            rust_inference::dtype::KvFormat::F16,
+            rust_inference::dtype::KvFormat::F16,
+            1e-2f32,
+        ),
+        (
+            "q8",
+            rust_inference::dtype::KvFormat::Q8_0,
+            rust_inference::dtype::KvFormat::Q8_0,
+            0.2f32,
+        ),
     ] {
         let mut a = KvCache::new(b.as_ref(), kv_heads, hd, kf, vf, theta, None).expect("cache");
         a.set_max_cap(Some(8));
@@ -149,7 +199,8 @@ fn compact_rolls_quantized_formats() {
             a.roll_if_needed(b.as_ref(), 1).expect("roll");
             let pos = a.pos;
             let k = rope(b.as_ref(), &tok(b.as_ref(), i, d, 1.0), pos, hd, theta);
-            a.update(b.as_ref(), &k, &tok(b.as_ref(), i, d, 10.0)).expect("update");
+            a.update(b.as_ref(), &k, &tok(b.as_ref(), i, d, 10.0))
+                .expect("update");
         }
         assert_eq!(a.pos, 8, "{name}: window pos after the roll");
         let av = b.to_cpu_f32(&a.view_v()).unwrap();
@@ -160,29 +211,68 @@ fn compact_rolls_quantized_formats() {
             let expect = tok(b.as_ref(), j + 4, d, 10.0);
             let got = &av[j * d..(j + 1) * d];
             let e = b.to_cpu_f32(&expect).unwrap();
-            let max_d = got.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let max_d = got
+                .iter()
+                .zip(&e)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             assert!(max_d < vtol, "{name}: value move at slot {j}: {max_d}");
         }
         // The attention over the rolled window must be close to the f32
         // reference (the storage precision, not the compaction, dominates).
         let qa = rope(b.as_ref(), &tok(b.as_ref(), 99, d, 3.0), 8, hd, theta);
-        let mask = b.from_cpu_f32(&vec![0.0f32; 8], vec![1, 1, 8]).unwrap();
+        let mask = b.from_cpu_f32(&[0.0f32; 8], vec![1, 1, 8]).unwrap();
         let ya = b.zeros(vec![1, 1, d]).unwrap();
-        b.attn_ar(&qa, &a.view(), &a.view_v(), Some(&mask), &ya, kv_heads, kv_heads, hd)
-            .expect("attn");
+        b.attn_ar(
+            &qa,
+            &a.view(),
+            &a.view_v(),
+            Some(&mask),
+            &ya,
+            kv_heads,
+            kv_heads,
+            hd,
+        )
+        .expect("attn");
         // The reference: the same 8 tokens in a fresh f32 cache at [0..8).
-        let mut r = KvCache::new(b.as_ref(), kv_heads, hd, rust_inference::dtype::KvFormat::F32, rust_inference::dtype::KvFormat::F32, theta, None).expect("cache");
+        let mut r = KvCache::new(
+            b.as_ref(),
+            kv_heads,
+            hd,
+            rust_inference::dtype::KvFormat::F32,
+            rust_inference::dtype::KvFormat::F32,
+            theta,
+            None,
+        )
+        .expect("cache");
         for i in 4..12 {
             let k = rope(b.as_ref(), &tok(b.as_ref(), i, d, 1.0), i - 4, hd, theta);
-            r.update(b.as_ref(), &k, &tok(b.as_ref(), i, d, 10.0)).expect("update");
+            r.update(b.as_ref(), &k, &tok(b.as_ref(), i, d, 10.0))
+                .expect("update");
         }
         let qb = rope(b.as_ref(), &tok(b.as_ref(), 99, d, 3.0), 8, hd, theta);
         let yb = b.zeros(vec![1, 1, d]).unwrap();
-        b.attn_ar(&qb, &r.view(), &r.view_v(), Some(&mask), &yb, kv_heads, kv_heads, hd)
-            .expect("attn ref");
+        b.attn_ar(
+            &qb,
+            &r.view(),
+            &r.view_v(),
+            Some(&mask),
+            &yb,
+            kv_heads,
+            kv_heads,
+            hd,
+        )
+        .expect("attn ref");
         let ga = b.to_cpu_f32(&ya).unwrap();
         let gb = b.to_cpu_f32(&yb).unwrap();
-        let max_d = ga.iter().zip(&gb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(max_d < 0.5, "{name}: attention over the rolled window diverges: {max_d}");
+        let max_d = ga
+            .iter()
+            .zip(&gb)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_d < 0.5,
+            "{name}: attention over the rolled window diverges: {max_d}"
+        );
     }
 }

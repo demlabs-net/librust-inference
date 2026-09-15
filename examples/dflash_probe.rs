@@ -21,7 +21,7 @@ fn top5(row: &[f32]) -> Vec<(usize, f32)> {
 
 #[allow(dead_code)]
 pub fn convert_zlab_q8() -> Result<(), Box<dyn Error>> {
-    use rust_inference::gguf::{self, GgufValue, GgufWriteTensor, GgmlType, write_gguf};
+    use rust_inference::gguf::{self, GgmlType, GgufValue, GgufWriteTensor, write_gguf};
     use rust_inference::quant::quant_q8_0;
     let home = std::env::var("HOME").unwrap();
     let old = format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-Q8_0.gguf");
@@ -80,7 +80,11 @@ pub fn convert_zlab_q8() -> Result<(), Box<dyn Error>> {
     let mut outbuf = Vec::new();
     write_gguf(&mut outbuf, &metadata, &tensors)?;
     std::fs::write(&out, &outbuf)?;
-    eprintln!("записан {out} ({} байт, {} тензоров)", outbuf.len(), tensors.len());
+    eprintln!(
+        "записан {out} ({} байт, {} тензоров)",
+        outbuf.len(),
+        tensors.len()
+    );
     Ok(())
 }
 
@@ -93,9 +97,9 @@ pub fn verify_zlab_q8() -> Result<(), Box<dyn Error>> {
     let gf = gguf::parse(&buf)?;
     let wm = WeightsMap::from_gguf(&gf)?;
     let qk = dequant_f32(wm.get("blk.0.attn_k.weight").unwrap());
-    let st = rust_inference::weights::read_safetensors_f32(
-        &std::path::PathBuf::from(format!("{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-zlab.safetensors")),
-    )?;
+    let st = rust_inference::weights::read_safetensors_f32(&std::path::PathBuf::from(format!(
+        "{home}/work/ai/inference/models/dflash/qwen3-8b-dflash-zlab.safetensors"
+    )))?;
     let ref_data = &st["layers.0.self_attn.k_proj.weight"];
     let mean_sq = ref_data.0.iter().map(|x| x * x).sum::<f32>() / ref_data.0.len() as f32;
     let mut max_d = 0.0f32;
@@ -105,16 +109,28 @@ pub fn verify_zlab_q8() -> Result<(), Box<dyn Error>> {
         max_d = max_d.max(d);
         sum_d += d;
     }
-    eprintln!("Q8-vs-zlab: max {max_d:.4} mean {} ref-rms {}", sum_d / ref_data.0.len() as f32, mean_sq.sqrt());
+    eprintln!(
+        "Q8-vs-zlab: max {max_d:.4} mean {} ref-rms {}",
+        sum_d / ref_data.0.len() as f32,
+        mean_sq.sqrt()
+    );
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|a| a == "--convert-zlab-q8").unwrap_or(false) {
+    if args
+        .get(1)
+        .map(|a| a == "--convert-zlab-q8")
+        .unwrap_or(false)
+    {
         return convert_zlab_q8();
     }
-    if args.get(1).map(|a| a == "--verify-zlab-q8").unwrap_or(false) {
+    if args
+        .get(1)
+        .map(|a| a == "--verify-zlab-q8")
+        .unwrap_or(false)
+    {
         return verify_zlab_q8();
     }
     let (tgt, drf) = (&args[1], &args[2]);

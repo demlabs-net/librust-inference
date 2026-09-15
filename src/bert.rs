@@ -451,7 +451,6 @@ impl BertEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::default_backend;
 
     /// Детерминированный LCG-генератор весов (от стабильного сида).
     struct Lcg(u64);
@@ -506,15 +505,11 @@ mod tests {
             let p = format!("encoder.layer.{i}");
             for part in ["query", "key", "value"] {
                 put(
-                    format!("{p}.attention.self.{part}.weight").into(),
+                    format!("{p}.attention.self.{part}.weight"),
                     t(d, d),
                     vec![d, d],
                 );
-                put(
-                    format!("{p}.attention.self.{part}.bias").into(),
-                    t(d, 1),
-                    vec![d],
-                );
+                put(format!("{p}.attention.self.{part}.bias"), t(d, 1), vec![d]);
             }
             put(
                 format!("{p}.attention.output.dense.weight"),

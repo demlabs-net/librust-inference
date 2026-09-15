@@ -311,8 +311,12 @@ impl GpuTensor {
     }
 
     /// Upload block-quantized GEMM weights (Ф1.3/1.4): raw ggml-блоки как есть
-    /// (Q4_0/Q8_0: 18/34 Б на 32 элемента; Q4_K/Q6_K: 148/210 Б на 256) —
+    /// (Q4_0/Q8_0: 18/34 Б на 32 элемента; Q4_K/Q6_K: 144/210 Б на 256) —
     /// деквантование внутри кернела. Размер данных проверяется по numel.
+    ///
+    /// Q4_K был 148 Б — это кастомный диалект, не совпадающий с GGUF, из-за
+    /// чего КОРРЕКТНЫЕ Q4_K-тензоры отвергались с «quantized data N B,
+    /// expected M B» ещё до загрузки в GPU.
     pub fn from_quantized(
         device: &Device,
         data: &[u8],
@@ -322,7 +326,9 @@ impl GpuTensor {
         let bytes_per_elem = match dtype {
             GpuDtype::Q4_0 => 18.0 / 32.0,
             GpuDtype::Q8_0 => 34.0 / 32.0,
-            GpuDtype::Q4_K => 148.0 / 256.0,
+            // Canonical ggml block_q4_K = 144 B / 256 weights (the 148 B
+            // dialect was removed together with its in-kernel layout).
+            GpuDtype::Q4_K => 144.0 / 256.0,
             GpuDtype::Q6_K => 210.0 / 256.0,
             other => {
                 return Err(MetalError::Shape(format!(
@@ -375,9 +381,14 @@ impl GpuTensor {
         if ptr.is_null() {
             return Err(MetalError::BufferAlloc);
         }
+        // `offset` — это view внутрь большего буфера (KV-кэш: компакция и
+        // срезы передвигают окно внутри той же аллокации). Раньше чтение шло
+        // от начала буфера, поэтому to_cpu_f32 на view возвращал ЧУЖИЕ
+        // элементы — молча, без ошибки.
+        let base = unsafe { (ptr as *const u8).add(self.offset) } as *const f32;
         let mut out = vec![0f32; self.numel()];
         unsafe {
-            std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), out.len());
+            std::ptr::copy_nonoverlapping(base, out.as_mut_ptr(), out.len());
         }
         Ok(out)
     }

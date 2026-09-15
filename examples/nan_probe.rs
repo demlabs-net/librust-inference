@@ -39,8 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok((ln, _, _)) = model.debug_layer_split(&be, &ids, 2) {
             let vl = be.to_cpu_f32(&ln)?;
             let nn = vl.iter().filter(|x| x.is_nan()).count();
-            let mx = vl.iter().cloned().fold(0.0f32, |m, x| m.max(if x.is_finite() { x.abs() } else { 0.0 }));
-            eprintln!("   layer2-normed: nan={nn} max_abs={mx:.3} first8={:?}", &vl[..8.min(vl.len())]);
+            let mx = vl.iter().cloned().fold(0.0f32, |m, x| {
+                m.max(if x.is_finite() { x.abs() } else { 0.0 })
+            });
+            eprintln!(
+                "   layer2-normed: nan={nn} max_abs={mx:.3} first8={:?}",
+                &vl[..8.min(vl.len())]
+            );
         }
         // бисект: префиксы
         // строка эмбеддингов токена-триггера
@@ -48,7 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ew = &tabs[33995 * 1024..(33995 + 1) * 1024];
         let nn = ew.iter().filter(|x| x.is_nan()).count();
         let inf = ew.iter().filter(|x| x.is_infinite()).count();
-        eprintln!("   emb[33995]: nan={nn} inf={inf} rms={:.4}", (ew.iter().map(|x| x*x).sum::<f32>()/1024.0).sqrt());
+        eprintln!(
+            "   emb[33995]: nan={nn} inf={inf} rms={:.4}",
+            (ew.iter().map(|x| x * x).sum::<f32>() / 1024.0).sqrt()
+        );
         let e2 = &tabs[19311 * 1024..(19311 + 1) * 1024];
         let nn2 = e2.iter().filter(|x| x.is_nan()).count();
         eprintln!("   emb[19311]: nan={nn2}");
@@ -75,7 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "{text:?}: prefill-logits nan={nan_logits} argmax={} ({:?})",
             best.0,
-            tok.decode_piece(best.0 as u32).chars().take(12).collect::<String>()
+            tok.decode_piece(best.0 as u32)
+                .chars()
+                .take(12)
+                .collect::<String>()
         );
         let h = model.forward_hidden(&be, &ids)?;
         let v = be.to_cpu_f32(&h)?;

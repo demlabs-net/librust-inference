@@ -50,8 +50,7 @@ fn mode0_matches_semantic_reference() {
         let vb_t = cpu.from_cpu_f32(&vb, vec![h * dp]).unwrap();
         let y_t = cpu.zeros(vec![t, d]).unwrap();
         cpu.mhsa_rel_pos(
-            &q_t, &k_t, &v_t, &qp_t, &p_t, &u_t, &vb_t, &y_t,
-            None, dk, dp, 0, scale,
+            &q_t, &k_t, &v_t, &qp_t, &p_t, &u_t, &vb_t, &y_t, None, dk, dp, 0, scale,
         )
         .unwrap();
         let y = cpu.to_cpu_f32(&y_t).unwrap();
@@ -66,8 +65,7 @@ fn mode0_matches_semantic_reference() {
                 for tk in 0..t {
                     let mut ac = 0.0f32;
                     for j in 0..dk {
-                        ac += (q[qt * d + hh * dk + j] + u[hh * dk + j])
-                            * k[tk * d + hh * dk + j];
+                        ac += (q[qt * d + hh * dk + j] + u[hh * dk + j]) * k[tk * d + hh * dk + j];
                     }
                     let off = tk as isize - qt as isize + t as isize - 1;
                     let mut bd = 0.0f32;

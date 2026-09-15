@@ -148,10 +148,10 @@ impl TrainJob {
             if !p.is_file() {
                 anyhow::bail!("dataset file not found: {}", p.display());
             }
-            if let Some(f) = &self.dataset_format {
-                if crate::datasets::DatasetFormat::parse(f).is_none() {
-                    anyhow::bail!("unknown dataset format: {f}");
-                }
+            if let Some(f) = &self.dataset_format
+                && crate::datasets::DatasetFormat::parse(f).is_none()
+            {
+                anyhow::bail!("unknown dataset format: {f}");
             }
         }
         Ok(())
@@ -220,12 +220,11 @@ impl JobStore {
         }
         for entry in std::fs::read_dir(&self.jobs_dir)? {
             let entry = entry?;
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(job) = serde_json::from_str::<TrainJob>(&text) {
-                        jobs.push(job);
-                    }
-                }
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("json")
+                && let Ok(text) = std::fs::read_to_string(entry.path())
+                && let Ok(job) = serde_json::from_str::<TrainJob>(&text)
+            {
+                jobs.push(job);
             }
         }
         jobs.sort_by(|a, b| {
@@ -483,32 +482,32 @@ impl Adam {
         let m_hat_c = (1.0 / (1.0 - self.beta1.powi(self.t as i32))) as f32;
         let v_hat_c = (1.0 / (1.0 - self.beta2.powi(self.t as i32))) as f32;
 
-        let mut new_m = bk.zeros(shape.clone())?;
-        bk.scale(m, &mut new_m, b1)?;
-        let mut g1 = bk.zeros(shape.clone())?;
-        bk.scale(grad, &mut g1, 1.0 - b1)?;
+        let new_m = bk.zeros(shape.clone())?;
+        bk.scale(m, &new_m, b1)?;
+        let g1 = bk.zeros(shape.clone())?;
+        bk.scale(grad, &g1, 1.0 - b1)?;
         bk.add(&new_m, &g1, m)?;
-        let mut new_v = bk.zeros(shape.clone())?;
-        bk.scale(v, &mut new_v, b2)?;
-        let mut g2 = bk.zeros(shape.clone())?;
-        bk.mul(grad, grad, &mut g2)?;
-        let mut g2s = bk.zeros(shape.clone())?;
-        bk.scale(&g2, &mut g2s, 1.0 - b2)?;
+        let new_v = bk.zeros(shape.clone())?;
+        bk.scale(v, &new_v, b2)?;
+        let g2 = bk.zeros(shape.clone())?;
+        bk.mul(grad, grad, &g2)?;
+        let g2s = bk.zeros(shape.clone())?;
+        bk.scale(&g2, &g2s, 1.0 - b2)?;
         bk.add(&new_v, &g2s, v)?;
-        let mut m_hat = bk.zeros(shape.clone())?;
-        bk.scale(m, &mut m_hat, m_hat_c)?;
-        let mut v_hat = bk.zeros(shape.clone())?;
-        bk.scale(v, &mut v_hat, v_hat_c)?;
-        let mut vs = bk.zeros(shape.clone())?;
-        bk.sqrt(&v_hat, &mut vs)?;
-        let mut vse = bk.zeros(shape.clone())?;
-        bk.add_scalar(&vs, &mut vse, self.eps as f32)?;
-        let mut upd = bk.zeros(shape.clone())?;
-        bk.div(&m_hat, &vse, &mut upd)?;
-        let mut upds = bk.zeros(shape.clone())?;
-        bk.scale(&upd, &mut upds, self.lr as f32)?;
-        let mut next = bk.zeros(shape.clone())?;
-        bk.sub(param, &upds, &mut next)?;
+        let m_hat = bk.zeros(shape.clone())?;
+        bk.scale(m, &m_hat, m_hat_c)?;
+        let v_hat = bk.zeros(shape.clone())?;
+        bk.scale(v, &v_hat, v_hat_c)?;
+        let vs = bk.zeros(shape.clone())?;
+        bk.sqrt(&v_hat, &vs)?;
+        let vse = bk.zeros(shape.clone())?;
+        bk.add_scalar(&vs, &vse, self.eps as f32)?;
+        let upd = bk.zeros(shape.clone())?;
+        bk.div(&m_hat, &vse, &upd)?;
+        let upds = bk.zeros(shape.clone())?;
+        bk.scale(&upd, &upds, self.lr as f32)?;
+        let next = bk.zeros(shape.clone())?;
+        bk.sub(param, &upds, &next)?;
         *param = next;
         Ok(())
     }
@@ -556,15 +555,15 @@ impl Trainer for DemoLoraTrainer {
             .map(|_| rand::Rng::random_range(&mut rng(), -0.1..0.1))
             .collect();
         let mut b_init: Vec<f32> = vec![0.0f32; HID_DIM * r];
-        if checkpoint_path.exists() {
-            if let Some(cp) = load_checkpoint(&checkpoint_path) {
-                if cp.a.len() == a_init.len() && cp.b.len() == b_init.len() {
-                    a_init = cp.a;
-                    b_init = cp.b;
-                    start_step = cp.step;
-                    tracing::info!(step = cp.step, loss = ?cp.loss, "resume from checkpoint");
-                }
-            }
+        if checkpoint_path.exists()
+            && let Some(cp) = load_checkpoint(&checkpoint_path)
+            && cp.a.len() == a_init.len()
+            && cp.b.len() == b_init.len()
+        {
+            a_init = cp.a;
+            b_init = cp.b;
+            start_step = cp.step;
+            tracing::info!(step = cp.step, loss = ?cp.loss, "resume from checkpoint");
         }
         let mut a = backend.from_cpu_f32(&a_init, vec![r, IN_DIM])?;
         let mut b = backend.from_cpu_f32(&b_init, vec![HID_DIM, r])?;
@@ -581,7 +580,7 @@ impl Trainer for DemoLoraTrainer {
         let mut best_loss: Option<f64> = None;
         let mut no_improve_steps = 0usize;
         let started = std::time::Instant::now();
-        let mut progress = |step: usize, total_steps: usize, loss: Option<f64>| {
+        let progress = |step: usize, total_steps: usize, loss: Option<f64>| {
             on_progress(&TrainProgress {
                 step,
                 total_steps,
@@ -637,7 +636,7 @@ impl Trainer for DemoLoraTrainer {
                 last_loss = Some(loss);
 
                 // Чекпойнт: шаг + a/b — для resume/прерывания.
-                if step % checkpoint_every == 0 {
+                if step.is_multiple_of(checkpoint_every) {
                     let cp_a = backend.to_cpu_f32(&a)?;
                     let cp_b = backend.to_cpu_f32(&b)?;
                     save_checkpoint(&checkpoint_path, step, &cp_a, &cp_b, Some(loss))?;
@@ -652,7 +651,15 @@ impl Trainer for DemoLoraTrainer {
                             if no_improve_steps >= p {
                                 tracing::info!(step, loss, "early-stop (no improvement)");
                                 progress(step, total_steps, last_loss);
-                                return export_adapter(job, &out_dir, backend.as_ref(), &a, &b, r, scale);
+                                return export_adapter(
+                                    job,
+                                    &out_dir,
+                                    backend.as_ref(),
+                                    &a,
+                                    &b,
+                                    r,
+                                    scale,
+                                );
                             }
                         }
                         Some(bl) => {
@@ -664,7 +671,7 @@ impl Trainer for DemoLoraTrainer {
                     }
                 }
 
-                if step % 10 == 0 || step == total_steps {
+                if step.is_multiple_of(10) || step == total_steps {
                     progress(step, total_steps, last_loss);
                 }
             }

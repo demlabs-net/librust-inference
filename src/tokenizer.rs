@@ -56,7 +56,7 @@ impl Tokenizer {
     /// Поддерживает longest-first порядок.
     pub fn add_special(&mut self, piece: Vec<u8>, id: u32) {
         self.special.push((piece, id));
-        self.special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        self.special.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
     }
     /// Собрать из готовых частей (для тестов и не-GGUF источников).
     pub fn from_parts(
@@ -98,7 +98,7 @@ impl Tokenizer {
             );
         }
 
-        let mut id_of = vocab
+        let id_of = vocab
             .iter()
             .enumerate()
             .map(|(i, p)| (p.clone(), i as u32))
@@ -152,15 +152,16 @@ impl Tokenizer {
             .and_then(GgufValue::as_array)
         {
             for (i, t) in arr.iter().enumerate() {
-                if let Some(tt) = t.as_u32() {
-                    if (tt == 3 || tt == 4) && vocab[i].len() > 1 {
-                        special.push((vocab[i].clone(), i as u32));
-                    }
+                if let Some(tt) = t.as_u32()
+                    && (tt == 3 || tt == 4)
+                    && vocab[i].len() > 1
+                {
+                    special.push((vocab[i].clone(), i as u32));
                 }
             }
         }
         // longest-first: жадный матч берёт самый длинный спец-токен.
-        special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        special.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
 
         Ok(Self {
             vocab,
@@ -392,14 +393,27 @@ fn unicode_tables() -> &'static ([char; 256], std::collections::HashMap<char, u8
 fn utf8_char_len(b: u8) -> usize {
     if b < 0x80 {
         1
-    } else if b >= 0xC2 && b <= 0xDF {
+    } else if (0xC2..=0xDF).contains(&b) {
         2
-    } else if b >= 0xE0 && b <= 0xEF {
+    } else if (0xE0..=0xEF).contains(&b) {
         3
-    } else if b >= 0xF0 && b <= 0xF4 {
+    } else if (0xF0..=0xF4).contains(&b) {
         4
     } else {
         0
+    }
+}
+
+/// Число байт UTF-8-символа по первому байту.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else {
+        4
     }
 }
 
@@ -530,18 +544,5 @@ mod tests {
         assert_eq!(d.push(b"hel"), "hel");
         assert_eq!(d.push(b"lo"), "lo");
         assert_eq!(d.finish(), "");
-    }
-}
-
-/// Число байт UTF-8-символа по первому байту.
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >> 5 == 0b110 {
-        2
-    } else if b >> 4 == 0b1110 {
-        3
-    } else {
-        4
     }
 }

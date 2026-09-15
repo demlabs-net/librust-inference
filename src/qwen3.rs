@@ -65,9 +65,9 @@ impl Qwen3Config {
         // panicked in the dim / n_heads fallback below (the same class the
         // dflash guard closed; qwen3 was left unguarded).
         if n_heads == 0 {
-            return Err(BackendError::Shape(
-                format!("{arch}.attention.head_count must be >= 1, got 0"),
-            ));
+            return Err(BackendError::Shape(format!(
+                "{arch}.attention.head_count must be >= 1, got 0"
+            )));
         }
         let n_kv_heads = u(&p("attention.head_count_kv"))?;
         let ffn_dim = u(&p("feed_forward_length"))?;
@@ -434,7 +434,7 @@ impl Qwen3Model {
             // and the mask — the compact resets the absolute positions, and
             // the current token must be roped at its NEW position (the
             // update-time roll would rope it at the pre-roll position).
-            if self.caches[0].roll_if_needed(backend, t)? {
+            if self.roll_windows_if_needed(backend, t)? {
                 self.pos_rope = self.caches[0].pos;
             }
             let mask = if t > 1 {
@@ -573,16 +573,19 @@ impl Qwen3Model {
         }
         let dim = self.cfg.dim;
         let t = ids.len();
-        let img_rows: Vec<usize> = (0..t)
-            .filter(|&k| ids[k] == vision_token)
-            .collect();
+        let img_rows: Vec<usize> = (0..t).filter(|&k| ids[k] == vision_token).collect();
         if img_rows.is_empty() {
             return Err(BackendError::Shape(
                 "deepstack: нет image-токенов в ids (vision_token не найден)".into(),
             ));
         }
         let n_img = img_rows.len();
-        eprintln!("deepstack: img_rows={} t={} vt={}", img_rows.len(), t, vision_token);
+        eprintln!(
+            "deepstack: img_rows={} t={} vt={}",
+            img_rows.len(),
+            t,
+            vision_token
+        );
         let mut out = Vec::with_capacity(deepstack.len());
         for (il, block) in deepstack.iter().enumerate() {
             // Блоки приходят 2D [nq, dim] либо 3D [1, nq, dim].
@@ -590,9 +593,11 @@ impl Qwen3Model {
             let (b, n, d) = match sh.len() {
                 2 => (1usize, sh[0], sh[1]),
                 3 => (sh[0], sh[1], sh[2]),
-                _ => return Err(BackendError::Shape(format!(
-                    "deepstack[{il}]: неожиданная форма {sh:?}"
-                ))),
+                _ => {
+                    return Err(BackendError::Shape(format!(
+                        "deepstack[{il}]: неожиданная форма {sh:?}"
+                    )));
+                }
             };
             if d != dim {
                 return Err(BackendError::Shape(format!(
@@ -607,12 +612,34 @@ impl Qwen3Model {
             let feats = backend.to_cpu_f32(block)?;
             let mut padded = vec![0.0f32; t * dim];
             for (k, &row) in img_rows.iter().enumerate() {
-                padded[row * dim..(row + 1) * dim]
-                    .copy_from_slice(&feats[k * dim..(k + 1) * dim]);
+                padded[row * dim..(row + 1) * dim].copy_from_slice(&feats[k * dim..(k + 1) * dim]);
             }
             out.push(backend.from_cpu_f32(&padded, vec![1, t, dim])?);
         }
         Ok(Some(out))
+    }
+
+    /// Roll EVERY layer's window before the current token's rope (plan 1.6).
+    ///
+    /// `compact()` lowers `pos` and re-rotates the kept keys, so a token roped
+    /// at the pre-roll position lands in a slot whose rotation does not match
+    /// its neighbours. Rolling only `caches[0]` (the earlier shape of this
+    /// code) left layers 1..N to compact inside their own `update()` — i.e.
+    /// AFTER their rope — so the rolled window never matched a fresh prefill.
+    /// All layers share one position, so the reported value is the new
+    /// `caches[0].pos`.
+    fn roll_windows_if_needed(
+        &mut self,
+        backend: &dyn Backend,
+        t: usize,
+    ) -> Result<bool, BackendError> {
+        let mut rolled = false;
+        for c in self.caches.iter_mut() {
+            if c.roll_if_needed(backend, t)? {
+                rolled = true;
+            }
+        }
+        Ok(rolled)
     }
 
     /// Скрытые состояния после `upto` слоёв (None — все) + out_norm.
@@ -628,6 +655,18 @@ impl Qwen3Model {
         upto: Option<usize>,
         deepstack: Option<&[Tensor]>,
     ) -> Result<Tensor, BackendError> {
+        // Plan 1.6: the window roll MUST run before the current token's rope.
+        // `compact()` re-rotates the kept keys for their new absolute positions
+        // and lowers `cache.pos`; a token roped at the pre-roll position would
+        // be stored in a slot whose rotation no longer matches its neighbours,
+        // and `pos_rope` would drift from `cache.pos` for the rest of the
+        // conversation. `prefill_extract` already rolled here — the shared path
+        // relied on the roll inside `update()`, which happens after the rope.
+        // M-RoPE (vision) token positions come from the caller in absolute
+        // coordinates that a roll does not remap, so that path is left alone.
+        if mrope.is_none() && self.roll_windows_if_needed(backend, t)? {
+            self.pos_rope = self.caches[0].pos;
+        }
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
         if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
             let xv = backend.to_cpu_f32(&x)?;
@@ -642,17 +681,15 @@ impl Qwen3Model {
         // раз на forward (Q3_NO_DS — осознанное отключение, без варнинга).
         if mrope.is_some()
             && std::env::var("Q3_NO_DS").is_err()
-            && deepstack.map_or(true, |d| d.is_empty())
+            && deepstack.is_none_or(|d| d.is_empty())
+            && let Some(n) = self.cfg.n_deepstack
+            && n > 0
         {
-            if let Some(n) = self.cfg.n_deepstack {
-                if n > 0 {
-                    tracing::warn!(
-                        n_deepstack = n,
-                        "mrope/vision forward: config expects {n} deepstack blocks, \
+            tracing::warn!(
+                n_deepstack = n,
+                "mrope/vision forward: config expects {n} deepstack blocks, \
                          none provided — vision hidden states will miss the deepstack adds"
-                    );
-                }
-            }
+            );
         }
         // N (iter-10): one mask per forward (see the other loops).
         let mask = if let Some(mrope) = mrope {
@@ -673,10 +710,10 @@ impl Qwen3Model {
             None
         };
         for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(u) = upto {
-                if i >= u {
-                    break;
-                }
+            if let Some(u) = upto
+                && i >= u
+            {
+                break;
             }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
@@ -741,14 +778,13 @@ impl Qwen3Model {
             // в prefill_with_vision (нули вне image-строк) — полное сложение.
             // Старый вариант `x[t] += embd_in[t + il + 1]` сдвигал на il+1
             // ТОКЕН эмбеддингов текста — не deepstack-фичи (ошибка).
-            if mrope.is_some() && std::env::var("Q3_NO_DS").is_err() {
-                if let Some(n_ds) = self.cfg.n_deepstack {
-                    if i < n_ds {
-                        if let Some(ds) = deepstack.and_then(|d| d.get(i)) {
-                            x = backend.deepstack(&x, ds, 0)?;
-                        }
-                    }
-                }
+            if mrope.is_some()
+                && std::env::var("Q3_NO_DS").is_err()
+                && let Some(n_ds) = self.cfg.n_deepstack
+                && i < n_ds
+                && let Some(ds) = deepstack.and_then(|d| d.get(i))
+            {
+                x = backend.deepstack(&x, ds, 0)?;
             }
         }
         if prof && t > 1 {
@@ -816,7 +852,7 @@ impl Qwen3Model {
         let r = (|| {
             let t = ids.len();
             let mut x = self.embed.forward(backend, ids, t)?;
-            if self.caches[0].roll_if_needed(backend, t)? {
+            if self.roll_windows_if_needed(backend, t)? {
                 self.pos_rope = self.caches[0].pos;
             }
             let mask = if t > 1 {
@@ -894,7 +930,7 @@ impl Qwen3Model {
             // and the mask — the compact resets the absolute positions, and
             // the current token must be roped at its NEW position (the
             // update-time roll would rope it at the pre-roll position).
-            if self.caches[0].roll_if_needed(backend, t)? {
+            if self.roll_windows_if_needed(backend, t)? {
                 self.pos_rope = self.caches[0].pos;
             }
             let mask = if t > 1 {
@@ -977,29 +1013,11 @@ impl Qwen3Model {
         (w.len() - 1) as u32
     }
 
-    /// Равномерное U(0,1) — тот же LCG, что в inference::sampling
-    /// (state = None → сид из часов, пишется обратно в state).
+    /// Равномерное U(0,1) — общий LCG-примитив проекта
+    /// ([`crate::inference::sampling::next_unit_f32`]); локальная копия формулы
+    /// раньше возвращала только [0, 0.25) и искажала rejection-sampling.
     fn uniform01(rng: &mut Option<u64>) -> f32 {
-        match rng {
-            Some(state) => {
-                *state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (*state >> 33) as f32 / (1u64 << 33) as f32
-            }
-            None => {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos();
-                let mut st = nanos as u64;
-                st = st
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                *rng = Some(st);
-                (st >> 33) as f32 / (1u64 << 33) as f32
-            }
-        }
+        crate::inference::sampling::next_unit_f32(rng)
     }
 
     /// Спекулятивный decode (Ф2.1 каркас): батч-верификация draft одним
@@ -1116,7 +1134,7 @@ impl Qwen3Model {
         pos: usize,
         t: usize,
         mrope: Option<&[u32]>,
-        causal: bool,
+        _causal: bool,
         cache_at: Option<usize>,
         // N (iter-10): the causal/mrope mask is IDENTICAL for every layer
         // (each layer's cache.pos equals the same value at its own update),
@@ -1253,21 +1271,21 @@ impl Qwen3Model {
         // N (iter-10): mask passed in from the caller (built once per
         // forward); the `causal`/`mrope` arguments are kept for the call
         // sites' None-vs-Some decision, but the build itself moved out.
-        let mask = mask.map(|m| m.clone());
+        let mask = mask.cloned();
         let ck = cache.view();
         let cv = cache.view_v();
         let attn_out = backend.zeros(vec![b, tq, q_size])?;
         let t_at = std::time::Instant::now();
         backend.attn_ar(
-                &q,
-                &ck,
-                &cv,
-                mask.as_ref(),
-                &attn_out,
-                attn.n_heads,
-                attn.n_kv_heads,
-                attn.head_dim,
-            )?;
+            &q,
+            &ck,
+            &cv,
+            mask.as_ref(),
+            &attn_out,
+            attn.n_heads,
+            attn.n_kv_heads,
+            attn.head_dim,
+        )?;
         if cfg!(debug_assertions) && std::env::var("LLM_BENCH").is_ok() && tq == 1 {
             eprintln!(
                 "  attn_ar {:.2}ms kv_update {:.2}ms",
@@ -1400,13 +1418,18 @@ fn backend_add(backend: &dyn Backend, a: &Tensor, b: &Tensor) -> Result<Tensor, 
     Ok(y)
 }
 
-#[cfg(all(test, feature = "metal"))]
-mod tests {
+/// Backend-agnostic fixtures: a randomly-initialised mini-Qwen3 that can be
+/// built on ANY backend. Kept outside the `metal`-gated test module so CPU and
+/// CUDA hosts exercise the same paths — the CPU backend runs the DEFAULT trait
+/// implementations of rope/kv_rerotated/rmsnorm_head_rope, which is exactly
+/// where the window-roll defects lived, and a Metal-only test module left them
+/// unreachable on Linux.
+#[cfg(test)]
+mod test_util {
     use super::*;
-    use crate::metal::MetalBackend;
     use crate::weights_map::{WeightTensor, WeightsMap};
 
-    fn rng_u64(seed: u64) -> impl FnMut() -> u64 {
+    pub fn rng_u64(seed: u64) -> impl FnMut() -> u64 {
         let mut s = seed;
         move || {
             s ^= s << 13;
@@ -1416,13 +1439,13 @@ mod tests {
         }
     }
 
-    fn rand_vec(n: usize, rng: &mut impl FnMut() -> u64) -> Vec<f32> {
+    pub fn rand_vec(n: usize, rng: &mut impl FnMut() -> u64) -> Vec<f32> {
         (0..n)
             .map(|_| ((rng() >> 32) as f32 / (1u64 << 32) as f32) * 2.0 - 1.0)
             .collect()
     }
 
-    fn cfg() -> Qwen3Config {
+    pub fn mini_cfg() -> Qwen3Config {
         Qwen3Config {
             dim: 16,
             n_layers: 2,
@@ -1441,15 +1464,10 @@ mod tests {
     }
 
     /// Мини-Qwen3: случайные веса; WeightsMap строится поверх owned-буферов.
-    fn mini_model() -> (MetalBackend, Qwen3Model) {
-        let backend = MetalBackend::new().expect("metal backend");
-        let c = cfg();
-        mini_model_with_cfg(c)
-    }
-
-    fn mini_model_with_cfg(c: Qwen3Config) -> (MetalBackend, Qwen3Model) {
-        let backend = MetalBackend::new().expect("metal backend");
-        let cfg = c.clone(); // входной конфиг (n_layers среза!) — не переопределять cfg()
+    /// Deterministic for a given config — two models built with the same `c`
+    /// hold identical weights (the roll-equivalence test relies on this).
+    pub fn build_model(backend: &dyn Backend, c: Qwen3Config) -> Qwen3Model {
+        let cfg = c.clone(); // входной конфиг (n_layers среза!) — не переопределять mini_cfg()
         let mut rng = rng_u64(0xC0FFEE);
         let mut storage: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
         storage.push((
@@ -1506,7 +1524,140 @@ mod tests {
             tensors,
             storage: vec![],
         };
-        let model = Qwen3Model::load(&backend, &wm, c).expect("load mini qwen3");
+        Qwen3Model::load(backend, &wm, cfg).expect("load mini qwen3")
+    }
+}
+
+/// Window-roll correctness (plan 1.6). Backend-agnostic on purpose: the
+/// `metal`-gated module nearby cannot run on Linux, and the CPU backend reaches
+/// the DEFAULT `rope_standard`/`kv_rerotated` implementations — the very code
+/// the window-roll defects lived in.
+#[cfg(all(test, any(feature = "cpu", feature = "cuda", feature = "metal")))]
+mod roll_tests {
+    use super::test_util::{build_model, mini_cfg};
+    use super::*;
+
+    /// Baseline: token-by-token decode (wide window, no roll) vs one prefill of
+    /// the same ids — establishes that the two paths agree before any roll.
+    #[test]
+    fn decode_by_one_matches_prefill_without_roll() {
+        let Ok(backend) = crate::backend::default_backend() else {
+            eprintln!("no backend — skipping");
+            return;
+        };
+        let c = mini_cfg(); // rope_max_seq = 128: no roll happens
+        let ids: Vec<u32> = (0..12u32).map(|i| i % 8).collect();
+
+        let mut fresh = build_model(backend.as_ref(), c.clone());
+        let ref_logits = fresh.prefill(backend.as_ref(), &ids).unwrap();
+
+        let mut stepwise = build_model(backend.as_ref(), c.clone());
+        let mut last = None;
+        for &t in &ids {
+            last = Some(stepwise.decode(backend.as_ref(), t).unwrap());
+        }
+
+        let v = c.vocab_size;
+        let got = backend.to_cpu_f32(&last.unwrap()).unwrap();
+        let refv = backend.to_cpu_f32(&ref_logits).unwrap();
+        let rows = refv.len() / v;
+        let expected = &refv[(rows - 1) * v..rows * v];
+        let dev = got
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(dev < 1e-2, "stepwise decode must match prefill: dev {dev}");
+    }
+
+    /// Sliding-window decode. Invariants that MUST survive a roll:
+    ///
+    /// 1. `pos_rope` tracks the rolled cache position. It used to keep counting
+    ///    from the pre-roll value (12 vs the rolled 8) and stayed wrong for the
+    ///    rest of the conversation.
+    /// 2. The window holds the RIGHT TOKENS — verified through LAYER-0 V, which
+    ///    is `W_v·norm(embed(token))`: no dependence on position or context, so
+    ///    it identifies a token exactly.
+    /// 3. LAYER-0 K equals a fresh prefill of the same window at 0..W: the kept
+    ///    keys were re-rotated for their new positions AND the token that
+    ///    triggered the roll was roped at its NEW position.
+    ///
+    /// Layers >0 are deliberately not compared: their K/V come from hidden
+    /// states of the pre-roll context, and a KV roll does not recompute them
+    /// (the same trade-off llama.cpp's context shift makes), so they legitimately
+    /// differ from a fresh prefill.
+    #[test]
+    fn rolled_window_keeps_tokens_and_rerotates_layer0() {
+        let Ok(backend) = crate::backend::default_backend() else {
+            eprintln!("no backend — skipping");
+            return;
+        };
+        let mut c = mini_cfg();
+        c.rope_max_seq = 8; // KV bounded by an 8-token window
+        let tokens: Vec<u32> = (0..12u32).map(|i| i % 8).collect();
+        let window = &tokens[tokens.len() - 8..];
+
+        let mut rolled = build_model(backend.as_ref(), c.clone());
+        for &t in &tokens {
+            rolled.decode(backend.as_ref(), t).expect("decode");
+        }
+        assert_eq!(rolled.caches[0].pos, 8, "the window must be full");
+        assert_eq!(
+            rolled.pos_rope, rolled.caches[0].pos,
+            "pos_rope must track the rolled cache position"
+        );
+
+        // Reference: the SAME weights prefilled with exactly the surviving
+        // window at positions 0..W. That is what the roll is supposed to leave
+        // behind, so the comparison is positional by construction (cache values
+        // are position-dependent, so comparing against the same token at its
+        // original absolute position would be meaningless).
+        let mut fresh = build_model(backend.as_ref(), c.clone());
+        fresh
+            .prefill(backend.as_ref(), window)
+            .expect("prefill window");
+
+        let rk = backend.to_cpu_f32(&rolled.caches[0].view()).unwrap();
+        let fk = backend.to_cpu_f32(&fresh.caches[0].view()).unwrap();
+        let rv = backend.to_cpu_f32(&rolled.caches[0].view_v()).unwrap();
+        let fv = backend.to_cpu_f32(&fresh.caches[0].view_v()).unwrap();
+        let dev = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let kdev = dev(&rk, &fk);
+        let vdev = dev(&rv, &fv);
+        assert!(
+            kdev < 1e-2,
+            "layer-0 keys must match a fresh prefill of the window: dev {kdev}"
+        );
+        assert!(
+            vdev < 1e-2,
+            "layer-0 values must match a fresh prefill of the window: dev {vdev}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::test_util::{build_model, mini_cfg, rand_vec, rng_u64};
+    use super::*;
+    use crate::metal::MetalBackend;
+
+    fn cfg() -> Qwen3Config {
+        mini_cfg()
+    }
+
+    /// Мини-Qwen3 на Metal (см. `test_util::build_model` — общий конструктор).
+    fn mini_model() -> (MetalBackend, Qwen3Model) {
+        mini_model_with_cfg(cfg())
+    }
+
+    fn mini_model_with_cfg(c: Qwen3Config) -> (MetalBackend, Qwen3Model) {
+        let backend = MetalBackend::new().expect("metal backend");
+        let model = build_model(&backend, c);
         (backend, model)
     }
 
@@ -1551,12 +1702,7 @@ mod tests {
         // Детерминированный сид: первый draw LCG > p3 → u·q = u > p —
         // гарантированное отклонение (при q=1 принятие ⇔ u ≤ p).
         let seed = (1u64..)
-            .find(|&s| {
-                let st = s
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (st >> 33) as f32 / (1u64 << 33) as f32 > p3
-            })
+            .find(|&s| crate::inference::sampling::lcg_unit_f32(s) > p3)
             .unwrap();
 
         model.reset_cache(&backend).unwrap();

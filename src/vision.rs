@@ -120,7 +120,7 @@ impl VisionModel {
                 .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
             let data = crate::weights_map::dequant_f32(tensor);
             let shape: Vec<usize> = tensor.shape.iter().map(|&d| d as usize).collect();
-            Ok(backend.from_cpu_f32(&data, shape)?)
+            backend.from_cpu_f32(&data, shape)
         };
         let d = cfg.embedding_length;
         let patch_embd = t("v.patch_embd.weight")?;
@@ -225,8 +225,8 @@ impl VisionModel {
             let x2 = ln.view(vec![b * tq, cfg.embedding_length]);
             let qkv = backend.zeros(vec![b * tq, 3 * cfg.embedding_length])?;
             backend.gemm_nt(&x2, &layer.qkv, &qkv)?;
-            let mut qkv_b = backend.zeros(qkv.shape().to_vec())?;
-            backend.add_bias(&qkv, &layer.qkv_b, &mut qkv_b)?;
+            let qkv_b = backend.zeros(qkv.shape().to_vec())?;
+            backend.add_bias(&qkv, &layer.qkv_b, &qkv_b)?;
             let qkv = qkv_b;
             let qkv = qkv.view(vec![b, tq, 3 * cfg.embedding_length]);
             let q = crate::nn::slice_last(backend, &qkv, cfg.embedding_length, 0)?;
@@ -255,8 +255,8 @@ impl VisionModel {
             let ao_b = backend.zeros(vec![b * tq, cfg.embedding_length])?;
             backend.add_bias(&ao0, &layer.attn_out_b, &ao_b)?;
             let ao = ao_b.view(vec![b, tq, cfg.embedding_length]);
-            let mut xr = backend.zeros(x.shape().to_vec())?;
-            backend.add(&x, &ao, &mut xr)?;
+            let xr = backend.zeros(x.shape().to_vec())?;
+            backend.add(&x, &ao, &xr)?;
             // ln2 → ffn (gelu)
             let xrv = xr.view(vec![b * tq, cfg.embedding_length]);
             let ln2_2d = backend.zeros(vec![b * tq, cfg.embedding_length])?;
@@ -273,8 +273,8 @@ impl VisionModel {
                 backend.gemm_nt(&g, &layer.ffn_down, &down)?;
                 backend.add_bias(&down, &layer.ffn_down_b, &down)?;
                 let down = down.view(vec![b, tq, cfg.embedding_length]);
-                let mut xf = backend.zeros(x.shape().to_vec())?;
-                backend.add(&xr, &down, &mut xf)?;
+                let xf = backend.zeros(x.shape().to_vec())?;
+                backend.add(&xr, &down, &xf)?;
                 x = xf;
             } else {
                 return Err(BackendError::Shape(

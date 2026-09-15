@@ -176,7 +176,7 @@ fn assert_close(g: &[f32], c: &[f32], what: &str) {
 
 #[test]
 fn attn_ar_q8q8_matches_f32() {
-    let mut kv = vec![0f32; 1 * 5 * 1 * 64];
+    let mut kv = vec![0f32; 5 * 64];
     Lcg::new(2).fill(&mut kv);
     let (kq, ksc) = quantize_q8(&kv, 64);
     let (vq, vsc) = quantize_q8(&kv, 64);
@@ -191,7 +191,7 @@ fn attn_ar_q8q8_matches_f32() {
 
 #[test]
 fn attn_ar_q8f16_matches_f32() {
-    let mut kv = vec![0f32; 1 * 5 * 1 * 64];
+    let mut kv = vec![0f32; 5 * 64];
     Lcg::new(2).fill(&mut kv);
     let (kq, ksc) = quantize_q8(&kv, 64);
     let vh: Vec<half::f16> = kv.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -207,7 +207,7 @@ fn attn_ar_q8f16_matches_f32() {
 
 #[test]
 fn attn_ar_f16q8_matches_f32() {
-    let mut kv = vec![0f32; 1 * 5 * 1 * 64];
+    let mut kv = vec![0f32; 5 * 64];
     Lcg::new(2).fill(&mut kv);
     let (vq, vsc) = quantize_q8(&kv, 64);
     let kh: Vec<half::f16> = kv.iter().map(|&v| half::f16::from_f32(v)).collect();

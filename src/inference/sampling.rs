@@ -1,5 +1,43 @@
 //! Top-p, temperature, repetition penalty, RAS sampling (CPU vectors).
 
+/// The project-wide 64-bit LCG step (Knuth MMIX constants). Every stochastic
+/// path in the workspace shares this one step so that a single change to the
+/// generator cannot leave half the code on the old distribution.
+#[inline]
+pub fn lcg_next(state: u64) -> u64 {
+    state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
+/// Uniform `f32` in `[0, 1)` derived from a raw LCG state.
+///
+/// Uses the top 24 bits, which `f32` represents exactly: the largest value is
+/// `(2^24 - 1) / 2^24 < 1.0`. Deriving from fewer bits (the previous
+/// `state >> 33`) silently produced `[0, 0.25)`, and dividing a wider value by
+/// `2^32` could round up to exactly `1.0`.
+#[inline]
+pub fn lcg_unit_f32(state: u64) -> f32 {
+    ((state >> 40) as f32) * (1.0 / (1u64 << 24) as f32)
+}
+
+/// Draw a uniform `f32` from a mutable LCG state, seeding from the clock on the
+/// first call (`None`). The advanced state is written back, so a caller that
+/// keeps `Some(state)` gets a deterministic stream.
+pub fn next_unit_f32(state: &mut Option<u64>) -> f32 {
+    let next = match state {
+        Some(s) => lcg_next(*s),
+        None => lcg_next(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64,
+        ),
+    };
+    *state = Some(next);
+    lcg_unit_f32(next)
+}
+
 /// Sampling parameters.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -115,26 +153,7 @@ pub fn top_p_sample_vec(
 fn sample_from(top_tokens: &[(usize, f32)], rng_state: &mut Option<u64>) -> u32 {
     let total: f32 = top_tokens.iter().map(|(_, p)| p).sum();
 
-    let r = match rng_state {
-        Some(state) => {
-            *state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (*state >> 33) as f32 / (1u64 << 33) as f32
-        }
-        None => {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos();
-            let mut state = nanos as u64;
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *rng_state = Some(state);
-            (state >> 33) as f32 / (1u64 << 33) as f32
-        }
-    };
+    let r = next_unit_f32(rng_state);
 
     let threshold = r * total;
     let mut cumsum = 0.0f32;
@@ -240,20 +259,31 @@ mod tests {
             repetition_penalty: 1.0,
             seed: Some(7),
         };
-        // With top_p near 1.0 both paths effectively sample from the same
-        // distribution: repeated draws must stay inside the top_k window.
-        let mut rng_a = None;
+        // Three largest logits are 0.9 (id 1), 0.8 (id 6), 0.7 (id 3).
+        const TOP3: [usize; 3] = [1, 6, 3];
+        // NOTE: with top_p=0.99 the cumulative mass reaches the cutoff only on
+        // the LAST of the 8 tokens, so the unrestricted path legitimately may
+        // return any of them. The earlier version of this test asserted that
+        // the unrestricted draw always landed in the top-3 — it only ever held
+        // because the RNG could not produce a draw above 0.25.
         let mut rng_b = None;
-        for _ in 0..50 {
-            let ta = top_p_sample_vec_history(&logits, &mk(3), &[], &mut rng_a);
-            let tb = top_p_sample_vec_history(&logits, &mk(0), &[], &mut rng_b);
+        let mut outside_top3 = 0;
+        let mut rng_a = None;
+        for _ in 0..200 {
+            let ta = top_p_sample_vec_history(&logits, &mk(3), &[], &mut rng_a) as usize;
             assert!(
-                ta < 3 || ta == 2,
+                TOP3.contains(&ta),
                 "top_k=3 must stay in the top-3 window, got {ta}"
             );
-            // The full-sort path returns one of the 3 largest (0.9, 0.8, 0.7).
-            assert!([1usize, 6, 3].contains(&(tb as usize)), "unexpected {tb}");
+            let tb = top_p_sample_vec_history(&logits, &mk(0), &[], &mut rng_b) as usize;
+            if !TOP3.contains(&tb) {
+                outside_top3 += 1;
+            }
         }
+        assert!(
+            outside_top3 > 0,
+            "an unrestricted draw never left the top-3 window — the RNG is truncated"
+        );
     }
 
     /// Repetition penalty больше не no-op: токен из истории выталкивается
@@ -271,7 +301,10 @@ mod tests {
         };
         // Без истории: argmax = 0 (top_k=1 — только он в окне).
         let mut rng = None;
-        assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[], &mut rng), 0);
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &mk(1.0), &[], &mut rng),
+            0
+        );
         // Токен 0 в истории: 2.0/2 = 1.0 < 1.5 → argmax = 1 → top_k=1 окно
         // не содержит 0 → ни один draw не вернёт 0.
         let mut rng = None;
@@ -291,7 +324,10 @@ mod tests {
         );
         // penalty == 1.0 — no-op.
         let mut rng = None;
-        assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[0], &mut rng), 0);
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &mk(1.0), &[0], &mut rng),
+            0
+        );
     }
 
     /// Wave-8 revert: direct `apply_repetition_penalty_vec` is per-OCCURRENCE
@@ -325,6 +361,59 @@ mod tests {
         let mut rng = None;
         // Штраф: [1.0, 1.5, 0.9, 0.1]; температура: [2.0, 3.0, 1.8, 0.2]
         // → argmax = 1.
-        assert_eq!(top_p_sample_vec_history(&logits, &params, &[0], &mut rng), 1);
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &params, &[0], &mut rng),
+            1
+        );
+    }
+
+    /// The old `(state >> 33) as f32 / 2^33` derivation could only return
+    /// [0, 0.25): the top of the range was unreachable and the mean sat at
+    /// 0.125. Guard the full [0, 1) span and the mean.
+    #[test]
+    fn unit_draw_spans_full_range() {
+        let mut st = Some(1u64);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut sum = 0.0f64;
+        const N: usize = 100_000;
+        for _ in 0..N {
+            let v = next_unit_f32(&mut st);
+            assert!((0.0..1.0).contains(&v), "draw outside [0,1): {v}");
+            lo = lo.min(v);
+            hi = hi.max(v);
+            sum += v as f64;
+        }
+        assert!(hi > 0.99, "upper range unreachable, max = {hi}");
+        assert!(lo < 0.01, "lower range unreachable, min = {lo}");
+        let mean = sum / N as f64;
+        assert!((mean - 0.5).abs() < 0.01, "mean {mean} is not 0.5");
+    }
+
+    /// Regression for the truncated draw: two EQUAL logits must be selected
+    /// about equally often. Under the old formula the first candidate owned
+    /// the whole threshold range, so the second was never reachable.
+    #[test]
+    fn equal_tokens_are_selected_evenly() {
+        let logits = [0.0f32, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            seed: None,
+        };
+        let mut st = Some(987_654_321u64);
+        let (mut first, mut second) = (0u32, 0u32);
+        for _ in 0..10_000 {
+            if top_p_sample_vec(&logits, &params, &mut st) == 0 {
+                first += 1;
+            } else {
+                second += 1;
+            }
+        }
+        assert!(
+            first > 4_000 && second > 4_000,
+            "biased selection: token0={first}, token1={second}"
+        );
     }
 }

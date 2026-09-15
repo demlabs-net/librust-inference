@@ -8,10 +8,10 @@
 
 use std::path::Path;
 
-use crate::gguf::{write_gguf, GgmlType, GgufValue, GgufWriteTensor};
-use crate::quant::{quantize, QuantFormat};
+use crate::gguf::{GgmlType, GgufValue, GgufWriteTensor, write_gguf};
+use crate::quant::{QuantFormat, quantize};
 use crate::train_qwen3::AdapterFile;
-use crate::weights_map::{dequant_f32, WeightsMap};
+use crate::weights_map::{WeightsMap, dequant_f32};
 
 /// Маппинг целевого формата → GGML-тип writer'а.
 pub fn ggml_type_of(fmt: QuantFormat) -> GgmlType {
@@ -38,7 +38,15 @@ pub fn parse_quant_format(s: &str) -> Option<QuantFormat> {
 }
 
 /// Применить адаптер к весам: delta[out, in] = α·B·A (B [out,r], A [r,in]).
-fn apply_adapter(w: &mut [f32], a: &[f32], b: &[f32], out: usize, inp: usize, rank: usize, alpha: f32) {
+fn apply_adapter(
+    w: &mut [f32],
+    a: &[f32],
+    b: &[f32],
+    out: usize,
+    inp: usize,
+    rank: usize,
+    alpha: f32,
+) {
     for l in 0..out {
         for k in 0..inp {
             let mut acc = 0.0f32;
@@ -80,32 +88,29 @@ pub fn export_merged_gguf(
     let mut with_adapter = 0usize;
     for t in &file.tensors {
         let wname = &t.name;
-        let wt = wm.get(wname).ok_or_else(|| {
-            anyhow::anyhow!("база без тензора {} (несовместимый файл)", wname)
-        })?;
+        let wt = wm
+            .get(wname)
+            .ok_or_else(|| anyhow::anyhow!("база без тензора {} (несовместимый файл)", wname))?;
         // логический размер: [out, in] (внутренний порядок WeightsMap)
         let shape: Vec<usize> = wt.shape.iter().map(|&s| s as usize).collect();
         let mut w = dequant_f32(wt);
-        match adapter.adapters.get(wname) {
-            Some(pair) => {
-                // [out, in]: a [r, inp], b [out, r]
-                let rank = adapter.rank;
-                let (out, inp) = (pair.b.len() / rank, pair.a.len() / rank);
-                if rank == 0
-                    || pair.a.len() % rank != 0
-                    || pair.b.len() % rank != 0
-                    || out * inp != w.len()
-                {
-                    anyhow::bail!(
-                        "adapter {}: размеры a/b не совпадают с весами {:?}",
-                        wname,
-                        shape
-                    );
-                }
-                apply_adapter(&mut w, &pair.a, &pair.b, out, inp, rank, alpha);
-                with_adapter += 1;
+        if let Some(pair) = adapter.adapters.get(wname) {
+            // [out, in]: a [r, inp], b [out, r]
+            let rank = adapter.rank;
+            let (out, inp) = (pair.b.len() / rank, pair.a.len() / rank);
+            if rank == 0
+                || pair.a.len() % rank != 0
+                || pair.b.len() % rank != 0
+                || out * inp != w.len()
+            {
+                anyhow::bail!(
+                    "adapter {}: размеры a/b не совпадают с весами {:?}",
+                    wname,
+                    shape
+                );
             }
-            None => {}
+            apply_adapter(&mut w, &pair.a, &pair.b, out, inp, rank, alpha);
+            with_adapter += 1;
         }
         let data = quantize(&w, fmt);
         total_bytes += data.len() as u64;
@@ -148,12 +153,10 @@ pub fn export_merged_gguf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gguf::{parse, GgufValue};
-    use std::io::Write;
+    use crate::gguf::{GgufValue, parse};
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("export-{}-{}", std::process::id(), name));
-        p
+        std::env::temp_dir().join(format!("export-{}-{}", std::process::id(), name))
     }
 
     fn write_tiny_base(path: &Path) {
@@ -164,13 +167,26 @@ mod tests {
         let bytes2: Vec<u8> = w2.iter().flat_map(|x| x.to_le_bytes()).collect();
         write_gguf(
             &mut buf,
-            &vec![
-                ("general.architecture".into(), GgufValue::String("tiny".into())),
+            &[
+                (
+                    "general.architecture".into(),
+                    GgufValue::String("tiny".into()),
+                ),
                 ("tiny.vocab_size".into(), GgufValue::U32(17)),
             ],
             &[
-                GgufWriteTensor { name: "w1.weight".into(), dims: vec![4, 3], ggml_type: GgmlType::F32, data: bytes1 },
-                GgufWriteTensor { name: "w2.weight".into(), dims: vec![3, 2], ggml_type: GgmlType::F32, data: bytes2 },
+                GgufWriteTensor {
+                    name: "w1.weight".into(),
+                    dims: vec![4, 3],
+                    ggml_type: GgmlType::F32,
+                    data: bytes1,
+                },
+                GgufWriteTensor {
+                    name: "w2.weight".into(),
+                    dims: vec![3, 2],
+                    ggml_type: GgmlType::F32,
+                    data: bytes2,
+                },
             ],
         )
         .unwrap();
@@ -212,7 +228,10 @@ mod tests {
         let out_bytes = std::fs::read(&out).unwrap();
         let f = parse(&out_bytes).unwrap();
         assert_eq!(f.architecture(), Some("tiny"));
-        assert_eq!(f.get("tiny.vocab_size").and_then(GgufValue::as_u32), Some(17));
+        assert_eq!(
+            f.get("tiny.vocab_size").and_then(GgufValue::as_u32),
+            Some(17)
+        );
         assert_eq!(
             f.get("inference.lora_rank").and_then(GgufValue::as_u32),
             Some(2)

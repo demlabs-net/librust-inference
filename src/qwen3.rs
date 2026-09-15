@@ -655,6 +655,23 @@ impl Qwen3Model {
         upto: Option<usize>,
         deepstack: Option<&[Tensor]>,
     ) -> Result<Tensor, BackendError> {
+        self.forward_layers_range(backend, x, t, mrope, upto, 0, deepstack)
+    }
+
+    /// PP-шардирование (7.5): forward слоёв в диапазоне [from..upto).
+    /// Скрытые ВХОДЯТ уже после эмбеддинга/предыдущей стадии, кэши слоя
+    /// обновляются как обычно; RoPE — от pos_rope. Возврат — скрытые после
+    /// последнего слоя диапазона (БЕЗ out_norm — нормирует последняя нода).
+    pub fn forward_layers_range(
+        &mut self,
+        backend: &dyn Backend,
+        mut x: Tensor,
+        t: usize,
+        mrope: Option<&[u32]>,
+        upto: Option<usize>,
+        from: usize,
+        deepstack: Option<&[Tensor]>,
+    ) -> Result<Tensor, BackendError> {
         // Plan 1.6: the window roll MUST run before the current token's rope.
         // `compact()` re-rotates the kept keys for their new absolute positions
         // and lowers `cache.pos`; a token roped at the pre-roll position would
@@ -714,6 +731,9 @@ impl Qwen3Model {
                 && i >= u
             {
                 break;
+            }
+            if i < from {
+                continue;
             }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;

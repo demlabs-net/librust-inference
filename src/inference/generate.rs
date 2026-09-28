@@ -71,11 +71,16 @@ pub struct VisionPrompt {
 /// получает выход его диапазона слоёв. Реализацию даёт сервис (кластерный
 /// канал с TLS); librust-inference знает только этот контракт.
 pub trait StageTransport: Send + Sync {
+    /// `reset` — начало новой последовательности (стадия сбрасывает свои KV:
+    /// её кэш мог остаться от прогрева/прошлой генерации), `pos` — позиция
+    /// первого токена запроса (стадия сверяет её со своим кэшем).
     fn forward_stage(
         &self,
         from: usize,
         upto: Option<usize>,
         norm_out: bool,
+        reset: bool,
+        pos: usize,
         t: usize,
         hidden: Vec<f32>,
     ) -> Result<Vec<f32>, String>;
@@ -87,6 +92,9 @@ pub trait StageTransport: Send + Sync {
 pub struct PpSplit {
     pub from: usize,
     pub transport: std::sync::Arc<dyn StageTransport>,
+    /// Первый вызов стадии в этой генерации (шлётся как reset: у соседа
+    /// кэш мог остаться от прогрева/прошлой генерации).
+    pub first: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct GenerateParams {
@@ -156,12 +164,18 @@ fn pp_forward(
 ) -> Result<crate::backend::Tensor, BackendError> {
     let t = ids.len();
     let dim = model.cfg.dim;
+    // Позиция ДО локального forward = стартовая позиция последовательности
+    // для стадии (её кэш должен стоять там же).
+    let start_pos = model.caches[0].pos;
+    let reset = pp
+        .first
+        .swap(false, std::sync::atomic::Ordering::Relaxed);
     let x = model.embed_ids(backend, ids)?;
     let mid = model.forward_layers_range(backend, x, t, None, Some(pp.from), 0, None, false)?;
     let hidden = backend.to_cpu_f32(&mid)?;
     let out = pp
         .transport
-        .forward_stage(pp.from, None, true, t, hidden)
+        .forward_stage(pp.from, None, true, reset, start_pos, t, hidden)
         .map_err(|e| BackendError::Shape(format!("PP-стадия: {e}")))?;
     if out.len() != t * dim {
         return Err(BackendError::Shape(format!(

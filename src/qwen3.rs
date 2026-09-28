@@ -134,6 +134,13 @@ pub struct Qwen3Layer {
 }
 
 /// Qwen3-модель (decode-состояние: KV-кэши в слоях).
+/// KV-объект модели (7.8): переносимое состояние всех слоёв + rope-позиция.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelKvState {
+    pub pos_rope: usize,
+    pub layers: Vec<crate::nn::KvState>,
+}
+
 pub struct Qwen3Model {
     pub cfg: Qwen3Config,
     embed: crate::nn::Embedding,
@@ -174,6 +181,51 @@ impl Qwen3Model {
         let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;
         Ok(logits.view(vec![b, tq, self.cfg.vocab_size]))
+    }
+
+    /// KV-объект модели (7.8): снимок ВСЕХ слоёв — перенос сессии на другой
+    /// экземпляр/ноду. Скрытые состояния и логиты не входят: продолжение
+    /// считается тем же prefill/decode по восстановленным кэшам.
+    pub fn export_kv(&self, backend: &dyn Backend) -> Result<ModelKvState, BackendError> {
+        let mut layers = Vec::with_capacity(self.caches.len());
+        for c in &self.caches {
+            layers.push(c.export_state(backend)?);
+        }
+        Ok(ModelKvState {
+            pos_rope: self.pos_rope,
+            layers,
+        })
+    }
+
+    /// Импорт KV-объекта (7.8): кэши приводятся к присланному состоянию.
+    /// Число слоёв и геометрия проверяются — KV от другой модели молча
+    /// испортил бы продолжение.
+    pub fn import_kv(
+        &mut self,
+        backend: &dyn Backend,
+        st: &ModelKvState,
+    ) -> Result<(), BackendError> {
+        if st.layers.len() != self.caches.len() {
+            return Err(BackendError::Shape(format!(
+                "импорт KV: слоёв {} в объекте, у модели {}",
+                st.layers.len(),
+                self.caches.len()
+            )));
+        }
+        for (i, (cache, layer)) in self.caches.iter_mut().zip(&st.layers).enumerate() {
+            cache.import_state(backend, layer)?;
+            let d = self.cfg.n_kv_heads * self.cfg.head_dim;
+            let want = layer.pos * d;
+            if !layer.k.is_empty() && layer.k.len() != want {
+                return Err(BackendError::Shape(format!(
+                    "импорт KV: слой {i}: {} значений при pos {} и d {d}",
+                    layer.k.len(),
+                    layer.pos
+                )));
+            }
+        }
+        self.pos_rope = st.pos_rope;
+        Ok(())
     }
 
     /// Сдвинуть логическую rope-позицию (PP-декод шагает как decode()).
@@ -1674,6 +1726,47 @@ mod tests {
         let backend = MetalBackend::new().expect("metal backend");
         let model = build_model(&backend, c);
         (backend, model)
+    }
+
+    /// 7.8 (KV-объект): снимок KV переносится на ДРУГОЙ экземпляр модели, и
+    /// ПРОДОЛЖЕНИЕ диалога совпадает бит-в-бит — иначе миграция сессии (или
+    /// отправка KV соседу) молча портит контекст. Сравниваются одинаковые
+    /// шаги последовательности: источник продолжает тем же токеном, что и
+    /// приёмник (сравнивать с более ранними шагами — сравнить разное).
+    #[test]
+    fn kv_object_transfer_continues_bit_exact() {
+        let (backend, mut src) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        src.prefill(&backend, &ids).unwrap();
+        for &t in &[5u32, 6, 7] {
+            src.decode(&backend, t).unwrap();
+        }
+        let st = src.export_kv(&backend).unwrap();
+
+        // Эталон: источник продолжает 8 и 9.
+        let mut l_src = Vec::new();
+        for &t in &[8u32, 9] {
+            l_src.push(backend.to_cpu_f32(&src.decode(&backend, t).unwrap()).unwrap());
+        }
+
+        // Приёмник: тот же KV импортирован в другой экземпляр тех же весов.
+        let (backend2, mut dst) = mini_model();
+        dst.import_kv(&backend2, &st).unwrap();
+        assert_eq!(dst.pos_rope, 7, "rope-позиция после импорта");
+        for (i, &t) in [8u32, 9].iter().enumerate() {
+            let l = backend2.to_cpu_f32(&dst.decode(&backend2, t).unwrap()).unwrap();
+            assert_eq!(l, l_src[i], "продолжение после импорта KV расходится (шаг {i})");
+        }
+
+        // Несовместимый объект — громкая ошибка, а не молчаливый мусор.
+        let (backend3, mut other) = mini_model_with_cfg(Qwen3Config {
+            n_kv_heads: 1,
+            ..mini_cfg()
+        });
+        assert!(
+            other.import_kv(&backend3, &st).is_err(),
+            "KV чужой геометрии обязан отвергаться"
+        );
     }
 
     /// 7.5 (унификация петель): prefill_extract идёт через ОБЩУЮ послойную

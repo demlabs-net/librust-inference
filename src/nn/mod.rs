@@ -368,6 +368,27 @@ impl Attention {
 /// Storage format: `KvFormat::F32` (default) or `KvFormat::F16` — f16 is
 /// quantized on write (kv_update) and dequantized inline in the fused
 /// attention kernels (CUDA); the CPU reference and Metal keep fp32.
+/// Состояние одного KV-кэша (7.8): строки [0..pos) в f32 + позиция. Формат
+/// хранения значений нормализован к f32 — перенос между нодами/бэкендами не
+/// зависит от того, чем кэш был на исходной ноде (f16/f32/q8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvState {
+    pub pos: usize,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
+/// Геометрия кэша: импортёр собирает такой же (или отказывается).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KvGeometry {
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_theta: f32,
+    pub mrope_sections: Option<[usize; 4]>,
+    pub k_format: crate::dtype::KvFormat,
+    pub v_format: crate::dtype::KvFormat,
+}
+
 pub struct KvCache {
     k: Tensor,
     v: Tensor,
@@ -450,6 +471,70 @@ impl KvCache {
             rope_theta,
             mrope_sections,
         })
+    }
+
+    /// KV-объект (7.8): геометрия кэша — нужна импортёру, чтобы собрать
+    /// такой же кэш (и отказаться, если KV от другой модели).
+    pub fn geometry(&self) -> KvGeometry {
+        KvGeometry {
+            n_kv_heads: self.k.shape()[2] / self.head_dim,
+            head_dim: self.head_dim,
+            rope_theta: self.rope_theta,
+            mrope_sections: self.mrope_sections,
+            k_format: self.k_format,
+            v_format: self.v_format,
+        }
+    }
+
+    /// Экспорт состояния (7.8): только строки [0..pos) в f32 — переносимая
+    /// часть KV. Кэш остаётся рабочим (чтение, не перемещение).
+    pub fn export_state(&self, backend: &dyn Backend) -> Result<KvState, BackendError> {
+        let k = if self.pos == 0 {
+            Vec::new()
+        } else {
+            crate::backend::download_in_dtype(backend, &self.view())?
+        };
+        let v = if self.pos == 0 {
+            Vec::new()
+        } else {
+            crate::backend::download_in_dtype(backend, &self.view_v())?
+        };
+        Ok(KvState {
+            pos: self.pos,
+            k,
+            v,
+        })
+    }
+
+    /// Импорт состояния (7.8): кэш приводится к присланному состоянию —
+    /// прежнее содержимое сбрасывается. Длина проверяется жёстко: молча
+    /// усечённый KV испортил бы продолжение диалога.
+    pub fn import_state(
+        &mut self,
+        backend: &dyn Backend,
+        st: &KvState,
+    ) -> Result<(), BackendError> {
+        self.shrink_to_init(backend)?;
+        if st.pos == 0 {
+            return Ok(());
+        }
+        let d = self.k.shape()[2];
+        let expect = st.pos * d;
+        if st.k.len() != expect || st.v.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "импорт KV: строк {} × d {d} = {expect}, прислано k={} v={}",
+                st.pos,
+                st.k.len(),
+                st.v.len()
+            )));
+        }
+        let k = backend.from_cpu_f32(&st.k, vec![1, st.pos, d])?;
+        let v = backend.from_cpu_f32(&st.v, vec![1, st.pos, d])?;
+        self.ensure(backend, st.pos)?;
+        backend.kv_update(&self.k, &k, 0)?;
+        backend.kv_update(&self.v, &v, 0)?;
+        self.pos = st.pos;
+        Ok(())
     }
 
     /// Roll the window NOW if `pos + tq` would exceed the cap (plan 1.6):

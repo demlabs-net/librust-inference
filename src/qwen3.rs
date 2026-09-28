@@ -415,6 +415,7 @@ impl Qwen3Model {
     /// Prefill + скрытые extract-слоёв (для DFlash-инжекта, Ф2.4): h_i —
     /// выход слоя i (attn+ffn+residual, без out_norm), по порядку `layers`.
     /// Один проход: кэши и логиты как в prefill, скрытые — побочный сбор.
+    /// Через ОБЩУЮ послойную петлю (forward_layers_inner).
     pub fn prefill_extract(
         &mut self,
         backend: &dyn Backend,
@@ -424,90 +425,9 @@ impl Qwen3Model {
         backend.begin_batch()?;
         let r = (|| {
             let t = ids.len();
-            let mut x = self.embed.forward(backend, ids, t)?;
-            let mut out = Vec::with_capacity(layers.len());
-            let mut li = 0usize;
-            let (mut p_attn, mut p_ffn) = (0.0f64, 0.0f64);
-            let prof = std::env::var("LLM_BENCH").is_ok();
-            // N (iter-10): one causal mask per forward — identical for every
-            // layer (each cache's pos is the same at its own update).
-            // N (plan 1.6): roll the window BEFORE the current token's rope
-            // and the mask — the compact resets the absolute positions, and
-            // the current token must be roped at its NEW position (the
-            // update-time roll would rope it at the pre-roll position).
-            if self.roll_windows_if_needed(backend, t)? {
-                self.pos_rope = self.caches[0].pos;
-            }
-            let mask = if t > 1 {
-                Some(crate::nn::build_causal_mask(
-                    backend,
-                    t,
-                    self.caches[0].pos + t,
-                    self.pos_rope,
-                    self.cfg.swa_window,
-                )?)
-            } else {
-                None
-            };
-            for (i, layer) in self.layers.iter().enumerate() {
-                let t0 = std::time::Instant::now();
-                if prof {
-                    backend.end_batch()?;
-                    backend.begin_batch()?;
-                }
-                let h = layer.attn_norm.forward(backend, &x)?;
-                let h = Self::rope_and_attn(
-                    &self.cfg,
-                    backend,
-                    &h,
-                    &layer.attn,
-                    &mut self.caches[i],
-                    self.pos_rope,
-                    t,
-                    None,
-                    true,
-                    None,
-                    mask.as_ref(),
-                )?;
-                x = backend_add(backend, &x, &h)?;
-                if prof {
-                    backend.end_batch()?;
-                    backend.begin_batch()?;
-                }
-                if prof {
-                    p_attn += t0.elapsed().as_secs_f64();
-                }
-                let t1 = std::time::Instant::now();
-                let h = layer.ffn_norm.forward(backend, &x)?;
-                let f = ffn_forward(backend, &h, &layer.ffn)?;
-                x = backend_add(backend, &x, &f)?;
-                // фичи для DFlash-инжекта = ВЫХОД extract-слоя (z-lab
-                // model.py: hidden_states[layer_id+1] = выход слоя layer_id
-                // после attn+ffn; fc обучался на выходах, не на входах).
-                if li < layers.len() && layers[li] == i {
-                    out.push(x.clone());
-                    li += 1;
-                }
-                if prof {
-                    backend.end_batch()?;
-                    backend.begin_batch()?;
-                }
-                if prof {
-                    p_ffn += t1.elapsed().as_secs_f64();
-                }
-            }
-            if prof {
-                eprintln!(
-                    "PROF prefill_extract t={}: attn {:.1}ms ({:.2}/layer) ffn {:.1}ms ({:.2}/layer)",
-                    t,
-                    p_attn * 1e3,
-                    p_attn * 1e3 / self.layers.len() as f64,
-                    p_ffn * 1e3,
-                    p_ffn * 1e3 / self.layers.len() as f64
-                );
-            }
-            let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-            let h = self.out_norm.forward(backend, &x)?;
+            let x = self.embed.forward(backend, ids, t)?;
+            let (h, out) = self.forward_layers_extract(backend, x, t, None, 0, None, layers)?;
+            let (b, tq, d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
             let h2 = h.view(vec![b * tq, d]);
             let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
             backend.gemm_nt(&h2, &self.output, &logits)?;
@@ -650,7 +570,7 @@ impl Qwen3Model {
     fn forward_layers_hidden(
         &mut self,
         backend: &dyn Backend,
-        mut x: Tensor,
+        x: Tensor,
         t: usize,
         mrope: Option<&[u32]>,
         upto: Option<usize>,
@@ -660,10 +580,55 @@ impl Qwen3Model {
     }
 
     /// PP-шардирование (7.5): forward слоёв в диапазоне [from..upto).
+    /// Скрытые ВХОДЯТ уже после эмбеддинга/предыдущей стадии, кэши слоёв
+    /// диапазона обновляются как обычно; RoPE — от pos_rope. Возврат —
+    /// скрытые после последнего слоя диапазона (norm_out=false: СЫРОЙ
+    /// residual — нормирует только последняя нода; см. коммент в петле).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layers_range(
+        &mut self,
+        backend: &dyn Backend,
+        x: Tensor,
+        t: usize,
+        mrope: Option<&[u32]>,
+        upto: Option<usize>,
+        from: usize,
+        deepstack: Option<&[Tensor]>,
+        norm_out: bool,
+    ) -> Result<Tensor, BackendError> {
+        let mut extract = Vec::new();
+        let mut split = None;
+        self.forward_layers_inner(
+            backend, x, t, mrope, upto, from, deepstack, norm_out, &[], &mut extract, None,
+            &mut split,
+        )
+    }
+
+    /// Выход extract-слоёв (без out_norm) — ЕДИНАЯ петля (forward_layers_inner).
+    fn forward_layers_extract(
+        &mut self,
+        backend: &dyn Backend,
+        x: Tensor,
+        t: usize,
+        mrope: Option<&[u32]>,
+        from: usize,
+        upto: Option<usize>,
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>), BackendError> {
+        let mut out = Vec::with_capacity(layers.len());
+        let mut split = None;
+        let h = self.forward_layers_inner(
+            backend, x, t, mrope, upto, from, None, true, layers, &mut out, None, &mut split,
+        )?;
+        Ok((h, out))
+    }
+
+    /// PP-шардирование (7.5): forward слоёв в диапазоне [from..upto).
     /// Скрытые ВХОДЯТ уже после эмбеддинга/предыдущей стадии, кэши слоя
     /// обновляются как обычно; RoPE — от pos_rope. Возврат — скрытые после
     /// последнего слоя диапазона (БЕЗ out_norm — нормирует последняя нода).
-    pub fn forward_layers_range(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers_inner(
         &mut self,
         backend: &dyn Backend,
         mut x: Tensor,
@@ -673,6 +638,14 @@ impl Qwen3Model {
         from: usize,
         deepstack: Option<&[Tensor]>,
         norm_out: bool,
+        // Сбор скрытых: выходы слоёв `extract_layers` (по возрастанию) в
+        // `extract_out` — DFlash-инжект (prefill_extract).
+        extract_layers: &[usize],
+        extract_out: &mut Vec<Tensor>,
+        // Отладочный срез слоя li: (вход после attn_norm, после attn-адда,
+        // после ffn-адда) — debug_layer_split; петля на нём останавливается.
+        split_at: Option<usize>,
+        split_out: &mut Option<(Tensor, Tensor, Tensor)>,
     ) -> Result<Tensor, BackendError> {
         // Plan 1.6: the window roll MUST run before the current token's rope.
         // `compact()` re-rotates the kept keys for their new absolute positions
@@ -732,6 +705,7 @@ impl Qwen3Model {
         } else {
             None
         };
+        let mut extract_li = 0usize;
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(u) = upto
                 && i >= u
@@ -742,29 +716,9 @@ impl Qwen3Model {
                 continue;
             }
             let t0 = std::time::Instant::now();
+            let capture_split = split_at == Some(i);
             let h = layer.attn_norm.forward(backend, &x)?;
-            if std::env::var("PP_DBG").is_ok() {
-                let xv = backend.to_cpu_f32(&x)?;
-                eprintln!(
-                    "PP_DBG L{} in-x rms={:.4} [0,:4]={:?} [1,:4]={:?} [2,:4]={:?}",
-                    i,
-                    (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt(),
-                    &xv[..4],
-                    &xv[xv.len() / 3..xv.len() / 3 + 4],
-                    &xv[2 * xv.len() / 3..2 * xv.len() / 3 + 4]
-                );
-            }
-            if std::env::var("PP_DBG").is_ok() && i == 2 {
-                let xv = backend.to_cpu_f32(&x)?;
-                let hv = backend.to_cpu_f32(&h)?;
-                eprintln!(
-                    "PP_DBG layer2 x rms={:.4} [0,:8]={:?} | normed rms={:.4} [0,:8]={:?}",
-                    (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt(),
-                    &xv[..8],
-                    (hv.iter().map(|v| v * v).sum::<f32>() / hv.len() as f32).sqrt(),
-                    &hv[..8]
-                );
-            }
+            let normed_cap = if capture_split { Some(h.clone()) } else { None };
             if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
                 let hv = backend.to_cpu_f32(&h)?;
                 eprintln!("INFER_DEBUG norm[0,:8]={:?}", &hv[..8]);
@@ -783,6 +737,7 @@ impl Qwen3Model {
                 mask.as_ref(),
             )?;
             x = backend_add(backend, &x, &h)?;
+            let after_attn_cap = if capture_split { Some(x.clone()) } else { None };
             if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
                 let first = xv.len() - t * self.cfg.dim;
@@ -810,16 +765,6 @@ impl Qwen3Model {
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
-            // 7.5-диагностика: PP_DBG=1 — дамп скрытых слоя 2 (split-vs-full).
-            if std::env::var("PP_DBG").is_ok() && i == 2 {
-                let xv = backend.to_cpu_f32(&x)?;
-                eprintln!(
-                    "PP_DBG after_layer2 rows={} rms={:.4} [0,:8]={:?}",
-                    xv.len() / self.cfg.dim,
-                    (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt(),
-                    &xv[..8]
-                );
-            }
             if prof {
                 prof_ffn += t1.elapsed().as_secs_f64();
             }
@@ -843,6 +788,20 @@ impl Qwen3Model {
                 && let Some(ds) = deepstack.and_then(|d| d.get(i))
             {
                 x = backend.deepstack(&x, ds, 0)?;
+            }
+            // Фичи для DFlash-инжекта = ВЫХОД extract-слоя (z-lab model.py:
+            // hidden_states[layer_id+1]; fc обучен на выходах слоёв).
+            if extract_li < extract_layers.len() && extract_layers[extract_li] == i {
+                extract_out.push(x.clone());
+                extract_li += 1;
+            }
+            if capture_split {
+                *split_out = Some((
+                    normed_cap.expect("split: normed"),
+                    after_attn_cap.expect("split: after_attn"),
+                    x.clone(),
+                ));
+                break;
             }
         }
         if prof && t > 1 {
@@ -918,63 +877,24 @@ impl Qwen3Model {
         backend.begin_batch()?;
         let r = (|| {
             let t = ids.len();
-            let mut x = self.embed.forward(backend, ids, t)?;
-            if self.roll_windows_if_needed(backend, t)? {
-                self.pos_rope = self.caches[0].pos;
-            }
-            let mask = if t > 1 {
-                Some(crate::nn::build_causal_mask(
-                    backend,
-                    t,
-                    self.caches[0].pos + t,
-                    self.pos_rope,
-                    self.cfg.swa_window,
-                )?)
-            } else {
-                None
-            };
-            for (i, layer) in self.layers.iter().enumerate() {
-                if i == li {
-                    let normed = layer.attn_norm.forward(backend, &x)?;
-                    let h = Self::rope_and_attn(
-                        &self.cfg,
-                        backend,
-                        &normed,
-                        &layer.attn,
-                        &mut self.caches[i],
-                        self.pos_rope,
-                        t,
-                        None,
-                        true,
-                        None,
-                        mask.as_ref(),
-                    )?;
-                    let after_attn = backend_add(backend, &x, &h)?;
-                    let h2 = layer.ffn_norm.forward(backend, &after_attn)?;
-                    let f = ffn_forward(backend, &h2, &layer.ffn)?;
-                    let after_ffn = backend_add(backend, &after_attn, &f)?;
-                    return Ok((normed, after_attn, after_ffn));
-                }
-                let h = layer.attn_norm.forward(backend, &x)?;
-                let h = Self::rope_and_attn(
-                    &self.cfg,
-                    backend,
-                    &h,
-                    &layer.attn,
-                    &mut self.caches[i],
-                    self.pos_rope,
-                    t,
-                    None,
-                    true,
-                    None,
-                    mask.as_ref(),
-                )?;
-                x = backend_add(backend, &x, &h)?;
-                let h = layer.ffn_norm.forward(backend, &x)?;
-                let f = ffn_forward(backend, &h, &layer.ffn)?;
-                x = backend_add(backend, &x, &f)?;
-            }
-            Err(BackendError::Shape("layer out of range".into()))
+            let x = self.embed.forward(backend, ids, t)?;
+            let mut split = None;
+            let mut extract = Vec::new();
+            let _ = self.forward_layers_inner(
+                backend,
+                x,
+                t,
+                None,
+                None,
+                0,
+                None,
+                false,
+                &[],
+                &mut extract,
+                Some(li),
+                &mut split,
+            )?;
+            split.ok_or_else(|| BackendError::Shape("layer out of range".into()))
         })();
         backend.end_batch()?;
         r
@@ -1726,6 +1646,35 @@ mod tests {
         let backend = MetalBackend::new().expect("metal backend");
         let model = build_model(&backend, c);
         (backend, model)
+    }
+
+    /// 7.5 (унификация петель): prefill_extract идёт через ОБЩУЮ послойную
+    /// петлю — логиты обязаны совпасть с prefill бит-в-бит, а скрытые — с
+    /// выходами тех же слоёв через forward_layers_range.
+    #[test]
+    fn prefill_extract_matches_prefill_and_range() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4];
+        // mini_cfg: n_layers = 2 → берём оба слоя.
+        let layers = [0usize, 1];
+        let (lg, ex) = model.prefill_extract(&backend, &ids, &layers).unwrap();
+        let lv = backend.to_cpu_f32(&lg).unwrap();
+
+        model.reset_cache(&backend).unwrap();
+        let lg2 = model.prefill(&backend, &ids).unwrap();
+        let lv2 = backend.to_cpu_f32(&lg2).unwrap();
+        assert_eq!(lv, lv2, "prefill_extract: логиты разошлись с prefill");
+
+        for (k, &li) in layers.iter().enumerate() {
+            model.reset_cache(&backend).unwrap();
+            let x = model.embed_forward_test(&backend, &ids).unwrap();
+            let h = model
+                .forward_layers_range(&backend, x, ids.len(), None, Some(li + 1), 0, None, false)
+                .unwrap();
+            let hv = backend.to_cpu_f32(&h).unwrap();
+            let ev = backend.to_cpu_f32(&ex[k]).unwrap();
+            assert_eq!(ev, hv, "extract[{k}] != выход слоя {li}");
+        }
     }
 
     /// Ключевой инвариант decode: лог-проблема декод-шага на позиции k

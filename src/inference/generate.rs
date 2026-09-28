@@ -176,6 +176,24 @@ fn pp_forward(
     model.lm_head(backend, &h)
 }
 
+/// Локальный forward после отказа PP (7.10). `seq` — ВСЯ обработанная
+/// последовательность (промпт + порождённое + текущий токен): в PP-режиме
+/// локально жили только слои [0..from), поэтому продолжать с текущим кэшем
+/// нельзя — нужен полный локальный префилл с чистого кэша (логиты последней
+/// строки — то, что вернул бы decode).
+fn local_fallback(
+    model: &mut Qwen3Model,
+    backend: &dyn Backend,
+    seq: &[u32],
+) -> Result<crate::backend::Tensor, BackendError> {
+    model.reset_cache(backend)?;
+    if seq.len() > 1 {
+        model.prefill(backend, seq)
+    } else {
+        model.decode(backend, seq[0])
+    }
+}
+
 /// Сгенерировать продолжение после `ids` (полный префилл выполняется
 /// здесь). Возвращает сгенерированные токены; события стримятся в
 /// `on_event`. Greedy при temperature <= 0.
@@ -197,7 +215,15 @@ pub fn generate(
                 "PP-разбиение не поддержано вместе с vision-промптом".into(),
             ));
         }
-        pp_forward(model, backend, &pp, ids)?
+        match pp_forward(model, backend, &pp, ids) {
+            Ok(lg) => lg,
+            Err(e) => {
+                // 7.10: сосед недоступен/ошибся — деградируем в локальную
+                // генерацию (модель у координатора полная), а не рвём запрос.
+                tracing::warn!(error = %e, "PP-стадия недоступна — локальная генерация");
+                local_fallback(model, backend, ids)?
+            }
+        }
     } else if let Some(v) = &params.vision {
         model.prefill_with_vision(
             backend,
@@ -303,7 +329,14 @@ pub fn generate(
         // (decode_spec: rejection sampling по Leviathan). Раньше здесь был
         // только счётчик с off-by-one (сравнение черновика следующей
         // позиции с уже выпущенным токеном) — 0% приёмки на любом драфтере.
-        if let (Some(drafter), true) = (&params.drafter, params.spec_gamma > 0) {
+        // PP (7.5) и спек-декод несовместимы: верификация черновиков гоняет
+        // forward ЦЕЛИКОМ и опирается на полный локальный KV, а в PP-режиме
+        // локально живут только слои [0..from). Молча включать нельзя —
+        // получились бы черновики, проверенные по пустому кэшу.
+        if let (Some(drafter), true) = (
+            &params.drafter,
+            params.spec_gamma > 0 && params.pp.is_none(),
+        ) {
             let (draft_tokens, draft_probs) = {
                 let mut dr = drafter.lock().unwrap();
                 dr.draft(backend, &history, params.spec_gamma)
@@ -356,12 +389,24 @@ pub fn generate(
                     break;
                 }
             } else if let Some(pp) = params.pp.as_ref() {
-                logits = pp_forward(model, backend, pp, &[next])?;
+                logits = match pp_forward(model, backend, pp, &[next]) {
+                    Ok(lg) => lg,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "PP-стадия недоступна — локальный decode");
+                        local_fallback(model, backend, &history)?
+                    }
+                };
             } else {
                 logits = model.decode(backend, next)?;
             }
         } else if let Some(pp) = params.pp.as_ref() {
-            logits = pp_forward(model, backend, pp, &[next])?;
+            logits = match pp_forward(model, backend, pp, &[next]) {
+                Ok(lg) => lg,
+                Err(e) => {
+                    tracing::warn!(error = %e, "PP-стадия недоступна — локальный decode");
+                    local_fallback(model, backend, &history)?
+                }
+            };
         } else {
             logits = model.decode(backend, next)?;
         }

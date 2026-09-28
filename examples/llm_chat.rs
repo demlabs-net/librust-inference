@@ -393,6 +393,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let vv = cfg.vocab_size;
                 let mut accepted: Vec<u32> = Vec::new();
                 let mut acc_len = 1usize;
+                // Строго верифицированные черновики (совпал posterior) — без
+                // пересэмпла на отказе: честная метрика приёмки (4.2b).
+                let mut verified = 0usize;
                 for i in 0..draft.len() {
                     let row = &v[(i + 1) * vv..(i + 2) * vv];
                     // posterior — СЭМПЛ из ПОЛНОГО softmax (z-lab: sample);
@@ -418,6 +421,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if post == draft[i] {
                         accepted.push(draft[i]);
                         acc_len += 1;
+                        verified += 1;
                     } else {
                         accepted.push(post);
                         break;
@@ -439,6 +443,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     logits,
                     extract: ext,
                     n_draft_accepted: acc_len.saturating_sub(1),
+                    n_draft_verified: verified,
                 }
             } else {
                 model.decode_spec(

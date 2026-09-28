@@ -433,6 +433,11 @@ impl KvCache {
     ) -> Result<Self, BackendError> {
         let cap = KV_CACHE_INIT_CAPACITY;
         let d = n_kv_heads * head_dim;
+        // Формат хранилища приводится к тому, что реально умеют KV-кернелы
+        // бэкенда (Metal: только f32 — f16-типизированная аллокация оставляла
+        // f32-данным половину нужных байт).
+        let k_format = backend.supported_kv_format(k_format);
+        let v_format = backend.supported_kv_format(v_format);
         Ok(Self {
             k: make_kv_tensor(backend, k_format, cap, d)?,
             v: make_kv_tensor(backend, v_format, cap, d)?,
@@ -575,6 +580,7 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.pos = 0;
     }
+
 
     /// Откат к позиции `pos` (спекулятивный decode: непринятые draft-токены).
     /// Данные остаются — следующий kv_update перезапишет хвост.

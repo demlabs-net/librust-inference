@@ -1432,10 +1432,13 @@ kernel void gemm_nt_q4_0(
         float d = (float)load_half_unaligned(blk);
         device const uchar* q = blk + 2;
         uint k0 = b * 32;
+        // Канонический ggml: байт j — веса j (младший ниббл) и j+16 (старший).
+        // Старое чередование (2j, 2j+1) молча читало не те веса на реальных
+        // Q4_0 GGUF (эталон dequant_q4_0 канонический с ревью iter-9).
         for (uint j = 0; j < 16; ++j) {
             uchar v = q[j];
-            acc += A[m * K + k0 + j * 2 + 0] * ((float)(v & 0xF) - 8.0f) * d;
-            acc += A[m * K + k0 + j * 2 + 1] * ((float)(v >> 4) - 8.0f) * d;
+            acc += A[m * K + k0 + j] * ((float)(v & 0xF) - 8.0f) * d;
+            acc += A[m * K + k0 + j + 16] * ((float)(v >> 4) - 8.0f) * d;
         }
     }
     C[m * N + n] = acc;
@@ -1517,6 +1520,41 @@ static inline float dot_q4_k(device const float* a, device const uchar* blk) {
     return acc;
 }
 
+// Q6_K (канонический ggml): вклад суперблока 256 в скалярное произведение
+// с a[0..256). Раскладка — как в dequantize_row_q6_K: две половины по 128,
+// в каждой l = 0..31 даёт 4 элемента (l, l+32, l+64, l+96): низкие нибблы ql,
+// старшие 2 бита из qh (по 2 бита на элемент, сдвиги 0/2/4/6), масштаб —
+// sch[l/16 + {0,2,4,6}] (int8, 16 элементов на подблок).
+static inline float dot_q6_k(device const float* a, device const uchar* s) {
+    float d = (float)load_half_unaligned(s + 208);
+    device const uchar* ql = s;
+    device const uchar* qh = s + 128;
+    device const char* sc = (device const char*)(s + 192);
+    float acc = 0.0f;
+    for (int h2 = 0; h2 < 2; ++h2) {
+        device const uchar* qlh = ql + h2 * 64;
+        device const uchar* qhh = qh + h2 * 32;
+        device const char* sch = sc + h2 * 8;
+        int base = h2 * 128;
+        for (int l = 0; l < 32; ++l) {
+            int is = l / 16;
+            float s1 = (float)sch[is + 0];
+            float s2 = (float)sch[is + 2];
+            float s3 = (float)sch[is + 4];
+            float s4 = (float)sch[is + 6];
+            int q1 = (int)((qlh[l + 0] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((qlh[l + 0] >> 4) | (((qhh[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) - 32;
+            acc += a[base + l + 0] * d * s1 * (float)q1;
+            acc += a[base + l + 32] * d * s2 * (float)q2;
+            acc += a[base + l + 64] * d * s3 * (float)q3;
+            acc += a[base + l + 96] * d * s4 * (float)q4;
+        }
+    }
+    return acc;
+}
+
 kernel void gemm_nt_q4_k(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],
@@ -1537,8 +1575,12 @@ kernel void gemm_nt_q4_k(
     C[m * N + n] = acc;
 }
 
-// Q6_K: суперблок 256: d(f16), ql[128] (4 бит), qh[64] (2 бит), scales[16]
-// (8 низких + 8 высоких нибблов = 16 × 8-бит). q = ql | (qh<<4); y = d*sc*(q-32).
+// Q6_K: КАНОНИЧЕСКИЙ ggml block_q6_K (210 Б/256): ql[128] (младшие 4 бита),
+// qh[64] (старшие 2 бита), scales[16] (int8 на 16-элементные подблоки),
+// d (f16) в КОНЦЕ блока (208..210). y = d·sc·(q − 32).
+// Прежний кернел читал кастомный диалект (d в начале, 8 × 8-битных масштабов
+// с ниббл-упаковкой) — на реальных GGUF Q6_K-весах Metal декодировал не те
+// числа, что CPU-эталон `dequant_q6_k` (тест quant_gemm ловил |Δ| 86..263).
 kernel void gemm_nt_q6_k(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],
@@ -1554,22 +1596,7 @@ kernel void gemm_nt_q6_k(
     float acc = 0.0f;
     for (uint sb = 0; sb < superblocks; ++sb) {
         device const uchar* s = B + (n * superblocks + sb) * 210;
-        float d = (float)load_half_unaligned(s);
-        device const uchar* ql = s + 2;
-        device const uchar* qh = s + 130;
-        device const uchar* scales = s + 194;
-        uint k0 = sb * 256;
-        for (uint b = 0; b < 8; ++b) {
-            float sc = (float)((scales[b] & 0xF) | ((scales[b + 8] & 0xF) << 4));
-            uint kb = k0 + b * 32;
-            for (uint j = 0; j < 32; ++j) {
-                uint idx = b * 32 + j;
-                uchar lo = (j % 2 == 0) ? (ql[idx / 2] & 0xF) : (ql[idx / 2] >> 4);
-                uchar hi = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x3;
-                float q = (float)(lo | (hi << 4));
-                acc += A[m * K + kb + j] * d * sc * (q - 32.0f);
-            }
-        }
+        acc += dot_q6_k(A + m * K + sb * 256, s);
     }
     C[m * N + n] = acc;
 }
@@ -1592,10 +1619,11 @@ kernel void mv_q4_0(
         float d = (float)load_half_unaligned(blk);
         device const uchar* q = blk + 2;
         uint k0 = b * 32;
+        // Канонический ggml: байт j — веса j и j+16 (см. gemm_nt_q4_0).
         for (uint j = 0; j < 16; ++j) {
             uchar v = q[j];
-            acc += A[k0 + j * 2 + 0] * ((float)(v & 0xF) - 8.0f) * d;
-            acc += A[k0 + j * 2 + 1] * ((float)(v >> 4) - 8.0f) * d;
+            acc += A[k0 + j] * ((float)(v & 0xF) - 8.0f) * d;
+            acc += A[k0 + j + 16] * ((float)(v >> 4) - 8.0f) * d;
         }
     }
     C[n] = acc;
@@ -1655,22 +1683,7 @@ kernel void mv_q6_k(
     float acc = 0.0f;
     for (uint sb = 0; sb < superblocks; ++sb) {
         device const uchar* s = B + (n * superblocks + sb) * 210;
-        float d = (float)load_half_unaligned(s);
-        device const uchar* ql = s + 2;
-        device const uchar* qh = s + 130;
-        device const uchar* scales = s + 194;
-        uint k0 = sb * 256;
-        for (uint b = 0; b < 8; ++b) {
-            float sc = (float)((scales[b] & 0xF) | ((scales[b + 8] & 0xF) << 4));
-            uint kb = k0 + b * 32;
-            for (uint j = 0; j < 32; ++j) {
-                uint idx = b * 32 + j;
-                uchar lo = (j % 2 == 0) ? (ql[idx / 2] & 0xF) : (ql[idx / 2] >> 4);
-                uchar hi = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x3;
-                float q = (float)(lo | (hi << 4));
-                acc += A[kb + j] * d * sc * (q - 32.0f);
-            }
-        }
+        acc += dot_q6_k(A + sb * 256, s);
     }
     C[n] = acc;
 }

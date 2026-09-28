@@ -648,6 +648,33 @@ fn reupload_in_dtype<B: Backend + ?Sized>(
     }
 }
 
+/// Download KV storage to the host as f32 — the read side of
+/// [`reupload_in_dtype`], dtype-dispatched the same way.
+///
+/// f16 goes through [`Backend::to_cpu_f16`]: `to_cpu_f32` REFUSES f16 storage
+/// by design, so the KV-roll defaults used to error out ("to_cpu_f32 on a
+/// quantized (f16/bf16) tensor") on every f16 KV — and Qwen3/Draft models
+/// build their caches as f16 — on any backend without a native
+/// `kv_shifted`/`kv_rerotated` (Metal). Backends whose f16 uploads are
+/// f32-backed (the `from_cpu_f16` default) report `F32` tensors and take the
+/// exact f32 branch.
+pub(crate) fn download_in_dtype<B: Backend + ?Sized>(
+    backend: &B,
+    src: &Tensor,
+) -> Result<Vec<f32>, BackendError> {
+    use crate::dtype::Dtype;
+    match src.dtype {
+        Dtype::F32 => backend.to_cpu_f32(src),
+        Dtype::F16 => Ok(backend.to_cpu_f16(src)?.into_iter().map(f32::from).collect()),
+        // q8_0 KV (Dtype::I8) has no reader here: its per-32-block scales are
+        // not part of the tensor. No cache is constructed with Q8_0 (see
+        // make_kv_tensor) — a loud error the day one is, never wrong data.
+        other => Err(BackendError::UnsupportedFormat(format!(
+            "download_in_dtype: unsupported KV storage {other:?}"
+        ))),
+    }
+}
+
 pub trait Backend: Send + Sync {
     /// Allocate a zero-initialized tensor of `shape`.
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;
@@ -746,6 +773,20 @@ pub trait Backend: Send + Sync {
     /// Metal — да (кернелы gemm_nt_f16/bf16); CPU-референс — только f32.
     fn supports_f16_weights(&self) -> bool {
         false
+    }
+
+    /// KV storage format this backend's KV KERNELS actually implement.
+    ///
+    /// [`KvCache`](crate::nn::KvCache) coerces the requested format through
+    /// this: the storage dtype must match the memory layout the kernels read
+    /// and write, or every `kv_update` lays the values out in one dtype while
+    /// `attn_ar` reads them in another. Metal is the case in point — its KV
+    /// kernels are f32-only (`kv_update_f32`/`attn_ar_f32`; the true f16
+    /// kernels are CUDA's `attn_ar_v4_f16f16`), so an f16-typed allocation
+    /// left the f32 data with HALF the bytes it needs, and the attention ran
+    /// off the end of the buffer past ~cap/2 rows. Default: as requested.
+    fn supported_kv_format(&self, fmt: crate::dtype::KvFormat) -> crate::dtype::KvFormat {
+        fmt
     }
     /// Стандартный rotate-half RoPE (HF/Qwen3): X (1, T, D) → Y, позиции
     /// pos..pos+T. CPU-референс — прямое вычисление; Metal — кернел.
@@ -907,6 +948,20 @@ pub trait Backend: Send + Sync {
 
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
+
+    /// Download fp16 storage to host memory (the f16 KV cache; f16 weights).
+    ///
+    /// `to_cpu_f32` cannot be reused for this: it REFUSES f16 storage by
+    /// design (reading the buffer as f32 returns garbage), and backends whose
+    /// `from_cpu_f16` widens to f32 (CPU) never report an f16 tensor anyway.
+    /// Default: unsupported — backends that keep true f16 storage override it.
+    /// The KV-roll defaults ([`kv_shifted`](Backend::kv_shifted) /
+    /// [`kv_rerotated`](Backend::kv_rerotated)) are the only consumers.
+    fn to_cpu_f16(&self, _t: &Tensor) -> Result<Vec<half::f16>, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "to_cpu_f16: backend does not expose fp16 storage".into(),
+        ))
+    }
 
     /// Activation compute dtype for GEMMs (the plan's activation axis:
     /// `TTS_ACTIVATION`/`STT_ACTIVATION` = fp32 | fp16 | bf16, default fp32).
@@ -1651,7 +1706,7 @@ pub trait Backend: Send + Sync {
     /// impossible — no storage access); CUDA shifts in place.
     fn kv_shifted(&self, buf: &Tensor, shift: usize, pos: usize) -> Result<Tensor, BackendError> {
         let (b, cap, d) = (buf.shape()[0], buf.shape()[1], buf.shape()[2]);
-        let xh = self.to_cpu_f32(buf)?;
+        let xh = download_in_dtype(self, buf)?;
         let n = (pos - shift) * d;
         let mut yh = vec![0.0f32; b * cap * d];
         for bi in 0..b {
@@ -1680,7 +1735,7 @@ pub trait Backend: Send + Sync {
         let (b, cap, d) = (k.shape()[0], k.shape()[1], k.shape()[2]);
         let nheads = d / head_dim;
         let pairs = head_dim / 2;
-        let mut xh = self.to_cpu_f32(k)?;
+        let mut xh = download_in_dtype(self, k)?;
         let sect_dims = mrope_sections.map(|s| s[0] + s[1] + s[2]).unwrap_or(0);
         let rotates = |pi: usize| -> bool {
             if sect_dims == 0 {

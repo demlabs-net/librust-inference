@@ -392,6 +392,32 @@ impl GpuTensor {
         }
         Ok(out)
     }
+
+    /// Download TRUE fp16 storage (the f16 KV cache). Mirror of
+    /// [`GpuTensor::to_cpu_f32`] with the matching dtype guard: the buffer
+    /// holds `__fp16`, so f32 reads would be garbage — the KV roll that needs
+    /// the stored keys back re-rotates them through this.
+    pub fn to_cpu_f16(&self, ctx: &MetalCtx) -> Result<Vec<half::f16>, MetalError> {
+        if self.dtype != GpuDtype::F16 {
+            return Err(MetalError::Shape(
+                "to_cpu_f16 on a non-f16 tensor".into(),
+            ));
+        }
+        ctx.flush_batch()?;
+        let barrier = ctx.queue.new_command_buffer();
+        barrier.commit();
+        barrier.wait_until_completed();
+        let ptr = self.buffer.contents();
+        if ptr.is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        let base = unsafe { (ptr as *const u8).add(self.offset) } as *const u16;
+        let mut out = vec![half::f16::from_bits(0); self.numel()];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = half::f16::from_bits(unsafe { *base.add(i) });
+        }
+        Ok(out)
+    }
 }
 
 /// 1D convolution parameters (stride/pad/dilation).
@@ -2455,6 +2481,13 @@ impl crate::backend::Backend for MetalBackend {
         Ok(t.as_gpu().to_cpu_f32(&self.ctx)?)
     }
 
+    fn to_cpu_f16(
+        &self,
+        t: &crate::backend::Tensor,
+    ) -> Result<Vec<half::f16>, crate::error::BackendError> {
+        Ok(t.as_gpu().to_cpu_f16(&self.ctx)?)
+    }
+
     fn deepstack(
         &self,
         x: &crate::backend::Tensor,
@@ -2465,6 +2498,17 @@ impl crate::backend::Backend for MetalBackend {
         self.ctx
             .deepstack_add_f32(x.as_gpu(), embd.as_gpu(), shift, &y)?;
         Ok(crate::backend::Tensor::from_gpu(y))
+    }
+
+    /// Metal's KV kernels are f32-only (`kv_update_f32`/`attn_ar_f32`; the
+    /// true f16 KV kernels — `attn_ar_v4_f16f16` — are CUDA's). An f16-typed
+    /// KV allocation therefore stores f32 values with half the bytes they
+    /// need: the attention ran past the end of the buffer from ~cap/2 rows on
+    /// (garbage/NaN in long contexts) and every host-side read of the cache
+    /// (the window roll) either refused or read halfs of f32 words. Coerce to
+    /// f32 until real f16 KV kernels exist here.
+    fn supported_kv_format(&self, _fmt: crate::dtype::KvFormat) -> crate::dtype::KvFormat {
+        crate::dtype::KvFormat::F32
     }
 
     fn begin_batch(&self) -> Result<(), crate::error::BackendError> {
@@ -3252,28 +3296,44 @@ mod quant_gemm_tests {
     }
 
     // Тестовые энкодеры Q4_K/Q6_K (K=256-синтетика; логика как в fixture-gen).
+    /// Канонический Q4_K (ggml block_q4_K, 144 Б/256): d (f16), dmin (f16),
+    /// scales[12] (6-битные scale/min 8 подблоков, get_scale_min_k4),
+    /// qs[128] (чанк-мажор: байт 32c+l = {low: 64c+l, high: 64c+32+l}).
+    /// Старая фикстура писала 148 Б (кастомный диалект scales[16]) — загрузчик
+    /// давно читает канонические 144 Б, и тест падал на size-check.
+    /// min-член не используем (dmin = 0): кодируются модули — тест сравнивает
+    /// Metal с CPU-деквантом ТЕХ ЖЕ байт.
     fn enc_q4_k(w: &[f32]) -> Vec<u8> {
         let mut out = Vec::new();
         for sb in w.chunks_exact(256) {
-            let max = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            let d = if max > 0.0 { max / 7.0 } else { 0.0 };
-            let dbits = (d.to_bits() >> 16) as u16;
-            out.extend_from_slice(&dbits.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes()); // dmin
-            let mut scales = [0u8; 16];
-            let mut qs = [0u8; 128];
-            for (b, blk) in sb.chunks_exact(32).enumerate() {
+            let smax = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let d = if smax > 0.0 { smax / 15.0 } else { 0.0 };
+            out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // dmin = 0
+            let mut sub_sc = [1u8; 8];
+            for (j, blk) in sb.chunks_exact(32).enumerate() {
                 let bmax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-                let sc = if d > 0.0 && bmax > 0.0 {
-                    ((bmax / (d * 7.0)).round() as u8).clamp(1, 15)
+                sub_sc[j] = if d > 0.0 && bmax > 0.0 {
+                    ((bmax / d).round() as u8).clamp(1, 15)
                 } else {
                     1
                 };
-                scales[b / 2] |= sc << ((b % 2) * 4);
-                for (j, pair) in blk.chunks_exact(2).enumerate() {
-                    let q0 = ((pair[0] / (d * sc as f32)).round() as i32 + 8).clamp(0, 15) as u8;
-                    let q1 = ((pair[1] / (d * sc as f32)).round() as i32 + 8).clamp(0, 15) as u8;
-                    qs[b * 16 + j] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+            }
+            // scales[0..4] — sc подблоков 0..3 (старшие 2 бита не нужны при
+            // sc ≤ 15), scales[4..8] — mins подблоков 0..3 = 0,
+            // scales[8..12] — sc подблоков 4..7 в младшем ниббле (mins = 0).
+            let mut scales = [0u8; 12];
+            scales[0..4].copy_from_slice(&sub_sc[0..4]);
+            scales[8..12].copy_from_slice(&sub_sc[4..8]);
+            let mut qs = [0u8; 128];
+            for c in 0..4 {
+                let (s_lo, s_hi) = (sub_sc[2 * c] as f32, sub_sc[2 * c + 1] as f32);
+                for l in 0..32 {
+                    let q_lo =
+                        ((sb[64 * c + l].abs() / (d * s_lo)).round() as i32).clamp(0, 15) as u8;
+                    let q_hi = ((sb[64 * c + 32 + l].abs() / (d * s_hi)).round() as i32)
+                        .clamp(0, 15) as u8;
+                    qs[32 * c + l] = (q_lo & 0x0F) | (q_hi << 4);
                 }
             }
             out.extend_from_slice(&scales);
@@ -3282,39 +3342,60 @@ mod quant_gemm_tests {
         out
     }
 
+    /// Канонический Q6_K (ggml block_q6_K, 210 Б/256): ql[128] (младшие
+    /// 4 бита), qh[64] (старшие 2 бита), scales[16] (int8 на 16-элементные
+    /// подблоки), d (f16) в КОНЦЕ блока. y = d·sc·(q − 32).
+    /// Прежняя фикстура кодировала кастомный диалект (d в начале, 8 × 8-бит
+    /// масштабов) — он совпадал со старым кернелом, но не с GGUF/эталоном.
     fn enc_q6_k(w: &[f32]) -> Vec<u8> {
         let mut out = Vec::new();
         for sb in w.chunks_exact(256) {
-            let max = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            let d = if max > 0.0 { max / 31.0 } else { 0.0 };
-            let dbits = (d.to_bits() >> 16) as u16;
-            out.extend_from_slice(&dbits.to_le_bytes());
+            let smax = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            // q − 32 ∈ [−32, 31]: d·s ≈ bmax/31 даёт полный диапазон.
+            let d = if smax > 0.0 { smax / (31.0 * 127.0) } else { 0.0 };
             let mut ql = [0u8; 128];
             let mut qh = [0u8; 64];
             let mut scales = [0u8; 16];
-            for (b, blk) in sb.chunks_exact(32).enumerate() {
-                let bmax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-                let sc = if d > 0.0 && bmax > 0.0 {
-                    ((bmax / (d * 31.0)).round() as u8).clamp(1, 255)
-                } else {
-                    1
-                };
-                scales[b] = sc & 0x0F;
-                scales[b + 8] = sc >> 4;
-                for (j, &w) in blk.iter().enumerate() {
-                    let q = ((w / (d * sc as f32)).round() as i32 + 32).clamp(0, 63) as u8;
-                    let idx = b * 32 + j;
-                    if j % 2 == 0 {
-                        ql[idx / 2] = q & 0x0F;
-                    } else {
-                        ql[idx / 2] |= (q & 0x0F) << 4;
+            for half in 0..2usize {
+                let base = half * 128;
+                for l in 0..32usize {
+                    let is = l / 16;
+                    for (k, off) in [0usize, 32, 64, 96].into_iter().enumerate() {
+                        let e = base + l + off;
+                        let blk16 = base + is * 16;
+                        let bmax = sb[blk16..blk16 + 16]
+                            .iter()
+                            .fold(0.0f32, |m, x| m.max(x.abs()));
+                        let sidx = half * 8 + is + 2 * k;
+                        let sc = if d > 0.0 && bmax > 0.0 {
+                            ((bmax / (31.0 * d)).round() as i32).clamp(1, 127) as u8
+                        } else {
+                            1
+                        };
+                        scales[sidx] = sc;
+                        let q = ((sb[e] / (d * sc as f32)).round() as i32 + 32).clamp(0, 63) as u8;
+                        let lo = q & 0x0F;
+                        let hi2 = (q >> 4) & 0x03;
+                        // низкие нибблы: q, l+32 → ql[l], ql[l+32];
+                        // высокие нибблы: q, l+32 → ql[l], ql[l+32] (старшие 4)
+                        let (qi, sh) = ((l + off / 32 * 32), 0u32);
+                        let _ = qi;
+                        let _ = sh;
+                        if off == 0 || off == 32 {
+                            let idx = half * 64 + l + off;
+                            ql[idx] |= lo;
+                        } else {
+                            let idx = half * 64 + l + (off - 64);
+                            ql[idx] |= lo << 4;
+                        }
+                        qh[half * 32 + l] |= hi2 << (2 * k);
                     }
-                    qh[idx / 4] |= ((q >> 4) & 0x03) << ((idx % 4) * 2);
                 }
             }
             out.extend_from_slice(&ql);
             out.extend_from_slice(&qh);
             out.extend_from_slice(&scales);
+            out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
         }
         out
     }

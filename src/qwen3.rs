@@ -343,11 +343,12 @@ impl Qwen3Model {
                 ffn_norm,
                 ffn,
             });
-            // N (iter-10): KV in f16 by default — halves the attention
-            // DRAM traffic (the decode bottleneck) and the cache VRAM; the
-            // f16 kv_update + attn_ar_v4_f16f16 kernels are tested
-            // (kv_f16.rs). F32 stays available via KvFormat for reference
-            // runs.
+            // N (iter-10): KV запрашивается в f16 — вдвое меньше трафик
+            // attention и VRAM кэша. Настоящий f16-KV есть только на CUDA
+            // (кернелы attn_ar_v4_f16f16, тест kv_f16.rs); `KvCache::new`
+            // приводит формат к тому, что реально умеет бэкенд
+            // (`Backend::supported_kv_format`) — Metal только f32, иначе
+            // f32-данные не влезали в f16-аллокацию (половина байт).
             caches.push(KvCache::new(
                 backend,
                 cfg.n_kv_heads,
@@ -855,8 +856,17 @@ impl Qwen3Model {
                 prof_ffn * 1e3 / self.layers.len() as f64
             );
         }
-        let h = self.out_norm.forward(backend, &x)?;
-        Ok(h)
+        // PP (7.5): нормирует ТОЛЬКО последняя стадия. Незавершённая стадия
+        // обязана вернуть сырой residual-поток: следующая подаёт его в свой
+        // первый attn_norm, и out_norm здесь молча подменял вход (0.48
+        // max-diff в split-vs-full — сравнивался нормированный выход стадии
+        // с сырым входом следующего слоя полного прогона).
+        if norm_out {
+            let h = self.out_norm.forward(backend, &x)?;
+            Ok(h)
+        } else {
+            Ok(x)
+        }
     }
 
     /// Общий путь слоёв после эмбеддинга (текст или vision-текст).
@@ -1674,10 +1684,10 @@ mod roll_tests {
             .prefill(backend.as_ref(), window)
             .expect("prefill window");
 
-        let rk = backend.to_cpu_f32(&rolled.caches[0].view()).unwrap();
-        let fk = backend.to_cpu_f32(&fresh.caches[0].view()).unwrap();
-        let rv = backend.to_cpu_f32(&rolled.caches[0].view_v()).unwrap();
-        let fv = backend.to_cpu_f32(&fresh.caches[0].view_v()).unwrap();
+        let rk = crate::backend::download_in_dtype(backend.as_ref(), &rolled.caches[0].view()).unwrap();
+        let fk = crate::backend::download_in_dtype(backend.as_ref(), &fresh.caches[0].view()).unwrap();
+        let rv = crate::backend::download_in_dtype(backend.as_ref(), &rolled.caches[0].view_v()).unwrap();
+        let fv = crate::backend::download_in_dtype(backend.as_ref(), &fresh.caches[0].view_v()).unwrap();
         let dev = |a: &[f32], b: &[f32]| {
             a.iter()
                 .zip(b)
@@ -2070,255 +2080,189 @@ mod attn_tests {
 
 #[cfg(all(test, feature = "metal"))]
 mod pp_range_tests {
+    use super::test_util::mini_cfg;
     use super::*;
     use crate::metal::MetalBackend;
     use std::collections::BTreeMap;
 
-    /// 7.5: разбиение слоёв [0..1)+[1..N) на двух «нодах» (два экземпляра
-    /// модели на одном бэке) численно равно полному forward.
-    /// Второй экземпляр нужен, чтобы исключить совпадение через общий кэш.
-    /// ДИАГНОСТИКА 7.5 (ignored, красный): split [0..2)+[2..N) vs полный —
-    /// стабильные 0.475 max-diff. ЛОКАЛИЗОВАНО (PP_DBG-трассировка):
-    /// входы слоёв 0 и 1 бит-в-бит совпадают в обоих путях, но ВЫХОД слоя 1
-    /// различается (rms 0.69 полный vs 0.76 split) — обработка слоя 1
-    /// зависит от чего-то вне (вход, веса, маска, rope — идентичны).
-    /// Гипотеза: состояние/ёмкость KV-кэша слоя 1 между вызовами
-    /// (shrink_to_init после fill). PP_DBG=1 — дампы по слоям.
+    /// 7.5 (PP-шардирование): разбиение слоёв [0..k)+[k..N) между двумя
+    /// «нодами» (два экземпляра модели на одном бэке) численно равно полному
+    /// forward — для КАЖДОЙ границы k. Второй экземпляр исключает совпадение
+    /// через общий кэш (и ловит расхождение весов).
+    ///
+    /// Контракт стадий: незавершённая стадия возвращает СЫРОЙ residual-поток
+    /// (`norm_out=false`), нормирует только последняя нода. Без этого
+    /// следующая стадия получает уже нормированный вход — те самые 0.48
+    /// max-diff, которые держали тест красным (мёртвый флаг `norm_out`).
     #[test]
-    #[ignore = "7.5: расхождение split vs full на границе стадий — нужна трассировка слоя 2"]
     fn two_stage_range_equals_full_forward() {
-        let c = Qwen3Config {
-            dim: 64,
-            n_layers: 4,
-            n_heads: 4,
-            n_kv_heads: 2,
-            head_dim: 16,
-            ffn_dim: 96,
-            vocab_size: 32,
-            rope_theta: 10_000.0,
-            rope_max_seq: 256,
-            norm_eps: 1e-6,
-            swa_window: None,
-            mrope_sections: None,
-            n_deepstack: None,
-        };
-        let backend = MetalBackend::new().unwrap();
-        // weights: build_model детерминирован по cfg? нет — строим ОДИН
-        // weights-map и грузим дважды (одинаковые веса в двух экземплярах).
-        let (be, mut model_a, mut model_b) = {
-            // соберём синтетический weights-map как в generate.rs-тестах
-            use crate::weights_map::{WeightTensor, WeightsMap};
-            let mut rng = crate::harness::Lcg::new(777);
-            let mut t: BTreeMap<String, (Vec<f32>, Vec<usize>)> = BTreeMap::new();
-            let dim = c.dim;
-            t.insert("token_embd.weight".into(), {
-                let v: Vec<f32> = (0..c.vocab_size * dim).map(|_| rng.next_f32()).collect();
-                (v, vec![c.vocab_size, dim])
-            });
-            for i in 0..c.n_layers {
-                let p = format!("blk.{i}.");
-                t.insert(format!("{p}attn_norm.weight"), {
-                    let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
-                    (v, vec![dim])
-                });
-                t.insert(format!("{p}attn_q.weight"), {
-                    let v: Vec<f32> = (0..c.n_heads * c.head_dim * dim)
-                        .map(|_| rng.next_f32() * 0.2 - 0.1)
-                        .collect();
-                    (v, vec![c.n_heads * c.head_dim, dim])
-                });
-                t.insert(format!("{p}attn_k.weight"), {
-                    let v: Vec<f32> = (0..c.n_kv_heads * c.head_dim * dim)
-                        .map(|_| rng.next_f32() * 0.2 - 0.1)
-                        .collect();
-                    (v, vec![c.n_kv_heads * c.head_dim, dim])
-                });
-                t.insert(format!("{p}attn_v.weight"), {
-                    let v: Vec<f32> = (0..c.n_kv_heads * c.head_dim * dim)
-                        .map(|_| rng.next_f32() * 0.2 - 0.1)
-                        .collect();
-                    (v, vec![c.n_kv_heads * c.head_dim, dim])
-                });
-                t.insert(format!("{p}attn_output.weight"), {
-                    let v: Vec<f32> = (0..dim * c.n_heads * c.head_dim)
-                        .map(|_| rng.next_f32() * 0.2 - 0.1)
-                        .collect();
-                    (v, vec![dim, c.n_heads * c.head_dim])
-                });
-                t.insert(format!("{p}attn_q_norm.weight"), {
-                    let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
-                    (v, vec![c.head_dim])
-                });
-                t.insert(format!("{p}attn_k_norm.weight"), {
-                    let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
-                    (v, vec![c.head_dim])
-                });
-                t.insert(format!("{p}ffn_norm.weight"), {
-                    let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
-                    (v, vec![dim])
-                });
-                t.insert(format!("{p}ffn_gate.weight"), {
-                    let v: Vec<f32> = (0..c.ffn_dim * dim).map(|_| rng.next_f32() * 0.2 - 0.1).collect();
-                    (v, vec![c.ffn_dim, dim])
-                });
-                t.insert(format!("{p}ffn_up.weight"), {
-                    let v: Vec<f32> = (0..c.ffn_dim * dim).map(|_| rng.next_f32() * 0.2 - 0.1).collect();
-                    (v, vec![c.ffn_dim, dim])
-                });
-                t.insert(format!("{p}ffn_down.weight"), {
-                    let v: Vec<f32> = (0..dim * c.ffn_dim).map(|_| rng.next_f32() * 0.2 - 0.1).collect();
-                    (v, vec![dim, c.ffn_dim])
-                });
-            }
-            t.insert("output_norm.weight".into(), {
-                let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
-                (v, vec![dim])
-            });
-            t.insert("output.weight".into(), {
-                let v: Vec<f32> = (0..c.vocab_size * dim)
-                    .map(|_| rng.next_f32() * 0.1 - 0.05)
-                    .collect();
-                (v, vec![c.vocab_size, dim])
-            });
-            let mut bytes: Vec<u8> = Vec::new();
-            let mut layout: Vec<(String, Vec<u64>, u64, usize)> = Vec::new();
-            for (name, (data, shape)) in &t {
-                let off = bytes.len();
-                for v in data {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                layout.push((
-                    name.clone(),
-                    shape.iter().map(|&d| d as u64).collect(),
-                    off as u64,
-                    data.len() * 4,
-                ));
-            }
-            let tensors: Vec<WeightTensor> = layout
-                .into_iter()
-                .map(|(name, shape, off, len)| WeightTensor {
-                    name,
-                    shape,
-                    format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
-                    offset: off,
-                    data: &bytes[off as usize..off as usize + len],
-                })
-                .collect();
-            let wm = WeightsMap {
-                arch: "qwen3".into(),
-                tensors,
-                storage: vec![crate::weights_map::Storage {
-                    offset: 0,
-                    data: &bytes,
-                }],
-            };
-            let ma = Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
-            let mb = Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
-            (backend, ma, mb)
-        };
+        let c = mini_cfg();
+        // weights: ОДИН weights-map → два экземпляра (одинаковые веса) +
+        // отдельный бэк на каждый экземпляр не нужен — бэк общий, как у
+        // двух стадий на одной машине.
+        let (be, mut model_a, mut model_b) = build_two_models(&c);
         let ids = [3u32, 7, 11];
         let t = ids.len();
-        // полный forward (stage A+B в одном экземпляре)
+
+        // (а) полный forward — эталон.
         model_a.reset_cache(&be).unwrap();
         let x = model_a.embed_forward_test(&be, &ids).unwrap();
-        eprintln!("--- PP_DBG full (model_a) ---");
-        let full = model_a.forward_layers_range(&be, x, t, None, None, 0, None, true).unwrap();
-        // две стадии
-        model_a.reset_cache(&be).unwrap();
-        model_b.reset_cache(&be).unwrap();
-        let x1 = model_a.embed_forward_test(&be, &ids).unwrap();
-        let mid = model_a
-            .forward_layers_range(&be, x1, t, None, Some(2), 0, None, false)
+        let full = model_a
+            .forward_layers_range(&be, x, t, None, None, 0, None, true)
             .unwrap();
-        // контроль: та же стадия [0..2) на model_b
-        model_b.reset_cache(&be).unwrap();
-        let x1b = model_b.embed_forward_test(&be, &ids).unwrap();
-        let mid_b = model_b
-            .forward_layers_range(&be, x1b, t, None, Some(2), 0, None, false)
-            .unwrap();
-        let mv = be.to_cpu_f32(&mid).unwrap();
-        let mbv = be.to_cpu_f32(&mid_b).unwrap();
-        let d12 = mv.iter().zip(mbv.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("stage1 a-vs-b diff = {d12}");
-        let mid_v = be.to_cpu_f32(&mid).unwrap();
-        let mid_b = be.from_cpu_f32(&mid_v, mid.shape().to_vec()).unwrap();
-        // 7.5-контракт: каждая PP-стадия стартует со СВЕЖИМ кэшем своих
-        // слоёв (в живом мире — reset при старте последовательности).
-        model_b.reset_cache(&be).unwrap();
-        eprintln!("--- PP_DBG stage-2 (model_b) ---");
-        let tail = model_b
-            .forward_layers_range(&be, mid_b, t, None, None, 2, None, true)
-            .unwrap();
-        // контроль: model_b полный == model_a полный?
+        let fa = be.to_cpu_f32(&full).unwrap();
+
+        // (б) все границы: [0..k) отдаёт СЫРОЙ выход, [k..N) нормирует.
+        for k in 1..c.n_layers {
+            model_a.reset_cache(&be).unwrap();
+            let xh = model_a.embed_forward_test(&be, &ids).unwrap();
+            let midk = model_a
+                .forward_layers_range(&be, xh, t, None, Some(k), 0, None, false)
+                .unwrap();
+            model_b.reset_cache(&be).unwrap();
+            let tk = model_b
+                .forward_layers_range(&be, midk, t, None, None, k, None, true)
+                .unwrap();
+            let tv = be.to_cpu_f32(&tk).unwrap();
+            let dk = fa
+                .iter()
+                .zip(tv.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(dk < 1e-4, "split@{k} разошёлся с полным forward: {dk}");
+        }
+
+        // (в) экземпляр не влияет: тот же полный forward на model_b.
         model_b.reset_cache(&be).unwrap();
         let x_b = model_b.embed_forward_test(&be, &ids).unwrap();
         let full_b = model_b
             .forward_layers_range(&be, x_b, t, None, None, 0, None, true)
             .unwrap();
-        let fa = be.to_cpu_f32(&full).unwrap();
         let fb = be.to_cpu_f32(&full_b).unwrap();
-        let d_inst = fa.iter().zip(fb.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("instance diff = {d_inst}");
-        // детерминизм чистого эмбеддинга
-        let e1 = model_a.embed_forward_test(&be, &ids).unwrap();
-        let e1v = be.to_cpu_f32(&e1).unwrap();
-        let e2 = model_a.embed_forward_test(&be, &ids).unwrap();
-        let e2v = be.to_cpu_f32(&e2).unwrap();
-        let de = e1v.iter().zip(e2v.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("embed determinism diff = {de}");
-        // extract[0] vs чистый эмбеддинг
-        model_a.reset_cache(&be).unwrap();
-        let ext = model_a.forward_extract(&be, &ids, &[0]).unwrap();
-        let ev = be.to_cpu_f32(&ext[0]).unwrap();
-        let dx = e1v.iter().zip(ev.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("extract[0]-vs-embed diff = {dx}");
-        // range(upto=0) vs чистый эмбеддинг
-        model_a.reset_cache(&be).unwrap();
-        let xi = model_a.embed_forward_test(&be, &ids).unwrap();
-        let part = model_a
-            .forward_layers_range(&be, xi, t, None, Some(0), 0, None, false)
-            .unwrap();
-        let pv = be.to_cpu_f32(&part).unwrap();
-        let dp = e1v.iter().zip(pv.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("range(0)-vs-embed diff = {dp}");
-        // исходный forward_layers_hidden(upto=2) с двойным сбросом
-        model_a.reset_cache(&be).unwrap();
-        let xi = model_a.embed_forward_test(&be, &ids).unwrap();
-        let hid = model_a.forward_layers_hidden(&be, xi, t, None, Some(2), None).unwrap();
-        let hv = be.to_cpu_f32(&hid).unwrap();
-        let dh = mv.iter().zip(hv.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("range-vs-hidden(upto2) diff = {dh}");
-        // детерминизм: mid повторно
-        model_a.reset_cache(&be).unwrap();
-        let x2 = model_a.embed_forward_test(&be, &ids).unwrap();
-        let mid2 = model_a.forward_layers_range(&be, x2, t, None, Some(2), 0, None, false).unwrap();
-        let m2 = be.to_cpu_f32(&mid2).unwrap();
-        let dm = mv.iter().zip(m2.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("mid determinism diff = {dm}");
-        // послойно: после слоя 2
-        model_a.reset_cache(&be).unwrap();
-        let xa = model_a.embed_forward_test(&be, &ids).unwrap();
-        let l2a = model_a.forward_layers_range(&be, xa, t, None, Some(3), 0, None, true).unwrap();
-        model_b.reset_cache(&be).unwrap();
-        let xb = model_b.embed_forward_test(&be, &ids).unwrap();
-        let mid1_b = model_b.forward_layers_range(&be, xb, t, None, Some(2), 0, None, false).unwrap();
-        model_b.reset_cache(&be).unwrap();
-        let l2b = model_b.forward_layers_range(&be, mid1_b, t, None, Some(3), 0, None, true).unwrap();
-        let la = be.to_cpu_f32(&l2a).unwrap();
-        let lb = be.to_cpu_f32(&l2b).unwrap();
-        let dl2 = la.iter().zip(lb.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("after-layer2 diff = {dl2}");
-        // сравнение
-        let a = fa.clone();
-        let b = be.to_cpu_f32(&tail).unwrap();
-        let max_d = a
+        let d_inst = fa
             .iter()
-            .zip(b.iter())
+            .zip(fb.iter())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
-        assert!(
-            max_d < 1e-4,
-            "двухстадийный forward разошёлся с полным: max_diff={max_d}"
-        );
+        assert_eq!(d_inst, 0.0, "два экземпляра одной модели разошлись");
+    }
+
+    /// Два экземпляра mini-модели с ОДНИМИ весами (общий weights-map).
+    fn build_two_models(c: &Qwen3Config) -> (MetalBackend, Qwen3Model, Qwen3Model) {
+        use crate::weights_map::{WeightTensor, WeightsMap};
+        let backend = MetalBackend::new().unwrap();
+        let mut rng = crate::harness::Lcg::new(777);
+        let dim = c.dim;
+        let mut t: BTreeMap<String, (Vec<f32>, Vec<usize>)> = BTreeMap::new();
+        t.insert("token_embd.weight".into(), {
+            let v: Vec<f32> = (0..c.vocab_size * dim).map(|_| rng.next_f32()).collect();
+            (v, vec![c.vocab_size, dim])
+        });
+        for i in 0..c.n_layers {
+            let p = format!("blk.{i}.");
+            t.insert(format!("{p}attn_norm.weight"), {
+                let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
+                (v, vec![dim])
+            });
+            t.insert(format!("{p}attn_q.weight"), {
+                let v: Vec<f32> = (0..c.n_heads * c.head_dim * dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![c.n_heads * c.head_dim, dim])
+            });
+            t.insert(format!("{p}attn_k.weight"), {
+                let v: Vec<f32> = (0..c.n_kv_heads * c.head_dim * dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![c.n_kv_heads * c.head_dim, dim])
+            });
+            t.insert(format!("{p}attn_v.weight"), {
+                let v: Vec<f32> = (0..c.n_kv_heads * c.head_dim * dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![c.n_kv_heads * c.head_dim, dim])
+            });
+            t.insert(format!("{p}attn_output.weight"), {
+                let v: Vec<f32> = (0..dim * c.n_heads * c.head_dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![dim, c.n_heads * c.head_dim])
+            });
+            t.insert(format!("{p}attn_q_norm.weight"), {
+                let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
+                (v, vec![c.head_dim])
+            });
+            t.insert(format!("{p}attn_k_norm.weight"), {
+                let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
+                (v, vec![c.head_dim])
+            });
+            t.insert(format!("{p}ffn_norm.weight"), {
+                let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
+                (v, vec![dim])
+            });
+            t.insert(format!("{p}ffn_gate.weight"), {
+                let v: Vec<f32> = (0..c.ffn_dim * dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![c.ffn_dim, dim])
+            });
+            t.insert(format!("{p}ffn_up.weight"), {
+                let v: Vec<f32> = (0..c.ffn_dim * dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![c.ffn_dim, dim])
+            });
+            t.insert(format!("{p}ffn_down.weight"), {
+                let v: Vec<f32> = (0..dim * c.ffn_dim)
+                    .map(|_| rng.next_f32() * 0.2 - 0.1)
+                    .collect();
+                (v, vec![dim, c.ffn_dim])
+            });
+        }
+        t.insert("output_norm.weight".into(), {
+            let v: Vec<f32> = (0..dim).map(|_| 0.5 + rng.next_f32() * 0.5).collect();
+            (v, vec![dim])
+        });
+        t.insert("output.weight".into(), {
+            let v: Vec<f32> = (0..c.vocab_size * dim)
+                .map(|_| rng.next_f32() * 0.1 - 0.05)
+                .collect();
+            (v, vec![c.vocab_size, dim])
+        });
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut layout: Vec<(String, Vec<u64>, u64, usize)> = Vec::new();
+        for (name, (data, shape)) in &t {
+            let off = bytes.len();
+            for v in data {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            layout.push((
+                name.clone(),
+                shape.iter().map(|&d| d as u64).collect(),
+                off as u64,
+                data.len() * 4,
+            ));
+        }
+        let tensors: Vec<WeightTensor> = layout
+            .into_iter()
+            .map(|(name, shape, off, len)| WeightTensor {
+                name,
+                shape,
+                format: crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32),
+                offset: off,
+                data: &bytes[off as usize..off as usize + len],
+            })
+            .collect();
+        let wm = WeightsMap {
+            arch: "qwen3".into(),
+            tensors,
+            storage: vec![crate::weights_map::Storage {
+                offset: 0,
+                data: &bytes,
+            }],
+        };
+        let ma = Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
+        let mb = Qwen3Model::load(&backend, &wm, c.clone()).unwrap();
+        (backend, ma, mb)
     }
 }

@@ -190,6 +190,25 @@ fn pp_forward(
     model.lm_head(backend, &h)
 }
 
+/// Восстановление после сбоя стадии (7.11): обе стороны переигрывают ВСЮ
+/// последовательность с чистого состояния — локальный сброс у координатора и
+/// `reset` у соседа. Иначе позиции кэшей расходятся (координатор пересеял
+/// последовательность локально, а у соседа остался старый хвост) и стадия
+/// честно отвечает «позиция N != запрошенной M». Возвращает логиты последней
+/// позиции; если стадия снова не сработала — ошибка (вызывающий уходит в
+/// локальный откат).
+fn pp_recover(
+    model: &mut Qwen3Model,
+    backend: &dyn Backend,
+    pp: &PpSplit,
+    seq: &[u32],
+) -> Result<crate::backend::Tensor, BackendError> {
+    model.reset_cache(backend)?;
+    // Следующая стадия обязана начать последовательность заново.
+    pp.first.store(true, std::sync::atomic::Ordering::Relaxed);
+    pp_forward(model, backend, pp, seq)
+}
+
 /// Локальный forward после отказа PP (7.10). `seq` — ВСЯ обработанная
 /// последовательность (промпт + порождённое + текущий токен): в PP-режиме
 /// локально жили только слои [0..from), поэтому продолжать с текущим кэшем
@@ -406,8 +425,17 @@ pub fn generate(
                 logits = match pp_forward(model, backend, pp, &[next]) {
                     Ok(lg) => lg,
                     Err(e) => {
-                        tracing::warn!(error = %e, "PP-стадия недоступна — локальный decode");
-                        local_fallback(model, backend, &history)?
+                        tracing::warn!(
+                            error = %e,
+                            "PP-стадия не сработала — переигрываем последовательность"
+                        );
+                        match pp_recover(model, backend, pp, &history) {
+                            Ok(lg) => lg,
+                            Err(e2) => {
+                                tracing::warn!(error = %e2, "PP-стадия недоступна — локальный decode");
+                                local_fallback(model, backend, &history)?
+                            }
+                        }
                     }
                 };
             } else {
@@ -417,8 +445,17 @@ pub fn generate(
             logits = match pp_forward(model, backend, pp, &[next]) {
                 Ok(lg) => lg,
                 Err(e) => {
-                    tracing::warn!(error = %e, "PP-стадия недоступна — локальный decode");
-                    local_fallback(model, backend, &history)?
+                    tracing::warn!(
+                        error = %e,
+                        "PP-стадия не сработала — переигрываем последовательность"
+                    );
+                    match pp_recover(model, backend, pp, &history) {
+                        Ok(lg) => lg,
+                        Err(e2) => {
+                            tracing::warn!(error = %e2, "PP-стадия недоступна — локальный decode");
+                            local_fallback(model, backend, &history)?
+                        }
+                    }
                 }
             };
         } else {

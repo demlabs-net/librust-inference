@@ -55,6 +55,56 @@ impl DrafterManifest {
     }
 }
 
+/// Транспорт черновиков (7.9): координатор просит СОСЕДНЮЮ ноду предложить
+/// `gamma` токенов по истории. Контракт намеренно узкий (токены, не фичи):
+/// верификация черновиков всегда ЛОКАЛЬНАЯ (rejection-sampling целевой
+/// моделью), поэтому неверный/пустой ответ соседа не портит распределение —
+/// он лишь снижает приёмку до нуля.
+pub trait DraftTransport: Send + Sync {
+    fn remote_draft(&self, history: &[u32], gamma: usize) -> Result<(Vec<u32>, Vec<f32>), String>;
+}
+
+/// Драфтер на соседней ноде (7.9, «спекуляция через сеть»): сам ничего не
+/// считает — пересылает историю и возвращает чужие черновики. У соседа
+/// собственный KV/драфтер; координатору не нужно держать драфтер в памяти.
+pub struct RemoteDrafter {
+    pub transport: std::sync::Arc<dyn DraftTransport>,
+    /// Последняя ошибка транспорта (диагностика/метрики): пустой ответ
+    /// означает нулевую приёмку, и без этого поля причина терялась бы.
+    pub last_error: Option<String>,
+}
+
+impl RemoteDrafter {
+    pub fn new(transport: std::sync::Arc<dyn DraftTransport>) -> Self {
+        Self {
+            transport,
+            last_error: None,
+        }
+    }
+}
+
+impl Drafter for RemoteDrafter {
+    fn draft(
+        &mut self,
+        _backend: &dyn crate::backend::Backend,
+        history: &[u32],
+        gamma: usize,
+    ) -> (Vec<u32>, Vec<f32>) {
+        match self.transport.remote_draft(history, gamma) {
+            Ok(v) => {
+                self.last_error = None;
+                v
+            }
+            Err(e) => {
+                // Сосед недоступен/ошибся — черновиков нет, генерация идёт
+                // обычным decode (верификация не нужна).
+                self.last_error = Some(e);
+                (Vec::new(), Vec::new())
+            }
+        }
+    }
+}
+
 /// Генератор draft-токенов. `backend` нужен графическим драфтерам
 /// (DFlash — диффузия на GPU); n-граммовый его игнорирует.
 pub trait Drafter {
@@ -114,12 +164,26 @@ impl Drafter for NGramDrafter {
         history: &[u32],
         gamma: usize,
     ) -> (Vec<u32>, Vec<f32>) {
+        ngram_lookup(history, gamma, self.max_order)
+    }
+}
+
+/// N-грамный lookup БЕЗ бэкенда (7.9): та же логика, что у
+/// [`NGramDrafter`], но вызываемая там, где графа нет вовсе — например на
+/// ноде-драфтере, обслуживающей черновики соседей по сети.
+pub fn ngram_lookup(
+    history: &[u32],
+    gamma: usize,
+    max_order: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let max_order = max_order.max(1);
+    {
         let mut drafts: Vec<u32> = Vec::new();
         let mut probs: Vec<f32> = Vec::new();
         let mut hist: Vec<u32> = history.to_vec();
         for _ in 0..gamma {
             let mut next: Option<(u32, f32)> = None;
-            let mut order = hist.len().min(self.max_order);
+            let mut order = hist.len().min(max_order);
             while order >= 1 && next.is_none() {
                 if hist.len() > order {
                     let suffix = &hist[hist.len() - order..];

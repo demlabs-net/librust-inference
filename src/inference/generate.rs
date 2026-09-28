@@ -73,6 +73,9 @@ pub struct GenerateParams {
     pub top_p: f32,
     pub top_k: usize,
     pub repeat_penalty: f32,
+    /// Сид сэмплинга: `Some` — детерминированный поток (материализуется через
+    /// [`crate::inference::sampling::state_from_seed`]), `None` — от часов.
+    pub seed: Option<u64>,
     /// Текстовые стоп-строки (проверяются по накопленному выводу).
     pub stop_strings: Vec<String>,
     /// Спек-декодинг (4.2b): драфтер + число драфт-токенов (0 = выкл).
@@ -90,6 +93,7 @@ impl Default for GenerateParams {
             top_p: 0.8,
             top_k: 0,
             repeat_penalty: 1.0,
+            seed: None,
             stop_strings: Vec::new(),
             drafter: None,
             spec_gamma: 0,
@@ -164,7 +168,11 @@ pub fn generate(
     let vocab = model.cfg.vocab_size;
 
     let mut generated: Vec<u32> = Vec::new();
-    let mut rng_state: Option<u64> = None;
+    // Сид запроса материализуется в состояние один раз на генерацию: и
+    // спекулятивный, и обычный путь сэмплят из этого одного потока.
+    let mut rng_state: Option<u64> = params
+        .seed
+        .map(crate::inference::sampling::state_from_seed);
     let mut decoder = IncrementalDecoder::new();
     let mut acc = String::new(); // накопленный текст (для stop-строк)
     // История для repetition penalty: промпт + уже порождённые токены
@@ -200,6 +208,8 @@ pub fn generate(
                 top_p: params.top_p,
                 top_k: params.top_k,
                 repetition_penalty: params.repeat_penalty,
+                // Поток несёт `rng_state` (сид уже материализован выше) —
+                // второй источник сида здесь дал бы двойной шаг LCG.
                 seed: None,
             };
             top_p_sample_vec_history(last, &sp, &history, &mut rng_state)

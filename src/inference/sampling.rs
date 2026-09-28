@@ -21,6 +21,28 @@ pub fn lcg_unit_f32(state: u64) -> f32 {
     ((state >> 40) as f32) * (1.0 / (1u64 << 24) as f32)
 }
 
+/// The LCG state a caller-supplied seed materializes to.
+///
+/// A seed is NOT a state: `lcg_unit_f32` reads the TOP 24 bits of the state, so
+/// a small integer seed (the common user choice — `seed = 42`) has zeros there
+/// and the first ~2^40 draws come back exactly `0.0`, which silently degrades
+/// temperature/top-p sampling to "always take the first candidate". One LCG
+/// step at seed time spreads the seed over all 64 bits; states materialized
+/// this way and clock-materialized ones (the `None` branch of
+/// `next_unit_f32`) are then interchangeable as stream states.
+#[inline]
+pub fn state_from_seed(seed: u64) -> u64 {
+    lcg_next(seed)
+}
+
+/// The first draw of the stream seeded with `seed` — `next_unit_f32` reading a
+/// state materialized by [`state_from_seed`]. Callers that need a seed with a
+/// property of its first draw read it here; a raw `lcg_unit_f32(seed)` is NOT
+/// that draw (see `state_from_seed`).
+pub fn seed_first_unit(seed: u64) -> f32 {
+    lcg_unit_f32(lcg_next(state_from_seed(seed)))
+}
+
 /// Draw a uniform `f32` from a mutable LCG state, seeding from the clock on the
 /// first call (`None`). The advanced state is written back, so a caller that
 /// keeps `Some(state)` gets a deterministic stream.
@@ -47,6 +69,8 @@ pub struct SamplingParams {
     /// top-p (0 = no limit). fishaudio S2-Pro reference default is 30.
     pub top_k: usize,
     pub repetition_penalty: f32,
+    /// Пользовательский сид потока — НЕ состояние LCG: материализуется через
+    /// [`state_from_seed`] (сырое значение как состояние даёт поток нулей).
     pub seed: Option<u64>,
 }
 
@@ -229,6 +253,38 @@ pub fn ras_penalty_vec(logits: &mut [f32], history: &[u32], window: usize, penal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Сид — не состояние: `lcg_unit_f32` читает биты 40..64, поэтому сырой
+    /// маленький сид (42, как в API) давал ПОТОК РОВНО НУЛЕЙ — temperature- и
+    /// top-p-сэмплинг молча вырождался в «всегда первый кандидат». Регрессия
+    /// нашлась по тесту `decode_spec_rejects_and_rolls_back`, который в цикле
+    /// подбора сида висел часами. `state_from_seed` перемешивает сид.
+    #[test]
+    fn state_from_seed_spreads_small_seeds() {
+        for s in [1u64, 7, 42, 12_345, 0xDEAD_BEEF] {
+            assert!(
+                seed_first_unit(s) > 0.0,
+                "сид {s}: первый draw ровно 0.0 — состояние не перемешано"
+            );
+            let mut rng = Some(state_from_seed(s));
+            let draws: Vec<f32> = (0..8).map(|_| next_unit_f32(&mut rng)).collect();
+            assert!(
+                draws.iter().any(|&u| u > 0.01),
+                "сид {s}: вырожденный поток {draws:?}"
+            );
+        }
+    }
+
+    /// Детерминированность: один сид — один поток (повтор даёт те же draws).
+    #[test]
+    fn seeded_stream_is_deterministic() {
+        let draws = |seed: u64| {
+            let mut rng = Some(state_from_seed(seed));
+            (0..6).map(|_| next_unit_f32(&mut rng)).collect::<Vec<f32>>()
+        };
+        assert_eq!(draws(42), draws(42));
+        assert_ne!(draws(42), draws(43));
+    }
 
     /// M15 regression: the top_k path sliced head[..k] where head is k-1
     /// long (select_nth puts the k-th element in the pivot) — k=1 panicked

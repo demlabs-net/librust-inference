@@ -1758,8 +1758,11 @@ mod tests {
         let p3 = Qwen3Model::softmax_prob(&pv, 3);
         // Детерминированный сид: первый draw LCG > p3 → u·q = u > p —
         // гарантированное отклонение (при q=1 принятие ⇔ u ≤ p).
+        // Ищем по `seed_first_unit` — первому draw потока: сырой
+        // `lcg_unit_f32(s)` читает биты 40..64 состояния, для s < 2^40 это
+        // ровно 0.0, и такой перебор не сходится НИКОГДА (тест висел).
         let seed = (1u64..)
-            .find(|&s| crate::inference::sampling::lcg_unit_f32(s) > p3)
+            .find(|&s| crate::inference::sampling::seed_first_unit(s) > p3)
             .unwrap();
 
         model.reset_cache(&backend).unwrap();
@@ -1769,7 +1772,7 @@ mod tests {
 
         model.reset_cache(&backend).unwrap();
         model.prefill(&backend, &ids).unwrap();
-        let mut rng = Some(seed);
+        let mut rng = Some(crate::inference::sampling::state_from_seed(seed));
         let out = model
             .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[])
             .unwrap();

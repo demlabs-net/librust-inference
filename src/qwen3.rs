@@ -158,6 +158,37 @@ impl Qwen3Model {
     pub fn output_projection(&self) -> &Tensor {
         &self.output
     }
+
+    /// Эмбеддинги токенов [1, T, D] — вход PP-стадии (7.5): координатор
+    /// считает эмбеддинг сам, к соседу едут активации, а не токены.
+    pub fn embed_ids(&self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+        self.embed.forward(backend, ids, ids.len())
+    }
+
+    /// Логиты из УЖЕ нормированных скрытых [1, T, D] (lm_head без out_norm).
+    /// Последняя PP-стадия отдаёт out_norm-выход, а lm_head остаётся на
+    /// координаторе — общий путь с prefill/forward_layers.
+    pub fn lm_head(&self, backend: &dyn Backend, h: &Tensor) -> Result<Tensor, BackendError> {
+        let (b, tq, d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
+        let h2 = h.view(vec![b * tq, d]);
+        let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
+        backend.gemm_nt(&h2, &self.output, &logits)?;
+        Ok(logits.view(vec![b, tq, self.cfg.vocab_size]))
+    }
+
+    /// Сдвинуть логическую rope-позицию (PP-декод шагает как decode()).
+    pub fn advance_rope(&mut self, t: usize) {
+        self.pos_rope += t;
+    }
+
+    /// Синхронизировать rope-позицию с кэшем ПЕРВОГО слоя диапазона (PP):
+    /// стадия обязана вести позиции ровно как координатор, иначе её rope
+    /// разъезжается с собственным KV (префилл-стадия — на t токенов, каждая
+    /// декод-стадия — на один).
+    pub fn sync_rope_to_cache(&mut self, from: usize) {
+        let i = from.min(self.caches.len() - 1);
+        self.pos_rope = self.caches[i].pos;
+    }
 }
 
 /// Результат спекулятивного шага (Ф2.1).
@@ -427,12 +458,9 @@ impl Qwen3Model {
             let t = ids.len();
             let x = self.embed.forward(backend, ids, t)?;
             let (h, out) = self.forward_layers_extract(backend, x, t, None, 0, None, layers)?;
-            let (b, tq, d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
-            let h2 = h.view(vec![b * tq, d]);
-            let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
-            backend.gemm_nt(&h2, &self.output, &logits)?;
+            let logits = self.lm_head(backend, &h)?;
             self.pos_rope = self.caches[0].pos;
-            Ok((logits.view(vec![b, tq, self.cfg.vocab_size]), out))
+            Ok((logits, out))
         })();
         backend.end_batch()?;
         r
@@ -657,7 +685,11 @@ impl Qwen3Model {
         // M-RoPE (vision) token positions come from the caller in absolute
         // coordinates that a roll does not remap, so that path is left alone.
         if mrope.is_none() && self.roll_windows_if_needed(backend, t)? {
-            self.pos_rope = self.caches[0].pos;
+            // Позицию берём от кэша ПЕРВОГО слоя ДИАПАЗОНА: при from > 0
+            // caches[0] принадлежит другой стадии и пуст (pos = 0) — стадия
+            // роупнула бы текущий токен в позицию 0.
+            let i = from.min(self.caches.len() - 1);
+            self.pos_rope = self.caches[i].pos;
         }
         let pos = if mrope.is_some() { 0 } else { self.pos_rope };
         if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
@@ -838,12 +870,8 @@ impl Qwen3Model {
         mrope: Option<&[u32]>,
         deepstack: Option<&[Tensor]>,
     ) -> Result<Tensor, BackendError> {
-        let (b, tq, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let h = self.forward_layers_hidden(backend, x, t, mrope, None, deepstack)?;
-        let h2 = h.view(vec![b * tq, d]);
-        let logits = backend.zeros(vec![b * tq, self.cfg.vocab_size])?;
-        backend.gemm_nt(&h2, &self.output, &logits)?;
-        Ok(logits.view(vec![b, tq, self.cfg.vocab_size]))
+        self.lm_head(backend, &h)
     }
 
     /// Скрытые состояния после всех слоёв (без lm_head) — для драфтеров.

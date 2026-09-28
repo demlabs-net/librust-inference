@@ -67,6 +67,28 @@ pub struct VisionPrompt {
     pub pos_after: usize,
 }
 
+/// Транспорт PP-стадии (7.5): координатор отдаёт соседу активации [t, dim] и
+/// получает выход его диапазона слоёв. Реализацию даёт сервис (кластерный
+/// канал с TLS); librust-inference знает только этот контракт.
+pub trait StageTransport: Send + Sync {
+    fn forward_stage(
+        &self,
+        from: usize,
+        upto: Option<usize>,
+        norm_out: bool,
+        t: usize,
+        hidden: Vec<f32>,
+    ) -> Result<Vec<f32>, String>;
+}
+
+/// Разбиение модели для PP (7.5): локально считаются слои [0..from), сосед —
+/// [from..] + out_norm. Эмбеддинг и lm_head всегда у координатора.
+#[derive(Clone)]
+pub struct PpSplit {
+    pub from: usize,
+    pub transport: std::sync::Arc<dyn StageTransport>,
+}
+
 pub struct GenerateParams {
     pub max_tokens: usize,
     pub temperature: f32,
@@ -83,6 +105,8 @@ pub struct GenerateParams {
     pub spec_gamma: usize,
     /// Vision (2.4b): картинка в промпте — prefill_with_vision вместо prefill.
     pub vision: Option<VisionPrompt>,
+    /// PP-разбиение (7.5): None — обычная локальная генерация.
+    pub pp: Option<PpSplit>,
 }
 
 impl Default for GenerateParams {
@@ -98,6 +122,7 @@ impl Default for GenerateParams {
             drafter: None,
             spec_gamma: 0,
             vision: None,
+            pp: None,
         }
     }
 }
@@ -119,6 +144,38 @@ pub fn check_stop(
     None
 }
 
+/// Один forward с PP-разбиением (7.5): эмбеддинг и lm_head — локально,
+/// слои [0..from) — локально, [from..] + out_norm — на соседней ноде.
+/// Позицию стадии ведёт локальный кэш [0..from) (sync_rope_to_cache) — то же
+/// правило, что у prefill/decode без PP: префилл +t, декод-итерация +1.
+fn pp_forward(
+    model: &mut Qwen3Model,
+    backend: &dyn Backend,
+    pp: &PpSplit,
+    ids: &[u32],
+) -> Result<crate::backend::Tensor, BackendError> {
+    let t = ids.len();
+    let dim = model.cfg.dim;
+    let x = model.embed_ids(backend, ids)?;
+    let mid = model.forward_layers_range(backend, x, t, None, Some(pp.from), 0, None, false)?;
+    let hidden = backend.to_cpu_f32(&mid)?;
+    let out = pp
+        .transport
+        .forward_stage(pp.from, None, true, t, hidden)
+        .map_err(|e| BackendError::Shape(format!("PP-стадия: {e}")))?;
+    if out.len() != t * dim {
+        return Err(BackendError::Shape(format!(
+            "PP-стадия: вернула {} элементов, ждали t*dim = {t}*{dim}",
+            out.len()
+        )));
+    }
+    let h = backend.from_cpu_f32(&out, vec![1, t, dim])?;
+    // Локальный кэш [0..from) — источник истины по позиции: префилл даёт +t,
+    // каждая декод-итерация +1 (как prefill/decode без PP).
+    model.sync_rope_to_cache(0);
+    model.lm_head(backend, &h)
+}
+
 /// Сгенерировать продолжение после `ids` (полный префилл выполняется
 /// здесь). Возвращает сгенерированные токены; события стримятся в
 /// `on_event`. Greedy при temperature <= 0.
@@ -132,7 +189,16 @@ pub fn generate(
 ) -> Result<Vec<u32>, BackendError> {
     let mut spec_stats = SpecStats::default();
     // Vision-префилл (2.4b): картинка уже посчитана — идём через M-RoPE.
-    let mut logits = if let Some(v) = &params.vision {
+    let mut logits = if let Some(pp) = params.pp.clone() {
+        // PP (7.5): средние слои — на соседе. Vision-путь PP пока не
+        // поддержан (M-RoPE/позиции картинки требуют передачи метаданных).
+        if params.vision.is_some() {
+            return Err(BackendError::Shape(
+                "PP-разбиение не поддержано вместе с vision-промптом".into(),
+            ));
+        }
+        pp_forward(model, backend, &pp, ids)?
+    } else if let Some(v) = &params.vision {
         model.prefill_with_vision(
             backend,
             &v.ids,
@@ -289,9 +355,13 @@ pub fn generate(
                 if finish.is_some() {
                     break;
                 }
+            } else if let Some(pp) = params.pp.as_ref() {
+                logits = pp_forward(model, backend, pp, &[next])?;
             } else {
                 logits = model.decode(backend, next)?;
             }
+        } else if let Some(pp) = params.pp.as_ref() {
+            logits = pp_forward(model, backend, pp, &[next])?;
         } else {
             logits = model.decode(backend, next)?;
         }

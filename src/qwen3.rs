@@ -742,6 +742,28 @@ impl Qwen3Model {
             }
             let t0 = std::time::Instant::now();
             let h = layer.attn_norm.forward(backend, &x)?;
+            if std::env::var("PP_DBG").is_ok() {
+                let xv = backend.to_cpu_f32(&x)?;
+                eprintln!(
+                    "PP_DBG L{} in-x rms={:.4} [0,:4]={:?} [1,:4]={:?} [2,:4]={:?}",
+                    i,
+                    (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt(),
+                    &xv[..4],
+                    &xv[xv.len() / 3..xv.len() / 3 + 4],
+                    &xv[2 * xv.len() / 3..2 * xv.len() / 3 + 4]
+                );
+            }
+            if std::env::var("PP_DBG").is_ok() && i == 2 {
+                let xv = backend.to_cpu_f32(&x)?;
+                let hv = backend.to_cpu_f32(&h)?;
+                eprintln!(
+                    "PP_DBG layer2 x rms={:.4} [0,:8]={:?} | normed rms={:.4} [0,:8]={:?}",
+                    (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt(),
+                    &xv[..8],
+                    (hv.iter().map(|v| v * v).sum::<f32>() / hv.len() as f32).sqrt(),
+                    &hv[..8]
+                );
+            }
             if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
                 let hv = backend.to_cpu_f32(&h)?;
                 eprintln!("INFER_DEBUG norm[0,:8]={:?}", &hv[..8]);
@@ -787,6 +809,16 @@ impl Qwen3Model {
             let h = layer.ffn_norm.forward(backend, &x)?;
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
+            // 7.5-диагностика: PP_DBG=1 — дамп скрытых слоя 2 (split-vs-full).
+            if std::env::var("PP_DBG").is_ok() && i == 2 {
+                let xv = backend.to_cpu_f32(&x)?;
+                eprintln!(
+                    "PP_DBG after_layer2 rows={} rms={:.4} [0,:8]={:?}",
+                    xv.len() / self.cfg.dim,
+                    (xv.iter().map(|v| v * v).sum::<f32>() / xv.len() as f32).sqrt(),
+                    &xv[..8]
+                );
+            }
             if prof {
                 prof_ffn += t1.elapsed().as_secs_f64();
             }
@@ -2042,12 +2074,13 @@ mod pp_range_tests {
     /// 7.5: разбиение слоёв [0..1)+[1..N) на двух «нодах» (два экземпляра
     /// модели на одном бэке) численно равно полному forward.
     /// Второй экземпляр нужен, чтобы исключить совпадение через общий кэш.
-    /// ДИАГНОСТИКА 7.5 (сейчас красный — известное расхождение): split
-    /// [0..2)+[2..N) vs полный forward даёт стабильные 0.475 max-diff при
-    /// сбросах кэшей на границах стадий. Все смежные проверки зелёные
-    /// (экземпляры/детерминизм/stage-1/mask-позиции) — расхождение внутри
-    /// обработки стадии-2; нужен дамп rope_and_attn слоя 2 в обоих путях.
-    /// Инструментарий в теле теста сохранён (побайтовые бисекты по слоям).
+    /// ДИАГНОСТИКА 7.5 (ignored, красный): split [0..2)+[2..N) vs полный —
+    /// стабильные 0.475 max-diff. ЛОКАЛИЗОВАНО (PP_DBG-трассировка):
+    /// входы слоёв 0 и 1 бит-в-бит совпадают в обоих путях, но ВЫХОД слоя 1
+    /// различается (rms 0.69 полный vs 0.76 split) — обработка слоя 1
+    /// зависит от чего-то вне (вход, веса, маска, rope — идентичны).
+    /// Гипотеза: состояние/ёмкость KV-кэша слоя 1 между вызовами
+    /// (shrink_to_init после fill). PP_DBG=1 — дампы по слоям.
     #[test]
     #[ignore = "7.5: расхождение split vs full на границе стадий — нужна трассировка слоя 2"]
     fn two_stage_range_equals_full_forward() {
@@ -2185,6 +2218,7 @@ mod pp_range_tests {
         // полный forward (stage A+B в одном экземпляре)
         model_a.reset_cache(&be).unwrap();
         let x = model_a.embed_forward_test(&be, &ids).unwrap();
+        eprintln!("--- PP_DBG full (model_a) ---");
         let full = model_a.forward_layers_range(&be, x, t, None, None, 0, None, true).unwrap();
         // две стадии
         model_a.reset_cache(&be).unwrap();
@@ -2208,6 +2242,7 @@ mod pp_range_tests {
         // 7.5-контракт: каждая PP-стадия стартует со СВЕЖИМ кэшем своих
         // слоёв (в живом мире — reset при старте последовательности).
         model_b.reset_cache(&be).unwrap();
+        eprintln!("--- PP_DBG stage-2 (model_b) ---");
         let tail = model_b
             .forward_layers_range(&be, mid_b, t, None, None, 2, None, true)
             .unwrap();

@@ -165,7 +165,10 @@ fn pp_forward(
     let t = ids.len();
     let dim = model.cfg.dim;
     // Позиция ДО локального forward = стартовая позиция последовательности
-    // для стадии (её кэш должен стоять там же).
+    // для стадии (её кэш должен стоять там же). Запоминается и для ОТКАТА:
+    // если стадия не приняла строки, локальные слои обязаны вернуться сюда,
+    // иначе стороны разъезжаются на токен и все следующие вызовы падают на
+    // проверке позиции (наблюдалось в кросс-машинном прогоне).
     let start_pos = model.caches[0].pos;
     let reset = pp
         .first
@@ -173,10 +176,17 @@ fn pp_forward(
     let x = model.embed_ids(backend, ids)?;
     let mid = model.forward_layers_range(backend, x, t, None, Some(pp.from), 0, None, false)?;
     let hidden = backend.to_cpu_f32(&mid)?;
-    let out = pp
-        .transport
-        .forward_stage(pp.from, None, true, reset, start_pos, t, hidden)
-        .map_err(|e| BackendError::Shape(format!("PP-стадия: {e}")))?;
+    let out = match pp.transport.forward_stage(pp.from, None, true, reset, start_pos, t, hidden) {
+        Ok(v) => v,
+        Err(e) => {
+            // Транзакционный откат: строки, которые стадия не приняла,
+            // снимаются и с локальных слоёв координатора.
+            for c in model.caches.iter_mut() {
+                c.truncate(start_pos);
+            }
+            return Err(BackendError::Shape(format!("PP-стадия: {e}")));
+        }
+    };
     if out.len() != t * dim {
         return Err(BackendError::Shape(format!(
             "PP-стадия: вернула {} элементов, ждали t*dim = {t}*{dim}",

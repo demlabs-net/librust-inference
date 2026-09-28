@@ -396,6 +396,8 @@ pub fn generate(
                     &draft_probs,
                     &mut rng_state,
                     &tlayers,
+                    // temperature <= 0: та же жадная траектория, что у decode.
+                    params.temperature <= 0.0,
                 )?;
                 if !tlayers.is_empty() {
                     let pos = model.caches[0].pos;

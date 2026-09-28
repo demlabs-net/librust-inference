@@ -1180,6 +1180,11 @@ impl Qwen3Model {
         draft_probs: &[f32],
         rng: &mut Option<u64>,
         extract_layers: &[usize],
+        // `greedy` — режим temperature<=0: верификация по ARGMAX (как в
+        // llama.cpp), а не rejection-sampling. Иначе спекулятивный путь
+        // сэмплировал бы из распределения, а обычный decode брал argmax —
+        // тексты спек- и жадной генерации расходились (наблюдалось на сервисе).
+        greedy: bool,
     ) -> Result<SpecOutcome, BackendError> {
         assert_eq!(draft.len(), draft_probs.len());
         let mut ids = Vec::with_capacity(1 + draft.len());
@@ -1198,15 +1203,35 @@ impl Qwen3Model {
         let mut n_verified = 0usize;
         for i in 0..draft.len() {
             let row = &ld[i * v..(i + 1) * v];
-            let p = Self::softmax_prob(row, draft[i]);
-            let q = draft_probs[i];
-            let u = Self::uniform01(rng);
-            if q <= 0.0 || u * q <= p {
+            let take_draft = if greedy {
+                // temperature <= 0: цель — детерминированный argmax.
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(t, _)| t as u32)
+                    == Some(draft[i])
+            } else {
+                let p = Self::softmax_prob(row, draft[i]);
+                let q = draft_probs[i];
+                let u = Self::uniform01(rng);
+                q <= 0.0 || u * q <= p
+            };
+            if take_draft {
                 accepted.push(draft[i]);
                 accepted_len += 1;
                 n_verified += 1;
             } else {
-                accepted.push(Self::sample_modified(row, draft[i], q, rng));
+                accepted.push(if greedy {
+                    // Отказ в жадном режиме: берём argmax цели (пересэмпл
+                    // не нужен — распределение вырождено).
+                    row.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(t, _)| t as u32)
+                        .unwrap_or(draft[i])
+                } else {
+                    Self::sample_modified(row, draft[i], draft_probs[i], rng)
+                });
                 break;
             }
         }
@@ -1893,7 +1918,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let out = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[])
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false)
             .unwrap();
         assert!(out.accepted.is_empty(), "γ=0: draft-токенов нет");
         let a = backend.to_cpu_f32(&d1).unwrap();
@@ -1914,7 +1939,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[])
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false)
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let p3 = Qwen3Model::softmax_prob(&pv, 3);
@@ -1936,7 +1961,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(crate::inference::sampling::state_from_seed(seed));
         let out = model
-            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[])
+            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[], false)
             .unwrap();
         assert_eq!(out.accepted.len(), 1, "мусорный draft отклонён");
         assert_ne!(
@@ -1960,7 +1985,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[])
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false)
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let a = pv
@@ -1976,7 +2001,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(0xDEAD_BEEF);
         let out = model
-            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[])
+            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[], false)
             .unwrap();
         assert_eq!(out.accepted, vec![a], "q < p → гарантированное принятие");
         assert_eq!(out.n_draft_accepted, 1);

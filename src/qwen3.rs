@@ -141,6 +141,80 @@ pub struct ModelKvState {
     pub layers: Vec<crate::nn::KvState>,
 }
 
+impl ModelKvState {
+    /// Бинарный кодек KV-объекта (7.8): компактная раскладка для передачи по
+    /// сети — json на сотнях МБ активаций непригоден. Формат:
+    /// `KVOB` | u32 версия | u64 pos_rope | u32 n_layers | (u64 pos, u64 len,
+    /// f32[len] k, f32[len] v)* . Длины — в элементах f32, little-endian.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            24 + self
+                .layers
+                .iter()
+                .map(|l| 24 + 8 * l.k.len())
+                .sum::<usize>(),
+        );
+        out.extend_from_slice(b"KVOB");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(self.pos_rope as u64).to_le_bytes());
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for l in &self.layers {
+            out.extend_from_slice(&(l.pos as u64).to_le_bytes());
+            out.extend_from_slice(&(l.k.len() as u64).to_le_bytes());
+            for v in &l.k {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in &l.v {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Разбор KV-объекта (7.8). Ошибки — громкие: усечённый/чужой блоб не
+    /// должен молча стать «пустым контекстом».
+    pub fn decode(bytes: &[u8]) -> Result<Self, BackendError> {
+        let bad = |m: &str| BackendError::Shape(format!("KV-объект: {m}"));
+        if bytes.len() < 20 || &bytes[0..4] != b"KVOB" {
+            return Err(bad("нет сигнатуры KVOB"));
+        }
+        let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if ver != 1 {
+            return Err(bad(&format!("версия {ver}")));
+        }
+        let pos_rope = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let n_layers = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let mut off = 20usize;
+        let mut layers = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            if off + 16 > bytes.len() {
+                return Err(bad(&format!("слой {i}: обрыв заголовка")));
+            }
+            let pos = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+            off += 16;
+            let need = len * 8;
+            if off + need > bytes.len() {
+                return Err(bad(&format!(
+                    "слой {i}: нужно {need} Б данных, есть {}",
+                    bytes.len() - off
+                )));
+            }
+            let rd = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            };
+            let k = rd(&bytes[off..off + len * 4]);
+            let v = rd(&bytes[off + len * 4..off + need]);
+            off += need;
+            layers.push(crate::nn::KvState { pos, k, v });
+        }
+        Ok(Self { pos_rope, layers })
+    }
+
+}
+
 pub struct Qwen3Model {
     pub cfg: Qwen3Config,
     embed: crate::nn::Embedding,
@@ -1757,6 +1831,14 @@ mod tests {
             let l = backend2.to_cpu_f32(&dst.decode(&backend2, t).unwrap()).unwrap();
             assert_eq!(l, l_src[i], "продолжение после импорта KV расходится (шаг {i})");
         }
+
+        // Кодек передачи (7.8): блоб кодируется и разбирается без потерь.
+        let blob = st.encode();
+        let back = ModelKvState::decode(&blob).unwrap();
+        assert_eq!(back, st, "KV-объект не пережил кодек");
+        // Обрезанный блоб отвергается, а не превращается в пустой контекст.
+        assert!(ModelKvState::decode(&blob[..blob.len() - 8]).is_err(), "обрыв не отвергнут");
+        assert!(ModelKvState::decode(b"XXXX").is_err(), "чужой блоб принят");
 
         // Несовместимый объект — громкая ошибка, а не молчаливый мусор.
         let (backend3, mut other) = mini_model_with_cfg(Qwen3Config {

@@ -21,7 +21,6 @@ use metal::*;
 use objc::rc::autoreleasepool;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, thiserror::Error)]
@@ -94,7 +93,7 @@ impl BufferPoolState {
         // результаты (decode/prefill в batch давали неверные логиты).
         // Новые буферы безопасны: Metal command buffer удерживает ресурсы
         // до завершения. После end_batch (wait) пул снова активен.
-        if BATCH_DEPTH.load(Ordering::Relaxed) == 0 && std::env::var("OMNI_NO_POOL").is_err() {
+        if batch_depth() == 0 && std::env::var("OMNI_NO_POOL").is_err() {
             if let Some(buf) = self
                 .free
                 .lock()
@@ -127,8 +126,8 @@ impl BufferPoolState {
     /// в глобальный deferred-список, который возвращается в пул после
     /// закрытия последнего batch (все command buffers выполнены).
     fn push(&self, buf: &Buffer) {
-        if BATCH_DEPTH.load(Ordering::Relaxed) > 0 {
-            DEFERRED.lock().unwrap().push(buf.clone());
+        if batch_depth() > 0 {
+            DEFERRED.with(|d| d.borrow_mut().push(buf.clone()));
             return;
         }
         let class = (buf.length() as usize + 4095) & !4095;
@@ -146,19 +145,33 @@ impl BufferPoolState {
     }
 }
 
-static POOL: OnceLock<Arc<BufferPoolState>> = OnceLock::new();
+use std::cell::{Cell, RefCell};
 
-/// Глобальная глубина batch-режима (все MetalCtx). Пока > 0 — acquire не
-/// переиспользует буферы пула, а push откладывает их в DEFERRED (они могут
-/// быть заняты невыполненными command buffers; см. BufferPoolState).
-static BATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Пул буферов — ПОТОКОЛОКАЛЬНЫЙ. Глобальный пул отдавал буфер,
+    /// освобождённый ДРУГИМ потоком, а у потоков разные Metal-очереди: один
+    /// поток мог писать (или ставить кернел) в буфер, который ещё
+    /// использовался чужим незавершённым command buffer'ом. Прогон тестов в
+    /// несколько потоков давал NaN/мусор в логитах (с `OMNI_NO_POOL=1` набор
+    /// чистый). Кросс-поточная миграция буферов исключена целиком.
+    static POOL_LOCAL: RefCell<BufferPoolState> = RefCell::new(BufferPoolState::new());
 
-/// Буферы, освобождённые внутри batch — возвращаются в пул после закрытия
-/// последнего batch (все command buffers выполнены, wait сделан).
-static DEFERRED: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+    /// Глубина batch-режима ЭТОГО потока: пока > 0 — acquire не
+    /// переиспользует буферы пула, а push откладывает их в DEFERRED (они
+    /// могут быть заняты невыполненными command buffers).
+    static BATCH_DEPTH: Cell<usize> = const { Cell::new(0) };
 
-fn pool() -> &'static Arc<BufferPoolState> {
-    POOL.get_or_init(|| Arc::new(BufferPoolState::new()))
+    /// Буферы, освобождённые внутри batch — возвращаются в пул после
+    /// закрытия последнего batch (все command buffers выполнены, wait сделан).
+    static DEFERRED: RefCell<Vec<Buffer>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_pool<R>(f: impl FnOnce(&BufferPoolState) -> R) -> R {
+    POOL_LOCAL.with(|p| f(&p.borrow()))
+}
+
+fn batch_depth() -> usize {
+    BATCH_DEPTH.with(|d| d.get())
 }
 
 /// Маркер принадлежности буфера пулу: последний клон (все view-клоны
@@ -185,7 +198,7 @@ impl Drop for GpuTensor {
     fn drop(&mut self) {
         if let Some(tok) = self.pooled.as_ref() {
             if Arc::strong_count(tok) == 1 {
-                pool().push(&self.buffer);
+                with_pool(|p| p.push(&self.buffer));
             }
         }
     }
@@ -226,7 +239,7 @@ impl GpuTensor {
     ) -> Result<Self, MetalError> {
         let expected: usize = shape.iter().product();
         assert_eq!(expected, data.len(), "GpuTensor data/shape mismatch");
-        let buffer = pool().acquire(device, data.len() * 4);
+        let buffer = with_pool(|p| p.acquire(device, data.len() * 4));
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -245,7 +258,7 @@ impl GpuTensor {
     /// Zero-filled buffer of the given shape (fp32).
     pub fn zeros(device: &Device, shape: Vec<usize>) -> Result<Self, MetalError> {
         let bytes = shape.iter().product::<usize>() * 4;
-        let buffer = pool().acquire(device, bytes);
+        let buffer = with_pool(|p| p.acquire(device, bytes));
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -270,7 +283,7 @@ impl GpuTensor {
     ) -> Result<Self, MetalError> {
         let expected: usize = shape.iter().product();
         assert_eq!(expected, data.len(), "GpuTensor f16 data/shape mismatch");
-        let buffer = pool().acquire(device, data.len() * 2);
+        let buffer = with_pool(|p| p.acquire(device, data.len() * 2));
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -294,7 +307,7 @@ impl GpuTensor {
     ) -> Result<Self, MetalError> {
         let expected: usize = shape.iter().product();
         assert_eq!(expected, data.len(), "GpuTensor bf16 data/shape mismatch");
-        let buffer = pool().acquire(device, data.len() * 2);
+        let buffer = with_pool(|p| p.acquire(device, data.len() * 2));
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -344,7 +357,7 @@ impl GpuTensor {
                 data.len()
             )));
         }
-        let buffer = pool().acquire(device, data.len());
+        let buffer = with_pool(|p| p.acquire(device, data.len()));
         if buffer.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -628,7 +641,7 @@ impl MetalCtx {
         let mut batch = self.batch.lock().unwrap();
         batch.depth += 1;
         batch.enters += 1;
-        BATCH_DEPTH.fetch_add(1, Ordering::Relaxed);
+        BATCH_DEPTH.with(|d| d.set(d.get() + 1));
     }
 
     /// How many batches were opened since the context was created
@@ -643,7 +656,7 @@ impl MetalCtx {
         let mut batch = self.batch.lock().unwrap();
         if batch.depth > 0 {
             batch.depth -= 1;
-            BATCH_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            BATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         }
         if batch.depth == 0 {
             if let Some(cmd) = batch.last.take() {
@@ -657,20 +670,22 @@ impl MetalCtx {
                 }
             }
             // Последний batch закрыт — все command buffers выполнены:
-            // возвращаем отложенные буферы в пул (см. BufferPoolState::push).
-            if BATCH_DEPTH.load(Ordering::Relaxed) == 0 {
-                let deferred = std::mem::take(&mut *DEFERRED.lock().unwrap());
-                for buf in deferred {
-                    let class = (buf.length() as usize + 4095) & !4095;
-                    let class = class.max(4096);
-                    pool()
-                        .free
-                        .lock()
-                        .unwrap()
-                        .entry(class)
-                        .or_default()
-                        .push(buf);
-                }
+            // возвращаем отложенные буферы в пул СВОЕГО потока
+            // (см. BufferPoolState::push).
+            if batch_depth() == 0 {
+                let deferred = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+                with_pool(|p| {
+                    for buf in deferred {
+                        let class = (buf.length() as usize + 4095) & !4095;
+                        let class = class.max(4096);
+                        p.free
+                            .lock()
+                            .unwrap()
+                            .entry(class)
+                            .or_default()
+                            .push(buf);
+                    }
+                });
             }
         }
         Ok(())
@@ -1892,7 +1907,7 @@ impl MetalCtx {
                 idx.len()
             )));
         }
-        let idx_buf = pool().acquire(&self.device, t * 4);
+        let idx_buf = with_pool(|p| p.acquire(&self.device, t * 4));
         if idx_buf.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -1909,7 +1924,7 @@ impl MetalCtx {
                 enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
             }
         });
-        pool().push(&idx_buf);
+        with_pool(|p| p.push(&idx_buf));
         res
     }
 
@@ -1986,7 +2001,7 @@ impl MetalCtx {
                 idx.len()
             )));
         }
-        let idx_buf = pool().acquire(&self.device, rows * 4);
+        let idx_buf = with_pool(|p| p.acquire(&self.device, rows * 4));
         if idx_buf.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -2016,7 +2031,7 @@ impl MetalCtx {
             }
             Ok(())
         })();
-        pool().push(&idx_buf);
+        with_pool(|p| p.push(&idx_buf));
         res
     }
 
@@ -2120,7 +2135,7 @@ impl MetalCtx {
                 idx.len()
             )));
         }
-        let idx_buf = pool().acquire(&self.device, t * 4);
+        let idx_buf = with_pool(|p| p.acquire(&self.device, t * 4));
         if idx_buf.contents().is_null() {
             return Err(MetalError::BufferAlloc);
         }
@@ -2138,7 +2153,7 @@ impl MetalCtx {
                 enc.set_bytes((4 + i) as u64, 8, (val as *const usize).cast());
             }
         });
-        pool().push(&idx_buf);
+        with_pool(|p| p.push(&idx_buf));
         res
     }
 
@@ -2397,7 +2412,7 @@ impl crate::backend::Backend for MetalBackend {
         let y = GpuTensor::zeros(&self.ctx.device, vec![1, tq, d])?;
         let grid = MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
         let group = MTLSize::new(1, 1, 8);
-        let pos_buf = pool().acquire(&self.ctx.device, pos4d.len() * 4);
+        let pos_buf = with_pool(|p| p.acquire(&self.ctx.device, pos4d.len() * 4));
         if pos_buf.contents().is_null() {
             return Err(MetalError::BufferAlloc.into());
         }
@@ -2420,7 +2435,7 @@ impl crate::backend::Backend for MetalBackend {
             ];
             enc.set_bytes(7, 16, (sects32.as_ptr() as *const u8).cast());
         });
-        pool().push(&pos_buf);
+        with_pool(|p| p.push(&pos_buf));
         res?;
         Ok(crate::backend::Tensor::from_gpu(y))
     }

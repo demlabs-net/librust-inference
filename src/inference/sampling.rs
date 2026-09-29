@@ -60,6 +60,27 @@ pub fn next_unit_f32(state: &mut Option<u64>) -> f32 {
     lcg_unit_f32(next)
 }
 
+/// Следующий токен ЖАДНОГО режима: argmax со ТЕМ ЖЕ штрафом за повторы, что
+/// применяет обычный decode. Единственная реализация для всех путей —
+/// спекулятивная верификация обязана сравнивать argmax С ШТРАФОМ, иначе
+/// принимает токены, которых жадный путь не выбрал бы (на живом сервисе это
+/// давало расхождение спек- и жадной генерации: штраф 1.1 по умолчанию, а
+/// частый токен («of») есть в истории).
+pub fn greedy_next(row: &[f32], history: &[u32], repeat_penalty: f32) -> u32 {
+    let mut penalized = row.to_vec();
+    apply_repetition_penalty_vec_unique(&mut penalized, history, repeat_penalty);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, l) in penalized.iter().enumerate() {
+        // Не-конечные логиты (NaN) не должны побеждать: NaN в partial_cmp
+        // давало Equal и «залипало» в аккумуляторе (P18c/iter-9).
+        let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
+        if best.is_none_or(|(_, bl)| l > bl) {
+            best = Some((i, l));
+        }
+    }
+    best.map(|(i, _)| i as u32).unwrap_or(0)
+}
+
 /// Sampling parameters.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {

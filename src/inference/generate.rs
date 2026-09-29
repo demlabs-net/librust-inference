@@ -302,6 +302,23 @@ pub fn generate(
     };
     let vocab = model.cfg.vocab_size;
 
+    // Диагностика параметров (LLM_DBG_PARAMS=1): расхождения спек/жадной
+    // генерации на живом сервисе искали именно сравнением эффективных
+    // параметров — печатаем те, что реально доехали до петли.
+    if std::env::var("LLM_DBG_PARAMS").is_ok() {
+        eprintln!(
+            "PARAMS temp={} top_p={} top_k={} rep={} spec_gamma={} seed={:?} max_tokens={} t={} ids={:?}",
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.repeat_penalty,
+            params.spec_gamma,
+            params.seed,
+            params.max_tokens,
+            ids.len(),
+            &ids[..ids.len().min(12)],
+        );
+    }
     let mut generated: Vec<u32> = Vec::new();
     // Сид запроса материализуется в состояние один раз на генерацию: и
     // спекулятивный, и обычный путь сэмплят из этого одного потока.
@@ -322,21 +339,14 @@ pub fn generate(
             // Greedy: ТОТ ЖЕ repetition penalty, что и в сэмплирующей ветке
             // (раньше greedy игнорировал history-штраф). Копия — last
             // остаётся нетронутым для следующих итераций.
-            let mut penalized = last.to_vec();
-            apply_repetition_penalty_vec_unique(&mut penalized, &history, params.repeat_penalty);
-            // P18c: a NaN logit used to PANIC in partial_cmp().unwrap().
-            // N (iter-9): the claim "treat non-finite as -inf" is now real —
-            // the old max_by kept a NaN at index 0 as the running max
-            // (partial_cmp(NaN, x) == None → Equal → accumulator survives).
-            let mut best: Option<(usize, f32)> = None;
-            for (i, l) in penalized.iter().enumerate() {
-                let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
-                if best.is_none_or(|(_, bl)| l > bl) {
-                    best = Some((i, l));
-                }
+            // Единственная реализация жадного шага (sampling::greedy_next):
+            // её же использует жадная верификация спека — расхождение
+            // (штраф в одном месте и отсутствие в другом) давало разные
+            // траектории спек- и обычной генерации.
+            if last.is_empty() {
+                return Err(BackendError::Shape("greedy: empty logits row".into()));
             }
-            best.map(|(i, _)| i as u32)
-                .ok_or_else(|| BackendError::Shape("greedy: empty logits row".into()))?
+            crate::inference::sampling::greedy_next(last, &history, params.repeat_penalty)
         } else {
             let sp = SamplingParams {
                 temperature: params.temperature,
@@ -396,8 +406,12 @@ pub fn generate(
                     &draft_probs,
                     &mut rng_state,
                     &tlayers,
-                    // temperature <= 0: та же жадная траектория, что у decode.
+                    // temperature <= 0: та же жадная траектория, что у decode
+                    // (включая штраф за повторы — верификация без него
+                    // принимала бы токены, которых жадный путь не выбрал бы).
                     params.temperature <= 0.0,
+                    &history,
+                    params.repeat_penalty,
                 )?;
                 if !tlayers.is_empty() {
                     let pos = model.caches[0].pos;
@@ -429,7 +443,20 @@ pub fn generate(
                     generated.push(t);
                     history.push(t);
                 }
-                logits = out.logits;
+                // Окно закрылось ПЕРЕСЭМПЛОМ (n_draft_accepted < γ): этот
+                // токен в KV-кэше НЕ лежит (SpecOutcome), а строка из
+                // `out.logits` описывает контекст с ОТКЛОНЁННЫМ черновиком —
+                // сэмплирование из неё повторяло пересэмпл в выводе. Доводим
+                // пересэмпл через forward: кэш и логиты снова согласованы.
+                let resampled = out.n_draft_accepted < draft_tokens.len();
+                logits = if resampled {
+                    match out.accepted.last() {
+                        Some(&last) => model.decode(backend, last)?,
+                        None => out.logits,
+                    }
+                } else {
+                    out.logits
+                };
                 if finish.is_some() {
                     break;
                 }

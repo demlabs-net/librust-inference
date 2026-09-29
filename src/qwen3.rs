@@ -1185,6 +1185,12 @@ impl Qwen3Model {
         // сэмплировал бы из распределения, а обычный decode брал argmax —
         // тексты спек- и жадной генерации расходились (наблюдалось на сервисе).
         greedy: bool,
+        // Для жадной верификации: та же история и штраф за повторы, что у
+        // обычного decode. Без них argmax считался бы без штрафа, и спек
+        // принимал бы токены, которых жадный путь не выбрал бы (расхождение
+        // траекторий на первом же частом токене из истории).
+        hist: &[u32],
+        repeat_penalty: f32,
     ) -> Result<SpecOutcome, BackendError> {
         assert_eq!(draft.len(), draft_probs.len());
         let mut ids = Vec::with_capacity(1 + draft.len());
@@ -1198,18 +1204,26 @@ impl Qwen3Model {
         // draft[i] принимается с вероятностью min(1, p/q), где p — softmax
         // таргета на draft[i], q — вероятность драфтера. Раньше сравнение
         // было детерминированным (q <= p → принять) — не сэмплирование.
-        let mut accepted: Vec<u32> = Vec::new();
+        // ВАЖНО: accepted[0] — ЯКОРЬ (id). Так записано в контракте
+        // SpecOutcome и на это опирается потребитель (generate стримит
+        // accepted[1..]). Реализация раньше пушила только черновики — первый
+        // принятый черновик окна терялся в выводе (наблюдалось на сервисе:
+        // «the capital France..» вместо «the capital of France.»).
+        let mut accepted: Vec<u32> = vec![id];
         let mut accepted_len = 1usize;
         let mut n_verified = 0usize;
         for i in 0..draft.len() {
             let row = &ld[i * v..(i + 1) * v];
+            // Эффективная история для позиции i: история петли (она уже
+            // включает якорь — его туда положила генерация) + принятые в этом
+            // окне черновики. Повторный push якоря давал двойной штраф —
+            // argmax расходился с обычным decode на частых токенах.
+            let mut h = Vec::with_capacity(hist.len() + accepted.len());
+            h.extend_from_slice(hist);
+            h.extend_from_slice(&accepted);
             let take_draft = if greedy {
-                // temperature <= 0: цель — детерминированный argmax.
-                row.iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(t, _)| t as u32)
-                    == Some(draft[i])
+                // temperature <= 0: цель — детерминированный argmax СО ШТРАФОМ.
+                crate::inference::sampling::greedy_next(row, &h, repeat_penalty) == draft[i]
             } else {
                 let p = Self::softmax_prob(row, draft[i]);
                 let q = draft_probs[i];
@@ -1222,13 +1236,9 @@ impl Qwen3Model {
                 n_verified += 1;
             } else {
                 accepted.push(if greedy {
-                    // Отказ в жадном режиме: берём argmax цели (пересэмпл
-                    // не нужен — распределение вырождено).
-                    row.iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(t, _)| t as u32)
-                        .unwrap_or(draft[i])
+                    // Отказ в жадном режиме: берём argmax цели СО ШТРАФОМ
+                    // (пересэмпл не нужен — распределение вырождено).
+                    crate::inference::sampling::greedy_next(row, &h, repeat_penalty)
                 } else {
                     Self::sample_modified(row, draft[i], draft_probs[i], rng)
                 });
@@ -1918,9 +1928,12 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let out = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false)
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], 1.0)
             .unwrap();
-        assert!(out.accepted.is_empty(), "γ=0: draft-токенов нет");
+        // Контракт SpecOutcome: accepted[0] — ЯКОРЬ (гарантированный токен);
+        // при γ=0 черновиков нет, значит список ровно из якоря.
+        assert_eq!(out.accepted, vec![5], "γ=0: в accepted только якорь");
+        assert_eq!(out.n_draft_accepted, 0);
         let a = backend.to_cpu_f32(&d1).unwrap();
         let b = backend.to_cpu_f32(&out.logits).unwrap();
         assert_eq!(a, b, "spec(γ=0) должен совпадать с decode");
@@ -1939,7 +1952,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false)
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], 1.0)
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let p3 = Qwen3Model::softmax_prob(&pv, 3);
@@ -1961,11 +1974,12 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(crate::inference::sampling::state_from_seed(seed));
         let out = model
-            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[], false)
+            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[], false, &[], 1.0)
             .unwrap();
-        assert_eq!(out.accepted.len(), 1, "мусорный draft отклонён");
+        assert_eq!(out.accepted.len(), 2, "якорь + пересэмпл: draft отклонён");
+        assert_eq!(out.accepted[0], 5, "accepted[0] — якорь");
         assert_ne!(
-            out.accepted[0], 3,
+            out.accepted[1], 3,
             "отклонён → пересэмпл ≠ draft (q=1 вычитает его массу)"
         );
         // KV откачен (остался id=5) — decode(6) даёт обычный результат.
@@ -1985,7 +1999,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false)
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], 1.0)
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let a = pv
@@ -2001,9 +2015,13 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(0xDEAD_BEEF);
         let out = model
-            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[], false)
+            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[], false, &[], 1.0)
             .unwrap();
-        assert_eq!(out.accepted, vec![a], "q < p → гарантированное принятие");
+        assert_eq!(
+            out.accepted,
+            vec![5, a],
+            "q < p → гарантированное принятие (accepted[0] — якорь)"
+        );
         assert_eq!(out.n_draft_accepted, 1);
         // Полное принятие: кэш не откатывался (база + id + draft).
         assert_eq!(model.caches[0].pos, ids.len() + 2);

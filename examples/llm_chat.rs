@@ -457,8 +457,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map(|d| d.model.extract_layers.clone())
                         .unwrap_or_default()
                         .as_slice(),
-                    // Пример работает с temperature > 0 (сэмплирование).
+                    // Пример работает с temperature > 0 (сэмплирование);
+                    // история/штраф нужны только жадной верификации.
                     false,
+                    &draft,
+                    1.0,
                 )?
             };
             // фичи принятых (первый шаг — префилл, заполняется ниже)

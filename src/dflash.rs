@@ -2240,6 +2240,143 @@ pub fn load_drafter_gguf(
     Ok(DFlashDrafter::new(model, target_embed, lm_head))
 }
 
+#[cfg(all(test, feature = "metal"))]
+mod env_matrix_tests {
+    use super::*;
+    use crate::metal::MetalBackend;
+
+    /// 7.9-диагностика: от чего зависит деградация драфтера на отдельной ноде
+    /// — от ТАБЛИЦ таргета (частичная загрузка: эмбеддинги+выход из GGUF) или
+    /// от БЭКЕНДА (свой контекст без модели)? Матрица 2×2 на ОДНИХ И ТЕХ ЖЕ
+    /// фичах: (таблицы модели | частичные) × (бэкенд модели | свой).
+    /// Запуск: QWEN_GGUF=…8B… DFLASH_GGUF=…drafter… cargo test --features metal \
+    ///   --lib env_matrix_tests -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dflash_drafter_env_matrix() {
+        let target = std::env::var("QWEN_GGUF").expect("QWEN_GGUF");
+        let drafter_path = std::env::var("DFLASH_GGUF").expect("DFLASH_GGUF");
+        let be_model = MetalBackend::new().unwrap();
+        let be_own = MetalBackend::new().unwrap();
+        let bytes = std::fs::read(&target).unwrap();
+        let gf = crate::gguf::parse(&bytes).unwrap();
+        let wm = crate::weights_map::WeightsMap::from_gguf(&gf).unwrap();
+        let vocab = gf
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let cfg = crate::qwen3::Qwen3Config::from_gguf(&gf, vocab).unwrap();
+        let mut model = crate::qwen3::Qwen3Model::load(&be_model, &wm, cfg).unwrap();
+
+        // Фичи — как в generate: extract-слои драфтера на префилле.
+        let ids: Vec<u32> = (0..13u32).map(|i| 100 + i).collect();
+        let tlayers = [1usize, 9, 17, 25, 33];
+        let (_lg, extract) = model.prefill_extract(&be_model, &ids, &tlayers).unwrap();
+
+        let mut d_a = load_drafter_gguf(
+            &be_model,
+            std::path::Path::new(&drafter_path),
+            model.token_embed_table().clone(),
+            model.output_projection().clone(),
+            vocab,
+        )
+        .unwrap();
+        let dim = model.token_embed_table().shape()[1];
+        let emb_t = wm.get("token_embd.weight").unwrap();
+        let emb_f = crate::weights_map::dequant_f32(emb_t);
+        let emb_b = be_own
+            .from_cpu_f32(&emb_f, vec![vocab, dim])
+            .unwrap();
+        let out_b = match wm.get("output.weight") {
+            Some(ow) => crate::qwen3::Qwen3Model::upload_weight_pub(
+                &be_own,
+                &wm,
+                "output.weight",
+                vec![ow.shape[0] as usize, ow.shape[1] as usize],
+            )
+            .unwrap(),
+            None => emb_b.clone(),
+        };
+        let mut d_b = load_drafter_gguf(
+            &be_own,
+            std::path::Path::new(&drafter_path),
+            emb_b,
+            out_b,
+            vocab,
+        )
+        .unwrap();
+
+        // C: частичные таблицы на бэкенде МОДЕЛИ; D: таблицы модели на СВОЁМ.
+        let emb_c = be_model.from_cpu_f32(&emb_f, vec![vocab, dim]).unwrap();
+        let out_c = match wm.get("output.weight") {
+            Some(ow) => crate::qwen3::Qwen3Model::upload_weight_pub(
+                &be_model,
+                &wm,
+                "output.weight",
+                vec![ow.shape[0] as usize, ow.shape[1] as usize],
+            )
+            .unwrap(),
+            None => emb_c.clone(),
+        };
+        let mut d_c = load_drafter_gguf(
+            &be_model,
+            std::path::Path::new(&drafter_path),
+            emb_c,
+            out_c,
+            vocab,
+        )
+        .unwrap();
+        let emb_d = crate::qwen3::Qwen3Model::upload_weight_pub(
+            &be_own,
+            &wm,
+            "token_embd.weight",
+            vec![vocab, dim],
+        )
+        .unwrap();
+        let out_d = match wm.get("output.weight") {
+            Some(ow) => crate::qwen3::Qwen3Model::upload_weight_pub(
+                &be_own,
+                &wm,
+                "output.weight",
+                vec![ow.shape[0] as usize, ow.shape[1] as usize],
+            )
+            .unwrap(),
+            None => emb_d.clone(),
+        };
+        let mut d_d = load_drafter_gguf(
+            &be_own,
+            std::path::Path::new(&drafter_path),
+            model.token_embed_table().clone(),
+            model.output_projection().clone(),
+            vocab,
+        )
+        .unwrap();
+        let _ = (emb_d, out_d);
+
+        let hist: Vec<u32> = ids.clone();
+        for (name, d, be) in [
+            ("A таблицы+бэкенд модели", &mut d_a, &be_model as &dyn crate::backend::Backend),
+            ("B партиалы+свой бэкенд", &mut d_b, &be_own as &dyn crate::backend::Backend),
+            ("C партиалы+бэкенд модели", &mut d_c, &be_model as &dyn crate::backend::Backend),
+            ("D таблицы+свой бэкенд", &mut d_d, &be_own as &dyn crate::backend::Backend),
+        ] {
+            crate::spec::Drafter::after_extract(d, be, &extract, ids.len(), ids.len())
+                .unwrap();
+            let (t1, p1) = crate::spec::Drafter::draft(d, be, &hist, 4);
+            let mut h2 = hist.clone();
+            h2.extend_from_slice(&t1);
+            let (t2, p2) = crate::spec::Drafter::draft(d, be, &h2, 4);
+            let nf = |p: &[f32]| p.iter().filter(|v| !v.is_finite()).count();
+            eprintln!(
+                "ENV_MATRIX {name}: draft1={t1:?} nonfinite={} | draft2={t2:?} nonfinite={}",
+                nf(&p1),
+                nf(&p2)
+            );
+        }
+    }
+}
+
 #[cfg(all(test, feature = "metal", feature = "cpu"))]
 mod real_dump_tests {
     use super::*;

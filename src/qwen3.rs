@@ -356,7 +356,7 @@ impl Qwen3Model {
     #[allow(clippy::too_many_arguments)]
     /// Квант-осведомлённая загрузка веса: Q4_0/Q8_0/Q4_K/Q6_K — нативно
     /// (dequant-in-kernel GEMM/MMV), иначе dequant→f16 (как раньше).
-    fn upload_q(
+    pub(crate) fn upload_q(
         backend: &dyn Backend,
         w: &WeightsMap<'_>,
         name: &str,
@@ -378,7 +378,7 @@ impl Qwen3Model {
 
     /// Fused-веса (q/k/v, gate/up) с нативным квантом, если ВСЕ части
     /// квантованы одинаково (GGUF-модели — всегда); иначе dequant→f16.
-    fn upload_fused(
+    pub(crate) fn upload_fused(
         backend: &dyn Backend,
         w: &WeightsMap<'_>,
         names: &[&str],
@@ -1213,51 +1213,9 @@ impl Qwen3Model {
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?; // [1, T, V]
         let v = logits.shape()[2];
         let ld = backend.to_cpu_f32(&logits)?;
-        // 2. Честное rejection-sampling (Leviathan et al., алгоритм 2):
-        // draft[i] принимается с вероятностью min(1, p/q), где p — softmax
-        // таргета на draft[i], q — вероятность драфтера. Раньше сравнение
-        // было детерминированным (q <= p → принять) — не сэмплирование.
-        // ВАЖНО: accepted[0] — ЯКОРЬ (id). Так записано в контракте
-        // SpecOutcome и на это опирается потребитель (generate стримит
-        // accepted[1..]). Реализация раньше пушила только черновики — первый
-        // принятый черновик окна терялся в выводе (наблюдалось на сервисе:
-        // «the capital France..» вместо «the capital of France.»).
-        let mut accepted: Vec<u32> = vec![id];
-        let mut accepted_len = 1usize;
-        let mut n_verified = 0usize;
-        for i in 0..draft.len() {
-            let row = &ld[i * v..(i + 1) * v];
-            // Эффективная история для позиции i: история петли (она уже
-            // включает якорь — его туда положила генерация) + принятые в этом
-            // окне черновики. Повторный push якоря давал двойной штраф —
-            // argmax расходился с обычным decode на частых токенах.
-            let mut h = Vec::with_capacity(hist.len() + accepted.len());
-            h.extend_from_slice(hist);
-            h.extend_from_slice(&accepted);
-            let take_draft = if greedy {
-                // temperature <= 0: цель — детерминированный argmax СО ШТРАФОМ.
-                crate::inference::sampling::greedy_next(row, &h, repeat_penalty) == draft[i]
-            } else {
-                let p = Self::softmax_prob(row, draft[i]);
-                let q = draft_probs[i];
-                let u = Self::uniform01(rng);
-                q <= 0.0 || u * q <= p
-            };
-            if take_draft {
-                accepted.push(draft[i]);
-                accepted_len += 1;
-                n_verified += 1;
-            } else {
-                accepted.push(if greedy {
-                    // Отказ в жадном режиме: берём argmax цели СО ШТРАФОМ
-                    // (пересэмпл не нужен — распределение вырождено).
-                    crate::inference::sampling::greedy_next(row, &h, repeat_penalty)
-                } else {
-                    Self::sample_modified(row, draft[i], draft_probs[i], rng)
-                });
-                break;
-            }
-        }
+        // 2. Проверка черновиков — общая для всех архитектур (verify_draft).
+        let (accepted, accepted_len, n_verified) =
+            verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, repeat_penalty);
         // 3. KV-откат непринятого хвоста: остаются prefill-база + id + принятые.
         if accepted_len < ids.len() {
             let base = self.caches[0].pos - ids.len();
@@ -1492,6 +1450,66 @@ impl Qwen3Model {
     }
 }
 
+/// Проверка черновиков спек-шага по логитам верификационного forward'а
+/// `ld` ([1+γ, V] построчно: строка i — распределение ПЕРЕД draft[i]).
+/// Возвращает (accepted, accepted_len, n_verified): accepted[0] — ЯКОРЬ `id`
+/// (контракт SpecOutcome: generate стримит accepted[1..]; раньше пушились
+/// только черновики, и первый принятый черновик окна терялся в выводе —
+/// «the capital France..» вместо «the capital of France.»), далее принятые
+/// черновики и, при отказе, пересэмпл. Общая для всех архитектур.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_draft(
+    ld: &[f32],
+    v: usize,
+    id: u32,
+    draft: &[u32],
+    draft_probs: &[f32],
+    rng: &mut Option<u64>,
+    greedy: bool,
+    hist: &[u32],
+    repeat_penalty: f32,
+) -> (Vec<u32>, usize, usize) {
+    let mut accepted: Vec<u32> = vec![id];
+    let mut accepted_len = 1usize;
+    let mut n_verified = 0usize;
+    for i in 0..draft.len() {
+        let row = &ld[i * v..(i + 1) * v];
+        // Эффективная история для позиции i: история петли (она уже
+        // включает якорь — его туда положила генерация) + принятые в этом
+        // окне токены (штраф — по множеству уникальных токенов, так что
+        // повтор якоря в срезе не удваивает его).
+        let mut h = Vec::with_capacity(hist.len() + accepted.len());
+        h.extend_from_slice(hist);
+        h.extend_from_slice(&accepted);
+        let take_draft = if greedy {
+            // temperature <= 0: цель — детерминированный argmax СО ШТРАФОМ.
+            crate::inference::sampling::greedy_next(row, &h, repeat_penalty) == draft[i]
+        } else {
+            // Честное rejection-sampling (Leviathan et al., алгоритм 2):
+            // draft[i] принимается с вероятностью min(1, p/q).
+            let p = Qwen3Model::softmax_prob(row, draft[i]);
+            let q = draft_probs[i];
+            let u = Qwen3Model::uniform01(rng);
+            q <= 0.0 || u * q <= p
+        };
+        if take_draft {
+            accepted.push(draft[i]);
+            accepted_len += 1;
+            n_verified += 1;
+        } else {
+            accepted.push(if greedy {
+                // Отказ в жадном режиме: argmax цели СО ШТРАФОМ (пересэмпл не
+                // нужен — распределение вырождено).
+                crate::inference::sampling::greedy_next(row, &h, repeat_penalty)
+            } else {
+                Qwen3Model::sample_modified(row, draft[i], draft_probs[i], rng)
+            });
+            break;
+        }
+    }
+    (accepted, accepted_len, n_verified)
+}
+
 /// QK-norm: per-head RMSNorm (w [dim], применяется по hd каждой головы).
 pub fn qk_norm_pub(
     backend: &dyn Backend,
@@ -1544,7 +1562,7 @@ fn build_mrope_mask(
 
 /// Загрузка GEMM-весов: f16 на бэкендах с поддержкой (Metal — вдвое меньше
 /// VRAM), f32-фоллбэк (CPU-референс).
-fn upload_w(
+pub(crate) fn upload_w(
     backend: &dyn Backend,
     data: &[f32],
     shape: Vec<usize>,

@@ -48,6 +48,9 @@ required-features = ["metal"]
 name = "llm_chat"
 required-features = ["metal"]
 [[example]]
+name = "qwen35_chat"
+required-features = ["metal"]
+[[example]]
 name = "vision_chat"
 required-features = ["metal"]
 [[example]]

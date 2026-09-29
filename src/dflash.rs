@@ -324,13 +324,20 @@ impl DFlashModel {
                 "{arch}.conv_group_size must be >= 1, got 0"
             )));
         }
+        // GGUF target_layers — индексы ВХОДОВ слоёв таргета: конвертер
+        // llama.cpp пишет HF target_layer_ids + 1, а llama.cpp читает
+        // llama_get_embeddings_layer_inp(id) = вход слоя id = ВЫХОД слоя id−1.
+        // Наш extract собирает ВЫХОДЫ слоёв (z-lab: hidden_states[id + 1]),
+        // поэтому индекс переводится обратно (−1). Без этого фичи брались на
+        // слой глубже обученного: Qwen3.5-4B — 3% приёмки вместо рабочей.
+        // safetensors-путь (config.json z-lab) уже в индексах выходов.
         let extract = gf
             .get(&p("target_layers"))
             .and_then(GgufValue::as_array)
             .map(|a| {
                 a.iter()
                     .filter_map(GgufValue::as_u32)
-                    .map(|v| v as usize)
+                    .map(|v| (v as usize).saturating_sub(1))
                     .collect()
             })
             .unwrap_or_default();
@@ -1405,7 +1412,10 @@ fn load_dense_layer(
                 cfg.dim,
             ],
         )?,
-        wo: up(&p("attn_output.weight"), vec![cfg.dim, cfg.dim])?,
+        // wo [dim, n_heads·head_dim]: у драфтера Qwen3.5-4B 32·128 = 4096 ≠
+        // dim 2560 — форма [dim, dim] отвергала корректный тензор (как у
+        // Qwen3Model::load, где wo всегда [dim, n_heads·head_dim]).
+        wo: up(&p("attn_output.weight"), vec![cfg.dim, cfg.n_heads * cfg.head_dim])?,
         qkv_bias: None,
         q_norm: Some(
             backend.from_cpu_f32(

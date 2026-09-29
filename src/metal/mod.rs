@@ -1928,6 +1928,71 @@ impl MetalCtx {
         res
     }
 
+    /// Эмбеддинги из таблицы в родном формате (f16/Q8_0/Q4_0/Q4_K/Q6_K):
+    /// деквант строки на лету — огромный словарь (Qwen3.5: 248K) не
+    /// раздувается в f32, а tied-таблица одновременно служит lm_head.
+    pub fn embedding_quant_f32(
+        &self,
+        idx: &[u32],
+        table: &GpuTensor,
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let (t, d) = (y.shape[1], y.shape[2]);
+        let n = table.shape[0];
+        if idx.len() != t || y.shape[0] != 1 || table.shape.get(1) != Some(&d) {
+            return Err(MetalError::Shape(format!(
+                "embedding_quant: idx {} / T {t} / table {:?} / y {:?}",
+                idx.len(),
+                table.shape,
+                y.shape
+            )));
+        }
+        let fmt: u32 = match table.dtype {
+            GpuDtype::F16 => 0,
+            GpuDtype::Q8_0 => 1,
+            GpuDtype::Q4_0 => 2,
+            GpuDtype::Q4_K => 3,
+            GpuDtype::Q6_K => 4,
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "embedding_quant: таблица {other:?} не поддержана"
+                )));
+            }
+        };
+        if let Some(block) = table.dtype.block_elems()
+            && !d.is_multiple_of(block)
+        {
+            return Err(MetalError::Shape(format!(
+                "embedding_quant: D={d} не кратно блоку {block} ({:?})",
+                table.dtype
+            )));
+        }
+        let idx_buf = with_pool(|p| p.acquire(&self.device, t * 4));
+        if idx_buf.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(idx.as_ptr(), idx_buf.contents().cast(), t);
+        }
+        let (t32, n32, d32) = (t as u32, n as u32, d as u32);
+        let res = self.run(
+            "embedding_quant_f32",
+            MTLSize::new(t as u64, d as u64, 1),
+            MTLSize::new(1, 64.min(d) as u64, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&idx_buf), 0);
+                enc.set_buffer(1, Some(&table.buffer), table.offset as u64);
+                enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(3, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&d32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&fmt as *const u32).cast());
+            },
+        );
+        with_pool(|p| p.push(&idx_buf));
+        res
+    }
+
     /// RoPE with interleaved pairs per head: X (B,T,D=H*HD),
     /// cos/sin (max_seq,HD/2), START absolute position offset.
     pub fn rope_interleaved_f32(
@@ -2094,6 +2159,227 @@ impl MetalCtx {
             }
         })?;
         Ok(())
+    }
+
+    // ── Ф9.4: Qwen3.5/3.8 (гибрид Gated DeltaNet) ──────────────────────────
+
+    /// Causal depthwise conv1d со стейтом (ggml_ssm_conv на [state | x]).
+    /// x [T, C], w [C, K], state [C, K-1] → y [T, C].
+    pub fn gdn_conv1d_f32(
+        &self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        state: &GpuTensor,
+        y: &GpuTensor,
+        t: usize,
+        c: usize,
+        k: usize,
+    ) -> Result<(), MetalError> {
+        let (t32, c32, k32) = (t as u32, c as u32, k as u32);
+        self.run(
+            "gdn_conv1d_f32",
+            MTLSize::new(t as u64, c as u64, 1),
+            MTLSize::new(1, 64.min(c) as u64, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+                enc.set_buffer(2, Some(&state.buffer), state.offset as u64);
+                enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(4, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&c32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&k32 as *const u32).cast());
+            },
+        )
+    }
+
+    /// Новый conv-стейт: последние K-1 позиций конкатенации [state | x].
+    pub fn gdn_conv_state_f32(
+        &self,
+        x: &GpuTensor,
+        state: &GpuTensor,
+        new_state: &GpuTensor,
+        t: usize,
+        c: usize,
+        k: usize,
+    ) -> Result<(), MetalError> {
+        let (t32, c32, k32) = (t as u32, c as u32, k as u32);
+        self.run(
+            "gdn_conv_state_f32",
+            MTLSize::new((k - 1) as u64, c as u64, 1),
+            MTLSize::new(1, 64.min(c) as u64, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&state.buffer), state.offset as u64);
+                enc.set_buffer(2, Some(&new_state.buffer), new_state.offset as u64);
+                enc.set_bytes(3, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&c32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&k32 as *const u32).cast());
+            },
+        )
+    }
+
+    /// L2-нормировка строк-голов: y = x / sqrt(Σx² + eps). x/y [rows, hd].
+    pub fn gdn_l2norm_f32(
+        &self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+        hd: usize,
+        eps: f32,
+    ) -> Result<(), MetalError> {
+        let (r32, h32) = (rows as u32, hd as u32);
+        self.run(
+            "gdn_l2norm_f32",
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(32.min(rows) as u64, 1, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(2, 4, (&r32 as *const u32).cast());
+                enc.set_bytes(3, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&eps as *const f32).cast());
+            },
+        )
+    }
+
+    /// Гейты GDN: g = softplus(alpha + dt_bias)·a, beta = sigmoid(beta_raw).
+    /// alpha/beta/g/b [n = T·H], dt_bias/a [H].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gates_f32(
+        &self,
+        alpha: &GpuTensor,
+        beta: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        b: &GpuTensor,
+        n: usize,
+        h: usize,
+    ) -> Result<(), MetalError> {
+        let (n32, h32) = (n as u32, h as u32);
+        self.run(
+            "gdn_gates_f32",
+            MTLSize::new(n as u64, 1, 1),
+            MTLSize::new(64.min(n) as u64, 1, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&alpha.buffer), alpha.offset as u64);
+                enc.set_buffer(1, Some(&beta.buffer), beta.offset as u64);
+                enc.set_buffer(2, Some(&dt_bias.buffer), dt_bias.offset as u64);
+                enc.set_buffer(3, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(4, Some(&g.buffer), g.offset as u64);
+                enc.set_buffer(5, Some(&b.buffer), b.offset as u64);
+                enc.set_bytes(6, 4, (&n32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+            },
+        )
+    }
+
+    /// Рекуррентный gated delta rule (ggml gated_delta_net, K=1): по
+    /// threadgroup на v-голову, поток на столбец стейта. Стейт [Hv, S, S]
+    /// обновляется на месте; out [T, Hv, S].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_delta_rule_f32(
+        &self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        g: &GpuTensor,
+        b: &GpuTensor,
+        state: &GpuTensor,
+        out: &GpuTensor,
+        t: usize,
+        hk: usize,
+        hv: usize,
+        s: usize,
+    ) -> Result<(), MetalError> {
+        let (t32, hk32, hv32, s32) = (t as u32, hk as u32, hv as u32, s as u32);
+        self.run(
+            "gdn_delta_rule_f32",
+            MTLSize::new((hv * s) as u64, 1, 1),
+            MTLSize::new(s as u64, 1, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(3, Some(&g.buffer), g.offset as u64);
+                enc.set_buffer(4, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(5, Some(&state.buffer), state.offset as u64);
+                enc.set_buffer(6, Some(&out.buffer), out.offset as u64);
+                enc.set_bytes(7, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&hk32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&hv32 as *const u32).cast());
+                enc.set_bytes(10, 4, (&s32 as *const u32).cast());
+            },
+        )
+    }
+
+    /// Гейтовая RMS-норма GDN: y = rmsnorm(x)·w · silu(z). x/z/y [rows, hd].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_norm_gated_f32(
+        &self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+        hd: usize,
+        eps: f32,
+    ) -> Result<(), MetalError> {
+        let (r32, h32) = (rows as u32, hd as u32);
+        self.run(
+            "gdn_norm_gated_f32",
+            MTLSize::new(rows as u64, 1, 1),
+            MTLSize::new(32.min(rows) as u64, 1, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&z.buffer), z.offset as u64);
+                enc.set_buffer(2, Some(&w.buffer), w.offset as u64);
+                enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(4, 4, (&r32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&eps as *const f32).cast());
+            },
+        )
+    }
+
+    /// IMROPE для текста с частичной ротацией (первые n_rot измерений головы).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_imrope_text_f32(
+        &self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        tq: usize,
+        d: usize,
+        hd: usize,
+        pos: usize,
+        theta: f32,
+        sections: [usize; 4],
+        n_rot: usize,
+    ) -> Result<(), MetalError> {
+        let (tq32, d32, hd32, pos32, nr32) =
+            (tq as u32, d as u32, hd as u32, pos as u32, n_rot as u32);
+        let sects: [u32; 4] = [
+            sections[0] as u32,
+            sections[1] as u32,
+            sections[2] as u32,
+            sections[3] as u32,
+        ];
+        self.run(
+            "rope_imrope_text_f32",
+            MTLSize::new(tq as u64, (d / hd) as u64, hd as u64),
+            MTLSize::new(1, 1, 64.min(hd) as u64),
+            |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(2, 4, (&tq32 as *const u32).cast());
+                enc.set_bytes(3, 4, (&d32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&pos32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&theta as *const f32).cast());
+                enc.set_bytes(7, 16, (sects.as_ptr() as *const u8).cast());
+                enc.set_bytes(8, 4, (&nr32 as *const u32).cast());
+            },
+        )
     }
 
     /// KV-cache update: dst (B,cap,D)[b, pos+t, d] = src (B,Tq,D)[b, t, d].
@@ -2438,6 +2724,139 @@ impl crate::backend::Backend for MetalBackend {
         with_pool(|p| p.push(&pos_buf));
         res?;
         Ok(crate::backend::Tensor::from_gpu(y))
+    }
+
+    // ── Ф9.4: гибрид Qwen3.5/3.8 (Gated DeltaNet) — кернелы ──
+
+    fn gdn_conv(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        state: &crate::backend::Tensor,
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
+    {
+        let (c, k) = (w.shape()[0], w.shape()[1]);
+        let t = x.numel() / c;
+        let y = self.zeros(x.shape().to_vec())?;
+        let ns = self.zeros(vec![c, k - 1])?;
+        self.ctx
+            .gdn_conv1d_f32(x.as_gpu(), w.as_gpu(), state.as_gpu(), y.as_gpu(), t, c, k)?;
+        self.ctx
+            .gdn_conv_state_f32(x.as_gpu(), state.as_gpu(), ns.as_gpu(), t, c, k)?;
+        Ok((y, ns))
+    }
+
+    fn gdn_l2norm(
+        &self,
+        x: &crate::backend::Tensor,
+        hd: usize,
+        eps: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let y = self.zeros(x.shape().to_vec())?;
+        self.ctx
+            .gdn_l2norm_f32(x.as_gpu(), y.as_gpu(), x.numel() / hd, hd, eps)?;
+        Ok(y)
+    }
+
+    fn gdn_gates(
+        &self,
+        alpha: &crate::backend::Tensor,
+        beta: &crate::backend::Tensor,
+        dt_bias: &crate::backend::Tensor,
+        a: &crate::backend::Tensor,
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
+    {
+        let g = self.zeros(alpha.shape().to_vec())?;
+        let b = self.zeros(beta.shape().to_vec())?;
+        self.ctx.gdn_gates_f32(
+            alpha.as_gpu(),
+            beta.as_gpu(),
+            dt_bias.as_gpu(),
+            a.as_gpu(),
+            g.as_gpu(),
+            b.as_gpu(),
+            alpha.numel(),
+            dt_bias.numel(),
+        )?;
+        Ok((g, b))
+    }
+
+    fn gdn_delta_rule(
+        &self,
+        q: &crate::backend::Tensor,
+        k: &crate::backend::Tensor,
+        v: &crate::backend::Tensor,
+        g: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        state: &crate::backend::Tensor,
+        hk: usize,
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
+    {
+        let (hv, s) = (state.shape()[0], state.shape()[1]);
+        let t = v.numel() / (hv * s);
+        let out = self.zeros(vec![t, hv, s])?;
+        // Стейт обновляется НА МЕСТЕ: одна threadgroup на v-голову проходит
+        // все T токенов последовательно (рекуррентность по времени).
+        self.ctx.gdn_delta_rule_f32(
+            q.as_gpu(),
+            k.as_gpu(),
+            v.as_gpu(),
+            g.as_gpu(),
+            b.as_gpu(),
+            state.as_gpu(),
+            out.as_gpu(),
+            t,
+            hk,
+            hv,
+            s,
+        )?;
+        Ok((out, state.clone()))
+    }
+
+    fn gdn_norm_gated(
+        &self,
+        x: &crate::backend::Tensor,
+        z: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        eps: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let hd = w.numel();
+        let y = self.zeros(x.shape().to_vec())?;
+        self.ctx.gdn_norm_gated_f32(
+            x.as_gpu(),
+            z.as_gpu(),
+            w.as_gpu(),
+            y.as_gpu(),
+            x.numel() / hd,
+            hd,
+            eps,
+        )?;
+        Ok(y)
+    }
+
+    fn rope_imrope_text(
+        &self,
+        x: &crate::backend::Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+        n_rot: usize,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let y = self.zeros(vec![1, tq, d])?;
+        self.ctx.rope_imrope_text_f32(
+            x.as_gpu(),
+            y.as_gpu(),
+            tq,
+            d,
+            hd,
+            pos,
+            theta,
+            sections,
+            n_rot,
+        )?;
+        Ok(y)
     }
 
     fn zeros(
@@ -3047,6 +3466,20 @@ impl crate::backend::Backend for MetalBackend {
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
         self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
+    fn embedding_quant(
+        &self,
+        idx: &[u32],
+        table: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        if table.as_gpu().dtype == GpuDtype::F32 {
+            self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
+        } else {
+            self.ctx.embedding_quant_f32(idx, table.as_gpu(), y.as_gpu())?;
+        }
         Ok(())
     }
 

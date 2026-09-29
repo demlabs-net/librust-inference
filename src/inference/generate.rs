@@ -5,9 +5,7 @@
 
 use crate::backend::Backend;
 use crate::error::BackendError;
-use crate::inference::sampling::{
-    SamplingParams, apply_repetition_penalty_vec_unique, top_p_sample_vec_history,
-};
+use crate::inference::sampling::{SamplingParams, top_p_sample_vec_history};
 use crate::qwen3::Qwen3Model;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
@@ -135,6 +133,271 @@ impl Default for GenerateParams {
     }
 }
 
+/// Модель, которую умеет вести петля генерации (Ф9.4): классический Qwen3
+/// (чистое внимание, KV) и гибрид Qwen3.5/3.8 (Gated DeltaNet + внимание).
+/// Обязательное — prefill/decode/спек-верификация; PP-стадии, vision и сбор
+/// скрытых для удалённого драфтера — возможности, которые есть не у всех
+/// архитектур: по умолчанию они отвечают ЯВНОЙ ошибкой, а не молча
+/// деградируют (рекуррентный стейт гибрида нельзя усечь или разрезать по
+/// нодам тем же способом, что KV).
+pub trait CausalLm {
+    /// Размер словаря (ширина строки логитов).
+    fn vocab_size(&self) -> usize;
+    /// Число слоёв (для PP-границ и extract-слоёв).
+    fn n_layers(&self) -> usize;
+    /// Архитектура (диагностика и тексты ошибок).
+    fn arch(&self) -> &str;
+    /// Число токенов в контексте (позиция следующего).
+    fn context_len(&self) -> usize;
+    /// Новая последовательность: пустой контекст.
+    fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError>;
+    /// Prefill ids → логиты [1, T, V].
+    fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError>;
+    /// Prefill + выходы слоёв `layers` (DFlash-инжект).
+    fn prefill_extract(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError>;
+    /// Один токен → логиты [1, 1, V].
+    fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError>;
+    /// Спек-шаг: верификация [id, draft…] одним forward'ом + откат хвоста.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_spec(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        rng: &mut Option<u64>,
+        extract_layers: &[usize],
+        greedy: bool,
+        hist: &[u32],
+        repeat_penalty: f32,
+    ) -> Result<crate::qwen3::SpecOutcome, BackendError>;
+    /// Prefill с картинкой (Qwen3-VL). По умолчанию — не поддержано.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_with_vision(
+        &mut self,
+        _backend: &dyn Backend,
+        _ids: &[u32],
+        _vision: &crate::backend::Tensor,
+        _deepstack: &[crate::backend::Tensor],
+        _vision_token: u32,
+        _pos4d: &[u32],
+        _pos_after: usize,
+    ) -> Result<crate::backend::Tensor, BackendError> {
+        Err(BackendError::UnsupportedFormat(format!(
+            "vision-промпт для архитектуры {} не поддержан",
+            self.arch()
+        )))
+    }
+    /// PP-стадия: эмбеддинги координатора.
+    fn embed_ids(&self, _backend: &dyn Backend, _ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        Err(self.pp_unsupported())
+    }
+    /// PP-стадия: слои [from..upto) на присланных скрытых.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers_range(
+        &mut self,
+        _backend: &dyn Backend,
+        _x: crate::backend::Tensor,
+        _t: usize,
+        _upto: Option<usize>,
+        _from: usize,
+        _norm_out: bool,
+    ) -> Result<crate::backend::Tensor, BackendError> {
+        Err(self.pp_unsupported())
+    }
+    /// PP-стадия: lm_head по нормированным скрытым.
+    fn lm_head(&self, _backend: &dyn Backend, _h: &crate::backend::Tensor) -> Result<crate::backend::Tensor, BackendError> {
+        Err(self.pp_unsupported())
+    }
+    /// PP-стадия: позиция кэша первого слоя диапазона.
+    fn stage_pos(&self, _from: usize) -> usize {
+        self.context_len()
+    }
+    /// PP-стадия: откат локальных слоёв до позиции (транзакция шага).
+    fn truncate_to(&mut self, _pos: usize) -> Result<(), BackendError> {
+        Err(self.pp_unsupported())
+    }
+    /// PP-стадия: синхронизировать rope-позицию с кэшем слоя `from`.
+    fn sync_rope_to_cache(&mut self, _from: usize) {}
+    /// Ошибка «PP не поддержан» — общий текст.
+    fn pp_unsupported(&self) -> BackendError {
+        BackendError::UnsupportedFormat(format!(
+            "PP-разбиение по нодам для архитектуры {} не поддержано \
+             (рекуррентный стейт слоёв не передаётся стадиям)",
+            self.arch()
+        ))
+    }
+}
+
+impl CausalLm for crate::qwen3::Qwen3Model {
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn n_layers(&self) -> usize {
+        self.cfg.n_layers
+    }
+    fn arch(&self) -> &str {
+        "qwen3"
+    }
+    fn context_len(&self) -> usize {
+        self.caches.first().map(|c| c.pos).unwrap_or(0)
+    }
+    fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
+        Qwen3Model::reset_cache(self, backend)
+    }
+    fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::prefill(self, backend, ids)
+    }
+    fn prefill_extract(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
+        Qwen3Model::prefill_extract(self, backend, ids, layers)
+    }
+    fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::decode(self, backend, id)
+    }
+    fn decode_spec(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        rng: &mut Option<u64>,
+        extract_layers: &[usize],
+        greedy: bool,
+        hist: &[u32],
+        repeat_penalty: f32,
+    ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
+        Qwen3Model::decode_spec(
+            self,
+            backend,
+            id,
+            draft,
+            draft_probs,
+            rng,
+            extract_layers,
+            greedy,
+            hist,
+            repeat_penalty,
+        )
+    }
+    fn prefill_with_vision(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        vision: &crate::backend::Tensor,
+        deepstack: &[crate::backend::Tensor],
+        vision_token: u32,
+        pos4d: &[u32],
+        pos_after: usize,
+    ) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::prefill_with_vision(
+            self,
+            backend,
+            ids,
+            vision,
+            deepstack,
+            vision_token,
+            pos4d,
+            pos_after,
+        )
+    }
+    fn embed_ids(&self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::embed_ids(self, backend, ids)
+    }
+    fn forward_layers_range(
+        &mut self,
+        backend: &dyn Backend,
+        x: crate::backend::Tensor,
+        t: usize,
+        upto: Option<usize>,
+        from: usize,
+        norm_out: bool,
+    ) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::forward_layers_range(self, backend, x, t, None, upto, from, None, norm_out)
+    }
+    fn lm_head(&self, backend: &dyn Backend, h: &crate::backend::Tensor) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::lm_head(self, backend, h)
+    }
+    fn stage_pos(&self, from: usize) -> usize {
+        self.caches[from.min(self.caches.len() - 1)].pos
+    }
+    fn truncate_to(&mut self, pos: usize) -> Result<(), BackendError> {
+        for c in self.caches.iter_mut() {
+            c.truncate(pos);
+        }
+        Ok(())
+    }
+    fn sync_rope_to_cache(&mut self, from: usize) {
+        Qwen3Model::sync_rope_to_cache(self, from)
+    }
+}
+
+impl CausalLm for crate::qwen35::Qwen35Model {
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn n_layers(&self) -> usize {
+        self.cfg.n_layers
+    }
+    fn arch(&self) -> &str {
+        &self.cfg.arch
+    }
+    fn context_len(&self) -> usize {
+        self.pos()
+    }
+    fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
+        crate::qwen35::Qwen35Model::reset_cache(self, backend)
+    }
+    fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        crate::qwen35::Qwen35Model::prefill(self, backend, ids)
+    }
+    fn prefill_extract(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
+        crate::qwen35::Qwen35Model::prefill_extract(self, backend, ids, layers)
+    }
+    fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError> {
+        crate::qwen35::Qwen35Model::decode(self, backend, id)
+    }
+    fn decode_spec(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        rng: &mut Option<u64>,
+        extract_layers: &[usize],
+        greedy: bool,
+        hist: &[u32],
+        repeat_penalty: f32,
+    ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
+        crate::qwen35::Qwen35Model::decode_spec(
+            self,
+            backend,
+            id,
+            draft,
+            draft_probs,
+            rng,
+            extract_layers,
+            greedy,
+            hist,
+            repeat_penalty,
+        )
+    }
+}
+
 /// Стоп-решение одного шага: EOG-токен, стоп-строка в накопленном тексте
 /// или None (продолжать). Вынесено отдельно — детерминированный юнит.
 pub fn check_stop(
@@ -156,34 +419,32 @@ pub fn check_stop(
 /// слои [0..from) — локально, [from..] + out_norm — на соседней ноде.
 /// Позицию стадии ведёт локальный кэш [0..from) (sync_rope_to_cache) — то же
 /// правило, что у prefill/decode без PP: префилл +t, декод-итерация +1.
-fn pp_forward(
-    model: &mut Qwen3Model,
+fn pp_forward<M: CausalLm + ?Sized>(
+    model: &mut M,
     backend: &dyn Backend,
     pp: &PpSplit,
     ids: &[u32],
 ) -> Result<crate::backend::Tensor, BackendError> {
     let t = ids.len();
-    let dim = model.cfg.dim;
     // Позиция ДО локального forward = стартовая позиция последовательности
     // для стадии (её кэш должен стоять там же). Запоминается и для ОТКАТА:
     // если стадия не приняла строки, локальные слои обязаны вернуться сюда,
     // иначе стороны разъезжаются на токен и все следующие вызовы падают на
     // проверке позиции (наблюдалось в кросс-машинном прогоне).
-    let start_pos = model.caches[0].pos;
+    let start_pos = model.stage_pos(0);
     let reset = pp
         .first
         .swap(false, std::sync::atomic::Ordering::Relaxed);
     let x = model.embed_ids(backend, ids)?;
-    let mid = model.forward_layers_range(backend, x, t, None, Some(pp.from), 0, None, false)?;
+    let dim = x.shape()[2];
+    let mid = model.forward_layers_range(backend, x, t, Some(pp.from), 0, false)?;
     let hidden = backend.to_cpu_f32(&mid)?;
     let out = match pp.transport.forward_stage(pp.from, None, true, reset, start_pos, t, hidden) {
         Ok(v) => v,
         Err(e) => {
             // Транзакционный откат: строки, которые стадия не приняла,
             // снимаются и с локальных слоёв координатора.
-            for c in model.caches.iter_mut() {
-                c.truncate(start_pos);
-            }
+            model.truncate_to(start_pos)?;
             return Err(BackendError::Shape(format!("PP-стадия: {e}")));
         }
     };
@@ -207,8 +468,8 @@ fn pp_forward(
 /// честно отвечает «позиция N != запрошенной M». Возвращает логиты последней
 /// позиции; если стадия снова не сработала — ошибка (вызывающий уходит в
 /// локальный откат).
-fn pp_recover(
-    model: &mut Qwen3Model,
+fn pp_recover<M: CausalLm + ?Sized>(
+    model: &mut M,
     backend: &dyn Backend,
     pp: &PpSplit,
     seq: &[u32],
@@ -224,8 +485,8 @@ fn pp_recover(
 /// локально жили только слои [0..from), поэтому продолжать с текущим кэшем
 /// нельзя — нужен полный локальный префилл с чистого кэша (логиты последней
 /// строки — то, что вернул бы decode).
-fn local_fallback(
-    model: &mut Qwen3Model,
+fn local_fallback<M: CausalLm + ?Sized>(
+    model: &mut M,
     backend: &dyn Backend,
     seq: &[u32],
 ) -> Result<crate::backend::Tensor, BackendError> {
@@ -237,11 +498,71 @@ fn local_fallback(
     }
 }
 
+/// Выбор следующего токена по строке логитов: жадный (со штрафом за
+/// повторы — единая реализация `sampling::greedy_next`, её же использует
+/// жадная верификация спека) или сэмплинг top-p/top-k.
+fn sample_next(
+    backend: &dyn Backend,
+    logits: &crate::backend::Tensor,
+    vocab: usize,
+    params: &GenerateParams,
+    history: &[u32],
+    rng_state: &mut Option<u64>,
+) -> Result<u32, BackendError> {
+    let v = backend.to_cpu_f32(logits)?;
+    if v.len() < vocab || vocab == 0 {
+        return Err(BackendError::Shape("sample: empty logits row".into()));
+    }
+    let last = &v[v.len() - vocab..];
+    Ok(if params.temperature <= 0.0 {
+        crate::inference::sampling::greedy_next(last, history, params.repeat_penalty)
+    } else {
+        let sp = SamplingParams {
+            temperature: params.temperature,
+            top_p: params.top_p,
+            top_k: params.top_k,
+            repetition_penalty: params.repeat_penalty,
+            // Поток несёт `rng_state` (сид уже материализован) — второй
+            // источник сида дал бы двойной шаг LCG.
+            seed: None,
+        };
+        top_p_sample_vec_history(last, &sp, history, rng_state)
+    })
+}
+
+enum Emit {
+    Ok,
+    Stop,
+}
+
+/// Отдать токен наружу: дельта текста (склейка UTF-8) + сырой токен.
+/// Stop — потребитель попросил остановиться.
+fn emit(
+    t: u32,
+    tok: &Tokenizer,
+    decoder: &mut IncrementalDecoder,
+    acc: &mut String,
+    on_event: &mut impl FnMut(GenerateEvent) -> bool,
+) -> Emit {
+    let piece = tok.decode_piece(t);
+    let delta = decoder.push(piece.as_bytes());
+    if !delta.is_empty() {
+        acc.push_str(&delta);
+        if !on_event(GenerateEvent::Delta(delta)) {
+            return Emit::Stop;
+        }
+    }
+    if !on_event(GenerateEvent::Token(t)) {
+        return Emit::Stop;
+    }
+    Emit::Ok
+}
+
 /// Сгенерировать продолжение после `ids` (полный префилл выполняется
 /// здесь). Возвращает сгенерированные токены; события стримятся в
 /// `on_event`. Greedy при temperature <= 0.
-pub fn generate(
-    model: &mut Qwen3Model,
+pub fn generate<M: CausalLm + ?Sized>(
+    model: &mut M,
     backend: &dyn Backend,
     tok: &Tokenizer,
     ids: &[u32],
@@ -258,6 +579,10 @@ pub fn generate(
                 "PP-разбиение не поддержано вместе с vision-промптом".into(),
             ));
         }
+        // Архитектура без PP (гибрид) — явная ошибка ДО сети: иначе отказ
+        // эмбеддингов ушёл бы в «сосед недоступен → локальный откат» и
+        // молча подменил распределённый режим локальным.
+        model.embed_ids(backend, &ids[..1])?;
         match pp_forward(model, backend, &pp, ids) {
             Ok(lg) => lg,
             Err(e) => {
@@ -300,7 +625,7 @@ pub fn generate(
     } else {
         model.decode(backend, ids[0])?
     };
-    let vocab = model.cfg.vocab_size;
+    let vocab = model.vocab_size();
 
     // Диагностика параметров (LLM_DBG_PARAMS=1): расхождения спек/жадной
     // генерации на живом сервисе искали именно сравнением эффективных
@@ -332,60 +657,40 @@ pub fn generate(
     let mut history: Vec<u32> = ids.to_vec();
     let mut finish: Option<FinishReason> = None;
 
-    for _ in 0..params.max_tokens {
-        let v = backend.to_cpu_f32(&logits)?;
-        let last = &v[v.len() - vocab..];
-        let next = if params.temperature <= 0.0 {
-            // Greedy: ТОТ ЖЕ repetition penalty, что и в сэмплирующей ветке
-            // (раньше greedy игнорировал history-штраф). Копия — last
-            // остаётся нетронутым для следующих итераций.
-            // Единственная реализация жадного шага (sampling::greedy_next):
-            // её же использует жадная верификация спека — расхождение
-            // (штраф в одном месте и отсутствие в другом) давало разные
-            // траектории спек- и обычной генерации.
-            if last.is_empty() {
-                return Err(BackendError::Shape("greedy: empty logits row".into()));
-            }
-            crate::inference::sampling::greedy_next(last, &history, params.repeat_penalty)
-        } else {
-            let sp = SamplingParams {
-                temperature: params.temperature,
-                top_p: params.top_p,
-                top_k: params.top_k,
-                repetition_penalty: params.repeat_penalty,
-                // Поток несёт `rng_state` (сид уже материализован выше) —
-                // второй источник сида здесь дал бы двойной шаг LCG.
-                seed: None,
-            };
-            top_p_sample_vec_history(last, &sp, &history, &mut rng_state)
-        };
+    // Якорь следующего спек-окна: при отказе черновика пересэмпл НЕ
+    // прогоняется отдельным decode — он становится первым токеном следующей
+    // верификации (z-lab dflash_generate, llama.cpp speculative: posterior =
+    // якорь). Отдельный decode стоил лишний forward таргета на каждый отказ
+    // и оставлял DFlash-драфтер без фич этого токена (дыра в контексте).
+    let mut pending: Option<u32> = None;
 
+    // Лимит — по числу ВЫДАННЫХ токенов, а не итераций: спек-шаг выдаёт
+    // до 1+γ токенов за итерацию, и счёт итераций пропускал лимит в разы
+    // (64 запрошено — 98 выдано на Qwen3.5 с N-грамм-драфтером).
+    while generated.len() < params.max_tokens {
+        let next = match pending.take() {
+            Some(p) => p,
+            None => sample_next(backend, &logits, vocab, params, &history, &mut rng_state)?,
+        };
         if let Some(r) = check_stop(next, tok.eos, &acc, &params.stop_strings) {
             finish = Some(r);
             break;
         }
-        let piece = tok.decode_piece(next);
-        let delta = decoder.push(piece.as_bytes());
-        if !delta.is_empty() {
-            acc.push_str(&delta);
-            if !on_event(GenerateEvent::Delta(delta)) {
-                return Ok(generated);
-            }
-        }
-        if !on_event(GenerateEvent::Token(next)) {
-            return Ok(generated);
+        match emit(next, tok, &mut decoder, &mut acc, &mut on_event) {
+            Emit::Stop => return Ok(generated),
+            Emit::Ok => {}
         }
         generated.push(next);
         history.push(next);
+        if generated.len() >= params.max_tokens {
+            break;
+        }
 
         // Спек-декодинг (4.2b): проверка черновиков ОДНИМ forward'ом
-        // (decode_spec: rejection sampling по Leviathan). Раньше здесь был
-        // только счётчик с off-by-one (сравнение черновика следующей
-        // позиции с уже выпущенным токеном) — 0% приёмки на любом драфтере.
-        // PP (7.5) и спек-декод несовместимы: верификация черновиков гоняет
-        // forward ЦЕЛИКОМ и опирается на полный локальный KV, а в PP-режиме
-        // локально живут только слои [0..from). Молча включать нельзя —
-        // получились бы черновики, проверенные по пустому кэшу.
+        // (decode_spec: rejection sampling по Leviathan). PP (7.5) и
+        // спек-декод несовместимы: верификация гоняет forward ЦЕЛИКОМ по
+        // полному локальному KV, а в PP-режиме локально живут только слои
+        // [0..from) — черновики проверялись бы по пустому кэшу.
         if let (Some(drafter), true) = (
             &params.drafter,
             params.spec_gamma > 0 && params.pp.is_none(),
@@ -413,75 +718,50 @@ pub fn generate(
                     &history,
                     params.repeat_penalty,
                 )?;
+                // Проверенные черновики (ровно те, что лежат в кэше таргета).
+                let n_ok = out.n_draft_accepted + 1; // якорь + проверенные
                 if !tlayers.is_empty() {
-                    let pos = model.caches[0].pos;
-                    let n_ok = out.n_draft_accepted + 1; // якорь + проверенные
+                    let pos = model.context_len();
                     let mut dr = drafter.lock().unwrap();
                     let _ = dr.after_extract(backend, &out.extract, pos, n_ok);
                 }
-                spec_stats.drafts += params.spec_gamma as u64;
+                spec_stats.drafts += draft_tokens.len() as u64;
                 let nv = out.n_draft_verified;
                 spec_stats.accepted += nv as u64;
-                spec_stats.rejected += (params.spec_gamma - nv) as u64;
-                // Проверенные черновики — настоящие токены: стримим их.
-                for &t in &out.accepted[1..] {
+                spec_stats.rejected += (draft_tokens.len() - nv) as u64;
+                // Принятые черновики — настоящие токены: стримим их (не
+                // дальше лимита max_tokens).
+                for &t in &out.accepted[1..n_ok] {
+                    if generated.len() >= params.max_tokens {
+                        break;
+                    }
                     if let Some(r) = check_stop(t, tok.eos, &acc, &params.stop_strings) {
                         finish = Some(r);
                         break;
                     }
-                    let piece = tok.decode_piece(t);
-                    let delta = decoder.push(piece.as_bytes());
-                    if !delta.is_empty() {
-                        acc.push_str(&delta);
-                        if !on_event(GenerateEvent::Delta(delta)) {
-                            return Ok(generated);
-                        }
-                    }
-                    if !on_event(GenerateEvent::Token(t)) {
-                        return Ok(generated);
+                    match emit(t, tok, &mut decoder, &mut acc, &mut on_event) {
+                        Emit::Stop => return Ok(generated),
+                        Emit::Ok => {}
                     }
                     generated.push(t);
                     history.push(t);
                 }
-                // Окно закрылось ПЕРЕСЭМПЛОМ (n_draft_accepted < γ): этот
-                // токен в KV-кэше НЕ лежит (SpecOutcome), а строка из
-                // `out.logits` описывает контекст с ОТКЛОНЁННЫМ черновиком —
-                // сэмплирование из неё повторяло пересэмпл в выводе. Доводим
-                // пересэмпл через forward: кэш и логиты снова согласованы.
-                let resampled = out.n_draft_accepted < draft_tokens.len();
-                logits = if resampled {
-                    match out.accepted.last() {
-                        Some(&last) => model.decode(backend, last)?,
-                        None => out.logits,
-                    }
-                } else {
-                    out.logits
-                };
                 if finish.is_some() {
                     break;
                 }
-            } else if let Some(pp) = params.pp.as_ref() {
-                logits = match pp_forward(model, backend, pp, &[next]) {
-                    Ok(lg) => lg,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "PP-стадия не сработала — переигрываем последовательность"
-                        );
-                        match pp_recover(model, backend, pp, &history) {
-                            Ok(lg) => lg,
-                            Err(e2) => {
-                                tracing::warn!(error = %e2, "PP-стадия недоступна — локальный decode");
-                                local_fallback(model, backend, &history)?
-                            }
-                        }
-                    }
-                };
-            } else {
-                logits = model.decode(backend, next)?;
+                // Окно закрылось отказом: пересэмпл (последний элемент
+                // accepted) в кэше НЕ лежит — он якорь следующей итерации.
+                // Полное принятие: логиты последней строки — продолжение.
+                if n_ok < out.accepted.len() {
+                    pending = out.accepted.last().copied();
+                } else {
+                    logits = out.logits;
+                }
+                continue;
             }
-        } else if let Some(pp) = params.pp.as_ref() {
-            logits = match pp_forward(model, backend, pp, &[next]) {
+        }
+        logits = if let Some(pp) = params.pp.as_ref() {
+            match pp_forward(model, backend, pp, &[next]) {
                 Ok(lg) => lg,
                 Err(e) => {
                     tracing::warn!(
@@ -496,10 +776,10 @@ pub fn generate(
                         }
                     }
                 }
-            };
+            }
         } else {
-            logits = model.decode(backend, next)?;
-        }
+            model.decode(backend, next)?
+        };
     }
     if finish.is_none() {
         finish = Some(FinishReason::MaxTokens);

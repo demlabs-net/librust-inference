@@ -1256,48 +1256,74 @@ kernel void attn_ar_f32_fused(
     // ВСЕГДА 32 лейна на голову: при n4 < 32 (hd=64 → n4=16) неактивные
     // лейны (lane >= n4) дают нулевой acc — simd_sum по 32 лейнам корректен;
     // их y4-запись дублирует активную (одинаковые значения — безопасно).
+    // При n4 > 32 (hd=256, Qwen3.5/3.8) лейн ведёт НЕСКОЛЬКО float4-срезов
+    // (d4 = lane + 32·c): раньше лейн брал только d4 = lane % n4, и головы
+    // шире 128 теряли половину измерений в скоре и в выходе.
     uint h = gid.y / 32u;
     uint lane = gid.y % 32u;
-    uint d4 = lane % n4;
     uint t = gid.z;
     if (b >= B || h >= H || t >= Tq) return;
     uint kvh = h / n_rep;
     uint D = H * HD;
     uint KVD = KVH * HD;
     const float scale = 1.0f / sqrt((float)HD);
-    const bool active = (lane < n4);
+    uint nc = (n4 + 31u) / 32u; // float4-срезов на лейн (1 для hd ≤ 128)
+    const uint MAXC = 4u;       // hd ≤ 512
     const device float4* qrow4 = (const device float4*)(Q + (b * Tq + t) * D + h * HD);
-    float4 q4 = qrow4[d4];
+    float4 q4[MAXC];
+    float4 y4[MAXC];
+    for (uint c = 0u; c < MAXC; ++c) {
+        uint d4 = lane + 32u * c;
+        q4[c] = (c < nc && d4 < n4) ? qrow4[d4] : float4(0.0f);
+        y4[c] = float4(0.0f);
+    }
     const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;
 
     // online-softmax в ОДНОМ проходе: running max m, ssum, y4-накопление.
     // -inf-маска: skip (continue) ДО exp — нет NaN (exp(-inf - -inf)).
     float m = -INFINITY;
     float ssum_local = 0.0f;
-    float4 y4 = 0.0f;
     for (uint j = 0u; j < Tkv; ++j) {
         const device float4* krow4 = (const device float4*)(K + (b * Tkv + j) * KVD + kvh * HD);
-        float4 k4 = krow4[d4];
-        float acc = (active) ? (q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w) : 0.0f;
+        float acc = 0.0f;
+        for (uint c = 0u; c < nc; ++c) {
+            uint d4 = lane + 32u * c;
+            if (d4 < n4) {
+                float4 k4 = krow4[d4];
+                acc += q4[c].x * k4.x + q4[c].y * k4.y + q4[c].z * k4.z + q4[c].w * k4.w;
+            }
+        }
         float s = simd_sum(acc) * scale;
         if (maskrow != nullptr) s += maskrow[j];
         if (s == -INFINITY) continue;
         if (s > m) {
             float e = exp(m - s); // < 1: пересчёт старых вкладов
-            y4 *= e;
+            for (uint c = 0u; c < nc; ++c) y4[c] *= e;
             ssum_local *= e;
             m = s;
         }
         float w = exp(s - m);
         ssum_local += w;
         const device float4* vrow4 = (const device float4*)(V + (b * Tkv + j) * KVD + kvh * HD);
-        y4 += w * vrow4[d4];
+        for (uint c = 0u; c < nc; ++c) {
+            uint d4 = lane + 32u * c;
+            if (d4 < n4) y4[c] += w * vrow4[d4];
+        }
     }
     // ssum_local у каждого лейна УЖЕ полный (w — broadcast из simd_sum) —
     // повторная simd_sum утроила бы его в 32 раза.
     float inv = (ssum_local > 0.0f) ? 1.0f / ssum_local : 0.0f;
     device float4* yrow4 = (device float4*)(Y + (b * Tq + t) * D + h * HD);
-    yrow4[d4] = y4 * inv;
+    if (n4 < 32u) {
+        // узкая голова: неактивные лейны дублируют d4 = lane % n4 (как раньше)
+        uint d4 = lane % n4;
+        if (lane < n4) yrow4[d4] = y4[0] * inv;
+    } else {
+        for (uint c = 0u; c < nc; ++c) {
+            uint d4 = lane + 32u * c;
+            if (d4 < n4) yrow4[d4] = y4[c] * inv;
+        }
+    }
 }
 
 // ── Deepstack (Qwen3-VL): y[t] = x[t] + embd[t+shift] (сдвиг — вклад входных
@@ -2293,4 +2319,264 @@ kernel void rmsnorm_head_rope_f32(
     float x1 = row[i + HD / 2] * inv * W[i + HD / 2];
     Y[base] = x0 * c - x1 * s;
     Y[base + HD / 2] = x1 * c + x0 * s;
+}
+
+// ═══════════════════ Ф9.4: Qwen3.5/3.8 (гибрид Gated DeltaNet) ═══════════════════
+// Эталон — llama.cpp src/models/qwen35.cpp + delta-net-base.cpp и CPU-опы ggml
+// (ssm_conv, gated_delta_net). Все кернелы — f32, данные row-major.
+
+// Causal depthwise conv1d со стейтом (ggml_ssm_conv на concat[state, x]).
+// X [T, C] — вход токенов; W [C, K] — ядро (строка канала подряд, как в GGUF
+// ssm_conv1d [K, C] ggml-порядка); STATE [C, K-1] — хвост предыдущих токенов
+// (слот j = токен t-(K-1)+j). Y[t, c] = Σ_j W[c, j] · in[t + j], где in —
+// конкатенация [STATE (K-1) | X (T)] по времени канала c.
+kernel void gdn_conv1d_f32(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device const float* STATE [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& T [[buffer(4)]],
+    constant uint& C [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, c = gid.y;
+    if (t >= T || c >= C) return;
+    float acc = 0.0f;
+    for (uint j = 0; j < K; ++j) {
+        // позиция в конкатенации: t + j; < K-1 → из стейта, иначе из X.
+        uint p = t + j;
+        float v = (p < K - 1) ? STATE[c * (K - 1) + p] : X[(p - (K - 1)) * C + c];
+        acc += W[c * K + j] * v;
+    }
+    Y[t * C + c] = acc;
+}
+
+// Сдвиг conv-стейта после T токенов: новый STATE = последние K-1 позиций
+// конкатенации [STATE | X]. Пишется в отдельный буфер (in-place пересекается).
+kernel void gdn_conv_state_f32(
+    device const float* X [[buffer(0)]],
+    device const float* STATE [[buffer(1)]],
+    device float* NEW [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& C [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint j = gid.x, c = gid.y;
+    if (j >= K - 1 || c >= C) return;
+    // позиция в конкатенации длиной (K-1)+T: хвост начинается с T.
+    uint p = T + j;
+    NEW[c * (K - 1) + j] = (p < K - 1) ? STATE[c * (K - 1) + p] : X[(p - (K - 1)) * C + c];
+}
+
+// L2-нормировка по голове (build_gdn_l2_norm = rms_norm(eps/n) · 1/sqrt(n)):
+// y = x / sqrt(Σx² + eps). X/Y [rows, HD], по потоку на строку-голову.
+kernel void gdn_l2norm_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& ROWS [[buffer(2)]],
+    constant uint& HD [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint r [[thread_position_in_grid]])
+{
+    if (r >= ROWS) return;
+    device const float* x = X + r * HD;
+    float ss = 0.0f;
+    for (uint i = 0; i < HD; ++i) ss += x[i] * x[i];
+    float inv = 1.0f / sqrt(ss + eps);
+    for (uint i = 0; i < HD; ++i) Y[r * HD + i] = x[i] * inv;
+}
+
+// Гейты GDN на токен и v-голову: g = softplus(alpha + dt_bias) · ssm_a,
+// beta = sigmoid(beta_raw). ALPHA/BETA [T, H]; G/B — выходы [T, H].
+kernel void gdn_gates_f32(
+    device const float* ALPHA [[buffer(0)]],
+    device const float* BETA [[buffer(1)]],
+    device const float* DT_BIAS [[buffer(2)]],
+    device const float* A [[buffer(3)]],
+    device float* G [[buffer(4)]],
+    device float* B [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= N) return;
+    uint h = i % H;
+    float a = ALPHA[i] + DT_BIAS[h];
+    // softplus с порогом (как ggml: при x > 20 — линейно)
+    float sp = a > 20.0f ? a : log(1.0f + exp(a));
+    G[i] = sp * A[h];
+    B[i] = 1.0f / (1.0f + exp(-BETA[i]));
+}
+
+// Рекуррентный gated delta rule (ggml_gated_delta_net, K=1, GDA-скаляр g).
+// Q/K [T, Hk, S], V [T, Hv, S], G/B [T, Hv]; STATE [Hv, S, S] хранится
+// ТРАНСПОНИРОВАННЫМ как в ggml: s[j*S + i] = S_math[i][j]. Одна threadgroup
+// на v-голову, поток на столбец j (S потоков, S ≤ 256). На каждый токен:
+//   s *= exp(g); delta_j = (v_j − Σ_i s[j][i]·k_i)·beta; s[j][i] += k_i·delta_j;
+//   out_j = (Σ_i s[j][i]·q_i) / sqrt(S).
+// Голова q/k для v-головы h — h % Hk (ggml: iq1 = iv1 % neq1).
+kernel void gdn_delta_rule_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* Kx [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* G [[buffer(3)]],
+    device const float* B [[buffer(4)]],
+    device float* STATE [[buffer(5)]],
+    device float* OUT [[buffer(6)]],
+    constant uint& T [[buffer(7)]],
+    constant uint& Hk [[buffer(8)]],
+    constant uint& Hv [[buffer(9)]],
+    constant uint& S [[buffer(10)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint j [[thread_position_in_threadgroup]])
+{
+    if (h >= Hv || j >= S) return;
+    device float* s = STATE + h * S * S + j * S; // строка j транспонированного стейта
+    uint hk = h % Hk;
+    float scale = 1.0f / sqrt((float)S);
+    for (uint t = 0; t < T; ++t) {
+        device const float* q = Q + (t * Hk + hk) * S;
+        device const float* k = Kx + (t * Hk + hk) * S;
+        float g = exp(G[t * Hv + h]);
+        float beta = B[t * Hv + h];
+        float kv = 0.0f;
+        for (uint i = 0; i < S; ++i) {
+            s[i] *= g;
+            kv += s[i] * k[i];
+        }
+        float delta = (V[(t * Hv + h) * S + j] - kv) * beta;
+        float o = 0.0f;
+        for (uint i = 0; i < S; ++i) {
+            s[i] += k[i] * delta;
+            o += s[i] * q[i];
+        }
+        OUT[(t * Hv + h) * S + j] = o * scale;
+    }
+}
+
+// Гейтовая RMS-норма GDN: y = rmsnorm(x)·w · silu(z), по голове HD.
+// X/Z/Y [rows, HD], W [HD]; поток на строку-голову.
+kernel void gdn_norm_gated_f32(
+    device const float* X [[buffer(0)]],
+    device const float* Z [[buffer(1)]],
+    device const float* W [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& ROWS [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint r [[thread_position_in_grid]])
+{
+    if (r >= ROWS) return;
+    device const float* x = X + r * HD;
+    device const float* z = Z + r * HD;
+    float ss = 0.0f;
+    for (uint i = 0; i < HD; ++i) ss += x[i] * x[i];
+    float inv = 1.0f / sqrt(ss / (float)HD + eps);
+    for (uint i = 0; i < HD; ++i) {
+        float zz = z[i];
+        float silu = zz / (1.0f + exp(-zz));
+        Y[r * HD + i] = x[i] * inv * W[i] * silu;
+    }
+}
+
+// IMROPE (Qwen3.5/3.8/3-VL, rope_type 40) для текста: позиции t=h=w=pos, e=0.
+// Ротируются только первые N_ROT измерений головы (частичный rope), пары —
+// NEOX (i, i + N_ROT/2). Частота пары i: theta^(-2i/N_ROT); секция пары
+// (i % sect_dims) выбирает позицию (t/h/w — все = pos для текста, e = 0).
+kernel void rope_imrope_text_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& tq [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    constant uint& pos [[buffer(5)]],
+    constant float& theta [[buffer(6)]],
+    constant uint4& sections [[buffer(7)]],
+    constant uint& N_ROT [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, h = gid.y, i = gid.z;
+    uint heads = D / HD;
+    if (t >= tq || h >= heads || i >= HD) return;
+    uint base = t * D + h * HD;
+    uint half_rot = N_ROT / 2;
+    if (i >= N_ROT) {                    // хвост головы без ротации
+        Y[base + i] = X[base + i];
+        return;
+    }
+    if (i >= half_rot) return;           // пару пишет младший индекс
+    uint sect_dims = sections.x + sections.y + sections.z + sections.w;
+    if (sect_dims == 0u) sect_dims = 1u;
+    uint sector = i % sect_dims;
+    bool is_e = !((sector % 3u == 1u && sector < 3u * sections.y)
+               || (sector % 3u == 2u && sector < 3u * sections.z)
+               || (sector % 3u == 0u && sector < 3u * sections.x));
+    float p = is_e ? 0.0f : (float)(pos + t);
+    float inv = pow(theta, -2.0f * (float)i / (float)N_ROT);
+    float c = cos(p * inv);
+    float s = sin(p * inv);
+    float x0 = X[base + i];
+    float x1 = X[base + i + half_rot];
+    Y[base + i] = x0 * c - x1 * s;
+    Y[base + i + half_rot] = x0 * s + x1 * c;
+}
+
+// Эмбеддинги из таблицы в РОДНОМ формате GGUF (Ф9.4): строка idx[t]
+// деквантуется на лету — у Qwen3.5 словарь 248K × 2560, в f32 таблица заняла
+// бы 2.5 ГБ, а тот же Q8_0-тензор ещё и служит lm_head (tied). FMT: 0 = f16,
+// 1 = Q8_0, 2 = Q4_0, 3 = Q4_K, 4 = Q6_K (раскладки — как в dequant_* из
+// weights_map и в квант-GEMM выше). Y [T, D].
+kernel void embedding_quant_f32(
+    device const uint* idx [[buffer(0)]],
+    device const uchar* table [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    constant uint& FMT [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, d = gid.y;
+    if (t >= T || d >= D) return;
+    uint row = idx[t];
+    if (row >= N) row = N - 1u;
+    float v = 0.0f;
+    if (FMT == 0u) {
+        device const half* p = (device const half*)table;
+        v = (float)p[row * D + d];
+    } else if (FMT == 1u) {
+        device const uchar* blk = table + (row * (D / 32u) + d / 32u) * 34u;
+        v = (float)((device const char*)(blk + 2))[d % 32u] * (float)load_half_unaligned(blk);
+    } else if (FMT == 2u) {
+        // канонический Q4_0: байт j — веса j (младший ниббл) и j+16 (старший)
+        device const uchar* blk = table + (row * (D / 32u) + d / 32u) * 18u;
+        uint j = d % 32u;
+        uchar q = blk[2u + (j % 16u)];
+        int nib = (j < 16u) ? (int)(q & 0xF) : (int)(q >> 4);
+        v = ((float)nib - 8.0f) * (float)load_half_unaligned(blk);
+    } else if (FMT == 3u) {
+        device const uchar* blk = table + (row * (D / 256u) + d / 256u) * 144u;
+        uint e = d % 256u;
+        uint b = e / 32u;
+        int sc, mn;
+        q4k_scale_min(blk + 4, b, sc, mn);
+        // чанк-мажор: байт qs[32·(e/64) + e%32], чётный подблок — младший ниббл
+        uchar q = blk[16u + 32u * (e / 64u) + (e % 32u)];
+        int nib = ((b & 1u) == 0u) ? (int)(q & 0xF) : (int)(q >> 4);
+        v = (float)load_half_unaligned(blk) * (float)sc * (float)nib
+            - (float)load_half_unaligned(blk + 2) * (float)mn;
+    } else {
+        device const uchar* s = table + (row * (D / 256u) + d / 256u) * 210u;
+        uint e = d % 256u;
+        uint h2 = e / 128u, r = e % 128u, qq = r / 32u, l = r % 32u;
+        device const uchar* qlh = s + h2 * 64u;
+        uchar qlb = (qq == 0u || qq == 2u) ? qlh[l] : qlh[l + 32u];
+        uint lo = (qq < 2u) ? (uint)(qlb & 0xF) : (uint)(qlb >> 4);
+        uint hi = ((uint)s[128u + h2 * 32u + l] >> (2u * qq)) & 3u;
+        float sc = (float)((device const char*)(s + 192u))[h2 * 8u + l / 16u + 2u * qq];
+        v = (float)load_half_unaligned(s + 208) * sc * ((float)(int)(lo | (hi << 4)) - 32.0f);
+    }
+    Y[t * D + d] = v;
 }

@@ -946,6 +946,204 @@ pub trait Backend: Send + Sync {
         self.from_cpu_f32(&y, vec![b, t, d])
     }
 
+    // ── Ф9.4: гибрид Qwen3.5/3.8 (Gated DeltaNet) ──
+    // Эталон — llama.cpp (qwen35.cpp, delta-net-base.cpp, CPU-опы ggml
+    // ssm_conv / gated_delta_net). Default-реализации — CPU-референс
+    // (оракул юнит-тестов кернелов); Metal переопределяет кернелами.
+
+    /// Causal depthwise conv1d со стейтом (ggml_ssm_conv над [state | x] по
+    /// времени канала). x [T, C] (любой ранг с последней осью C), w [C, K],
+    /// state [C, K-1] (слот j — токен t-(K-1)+j) → (y [T, C], новый state).
+    fn gdn_conv(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (c, k) = (w.shape()[0], w.shape()[1]);
+        let t = x.numel() / c;
+        let (xv, wv, sv) = (self.to_cpu_f32(x)?, self.to_cpu_f32(w)?, self.to_cpu_f32(state)?);
+        let at = |ch: usize, p: usize| -> f32 {
+            if p < k - 1 {
+                sv[ch * (k - 1) + p]
+            } else {
+                xv[(p - (k - 1)) * c + ch]
+            }
+        };
+        let mut y = vec![0.0f32; t * c];
+        for tt in 0..t {
+            for ch in 0..c {
+                y[tt * c + ch] = (0..k).map(|j| wv[ch * k + j] * at(ch, tt + j)).sum();
+            }
+        }
+        let mut ns = vec![0.0f32; c * (k - 1)];
+        for ch in 0..c {
+            for j in 0..k - 1 {
+                ns[ch * (k - 1) + j] = at(ch, t + j);
+            }
+        }
+        Ok((
+            self.from_cpu_f32(&y, x.shape().to_vec())?,
+            self.from_cpu_f32(&ns, vec![c, k - 1])?,
+        ))
+    }
+
+    /// L2-нормировка голов (build_gdn_l2_norm): y = x / sqrt(Σx² + eps) по
+    /// каждому отрезку длины `hd` последней оси.
+    fn gdn_l2norm(&self, x: &Tensor, hd: usize, eps: f32) -> Result<Tensor, BackendError> {
+        let xv = self.to_cpu_f32(x)?;
+        let mut y = vec![0.0f32; xv.len()];
+        for (row, out) in xv.chunks_exact(hd).zip(y.chunks_exact_mut(hd)) {
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            for (o, v) in out.iter_mut().zip(row) {
+                *o = v * inv;
+            }
+        }
+        self.from_cpu_f32(&y, x.shape().to_vec())
+    }
+
+    /// Гейты GDN: g = softplus(alpha + dt_bias)·a (a = −exp(A_log) уже в
+    /// GGUF), beta = sigmoid(beta_raw). alpha/beta [T, H], dt_bias/a [H].
+    fn gdn_gates(
+        &self,
+        alpha: &Tensor,
+        beta: &Tensor,
+        dt_bias: &Tensor,
+        a: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (av, bv) = (self.to_cpu_f32(alpha)?, self.to_cpu_f32(beta)?);
+        let (dv, aa) = (self.to_cpu_f32(dt_bias)?, self.to_cpu_f32(a)?);
+        let h = dv.len();
+        let mut g = vec![0.0f32; av.len()];
+        let mut b = vec![0.0f32; bv.len()];
+        for i in 0..av.len() {
+            let x = av[i] + dv[i % h];
+            let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+            g[i] = sp * aa[i % h];
+            b[i] = 1.0 / (1.0 + (-bv[i]).exp());
+        }
+        Ok((
+            self.from_cpu_f32(&g, alpha.shape().to_vec())?,
+            self.from_cpu_f32(&b, beta.shape().to_vec())?,
+        ))
+    }
+
+    /// Рекуррентный gated delta rule (ggml_gated_delta_net). q/k [T, Hk, S],
+    /// v [T, Hv, S], g/b [T, Hv]; state [Hv, S, S] ТРАНСПОНИРОВАН как в ggml
+    /// (s[j·S + i] = S[i][j]). Голова q/k для v-головы h — h % Hk. Возврат —
+    /// (out [T, Hv, S], новый state); Metal обновляет стейт на месте.
+    fn gdn_delta_rule(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        b: &Tensor,
+        state: &Tensor,
+        hk: usize,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (hv, s) = (state.shape()[0], state.shape()[1]);
+        let t = v.numel() / (hv * s);
+        let (qv, kv, vv) = (self.to_cpu_f32(q)?, self.to_cpu_f32(k)?, self.to_cpu_f32(v)?);
+        let (gv, bv) = (self.to_cpu_f32(g)?, self.to_cpu_f32(b)?);
+        let mut st = self.to_cpu_f32(state)?;
+        let mut out = vec![0.0f32; t * hv * s];
+        let scale = 1.0 / (s as f32).sqrt();
+        let mut delta = vec![0.0f32; s];
+        for h in 0..hv {
+            let hq = h % hk;
+            let m = &mut st[h * s * s..(h + 1) * s * s];
+            for tt in 0..t {
+                let qd = &qv[(tt * hk + hq) * s..(tt * hk + hq + 1) * s];
+                let kd = &kv[(tt * hk + hq) * s..(tt * hk + hq + 1) * s];
+                let vd = &vv[(tt * hv + h) * s..(tt * hv + h + 1) * s];
+                let eg = gv[tt * hv + h].exp();
+                let beta = bv[tt * hv + h];
+                m.iter_mut().for_each(|x| *x *= eg);
+                for j in 0..s {
+                    let dot: f32 = (0..s).map(|i| m[j * s + i] * kd[i]).sum();
+                    delta[j] = (vd[j] - dot) * beta;
+                }
+                for j in 0..s {
+                    for i in 0..s {
+                        m[j * s + i] += kd[i] * delta[j];
+                    }
+                }
+                for j in 0..s {
+                    let dot: f32 = (0..s).map(|i| m[j * s + i] * qd[i]).sum();
+                    out[(tt * hv + h) * s + j] = dot * scale;
+                }
+            }
+        }
+        Ok((
+            self.from_cpu_f32(&out, vec![t, hv, s])?,
+            self.from_cpu_f32(&st, state.shape().to_vec())?,
+        ))
+    }
+
+    /// Гейтовая RMS-норма GDN: y = rmsnorm(x)·w·silu(z) по отрезкам длины
+    /// hd = w.len() последней оси (x и z одной формы).
+    fn gdn_norm_gated(
+        &self,
+        x: &Tensor,
+        z: &Tensor,
+        w: &Tensor,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let (xv, zv, wv) = (self.to_cpu_f32(x)?, self.to_cpu_f32(z)?, self.to_cpu_f32(w)?);
+        let hd = wv.len();
+        let mut y = vec![0.0f32; xv.len()];
+        for r in 0..xv.len() / hd {
+            let row = &xv[r * hd..(r + 1) * hd];
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps).sqrt();
+            for i in 0..hd {
+                let zz = zv[r * hd + i];
+                y[r * hd + i] = row[i] * inv * wv[i] * (zz / (1.0 + (-zz).exp()));
+            }
+        }
+        self.from_cpu_f32(&y, x.shape().to_vec())
+    }
+
+    /// IMROPE для текста с ЧАСТИЧНОЙ ротацией (Qwen3.5/3.8: n_rot = 64 из
+    /// hd = 256): пары NEOX (i, i + n_rot/2) первых n_rot измерений, частота
+    /// theta^(−2i/n_rot), сектор пары i % Σsections выбирает t/h/w (для текста
+    /// все = pos) или e (позиция 0); хвост головы [n_rot..hd) не трогается.
+    /// X [1, T, D] → Y. n_rot = hd совпадает с [`Backend::rope_mrope_text`].
+    fn rope_imrope_text(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+        n_rot: usize,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = xd.clone();
+        let half = n_rot / 2;
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let (s0, s1, s2) = (sections[0], sections[1], sections[2]);
+        for tt in 0..tq {
+            for h in 0..d / hd {
+                for i in 0..half {
+                    let sector = i % sect_dims;
+                    let is_e = !((sector % 3 == 0 && sector < 3 * s0)
+                        || (sector % 3 == 1 && sector < 3 * s1)
+                        || (sector % 3 == 2 && sector < 3 * s2));
+                    let p = if is_e { 0.0 } else { (pos + tt) as f32 };
+                    let inv = theta.powf(-2.0 * i as f32 / n_rot as f32);
+                    let (c, s) = ((p * inv).cos(), (p * inv).sin());
+                    let idx = tt * d + h * hd + i;
+                    let (x0, x1) = (xd[idx], xd[idx + half]);
+                    yd[idx] = x0 * c - x1 * s;
+                    yd[idx + half] = x0 * s + x1 * c;
+                }
+            }
+        }
+        self.from_cpu_f32(&yd, x.shape().to_vec())
+    }
+
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
 
@@ -1489,6 +1687,14 @@ pub trait Backend: Send + Sync {
     // ── embedding ──
     /// Gather rows of `table` (V, D) by `idx` → Y (len(idx), D). f32-compute.
     fn embedding(&self, idx: &[u32], table: &Tensor, y: &Tensor) -> Result<(), BackendError>;
+
+    /// Эмбеддинги из таблицы, загруженной через [`Backend::from_quantized`]
+    /// (Ф9.4): Metal держит её в родном формате GGUF и деквантует строку на
+    /// лету; бэкенды, у которых from_quantized — деквант в f32 (CPU/CUDA-
+    /// фоллбэк), читают таблицу обычным [`Backend::embedding`].
+    fn embedding_quant(&self, idx: &[u32], table: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        self.embedding(idx, table, y)
+    }
 
     /// Embedding with vision-token override (Ф1.11): токены == override_id
     /// заменяются строками из `vision` (по порядку появления). Всё на GPU.

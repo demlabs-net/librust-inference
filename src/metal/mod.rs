@@ -74,13 +74,43 @@ impl GpuDtype {
 /// освободить живую память (источник недетерминизма промежуточных буферов).
 pub struct BufferPoolState {
     free: Mutex<HashMap<usize, Vec<Buffer>>>,
+    /// Байты в free-листе. Лист раньше рос без предела: в batch-режиме
+    /// буферы не переиспользуются (acquire создаёт новые), а после батча все
+    /// отложенные уходили в лист — долгая генерация копила память (Qwen3-0.6B:
+    /// RSS 3.7 → 11.6 ГБ за 1500 токенов; стресс-приёмка Ф8.3).
+    free_bytes: std::cell::Cell<usize>,
+}
+
+/// Предел free-листа пула (байты): сверх него освобождённые буферы
+/// отдаются системе, а не копятся. `INFER_METAL_POOL_MB` переопределяет.
+fn pool_cap_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("INFER_METAL_POOL_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            * 1024
+            * 1024
+    })
 }
 
 impl BufferPoolState {
     fn new() -> Self {
         Self {
             free: Mutex::new(HashMap::new()),
+            free_bytes: std::cell::Cell::new(0),
         }
+    }
+
+    /// Положить буфер в free-лист с учётом предела: не влез — drop (память
+    /// возвращается системе; единственный refcount — наш).
+    fn put_free(&self, free: &mut HashMap<usize, Vec<Buffer>>, class: usize, buf: Buffer) {
+        if self.free_bytes.get() + class > pool_cap_bytes() {
+            return;
+        }
+        self.free_bytes.set(self.free_bytes.get() + class);
+        free.entry(class).or_default().push(buf);
     }
 
     /// Взять буфер размера >= bytes (класс 4KB) или создать (маркер снят).
@@ -101,22 +131,20 @@ impl BufferPoolState {
                 .get_mut(&class)
                 .and_then(|v| v.pop())
             {
+                self.free_bytes.set(self.free_bytes.get().saturating_sub(class));
                 return buf;
             }
         }
-        let zeroed = vec![0u8; class];
-        // newBufferWithBytes может вернуть +0 (autoreleased): тогда Rust
-        // держит мёртвую ссылку — Metal переиспользует память, данные
-        // портятся. Трюк: clone (retain — refcount 1) + forget оригинала —
-        // клон живёт (не переиспользуется), а его drop освобождает память.
-        let buf = device.new_buffer_with_data(
-            zeroed.as_ptr().cast(),
-            class as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let kept = buf.clone();
-        std::mem::forget(buf);
-        kept
+        // newBuffer* — семейство `new` (Cocoa ownership): объект приходит
+        // С УЖЕ ВЗЯТЫМ владением (+1, retainCount 1, без autorelease) —
+        // единственный `Buffer` и есть этот refcount, его drop освобождает
+        // память. Прежний «трюк» clone + forget добавлял ВТОРОЙ retain,
+        // который никто не отпускал: утекал КАЖДЫЙ буфер (стресс Ф8.3: 5 ГБ
+        // устройства за 40 шагов; долгая генерация уводила машину в своп и
+        // демон получал jetsam-SIGKILL). Проверка — tests/metal_buffer_leak.
+        // Новые shared-буферы Metal отдаёт обнулёнными — копия нулей через
+        // newBufferWithBytes не нужна.
+        device.new_buffer(class as u64, MTLResourceOptions::StorageModeShared)
     }
 
     /// Вернуть буфер в пул (retain — пул держит единственный refcount).
@@ -133,15 +161,17 @@ impl BufferPoolState {
         let class = (buf.length() as usize + 4095) & !4095;
         let class = class.max(4096);
         let mut free = self.free.lock().unwrap();
-        let v = free.entry(class).or_default();
         if std::env::var("OMNI_DUP").is_ok() {
             let p = buf.contents();
-            let dup = v.iter().filter(|b| b.contents() == p).count();
+            let dup = free
+                .get(&class)
+                .map(|v| v.iter().filter(|b| b.contents() == p).count())
+                .unwrap_or(0);
             if dup > 0 {
                 eprintln!("OMNI_DUP: DOUBLE PUSH ptr={p:?} len={}", buf.length());
             }
         }
-        v.push(buf.clone());
+        self.put_free(&mut free, class, buf.clone());
     }
 }
 
@@ -675,15 +705,11 @@ impl MetalCtx {
             if batch_depth() == 0 {
                 let deferred = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
                 with_pool(|p| {
+                    let mut free = p.free.lock().unwrap();
                     for buf in deferred {
                         let class = (buf.length() as usize + 4095) & !4095;
                         let class = class.max(4096);
-                        p.free
-                            .lock()
-                            .unwrap()
-                            .entry(class)
-                            .or_default()
-                            .push(buf);
+                        p.put_free(&mut free, class, buf);
                     }
                 });
             }

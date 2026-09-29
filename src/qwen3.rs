@@ -240,6 +240,19 @@ impl Qwen3Model {
         &self.output
     }
 
+    /// Квант-осознанная загрузка ОДНОГО тензора из weights-map (7.9): нужна
+    /// ноде-драфтеру, которой от таргета требуются только эмбеддинги и
+    /// выходная проекция — грузить всю модель (гигабайты) ради двух тензоров
+    /// незачем. Q4_0/Q8_0/Q4_K/Q6_K остаются в своём виде (деквант в кернеле).
+    pub fn upload_weight_pub(
+        backend: &dyn Backend,
+        w: &crate::weights_map::WeightsMap<'_>,
+        name: &str,
+        shape: Vec<usize>,
+    ) -> Result<Tensor, BackendError> {
+        Self::upload_q(backend, w, name, shape)
+    }
+
     /// Эмбеддинги токенов [1, T, D] — вход PP-стадии (7.5): координатор
     /// считает эмбеддинг сам, к соседу едут активации, а не токены.
     pub fn embed_ids(&self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {

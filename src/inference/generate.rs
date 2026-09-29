@@ -509,6 +509,14 @@ pub fn generate(
         return Ok(generated);
     }
     if params.spec_gamma > 0 && params.drafter.is_some() {
+        // Диагностика приёмки (LLM_DBG_PARAMS=1): без неё «спек не дал выигрыша»
+        // неотличим от «черновики не предлагались» — а это разные дефекты.
+        if std::env::var("LLM_DBG_PARAMS").is_ok() {
+            eprintln!(
+                "SPEC drafts={} accepted={} rejected={}",
+                spec_stats.drafts, spec_stats.accepted, spec_stats.rejected
+            );
+        }
         on_event(GenerateEvent::SpecStats(spec_stats));
     }
     on_event(GenerateEvent::Done(finish.unwrap()));

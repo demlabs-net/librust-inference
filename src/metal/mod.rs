@@ -2233,8 +2233,32 @@ impl MetalCtx {
         let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
         let tkv = k.shape[1];
         let n_rep = n_heads / kv_heads;
-        let grid = MTLSize::new(b as u64, n_heads as u64, tq as u64);
-        let group = MTLSize::new(1, 1, 1);
+        // Decode (один запрос, без маски): голова = threadgroup из 8
+        // simdgroup'ов, ключи делятся между ними (flash-decoding).
+        if b == 1
+            && tq == 1
+            && mask.is_none()
+            && hd.is_multiple_of(4)
+            && hd <= 256
+            && n_heads.is_multiple_of(kv_heads)
+            && std::env::var("INFER_ATTN_LEGACY").is_err()
+        {
+            let (tkv32, h32, kvh32, hd32) = (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            let bytes = (8 * (2 + hd) * 4).div_ceil(16) * 16;
+            let grid = MTLSize::new((n_heads * 256) as u64, 1, 1);
+            let group = MTLSize::new(256, 1, 1);
+            return self.run("attn_decode_split_f32", grid, group, |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(4, 4, (&tkv32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&hd32 as *const u32).cast());
+                enc.set_threadgroup_memory_length(0, bytes as u64);
+            });
+        }
         let grid = MTLSize::new(b as u64, (n_heads * 32) as u64, tq as u64);
         let group = MTLSize::new(1, 32, 1);
         self.run("attn_ar_f32_fused", grid, group, |enc| {

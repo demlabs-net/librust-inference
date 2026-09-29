@@ -3024,3 +3024,92 @@ kernel void gemm_nt_q8_0_mm(
         }
     }
 }
+
+// ── Decode-attention (Tq=1) с разбиением ключей между simdgroup'ами (Ф8.2b) ──
+// attn_ar_f32_fused ведёт голову ОДНИМ simdgroup'ом и проходит все Tkv ключей
+// последовательно (simd_sum на каждом ключе): при 16 головах GPU занят 16
+// simdgroup'ами — ~120 мкс на слой у Qwen3-0.6B (больше матвеков слоя).
+// Здесь голова = threadgroup из NSG simdgroup'ов: simdgroup g берёт ключи
+// j ≡ g (mod NSG), ведёт свои (max, sum, acc) online-softmax, в конце
+// частичные результаты сливаются через threadgroup-память (как
+// flash-decoding). HD ≤ 256, кратно 4; лейн держит HD/128 float4.
+#define AD_NSG 8u
+kernel void attn_decode_split_f32(
+    device const float* Q [[buffer(0)]],     // [1, H*HD]
+    device const float* K [[buffer(1)]],     // [Tkv, KVH*HD]
+    device const float* V [[buffer(2)]],
+    device float* Y [[buffer(3)]],           // [1, H*HD]
+    constant uint& Tkv [[buffer(4)]],
+    constant uint& H [[buffer(5)]],
+    constant uint& KVH [[buffer(6)]],
+    constant uint& HD [[buffer(7)]],
+    threadgroup float* sh [[threadgroup(0)]],   // AD_NSG × (2 + HD)
+    uint h [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    if (h >= H) return;
+    const uint kvh = h / (H / KVH);
+    const uint KD = KVH * HD;
+    const uint n4 = HD / 4u;
+    const uint nc = (n4 + 31u) / 32u;            // float4 на лейн (≤ 2)
+    const float scale = 1.0f / sqrt((float)HD);
+    device const float4* q4 = (device const float4*)(Q + h * HD);
+    float4 qv[2], acc[2];
+    for (uint c = 0; c < 2u; ++c) {
+        const uint d4 = lane + 32u * c;
+        qv[c] = (c < nc && d4 < n4) ? q4[d4] * scale : float4(0.0f);
+        acc[c] = float4(0.0f);
+    }
+    float m = -INFINITY, s = 0.0f;
+    for (uint j = sgitg; j < Tkv; j += AD_NSG) {
+        device const float4* k4 = (device const float4*)(K + (ulong)j * KD + kvh * HD);
+        float dot = 0.0f;
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) {
+                const float4 kk = k4[d4];
+                dot += qv[c].x * kk.x + qv[c].y * kk.y + qv[c].z * kk.z + qv[c].w * kk.w;
+            }
+        }
+        const float sc = simd_sum(dot);
+        const float mn = max(m, sc);
+        const float corr = exp(m - mn);          // m = -inf → 0
+        const float p = exp(sc - mn);
+        s = s * corr + p;
+        device const float4* v4 = (device const float4*)(V + (ulong)j * KD + kvh * HD);
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) acc[c] = acc[c] * corr + p * v4[d4];
+        }
+        m = mn;
+    }
+    // слияние частичных результатов simdgroup'ов
+    threadgroup float* mine = sh + sgitg * (2u + HD);
+    if (lane == 0u) { mine[0] = m; mine[1] = s; }
+    for (uint c = 0; c < nc; ++c) {
+        const uint d4 = lane + 32u * c;
+        if (d4 < n4) *((threadgroup float4*)(mine + 2u) + d4) = acc[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg != 0u) return;
+    float gm = -INFINITY;
+    for (uint g = 0; g < AD_NSG; ++g) gm = max(gm, sh[g * (2u + HD)]);
+    float gs = 0.0f;
+    float4 out[2] = {float4(0.0f), float4(0.0f)};
+    for (uint g = 0; g < AD_NSG; ++g) {
+        threadgroup float* part = sh + g * (2u + HD);
+        const float w = (part[0] == -INFINITY) ? 0.0f : exp(part[0] - gm);
+        gs += part[1] * w;
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) out[c] += *((threadgroup float4*)(part + 2u) + d4) * w;
+        }
+    }
+    const float inv = (gs > 0.0f) ? 1.0f / gs : 0.0f;
+    device float4* y4 = (device float4*)(Y + h * HD);
+    for (uint c = 0; c < nc; ++c) {
+        const uint d4 = lane + 32u * c;
+        if (d4 < n4) y4[d4] = out[c] * inv;
+    }
+}

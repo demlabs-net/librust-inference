@@ -1041,6 +1041,55 @@ mod tests {
         }
     }
 
+    /// Decode-attention (Tq=1, без маски): ключи делятся между simdgroup'ами
+    /// — длины KV меньше и не кратные их числу, hd 64/128/256, GQA.
+    #[test]
+    fn decode_attention_matches_reference() {
+        let be = MetalBackend::new().unwrap();
+        for &(tkv, nh, nkv, hd) in &[
+            (1usize, 4usize, 2usize, 128usize),
+            (5, 4, 2, 128),
+            (65, 16, 8, 128),
+            (300, 16, 4, 256),
+            (9, 8, 8, 64),
+        ] {
+            let mut r = rng((tkv * 31 + hd) as u64);
+            let q = rand(nh * hd, &mut r);
+            let k = rand(tkv * nkv * hd, &mut r);
+            let v = rand(tkv * nkv * hd, &mut r);
+            let out = be.zeros(vec![1, 1, nh * hd]).unwrap();
+            be.attn_ar(
+                &be.from_cpu_f32(&q, vec![1, 1, nh * hd]).unwrap(),
+                &be.from_cpu_f32(&k, vec![1, tkv, nkv * hd]).unwrap(),
+                &be.from_cpu_f32(&v, vec![1, tkv, nkv * hd]).unwrap(),
+                None,
+                &out,
+                nh,
+                nkv,
+                hd,
+            )
+            .unwrap();
+            let mut ro = vec![0.0f32; nh * hd];
+            for h in 0..nh {
+                let kh = h / (nh / nkv);
+                let qr = &q[h * hd..][..hd];
+                let sc: Vec<f32> = (0..tkv)
+                    .map(|j| {
+                        let kr = &k[(j * nkv + kh) * hd..][..hd];
+                        qr.iter().zip(kr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()
+                    })
+                    .collect();
+                let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                let sum: f32 = e.iter().sum();
+                for d in 0..hd {
+                    ro[h * hd + d] = (0..tkv).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                }
+            }
+            close(&be.to_cpu_f32(&out).unwrap(), &ro, 1e-4, &format!("decode attn tkv={tkv} hd={hd}"));
+        }
+    }
+
     #[test]
     fn attention_wide_heads_match_reference() {
         // hd = 256 (Qwen3.5): лейн ведёт два float4-среза — раньше половина

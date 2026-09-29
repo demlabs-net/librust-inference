@@ -1134,8 +1134,24 @@ impl crate::spec::Drafter for DFlashDrafter {
             return Ok(());
         }
         if std::env::var("LLM_DBG_SPEC").is_ok() {
+            // max_abs/nonfinite фич: сравнение локального тракта с удалённым —
+            // при одинаковых shapes/accepted расхождение чисел укажет на
+            // транспорт, а совпадение — на состояние драфтера.
+            let mut mx = 0.0f32;
+            let mut nonfinite = 0usize;
+            for t in extract {
+                if let Ok(v) = _backend.to_cpu_f32(t) {
+                    for x in &v {
+                        if !x.is_finite() {
+                            nonfinite += 1;
+                        } else {
+                            mx = mx.max(x.abs());
+                        }
+                    }
+                }
+            }
             eprintln!(
-                "after_extract: n={} shapes={:?} accepted={}",
+                "after_extract: n={} shapes={:?} accepted={} max_abs={mx:.3} nonfinite={nonfinite}",
                 extract.len(),
                 extract
                     .iter()

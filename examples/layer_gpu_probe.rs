@@ -1,6 +1,11 @@
-//! GPU-время компонентов decode-слоя Qwen3-8B (Ф8.2): каждый шаг
-//! прогоняется 64 раза подряд в ОДНОМ батче — CPU-кодирование перекрывается
-//! исполнением, замер ≈ чистое GPU-время на вызов.
+//! GPU-время каждой операции слоя Qwen3 (Ф8.2) при заданных формах: каждая
+//! операция повторяется подряд в ОДНОМ батче — CPU-кодирование перекрывается
+//! исполнением, замер ≈ чистое GPU-время вызова. Сумма по слою × число слоёв
+//! сравнивается с реальным prefill/decode — остаток = накладные расходы вне
+//! кернелов.
+//!
+//! `layer_gpu_probe [dim ffn heads kv_heads head_dim T ctx]`
+//! (по умолчанию Qwen3-8B, T=1 — decode; T=128 — prefill; ctx — длина KV)
 #![cfg(feature = "metal")]
 use rust_inference::backend::Backend;
 use rust_inference::dtype::WeightFormat;
@@ -18,64 +23,75 @@ fn q8(n: usize, k: usize) -> Vec<u8> {
     out
 }
 
-fn time<F: FnMut()>(be: &MetalBackend, name: &str, mut f: F) -> f64 {
+fn time<F: FnMut()>(be: &MetalBackend, name: &str, reps: usize, mut f: F) -> f64 {
     for _ in 0..2 {
         be.begin_batch().unwrap();
         f();
         be.end_batch().unwrap();
     }
-    let n = 64;
     let t0 = Instant::now();
     be.begin_batch().unwrap();
-    for _ in 0..n {
+    for _ in 0..reps {
         f();
     }
     be.end_batch().unwrap();
-    let us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
-    println!("{name:34} {us:8.1} мкс");
+    let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    println!("{name:34} {us:9.1} мкс");
     us
 }
 
 fn main() {
+    let a: Vec<usize> = std::env::args().skip(1).filter_map(|v| v.parse().ok()).collect();
+    let g = |i: usize, d: usize| a.get(i).copied().unwrap_or(d);
+    let (d, ffn, nh, nkv, hd, t, ctx) = (g(0, 4096), g(1, 12288), g(2, 32), g(3, 8), g(4, 128), g(5, 1), g(6, 64));
+    let reps = if t == 1 { 64 } else { 16 };
     let be = MetalBackend::new().unwrap();
-    let d = 4096;
-    let wqkv = be.from_quantized(&q8(6144, d), vec![6144, d], WeightFormat::Q8_0).unwrap();
-    let wo = be.from_quantized(&q8(d, d), vec![d, d], WeightFormat::Q8_0).unwrap();
-    let w13 = be.from_quantized(&q8(24576, d), vec![24576, d], WeightFormat::Q8_0).unwrap();
-    let w2 = be.from_quantized(&q8(d, 12288), vec![d, 12288], WeightFormat::Q8_0).unwrap();
-    let x = be.from_cpu_f32(&vec![0.01f32; d], vec![1, d]).unwrap();
-    let qkv = be.zeros(vec![1, 6144]).unwrap();
-    let f = be.zeros(vec![1, 24576]).unwrap();
-    let g = be.zeros(vec![1, 12288]).unwrap();
-    let y = be.zeros(vec![1, d]).unwrap();
-    let mut total = 0.0;
-    total += time(&be, "mv wqkv 6144x4096", || be.gemm_nt(&x, &wqkv, &qkv).unwrap());
-    total += time(&be, "mv wo 4096x4096", || be.gemm_nt(&x, &wo, &y).unwrap());
-    total += time(&be, "mv w13 24576x4096", || be.gemm_nt(&x, &w13, &f).unwrap());
-    total += time(&be, "silu_mul 12288", || be.silu_mul_fused(&f, &g, 12288).unwrap());
-    total += time(&be, "mv w2 4096x12288", || be.gemm_nt(&g, &w2, &y).unwrap());
+    let (qs, kvs) = (nh * hd, nkv * hd);
+    let wqkv = be.from_quantized(&q8(qs + 2 * kvs, d), vec![qs + 2 * kvs, d], WeightFormat::Q8_0).unwrap();
+    let wo = be.from_quantized(&q8(d, qs), vec![d, qs], WeightFormat::Q8_0).unwrap();
+    let w13 = be.from_quantized(&q8(2 * ffn, d), vec![2 * ffn, d], WeightFormat::Q8_0).unwrap();
+    let w2 = be.from_quantized(&q8(d, ffn), vec![d, ffn], WeightFormat::Q8_0).unwrap();
+    let x = be.from_cpu_f32(&vec![0.01f32; t * d], vec![t, d]).unwrap();
+    let x3 = x.view(vec![1, t, d]);
+    let y = be.zeros(vec![t, d]).unwrap();
+    let qkv = be.zeros(vec![t, qs + 2 * kvs]).unwrap();
+    let f = be.zeros(vec![t, 2 * ffn]).unwrap();
+    let gm = be.zeros(vec![t, ffn]).unwrap();
     let w = be.from_cpu_f32(&vec![1.0f32; d], vec![d]).unwrap();
-    total += 2.0 * time(&be, "rmsnorm x2", || be.rmsnorm(&x, &w, &y, 1e-6).unwrap());
-    let q = be.zeros(vec![1, 1, 4096]).unwrap();
-    let qw = be.from_cpu_f32(&vec![1.0f32; 128], vec![128]).unwrap();
-    let k1 = be.zeros(vec![1, 1, 1024]).unwrap();
-    total += time(&be, "norm_rope q", || {
-        let _ = be.rmsnorm_head_rope(&q, &qw, 50, 128, 1e6, 32, 1e-6).unwrap();
+    let qw = be.from_cpu_f32(&vec![1.0f32; hd], vec![hd]).unwrap();
+    let q = be.zeros(vec![1, t, qs]).unwrap();
+    let k1 = be.zeros(vec![1, t, kvs]).unwrap();
+    let kv = be.zeros(vec![1, ctx + t, kvs]).unwrap();
+    let o = be.zeros(vec![1, t, qs]).unwrap();
+    let mask = if t > 1 {
+        Some(rust_inference::nn::build_causal_mask(&be, t, ctx + t, ctx, None).unwrap())
+    } else {
+        None
+    };
+    let buf = be.zeros(vec![1, ctx + t + 256, kvs]).unwrap();
+    let qkv3 = qkv.view(vec![1, t, qs + 2 * kvs]);
+    println!("слой: dim {d} ffn {ffn} heads {nh}/{nkv}×{hd}, T={t}, ctx={ctx}");
+    let mut total = 0.0;
+    total += 2.0 * time(&be, "rmsnorm ×2", reps, || be.rmsnorm(&x, &w, &y, 1e-6).unwrap());
+    total += time(&be, "gemm wqkv", reps, || be.gemm_nt(&x, &wqkv, &qkv).unwrap());
+    total += 3.0 * time(&be, "slice_last ×3", reps, || {
+        let _ = rust_inference::nn::slice_last(&be, &qkv3, qs, 0).unwrap();
     });
-    total += time(&be, "norm_rope k", || {
-        let _ = be.rmsnorm_head_rope(&k1, &qw, 50, 128, 1e6, 8, 1e-6).unwrap();
+    total += time(&be, "norm+rope q", reps, || {
+        let _ = be.rmsnorm_head_rope(&q, &qw, ctx, hd, 1e6, nh, 1e-6).unwrap();
     });
-    let kv = be.zeros(vec![1, 64, 1024]).unwrap();
-    let o = be.zeros(vec![1, 1, 4096]).unwrap();
-    total += time(&be, "attn_ar tkv=64", || be.attn_ar(&q, &kv, &kv, None, &o, 32, 8, 128).unwrap());
-    let buf = be.zeros(vec![1, 4096, 1024]).unwrap();
-    total += 2.0 * time(&be, "kv_update x2", || be.kv_update(&buf, &k1, 10).unwrap());
-    let q3 = be.zeros(vec![1, 1, 6144]).unwrap();
-    total += 3.0 * time(&be, "slice_last x3", || {
-        let _ = rust_inference::nn::slice_last(&be, &q3, 1024, 0).unwrap();
+    total += time(&be, "norm+rope k", reps, || {
+        let _ = be.rmsnorm_head_rope(&k1, &qw, ctx, hd, 1e6, nkv, 1e-6).unwrap();
     });
-    total += 2.0 * time(&be, "add x2", || be.add(&x, &x, &y).unwrap());
-    let bytes = (6144 + 4096 + 24576) as f64 * 4096.0 * 34.0 / 32.0 + 4096.0 * 12288.0 * 34.0 / 32.0;
-    println!("сумма на слой: {total:.0} мкс; веса слоя {:.1} МБ → потолок ~{:.0} мкс при 300 ГБ/с; 36 слоёв ≈ {:.1} мс",
-        bytes / 1e6, bytes / 300e3, total * 36.0 / 1e3);
+    total += 2.0 * time(&be, "kv_update ×2", reps, || be.kv_update(&buf, &k1, ctx).unwrap());
+    total += time(&be, &format!("attn_ar tkv={}", ctx + t), reps, || {
+        be.attn_ar(&q, &kv, &kv, mask.as_ref(), &o, nh, nkv, hd).unwrap()
+    });
+    let o2 = o.view(vec![t, qs]);
+    total += time(&be, "gemm wo", reps, || be.gemm_nt(&o2, &wo, &y).unwrap());
+    total += 2.0 * time(&be, "add ×2", reps, || be.add(&x3, &x3, &x3).unwrap());
+    total += time(&be, "gemm w13", reps, || be.gemm_nt(&x, &w13, &f).unwrap());
+    total += time(&be, "silu_mul", reps, || be.silu_mul_fused(&f, &gm, ffn).unwrap());
+    total += time(&be, "gemm w2", reps, || be.gemm_nt(&gm, &w2, &y).unwrap());
+    println!("сумма на слой: {total:.0} мкс");
 }

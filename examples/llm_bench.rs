@@ -63,8 +63,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     for _ in 0..reps {
         model.reset_cache(&be)?;
         let t0 = Instant::now();
-        let lg = model.prefill(&be, &prompt)?;
-        let _ = be.to_cpu_f32(&lg.view_restricted(vec![1]))?;
+        // Как генерация: логиты только последней позиции (llama-bench тоже
+        // выводит лишь их).
+        let lg = model.prefill_last(&be, &prompt)?;
+        let _ = be.to_cpu_f32(&lg)?;
         pp_ts.push(pp as f64 / t0.elapsed().as_secs_f64());
 
         let t0 = Instant::now();

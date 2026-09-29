@@ -153,6 +153,11 @@ pub trait CausalLm {
     fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError>;
     /// Prefill ids → логиты [1, T, V].
     fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError>;
+    /// Prefill → логиты ТОЛЬКО последней позиции [1, 1, V] (генерации нужны
+    /// лишь они; lm_head по одной строке вместо T).
+    fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        self.prefill(backend, ids)
+    }
     /// Prefill + выходы слоёв `layers` (DFlash-инжект).
     fn prefill_extract(
         &mut self,
@@ -252,6 +257,9 @@ impl CausalLm for crate::qwen3::Qwen3Model {
     }
     fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::prefill(self, backend, ids)
+    }
+    fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        Qwen3Model::prefill_last(self, backend, ids)
     }
     fn prefill_extract(
         &mut self,
@@ -359,6 +367,9 @@ impl CausalLm for crate::qwen35::Qwen35Model {
     }
     fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
         crate::qwen35::Qwen35Model::prefill(self, backend, ids)
+    }
+    fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+        crate::qwen35::Qwen35Model::prefill_last(self, backend, ids)
     }
     fn prefill_extract(
         &mut self,
@@ -492,7 +503,7 @@ fn local_fallback<M: CausalLm + ?Sized>(
 ) -> Result<crate::backend::Tensor, BackendError> {
     model.reset_cache(backend)?;
     if seq.len() > 1 {
-        model.prefill(backend, seq)
+        model.prefill_last(backend, seq)
     } else {
         model.decode(backend, seq[0])
     }
@@ -620,7 +631,7 @@ pub fn generate<M: CausalLm + ?Sized>(
                 }
                 lg
             }
-            _ => model.prefill(backend, ids)?,
+            _ => model.prefill_last(backend, ids)?,
         }
     } else {
         model.decode(backend, ids[0])?

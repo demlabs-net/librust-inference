@@ -1367,15 +1367,20 @@ impl MetalCtx {
         // верификация спека). INFER_GEMM_Q8_LEGACY=1 — прежний m8f4 (сверка).
         if m > 1 && b.dtype == GpuDtype::Q8_0 && std::env::var("INFER_GEMM_Q8_LEGACY").is_err() {
             let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-            let grid = MTLSize::new((n.div_ceil(64) * 128) as u64, m.div_ceil(32) as u64, 1);
+            // Схема ggml kernel_mul_mm: threadgroup 128 потоков на тайл
+            // 32 (M) × 64 (N); grid — (M-тайлы, N-тайлы) threadgroup'ов.
+            let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
             let group = MTLSize::new(128, 1, 1);
-            return self.run("gemm_nt_q8_0_mma", grid, group, |enc| {
+            return self.run("gemm_nt_q8_0_mm", grid, group, |enc| {
                 enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
                 enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
                 enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
                 enc.set_bytes(3, 4, (&m32 as *const u32).cast());
                 enc.set_bytes(4, 4, (&k32 as *const u32).cast());
                 enc.set_bytes(5, 4, (&n32 as *const u32).cast());
+                // 8 КБ: тайлы весов/активаций (4+2 КБ) и staging хвостового
+                // тайла выхода (32×64 float).
+                enc.set_threadgroup_memory_length(0, 8192);
             });
         }
         // m>1: m8-кернелы (n-столбец × 8 m-строк, явные аккумуляторы) —

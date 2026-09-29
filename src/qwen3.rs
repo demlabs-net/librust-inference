@@ -230,6 +230,11 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
+    /// FFN слоя `i` (диагностика производительности: examples/prefill_breakdown).
+    pub fn debug_ffn(&self, i: usize) -> &SwiGLU {
+        &self.layers[i].ffn
+    }
+
     /// Таблица эмбеддингов (для DFlash-драфтера, 4.2b).
     pub fn token_embed_table(&self) -> &Tensor {
         &self.embed.table
@@ -582,6 +587,25 @@ impl Qwen3Model {
         r
     }
 
+    /// Prefill, у которого нужны логиты только ПОСЛЕДНЕЙ позиции ([1, 1, V]) —
+    /// генерация читает лишь их. lm_head (самая большая матрица: V×D) идёт
+    /// по одной строке вместо T: на промпте 128 токенов у Qwen3-8B это
+    /// ~1/4 всей prefill-работы. Кэш и позиции — как у [`Self::prefill`].
+    pub fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+        backend.begin_batch()?;
+        let r = (|| {
+            let t = ids.len();
+            let x = self.embed.forward(backend, ids, t)?;
+            let h = self.forward_layers_hidden(backend, x, t, None, None, None)?;
+            self.pos_rope = self.caches[0].pos;
+            let d = self.cfg.dim;
+            let last = h.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d);
+            self.lm_head(backend, &last)
+        })();
+        backend.end_batch()?;
+        r
+    }
+
     /// Prefill + скрытые extract-слоёв (для DFlash-инжекта, Ф2.4): h_i —
     /// выход слоя i (attn+ffn+residual, без out_norm), по порядку `layers`.
     /// Один проход: кэши и логиты как в prefill, скрытые — побочный сбор.
@@ -908,6 +932,11 @@ impl Qwen3Model {
                 mask.as_ref(),
             )?;
             x = backend_add(backend, &x, &h)?;
+            if prof {
+                // PROF — GPU-время: синхронизация перед замером (без неё
+                // счётчик показывал только CPU-кодирование батча).
+                backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
+            }
             let after_attn_cap = if capture_split { Some(x.clone()) } else { None };
             if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
                 let xv = backend.to_cpu_f32(&x)?;
@@ -937,6 +966,7 @@ impl Qwen3Model {
             let f = ffn_forward(backend, &h, &layer.ffn)?;
             x = backend_add(backend, &x, &f)?;
             if prof {
+                backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
                 prof_ffn += t1.elapsed().as_secs_f64();
             }
             if std::env::var("OMNI_REF").is_ok() && i == 0 {
@@ -1324,6 +1354,16 @@ impl Qwen3Model {
             }
             qkv
         };
+        let prof_attn = std::env::var("LLM_PROF_ATTN").is_ok();
+        let sync = |x: &Tensor| -> Result<f64, BackendError> {
+            if prof_attn {
+                backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
+            }
+            Ok(0.0)
+        };
+        let tp0 = std::time::Instant::now();
+        sync(&qkv)?;
+        let t_qkv = tp0.elapsed().as_secs_f64();
         let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
         let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
         let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
@@ -1407,6 +1447,8 @@ impl Qwen3Model {
             };
             (q, k)
         };
+        sync(&k)?;
+        let t_norm = tp0.elapsed().as_secs_f64();
         // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
         // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
         let t_upd = std::time::Instant::now();
@@ -1441,11 +1483,24 @@ impl Qwen3Model {
             );
         }
 
+        sync(&attn_out)?;
+        let t_attn = tp0.elapsed().as_secs_f64();
         let out = Linear {
             w: attn.wo.clone(),
             b: None,
         }
         .forward(backend, &attn_out)?;
+        if prof_attn {
+            sync(&out)?;
+            let t_all = tp0.elapsed().as_secs_f64();
+            eprintln!(
+                "ATTN t={tq} qkv {:.2} slice+norm/rope {:.2} kv+attn {:.2} wo {:.2} мс",
+                t_qkv * 1e3,
+                (t_norm - t_qkv) * 1e3,
+                (t_attn - t_norm) * 1e3,
+                (t_all - t_attn) * 1e3
+            );
+        }
         Ok(out)
     }
 }
@@ -2092,6 +2147,19 @@ mod tests {
     }
 
     /// совпадает с prefill-логитами на позиции k (при том же состоянии KV).
+    #[test]
+    fn prefill_last_equals_last_row_of_prefill() {
+        let (backend, mut a) = mini_model();
+        let (_, mut b) = mini_model();
+        let ids = [1u32, 2, 3, 4, 5];
+        let full = backend.to_cpu_f32(&a.prefill(&backend, &ids).unwrap()).unwrap();
+        let last = backend.to_cpu_f32(&b.prefill_last(&backend, &ids).unwrap()).unwrap();
+        let v = a.cfg.vocab_size;
+        assert_eq!(last.len(), v, "prefill_last: одна строка логитов");
+        assert_eq!(&full[full.len() - v..], &last[..], "последняя строка расходится");
+        assert_eq!(a.caches[0].pos, b.caches[0].pos, "кэш после prefill_last");
+    }
+
     #[test]
     fn decode_matches_prefill_last_logits() {
         let (backend, mut model) = mini_model();

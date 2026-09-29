@@ -242,6 +242,8 @@ pub struct Qwen35Model {
     states: Vec<Option<GdnState>>,
     /// Позиция следующего токена (число токенов в контексте).
     pos: usize,
+    /// forward считает логиты только последней позиции (prefill_last).
+    last_only: bool,
 }
 
 impl Qwen35Model {
@@ -405,6 +407,7 @@ impl Qwen35Model {
             caches,
             states,
             pos: 0,
+            last_only: false,
         })
     }
 
@@ -492,6 +495,20 @@ impl Qwen35Model {
     pub fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
         backend.begin_batch()?;
         let r = self.forward(backend, &[id], &[], &mut Vec::new());
+        backend.end_batch()?;
+        r
+    }
+
+    /// Prefill с логитами только последней позиции ([1, 1, V]) — генерация
+    /// читает лишь их; lm_head (V=248K строк!) идёт по одной строке вместо T.
+    pub fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+        if ids.is_empty() {
+            return Err(BackendError::Shape("qwen35 prefill: пустой промпт".into()));
+        }
+        backend.begin_batch()?;
+        self.last_only = true;
+        let r = self.forward(backend, ids, &[], &mut Vec::new());
+        self.last_only = false;
         backend.end_batch()?;
         r
     }
@@ -681,6 +698,11 @@ impl Qwen35Model {
         }
         self.pos += t;
         let t_head = std::time::Instant::now();
+        let (x, t) = if self.last_only && t > 1 {
+            (x.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d), 1)
+        } else {
+            (x, t)
+        };
         let h = self.out_norm.forward(backend, &x)?;
         let logits = self.head_rows(backend, &h, t)?;
         if prof {
@@ -957,6 +979,66 @@ mod tests {
             }
         }
         close(&yv, &ry, 1e-4, "imrope");
+    }
+
+    /// Attention prefill-пути (Tq > 1): контекст в кэше (Tkv > Tq, причинная
+    /// маска со смещением), hd 128 и 256, GQA 2:1 и 4:1, Tq не кратно 32.
+    #[test]
+    fn prefill_attention_matches_reference() {
+        let be = MetalBackend::new().unwrap();
+        for &(tq, past, nh, nkv, hd) in &[
+            (37usize, 11usize, 4usize, 2usize, 128usize),
+            (19, 40, 4, 1, 128),
+            (19, 40, 4, 2, 128),
+            (19, 11, 4, 1, 256),
+            (19, 40, 4, 1, 256),
+        ] {
+            let tkv = past + tq;
+            let mut r = rng((tq * 1000 + hd) as u64);
+            let q = rand(tq * nh * hd, &mut r);
+            let k = rand(tkv * nkv * hd, &mut r);
+            let v = rand(tkv * nkv * hd, &mut r);
+            let mask = crate::nn::build_causal_mask(&be, tq, tkv, past, None).unwrap();
+            let out = be.zeros(vec![1, tq, nh * hd]).unwrap();
+            be.attn_ar(
+                &be.from_cpu_f32(&q, vec![1, tq, nh * hd]).unwrap(),
+                &be.from_cpu_f32(&k, vec![1, tkv, nkv * hd]).unwrap(),
+                &be.from_cpu_f32(&v, vec![1, tkv, nkv * hd]).unwrap(),
+                Some(&mask),
+                &out,
+                nh,
+                nkv,
+                hd,
+            )
+            .unwrap();
+            let mut ro = vec![0.0f32; tq * nh * hd];
+            for t in 0..tq {
+                for h in 0..nh {
+                    let kh = h / (nh / nkv);
+                    let qr = &q[(t * nh + h) * hd..][..hd];
+                    let lim = past + t + 1; // причинно: ключи 0..=past+t
+                    let sc: Vec<f32> = (0..lim)
+                        .map(|j| {
+                            let kr = &k[(j * nkv + kh) * hd..][..hd];
+                            qr.iter().zip(kr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()
+                        })
+                        .collect();
+                    let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                    let sum: f32 = e.iter().sum();
+                    for d in 0..hd {
+                        ro[(t * nh + h) * hd + d] =
+                            (0..lim).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                    }
+                }
+            }
+            close(
+                &be.to_cpu_f32(&out).unwrap(),
+                &ro,
+                1e-4,
+                &format!("prefill attn tq={tq} past={past} kv={nkv} hd={hd}"),
+            );
+        }
     }
 
     #[test]

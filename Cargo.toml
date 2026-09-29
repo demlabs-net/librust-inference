@@ -66,6 +66,9 @@ required-features = ["metal"]
 name = "layer_gpu_probe"
 required-features = ["metal"]
 [[example]]
+name = "prefill_breakdown"
+required-features = ["metal"]
+[[example]]
 name = "vision_chat"
 required-features = ["metal"]
 [[example]]

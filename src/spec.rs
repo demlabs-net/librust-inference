@@ -62,6 +62,19 @@ impl DrafterManifest {
 /// он лишь снижает приёмку до нуля.
 pub trait DraftTransport: Send + Sync {
     fn remote_draft(&self, history: &[u32], gamma: usize) -> Result<(Vec<u32>, Vec<f32>), String>;
+
+    /// Скрытые таргета для удалённого графического драфтера (DFlash): без них
+    /// он «слеп» (приёмка ~0). `features` — по слоям `target_layers()`,
+    /// каждая [t, dim]; `pos`/`n_accepted` — как в `Drafter::after_extract`.
+    /// Дефолт — транспорт фичи не умеет (N-грамный драфтер их не требует).
+    fn remote_features(
+        &self,
+        _features: &[(Vec<usize>, Vec<f32>)],
+        _pos: usize,
+        _n_accepted: usize,
+    ) -> Result<(), String> {
+        Err("транспорт черновиков не умеет передавать фичи таргета".into())
+    }
 }
 
 /// Драфтер на соседней ноде (7.9, «спекуляция через сеть»): сам ничего не
@@ -84,6 +97,36 @@ impl RemoteDrafter {
 }
 
 impl Drafter for RemoteDrafter {
+    fn after_extract(
+        &mut self,
+        backend: &dyn crate::backend::Backend,
+        extract: &[crate::backend::Tensor],
+        pos: usize,
+        n_accepted: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        if extract.is_empty() {
+            return Ok(());
+        }
+        let mut feats = Vec::with_capacity(extract.len());
+        for t in extract {
+            let shape = t.shape().to_vec();
+            let data = backend.to_cpu_f32(t)?;
+            feats.push((shape, data));
+        }
+        match self.transport.remote_features(&feats, pos, n_accepted) {
+            Ok(()) => {
+                self.last_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                // Сосед не принял фичи: черновики будут слепыми (приёмка ~0),
+                // но генерация не ломается — фиксируем причину.
+                self.last_error = Some(e);
+                Ok(())
+            }
+        }
+    }
+
     fn draft(
         &mut self,
         _backend: &dyn crate::backend::Backend,

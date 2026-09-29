@@ -81,6 +81,21 @@ pub struct BufferPoolState {
     free_bytes: std::cell::Cell<usize>,
 }
 
+/// Порог dispatch'ей на command buffer в batch-режиме (см. BatchState).
+/// `INFER_METAL_CB_CHUNK` переопределяет; 0 — без порционного коммита.
+fn cb_chunk() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var("INFER_METAL_CB_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            // Замер (M3 Max, pp128/tg64): 8–32 — плато, 0 (без порций) —
+            // prefill на треть медленнее; 16 — середина плато.
+            None => 16,
+        }
+    })
+}
+
 /// Предел free-листа пула (байты): сверх него освобождённые буферы
 /// отдаются системе, а не копятся. `INFER_METAL_POOL_MB` переопределяет.
 fn pool_cap_bytes() -> usize {
@@ -501,6 +516,10 @@ struct BatchState {
     /// барьеров, ни per-kernel command buffer'ов не нужно.
     cmd: Option<CommandBuffer>,
     enc: Option<ComputeCommandEncoder>,
+    /// Dispatch'ей в открытом энкодере: по достижении порога (см.
+    /// `cb_chunk`) command buffer коммитится без ожидания и открывается
+    /// следующий — GPU начинает исполнять шаг, пока CPU кодирует остаток.
+    in_enc: usize,
     /// Последний закоммиченный command buffer (flush без ожидания не
     /// делается — поле для совместимости ожидания в end_batch).
     last: Option<CommandBuffer>,
@@ -514,6 +533,7 @@ impl BatchState {
     /// Закрыть энкодер и закоммитить command buffer батча (если есть);
     /// коммит становится `last` — его ждёт вызывающий.
     fn commit_open(&mut self) {
+        self.in_enc = 0;
         if let Some(enc) = self.enc.take() {
             enc.end_encoding();
         }
@@ -691,6 +711,15 @@ impl MetalCtx {
                 enc.set_compute_pipeline_state(&pipeline);
                 setup(enc);
                 enc.dispatch_threads(grid, group);
+                batch.in_enc += 1;
+                // Порционный коммит: с одним command buffer'ом на батч GPU
+                // простаивал, пока CPU кодировал ВЕСЬ шаг (prefill Qwen3-8B —
+                // 50 мс CPU из 375). Очередь исполняет command buffer'ы по
+                // порядку коммита, отслеживание зависимостей буферов сохраняет
+                // корректность между ними.
+                if batch.in_enc >= cb_chunk() {
+                    batch.commit_open();
+                }
                 return Ok(());
             }
         }

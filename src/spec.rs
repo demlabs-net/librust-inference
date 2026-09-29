@@ -63,6 +63,15 @@ impl DrafterManifest {
 pub trait DraftTransport: Send + Sync {
     fn remote_draft(&self, history: &[u32], gamma: usize) -> Result<(Vec<u32>, Vec<f32>), String>;
 
+    /// Какие слои таргета нужны удалённому драфтеру (DFlash). КРИТИЧНО:
+    /// координатор собирает extract-скрытые ТОЛЬКО для этих слоёв, и при
+    /// пустом ответе не собирает их вовсе — драфтер остаётся слепым, выдаёт
+    /// вырожденные черновики (последний id словаря, NaN-вероятности) и приёмка
+    /// равна нулю. Дефолт — пусто (N-граму фичи не нужны).
+    fn remote_target_layers(&self) -> Result<Vec<usize>, String> {
+        Ok(Vec::new())
+    }
+
     /// Скрытые таргета для удалённого графического драфтера (DFlash): без них
     /// он «слеп» (приёмка ~0). `features` — по слоям `target_layers()`,
     /// каждая [t, dim]; `pos`/`n_accepted` — как в `Drafter::after_extract`.
@@ -85,6 +94,9 @@ pub struct RemoteDrafter {
     /// Последняя ошибка транспорта (диагностика/метрики): пустой ответ
     /// означает нулевую приёмку, и без этого поля причина терялась бы.
     pub last_error: Option<String>,
+    /// Слои таргета, запрошенные у соседа (`OnceLock`: спрашиваем один раз и
+    /// отдаём ссылку без unsafe; ошибка соседа кэш не заполняет — повторяем).
+    layers: std::sync::OnceLock<Vec<usize>>,
 }
 
 impl RemoteDrafter {
@@ -92,11 +104,27 @@ impl RemoteDrafter {
         Self {
             transport,
             last_error: None,
+            layers: std::sync::OnceLock::new(),
         }
     }
 }
 
 impl Drafter for RemoteDrafter {
+    fn target_layers(&self) -> &[usize] {
+        // Слои приезжают от соседа: без них координатор не соберёт extract и
+        // драфтер будет слепым (наблюдалось 0% приёмки и вырожденные черновики).
+        if let Some(l) = self.layers.get() {
+            return l.as_slice();
+        }
+        if let Ok(l) = self.transport.remote_target_layers() {
+            let _ = self.layers.set(l);
+        }
+        match self.layers.get() {
+            Some(l) => l.as_slice(),
+            None => &[],
+        }
+    }
+
     fn after_extract(
         &mut self,
         backend: &dyn crate::backend::Backend,

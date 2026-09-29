@@ -117,23 +117,24 @@ impl BufferPoolState {
     fn acquire(&self, device: &Device, bytes: usize) -> Buffer {
         let class = (bytes + 4095) & !4095;
         let class = class.max(4096);
-        // В batch-режиме пул НЕ используется: его буферы могут быть заняты
-        // НЕВЫПОЛНЕННЫМИ command buffers (в очереди GPU) — CPU-запись в них
-        // (from_cpu_f32/zeros) гоняется с чтением/записью GPU → мусорные
-        // результаты (decode/prefill в batch давали неверные логиты).
-        // Новые буферы безопасны: Metal command buffer удерживает ресурсы
-        // до завершения. После end_batch (wait) пул снова активен.
-        if batch_depth() == 0 && std::env::var("OMNI_NO_POOL").is_err() {
-            if let Some(buf) = self
+        // Free-лист содержит ТОЛЬКО простаивающие буферы: освобождённые
+        // внутри батча уходят в DEFERRED и возвращаются в лист лишь после
+        // ожидания завершения батча (end_batch), вне батча каждый кернел
+        // ждётся синхронно. Поэтому выдача из листа безопасна и в
+        // batch-режиме (CPU-запись в буфер не гоняется с GPU). Раньше в
+        // батче пул не использовался вовсе — каждый промежуточный тензор
+        // decode-шага был новым MTLBuffer (~4 мс CPU на шаг, больше
+        // GPU-работы у малых моделей).
+        if std::env::var("OMNI_NO_POOL").is_err()
+            && let Some(buf) = self
                 .free
                 .lock()
                 .unwrap()
                 .get_mut(&class)
                 .and_then(|v| v.pop())
-            {
-                self.free_bytes.set(self.free_bytes.get().saturating_sub(class));
-                return buf;
-            }
+        {
+            self.free_bytes.set(self.free_bytes.get().saturating_sub(class));
+            return buf;
         }
         // newBuffer* — семейство `new` (Cocoa ownership): объект приходит
         // С УЖЕ ВЗЯТЫМ владением (+1, retainCount 1, без autorelease) —
@@ -490,10 +491,18 @@ pub struct MetalCtx {
     batch: Mutex<BatchState>,
 }
 
+#[derive(Default)]
 struct BatchState {
     depth: usize,
-    /// Последний закоммиченный command buffer батча — end_batch ждёт его
-    /// (сериализация очереди гарантирует завершение всех предыдущих).
+    /// Command buffer батча и его ЕДИНСТВЕННЫЙ compute-энкодер (serial
+    /// dispatch): все кернелы шага пишутся в один энкодер, коммит — один
+    /// на батч (flush/end_batch). Serial-энкодер исполняет dispatch'и по
+    /// порядку, а hazard tracking буферов упорядочивает зависимые — ни
+    /// барьеров, ни per-kernel command buffer'ов не нужно.
+    cmd: Option<CommandBuffer>,
+    enc: Option<ComputeCommandEncoder>,
+    /// Последний закоммиченный command buffer (flush без ожидания не
+    /// делается — поле для совместимости ожидания в end_batch).
     last: Option<CommandBuffer>,
     /// Diagnostics: how many times a batch was opened (tests assert the
     /// wake path actually batches — a regression that drops begin_batch
@@ -501,12 +510,41 @@ struct BatchState {
     enters: u64,
 }
 
-impl Default for BatchState {
-    fn default() -> Self {
-        Self {
-            depth: 0,
-            last: None,
-            enters: 0,
+impl BatchState {
+    /// Закрыть энкодер и закоммитить command buffer батча (если есть);
+    /// коммит становится `last` — его ждёт вызывающий.
+    fn commit_open(&mut self) {
+        if let Some(enc) = self.enc.take() {
+            enc.end_encoding();
+        }
+        if let Some(cmd) = self.cmd.take() {
+            cmd.commit();
+            self.last = Some(cmd);
+        }
+    }
+
+    /// Дождаться последнего коммита и проверить статус (Metal может упасть
+    /// молча: wait возвращается, а в буферах мусор).
+    fn wait_last(&mut self) {
+        if let Some(cmd) = self.last.take() {
+            cmd.wait_until_completed();
+            let status = cmd.status();
+            if status != metal::MTLCommandBufferStatus::Completed {
+                tracing::error!(
+                    status = ?status,
+                    "Metal batch command buffer failed — results are garbage"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for BatchState {
+    fn drop(&mut self) {
+        // Энкодер, отпущенный без endEncoding, — assert Metal (аварийное
+        // завершение процесса): закрываем, даже если батч брошен ошибкой.
+        if let Some(enc) = self.enc.take() {
+            enc.end_encoding();
         }
     }
 }
@@ -622,28 +660,37 @@ impl MetalCtx {
         group: MTLSize,
         setup: impl FnOnce(&ComputeCommandEncoderRef),
     ) -> Result<(), MetalError> {
-        // Batch path: КАЖДЫЙ кернел — СВОЙ command buffer (commit без wait),
-        // один wait на последний в конце батча. Сериализация очереди Metal
-        // даёт implicit memory sync между command buffers — memoryBarrier
-        // внутри одного CB стоил ~0.2мс × ~270 кернелов (decode-шаг 65мс при
-        // GPU-времени 3мс). Пул при этом отложен (DEFERRED) до закрытия
-        // последнего батча — буферы невыполненных CB не переиспользуются.
+        // Batch path: ВСЕ кернелы шага — в ОДИН serial compute-энкодер
+        // одного command buffer'а; коммит+ожидание — один раз в конце батча
+        // (или в flush перед чтением на хосте). Раньше каждый кернел
+        // получал СВОЙ command buffer (commit на кернел): ~300 коммитов на
+        // decode-шаг — оверхед драйвера съедал больше, чем GPU-работа
+        // (decode Qwen3-8B 6 tok/s при bandwidth-потолке ~35). Пул отложен
+        // (DEFERRED) до закрытия последнего батча — буферы невыполненного
+        // command buffer'а не переиспользуются.
         {
             let mut batch = self.batch.lock().unwrap();
             if batch.depth > 0 {
-                // Fetch the pipeline BEFORE opening the encoder: a pipeline
-                // error must not leave an active encoder on the pending
-                // command buffer (a later flush would commit a buffer with
-                // an unterminated encoder — an ObjC exception, process abort).
+                // Fetch the pipeline BEFORE touching the encoder: a pipeline
+                // error must not leave a half-configured dispatch.
                 let pipeline = self.pipeline(kernel)?;
-                let cmd = self.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
+                if batch.enc.is_none() {
+                    // autoreleasepool: авто-освобождаемые ссылки на новые
+                    // объекты сливаются сразу; владение держат to_owned.
+                    let (cmd, enc) = autoreleasepool(|| {
+                        let cmd = self.queue.new_command_buffer().to_owned();
+                        let enc = cmd
+                            .compute_command_encoder_with_dispatch_type(MTLDispatchType::Serial)
+                            .to_owned();
+                        (cmd, enc)
+                    });
+                    batch.cmd = Some(cmd);
+                    batch.enc = Some(enc);
+                }
+                let enc = batch.enc.as_ref().expect("encoder opened above");
                 enc.set_compute_pipeline_state(&pipeline);
                 setup(enc);
                 enc.dispatch_threads(grid, group);
-                enc.end_encoding();
-                cmd.commit();
-                batch.last = Some(cmd.to_owned());
                 return Ok(());
             }
         }
@@ -689,16 +736,8 @@ impl MetalCtx {
             BATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         }
         if batch.depth == 0 {
-            if let Some(cmd) = batch.last.take() {
-                cmd.wait_until_completed();
-                let status = cmd.status();
-                if status != metal::MTLCommandBufferStatus::Completed {
-                    tracing::error!(
-                        status = ?status,
-                        "Metal batch command buffer failed — results are garbage"
-                    );
-                }
-            }
+            batch.commit_open();
+            batch.wait_last();
             // Последний batch закрыт — все command buffers выполнены:
             // возвращаем отложенные буферы в пул СВОЕГО потока
             // (см. BufferPoolState::push).
@@ -730,16 +769,8 @@ impl MetalCtx {
     /// status + error when it happens instead of shipping the garbage.
     pub fn flush_batch(&self) -> Result<(), MetalError> {
         let mut batch = self.batch.lock().unwrap();
-        if let Some(cmd) = batch.last.take() {
-            cmd.wait_until_completed();
-            let status = cmd.status();
-            if status != metal::MTLCommandBufferStatus::Completed {
-                tracing::error!(
-                    status = ?status,
-                    "Metal batch command buffer failed — results are garbage"
-                );
-            }
-        }
+        batch.commit_open();
+        batch.wait_last();
         Ok(())
     }
 
@@ -1332,6 +1363,21 @@ impl MetalCtx {
                 b.dtype
             )));
         }
+        // m>1, Q8_0: тайловый GEMM на матричных блоках simdgroup (prefill и
+        // верификация спека). INFER_GEMM_Q8_LEGACY=1 — прежний m8f4 (сверка).
+        if m > 1 && b.dtype == GpuDtype::Q8_0 && std::env::var("INFER_GEMM_Q8_LEGACY").is_err() {
+            let (m32, k32, n32) = (m as u32, k as u32, n as u32);
+            let grid = MTLSize::new((n.div_ceil(64) * 128) as u64, m.div_ceil(32) as u64, 1);
+            let group = MTLSize::new(128, 1, 1);
+            return self.run("gemm_nt_q8_0_mma", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&m32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&n32 as *const u32).cast());
+            });
+        }
         // m>1: m8-кернелы (n-столбец × 8 m-строк, явные аккумуляторы) —
         // B читается 1 раз на 8 строк; F16 — half4-чтения.
         if m > 1 {
@@ -1401,6 +1447,22 @@ impl MetalCtx {
                 "mv_quantized: K={k} not a multiple of block {block} ({:?})",
                 b.dtype
             )));
+        }
+        // Q8_0 (основной квант LLM): simdgroup-кооперативный кернел — лейны
+        // читают соседние байты строки (коалесцированно), 8 строк на
+        // threadgroup из 64 потоков. Прочие кванты — поток на строку.
+        if b.dtype == GpuDtype::Q8_0 && std::env::var("INFER_MV_Q8_LEGACY").is_err() {
+            let (k32, n32) = (k as u32, n as u32);
+            // 2 строки на threadgroup из 4 simdgroup'ов (K делится между ними).
+            let grid = MTLSize::new((n.div_ceil(2) * 128) as u64, 1, 1);
+            let group = MTLSize::new(128, 1, 1);
+            return self.run("mv_q8_0_ks", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
         }
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(64, 1, 1);
@@ -1538,15 +1600,18 @@ impl MetalCtx {
     ) -> Result<(), MetalError> {
         let d = x.shape[x.shape.len() - 1];
         let rows = x.numel() / d;
-        let grid = MTLSize::new(rows as u64, 1, 1);
-        let group = MTLSize::new(1, 1, 1);
-        self.run("rmsnorm_f32", grid, group, |enc| {
+        // threadgroup на строку (см. rmsnorm_row_f32): 256 потоков, для
+        // коротких строк — до ближайшего кратного 32.
+        let tpg = d.clamp(32, 256).div_ceil(32) * 32;
+        let grid = MTLSize::new((rows * tpg) as u64, 1, 1);
+        let group = MTLSize::new(tpg as u64, 1, 1);
+        let d32 = d as u32;
+        self.run("rmsnorm_row_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
             enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
-            enc.set_bytes(3, 8, (&rows as *const usize).cast());
-            enc.set_bytes(4, 8, (&d as *const usize).cast());
-            enc.set_bytes(5, 4, (&eps as *const f32).cast());
+            enc.set_bytes(3, 4, (&d32 as *const u32).cast());
+            enc.set_bytes(4, 4, (&eps as *const f32).cast());
         })
     }
 
@@ -2319,10 +2384,25 @@ impl MetalCtx {
         s: usize,
     ) -> Result<(), MetalError> {
         let (t32, hk32, hv32, s32) = (t as u32, hk as u32, hv as u32, s as u32);
+        // S кратно 32 и ≤ 256 — simdgroup-параллельный вариант (4 строки
+        // стейта на threadgroup, строка на simdgroup); иначе — поток на строку.
+        let (kernel, grid, group) = if s.is_multiple_of(32) && s <= 256 && (hv * s).is_multiple_of(4) {
+            (
+                "gdn_delta_rule_sg_f32",
+                MTLSize::new((hv * s / 4 * 128) as u64, 1, 1),
+                MTLSize::new(128, 1, 1),
+            )
+        } else {
+            (
+                "gdn_delta_rule_f32",
+                MTLSize::new((hv * s) as u64, 1, 1),
+                MTLSize::new(s as u64, 1, 1),
+            )
+        };
         self.run(
-            "gdn_delta_rule_f32",
-            MTLSize::new((hv * s) as u64, 1, 1),
-            MTLSize::new(s as u64, 1, 1),
+            kernel,
+            grid,
+            group,
             |enc| {
                 enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
                 enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
@@ -2483,16 +2563,17 @@ impl MetalCtx {
         // for prefill batches). HD lives on the LAST axis.
         let hd = x.shape[x.shape.len() - 1] / h;
         let rows = x.shape.iter().product::<usize>() / (h * hd);
-        let grid = MTLSize::new(rows as u64, h as u64, hd as u64);
-        let group = MTLSize::new(1, 1, 8);
-        self.run("rmsnorm_head_f32", grid, group, |enc| {
+        let nh = (rows * h) as u32;
+        let hd32 = hd as u32;
+        let grid = MTLSize::new(rows as u64 * h as u64 * 32, 1, 1);
+        let group = MTLSize::new(64, 1, 1);
+        self.run("rmsnorm_head_sg_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
             enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
-            for (i, v) in [rows, h, hd].iter().enumerate() {
-                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
-            }
-            enc.set_bytes(6, 4, (&eps as *const f32).cast());
+            enc.set_bytes(3, 4, (&nh as *const u32).cast());
+            enc.set_bytes(4, 4, (&hd32 as *const u32).cast());
+            enc.set_bytes(5, 4, (&eps as *const f32).cast());
         })
     }
 
@@ -2663,17 +2744,19 @@ impl crate::backend::Backend for MetalBackend {
         let xg = x.inner_metal();
         let wg = w.inner_metal();
         let yg = y.inner_metal();
-        let grid = metal::MTLSize::new(tq as u64, h as u64, (hd / 2) as u64);
-        let group = metal::MTLSize::new(1, 4, 4);
-        self.ctx.run("rmsnorm_head_rope_f32", grid, group, |enc| {
+        // simdgroup на (токен, голову) — см. rmsnorm_head_rope_sg_f32.
+        let (h32, nh32, hd32, pos32) = (h as u32, (tq * h) as u32, hd as u32, pos as u32);
+        let grid = metal::MTLSize::new((tq * h * 32) as u64, 1, 1);
+        let group = metal::MTLSize::new(64, 1, 1);
+        self.ctx.run("rmsnorm_head_rope_sg_f32", grid, group, |enc| {
             enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
             enc.set_buffer(1, Some(&wg.buffer), wg.offset as u64);
             enc.set_buffer(2, Some(&yg.buffer), yg.offset as u64);
-            for (i, v) in [tq, h, hd].iter().enumerate() {
-                enc.set_bytes((3 + i) as u64, 8, (v as *const usize).cast());
-            }
+            enc.set_bytes(3, 4, (&h32 as *const u32).cast());
+            enc.set_bytes(4, 4, (&nh32 as *const u32).cast());
+            enc.set_bytes(5, 4, (&hd32 as *const u32).cast());
             enc.set_bytes(6, 4, (&eps as *const f32).cast());
-            enc.set_bytes(7, 8, (&pos as *const usize).cast());
+            enc.set_bytes(7, 4, (&pos32 as *const u32).cast());
             enc.set_bytes(8, 4, (&theta as *const f32).cast());
         })?;
         Ok(y)
@@ -3879,7 +3962,20 @@ mod quant_gemm_tests {
         let src: Vec<f32> = (0..8 * 256)
             .map(|i| ((i as f32 * 7919.0).sin() * 0.5))
             .collect();
+        // Q8_0 128×96 (синтетический): полные тайлы tiled-GEMM (64 по N,
+        // 32 по M) и K из нескольких блоков — фикстура 64×32 их не задевает.
+        let q8_big: Vec<u8> = (0..128 * 96 / 32)
+            .flat_map(|b| {
+                let mut blk = half::f16::from_f32(0.01 + (b % 7) as f32 * 0.003)
+                    .to_bits()
+                    .to_le_bytes()
+                    .to_vec();
+                blk.extend((0..32).map(|j| (((b * 37 + j * 11) % 255) as i32 - 127) as i8 as u8));
+                blk
+            })
+            .collect();
         vec![
+            (q8_big, vec![128, 96], GpuDtype::Q8_0, 0.05),
             (enc_q4_k(&src), vec![8, 256], GpuDtype::Q4_K, 0.15),
             (enc_q6_k(&src), vec![8, 256], GpuDtype::Q6_K, 0.06),
             // Q4_0/Q8_0 — прямо из фикстур (K=32, те же веса, что у f16)
@@ -3934,10 +4030,14 @@ mod quant_gemm_tests {
     fn quantized_gemm_matches_cpu() {
         let ctx = MetalCtx::new().expect("MetalCtx");
         let dev = &ctx.device;
-        for (bytes, shape, dtype, tol) in cases() {
+        // m: хвостовой тайл (3), ровно тайл (32), несколько тайлов с
+        // хвостом (77) — у Q8_0 разные пути выгрузки tiled-GEMM.
+        for ((bytes, shape, dtype, tol), m) in cases()
+            .into_iter()
+            .flat_map(|c| [3usize, 32, 77].map(move |m| (c.clone(), m)))
+        {
             let n = shape[0];
             let k = shape[1];
-            let m = 3usize;
             let b = GpuTensor::from_quantized(dev, &bytes, shape.clone(), dtype).unwrap();
             // CPU-референс: деквант тех же байт
             let tmp = WeightsMap {

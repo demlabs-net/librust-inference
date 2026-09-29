@@ -858,9 +858,14 @@ mod tests {
 
     #[test]
     fn delta_rule_kernel_matches_reference() {
+        // S=16 — поточный кернел; S=128 (как у Qwen3.5) — simdgroup-вариант.
+        delta_rule_case(3, 2, 4, 16);
+        delta_rule_case(5, 2, 4, 128);
+    }
+
+    fn delta_rule_case(t: usize, hk: usize, hv: usize, s: usize) {
         let be = MetalBackend::new().unwrap();
-        let mut r = rng(0xD17A);
-        let (t, hk, hv, s) = (3usize, 2usize, 4usize, 16usize);
+        let mut r = rng(0xD17A ^ s as u64);
         let q = rand(t * hk * s, &mut r);
         let k = rand(t * hk * s, &mut r);
         let v = rand(t * hv * s, &mut r);

@@ -1778,6 +1778,44 @@ pub trait Backend: Send + Sync {
         self.rmsnorm_head(x, w, &tmp, h, eps)?;
         self.rope_standard(&tmp, pos, hd, theta)
     }
+    /// Разбор fused-qkv decode-шага (Ф8.2b): qkv [T, (H+2·KVH)·HD] →
+    /// q = rope(rmsnorm_head(q)) — возвращается [1, T, H·HD];
+    /// k = rope(rmsnorm_head(k)) и v — пишутся прямо в строки [pos_kv..pos_kv+T)
+    /// KV-буферов kbuf/vbuf [1, cap, KVH·HD] (f32). Заменяет slice ×3 +
+    /// norm/rope ×2 + kv_update ×2 одним проходом. Default — составной путь
+    /// из тех же примитивов; Metal — один кернел.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_norm_rope_kv(
+        &self,
+        qkv: &Tensor,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+        kbuf: &Tensor,
+        vbuf: &Tensor,
+        h: usize,
+        kvh: usize,
+        hd: usize,
+        rope_pos: usize,
+        pos_kv: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let t = qkv.numel() / ((h + 2 * kvh) * hd);
+        let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
+        let part = |width: usize, off: usize| -> Result<Tensor, BackendError> {
+            let y = self.zeros(vec![t, width])?;
+            self.slice_last(&rows, &y, off)?;
+            Ok(y.view(vec![1, t, width]))
+        };
+        let q = part(h * hd, 0)?;
+        let k = part(kvh * hd, h * hd)?;
+        let v = part(kvh * hd, (h + kvh) * hd)?;
+        let q = self.rmsnorm_head_rope(&q, q_norm, rope_pos, hd, theta, h, eps)?;
+        let k = self.rmsnorm_head_rope(&k, k_norm, rope_pos, hd, theta, kvh, eps)?;
+        self.kv_update(kbuf, &k, pos_kv)?;
+        self.kv_update(vbuf, &v, pos_kv)?;
+        Ok(q)
+    }
     /// LayerNorm applied per head: X (rows, h·hd), w/b per head-dim (hd).
     fn layernorm_head(
         &self,

@@ -3113,3 +3113,55 @@ kernel void attn_decode_split_f32(
         if (d4 < n4) y4[d4] = out[c] * inv;
     }
 }
+
+// ── Fused qkv-разбор decode-шага (Ф8.2b) ─────────────────────────────────────
+// simdgroup на (токен, голову) по всем H + 2·KVH головам qkv-строки:
+//   голова < H        → rmsnorm+rope(q) → Q[t, h]
+//   H ≤ голова < H+KVH → rmsnorm+rope(k) → KBUF[pos_kv + t, kh]
+//   иначе              → копия v        → VBUF[pos_kv + t, vh]
+// Вместо slice ×3 + norm/rope ×2 + kv_update ×2 (7 кернелов на слой).
+kernel void qkv_norm_rope_kv_f32(
+    device const float* QKV [[buffer(0)]],   // [T, (H+2·KVH)·HD]
+    device const float* WQ [[buffer(1)]],
+    device const float* WK [[buffer(2)]],
+    device float* Q [[buffer(3)]],           // [T, H·HD]
+    device float* KBUF [[buffer(4)]],        // [cap, KVH·HD]
+    device float* VBUF [[buffer(5)]],
+    constant uint& T [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    constant uint& rope_pos [[buffer(10)]],
+    constant uint& pos_kv [[buffer(11)]],
+    constant float& theta [[buffer(12)]],
+    constant float& eps [[buffer(13)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint NHT = H + 2u * KVH;
+    const uint head = gid / 32u, lane = gid % 32u;
+    if (head >= T * NHT) return;
+    const uint t = head / NHT, hh = head % NHT;
+    device const float* x = QKV + (ulong)t * NHT * HD + (ulong)hh * HD;
+    if (hh >= H + KVH) {
+        device float* y = VBUF + ((ulong)(pos_kv + t) * KVH + (hh - H - KVH)) * HD;
+        for (uint i = lane; i < HD; i += 32u) y[i] = x[i];
+        return;
+    }
+    const bool is_q = hh < H;
+    device const float* W = is_q ? WQ : WK;
+    device float* y = is_q ? Q + ((ulong)t * H + hh) * HD
+                           : KBUF + ((ulong)(pos_kv + t) * KVH + (hh - H)) * HD;
+    float s = 0.0f;
+    for (uint i = lane; i < HD; i += 32u) s += x[i] * x[i];
+    const float inv = rsqrt(simd_sum(s) / (float)HD + eps);
+    const float p = (float)(rope_pos + t);
+    const uint half_hd = HD / 2u;
+    for (uint i = lane; i < half_hd; i += 32u) {
+        const float fr = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
+        const float c = cos(p * fr), sn = sin(p * fr);
+        const float x0 = x[i] * inv * W[i];
+        const float x1 = x[i + half_hd] * inv * W[i + half_hd];
+        y[i] = x0 * c - x1 * sn;
+        y[i + half_hd] = x1 * c + x0 * sn;
+    }
+}

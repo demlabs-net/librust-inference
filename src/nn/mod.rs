@@ -652,6 +652,35 @@ impl KvCache {
         Ok(())
     }
 
+    /// Подготовить дозапись `tq` строк на текущую позицию, когда k/v пишет
+    /// сам вызывающий (fused-кернел `Backend::qkv_norm_rope_kv`): откат окна
+    /// при переполнении и рост ёмкости — как в [`Self::update`]. Возвращает
+    /// (позиция первой строки, k-буфер, v-буфер) — буферы целиком [1, cap, D];
+    /// после записи — [`Self::advance`].
+    pub(crate) fn begin_append(
+        &mut self,
+        backend: &dyn Backend,
+        tq: usize,
+    ) -> Result<(usize, Tensor, Tensor), BackendError> {
+        if let Some(max) = self.max_cap
+            && self.pos + tq > max
+        {
+            self.compact(backend)?;
+        }
+        self.ensure(backend, self.pos + tq)?;
+        Ok((self.pos, self.k.clone(), self.v.clone()))
+    }
+
+    /// Зафиксировать `tq` строк, записанных после [`Self::begin_append`].
+    pub(crate) fn advance(&mut self, tq: usize) {
+        self.pos += tq;
+    }
+
+    /// Хранилище k и v — f32 (прямая запись fused-кернелом допустима).
+    pub(crate) fn is_f32(&self) -> bool {
+        self.k_format == crate::dtype::KvFormat::F32 && self.v_format == crate::dtype::KvFormat::F32
+    }
+
     /// View of the first `pos` rows (same buffer, restricted shape).
     pub fn view(&self) -> Tensor {
         let d = self.k.shape()[2];

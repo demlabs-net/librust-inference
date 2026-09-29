@@ -1364,99 +1364,132 @@ impl Qwen3Model {
         let tp0 = std::time::Instant::now();
         sync(&qkv)?;
         let t_qkv = tp0.elapsed().as_secs_f64();
-        let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
-        let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
-        let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
-        if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
-            for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
-                let tv = backend.to_cpu_f32(t)?;
-                eprintln!("INFER_DEBUG {tag}_slice[:8]={:?}", &tv[..8.min(tv.len())]);
-            }
-        }
-        if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
-            let qv = backend.to_cpu_f32(&q)?;
-            let kvv = backend.to_cpu_f32(&k)?;
-            let hv = backend.to_cpu_f32(h)?;
-            let t = tq;
-            eprintln!(
-                "OMNI_REF our_ln[-1,:8]={:?}",
-                &hv[(t - 1) * q_size..(t - 1) * q_size + 8]
-            );
-            eprintln!(
-                "OMNI_REF our_q0[-1,:8]={:?}",
-                &qv[(t - 1) * q_size..(t - 1) * q_size + 8]
-            );
-            eprintln!(
-                "OMNI_REF our_k0[-1,:8]={:?}",
-                &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]
-            );
-        }
-        // НОРМАЛИЗАЦИЯ — ТОЛЬКО ОДНА, В ВЕТКАХ НИЖЕ. Раньше здесь стоял
-        // пред-норм qk_norm, а затем fused rmsnorm_head_rope / qk_norm_pub
-        // нормировали q/k ВТОРОЙ раз: 2× норм на реальном GGUF (Qwen3
-        // 0.6B/8B) давал вырожденный вывод (повтор «|وووو…»). Ветки
-        // сами нормируют: else — rmsnorm_head_rope, mrope — qk_norm_pub.
-        let (q, k) = if let Some(mrope) = mrope {
-            let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
-            let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
-            let sects = cfg.mrope_sections.expect("mrope без sections");
-            (
-                backend.rope_mrope(&q, mrope, attn.head_dim, cfg.rope_theta, sects)?,
-                backend.rope_mrope(&k, mrope, attn.head_dim, cfg.rope_theta, sects)?,
-            )
-        } else if let Some(sects) = cfg.mrope_sections {
-            let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
-            let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
-            (
-                backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?,
-                backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?,
-            )
+        // Decode/prefill без картинок, с QK-norm и f32-KV: разбор qkv, norm+RoPE
+        // q/k и запись k/v в кэш — ОДНИМ кернелом (было 7 на слой: slice ×3,
+        // norm/rope ×2, kv_update ×2 — у малых моделей мелкие кернелы
+        // стоили больше матвеков). Прочие случаи (M-RoPE, DFlash cache_at,
+        // модели без QK-norm, f16/q8-KV) — прежним путём.
+        let fused = cache_at.is_none()
+            && mrope.is_none()
+            && cfg.mrope_sections.is_none()
+            && cache.is_f32()
+            && std::env::var("INFER_QKV_UNFUSED").is_err();
+        let (q, t_norm, t_upd_d) = if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
+            let t_upd = std::time::Instant::now();
+            let (pos_kv, kb, vb) = cache.begin_append(backend, tq)?;
+            let q = backend.qkv_norm_rope_kv(
+                &qkv,
+                qn,
+                kn,
+                &kb,
+                &vb,
+                attn.n_heads,
+                attn.n_kv_heads,
+                attn.head_dim,
+                pos,
+                pos_kv,
+                cfg.rope_theta,
+                1e-6,
+            )?;
+            cache.advance(tq);
+            sync(&q)?;
+            (q, tp0.elapsed().as_secs_f64(), t_upd.elapsed().as_secs_f64())
         } else {
-            // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4; дефолт
-            // (CPU/CUDA) — два шага
-            let q = match &attn.q_norm {
-                Some(w) => {
-                    let q = backend.rmsnorm_head_rope(
-                        &q,
+            let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
+            let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
+            let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
+            if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
+                for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
+                    let tv = backend.to_cpu_f32(t)?;
+                    eprintln!("INFER_DEBUG {tag}_slice[:8]={:?}", &tv[..8.min(tv.len())]);
+                }
+            }
+            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
+                let qv = backend.to_cpu_f32(&q)?;
+                let kvv = backend.to_cpu_f32(&k)?;
+                let hv = backend.to_cpu_f32(h)?;
+                let t = tq;
+                eprintln!(
+                    "OMNI_REF our_ln[-1,:8]={:?}",
+                    &hv[(t - 1) * q_size..(t - 1) * q_size + 8]
+                );
+                eprintln!(
+                    "OMNI_REF our_q0[-1,:8]={:?}",
+                    &qv[(t - 1) * q_size..(t - 1) * q_size + 8]
+                );
+                eprintln!(
+                    "OMNI_REF our_k0[-1,:8]={:?}",
+                    &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]
+                );
+            }
+            // НОРМАЛИЗАЦИЯ — ТОЛЬКО ОДНА, В ВЕТКАХ НИЖЕ. Раньше здесь стоял
+            // пред-норм qk_norm, а затем fused rmsnorm_head_rope / qk_norm_pub
+            // нормировали q/k ВТОРОЙ раз: 2× норм на реальном GGUF (Qwen3
+            // 0.6B/8B) давал вырожденный вывод (повтор «|وووو…»). Ветки
+            // сами нормируют: else — rmsnorm_head_rope, mrope — qk_norm_pub.
+            let (q, k) = if let Some(mrope) = mrope {
+                let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
+                let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
+                let sects = cfg.mrope_sections.expect("mrope без sections");
+                (
+                    backend.rope_mrope(&q, mrope, attn.head_dim, cfg.rope_theta, sects)?,
+                    backend.rope_mrope(&k, mrope, attn.head_dim, cfg.rope_theta, sects)?,
+                )
+            } else if let Some(sects) = cfg.mrope_sections {
+                let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
+                let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
+                (
+                    backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?,
+                    backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?,
+                )
+            } else {
+                // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4; дефолт
+                // (CPU/CUDA) — два шага
+                let q = match &attn.q_norm {
+                    Some(w) => {
+                        let q = backend.rmsnorm_head_rope(
+                            &q,
+                            w,
+                            pos,
+                            attn.head_dim,
+                            cfg.rope_theta,
+                            attn.n_heads,
+                            1e-6,
+                        )?;
+                        if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
+                            let qv = backend.to_cpu_f32(&q)?;
+                            eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
+                        }
+                        q
+                    }
+                    None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
+                };
+                let k = match &attn.k_norm {
+                    Some(w) => backend.rmsnorm_head_rope(
+                        &k,
                         w,
                         pos,
                         attn.head_dim,
                         cfg.rope_theta,
-                        attn.n_heads,
+                        attn.n_kv_heads,
                         1e-6,
-                    )?;
-                    if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
-                        let qv = backend.to_cpu_f32(&q)?;
-                        eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
-                    }
-                    q
-                }
-                None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
+                    )?,
+                    None => rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
+                };
+                (q, k)
             };
-            let k = match &attn.k_norm {
-                Some(w) => backend.rmsnorm_head_rope(
-                    &k,
-                    w,
-                    pos,
-                    attn.head_dim,
-                    cfg.rope_theta,
-                    attn.n_kv_heads,
-                    1e-6,
-                )?,
-                None => rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
-            };
-            (q, k)
+            sync(&k)?;
+            let t_norm = tp0.elapsed().as_secs_f64();
+            // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
+            // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
+            let t_upd = std::time::Instant::now();
+            match cache_at {
+                Some(at) => cache.update_at(backend, &k, &v, at)?,
+                None => cache.update(backend, &k, &v)?,
+            }
+            let t_upd_d = t_upd.elapsed().as_secs_f64();
+            (q, t_norm, t_upd_d)
         };
-        sync(&k)?;
-        let t_norm = tp0.elapsed().as_secs_f64();
-        // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
-        // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
-        let t_upd = std::time::Instant::now();
-        match cache_at {
-            Some(at) => cache.update_at(backend, &k, &v, at)?,
-            None => cache.update(backend, &k, &v)?,
-        }
-        let t_upd_d = t_upd.elapsed().as_secs_f64();
         // N (iter-10): mask passed in from the caller (built once per
         // forward); the `causal`/`mrope` arguments are kept for the call
         // sites' None-vs-Some decision, but the build itself moved out.

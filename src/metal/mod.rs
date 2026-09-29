@@ -2791,6 +2791,58 @@ impl crate::backend::Backend for MetalBackend {
         Ok(y)
     }
 
+    fn qkv_norm_rope_kv(
+        &self,
+        qkv: &crate::backend::Tensor,
+        q_norm: &crate::backend::Tensor,
+        k_norm: &crate::backend::Tensor,
+        kbuf: &crate::backend::Tensor,
+        vbuf: &crate::backend::Tensor,
+        h: usize,
+        kvh: usize,
+        hd: usize,
+        rope_pos: usize,
+        pos_kv: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let t = qkv.numel() / ((h + 2 * kvh) * hd);
+        let (kg, vg) = (kbuf.as_gpu(), vbuf.as_gpu());
+        // KV-буферы обязаны быть f32 и вмещать строки [pos_kv, pos_kv + t).
+        let cap = kg.shape[kg.shape.len() - 2];
+        if kg.dtype != GpuDtype::F32 || vg.dtype != GpuDtype::F32 || pos_kv + t > cap {
+            return Err(crate::error::BackendError::Shape(format!(
+                "qkv_norm_rope_kv: KV {:?}/{:?} cap {cap}, нужны строки {pos_kv}..{}",
+                kg.dtype,
+                vg.dtype,
+                pos_kv + t
+            )));
+        }
+        let q = self.zeros(vec![1, t, h * hd])?;
+        let (t32, h32, kvh32, hd32, rp32, pk32) =
+            (t as u32, h as u32, kvh as u32, hd as u32, rope_pos as u32, pos_kv as u32);
+        let grid = MTLSize::new((t * (h + 2 * kvh) * 32) as u64, 1, 1);
+        let group = MTLSize::new(64, 1, 1);
+        let (xg, wq, wk, qg) = (qkv.as_gpu(), q_norm.as_gpu(), k_norm.as_gpu(), q.as_gpu());
+        self.ctx.run("qkv_norm_rope_kv_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+            enc.set_buffer(1, Some(&wq.buffer), wq.offset as u64);
+            enc.set_buffer(2, Some(&wk.buffer), wk.offset as u64);
+            enc.set_buffer(3, Some(&qg.buffer), qg.offset as u64);
+            enc.set_buffer(4, Some(&kg.buffer), kg.offset as u64);
+            enc.set_buffer(5, Some(&vg.buffer), vg.offset as u64);
+            enc.set_bytes(6, 4, (&t32 as *const u32).cast());
+            enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+            enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+            enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+            enc.set_bytes(10, 4, (&rp32 as *const u32).cast());
+            enc.set_bytes(11, 4, (&pk32 as *const u32).cast());
+            enc.set_bytes(12, 4, (&theta as *const f32).cast());
+            enc.set_bytes(13, 4, (&eps as *const f32).cast());
+        })?;
+        Ok(q)
+    }
+
     fn rope_mrope_text(
         &self,
         x: &crate::backend::Tensor,

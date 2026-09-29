@@ -1041,6 +1041,37 @@ mod tests {
         }
     }
 
+    /// Fused-разбор qkv (Metal-кернел) == составной путь трейта (slice,
+    /// norm+rope, kv_update): q на выходе и строки k/v в KV-буферах.
+    #[test]
+    fn fused_qkv_norm_rope_kv_matches_composite() {
+        let be = MetalBackend::new().unwrap();
+        for &(t, h, kvh, hd, pos) in &[(1usize, 16usize, 8usize, 128usize, 37usize), (5, 4, 2, 64, 0)] {
+            let mut r = rng((t * 7 + hd) as u64);
+            let qkv = be.from_cpu_f32(&rand(t * (h + 2 * kvh) * hd, &mut r), vec![1, t, (h + 2 * kvh) * hd]).unwrap();
+            let qn = be.from_cpu_f32(&rand(hd, &mut r), vec![hd]).unwrap();
+            let kn = be.from_cpu_f32(&rand(hd, &mut r), vec![hd]).unwrap();
+            let cap = pos + t + 3;
+            let mk = || be.zeros(vec![1, cap, kvh * hd]).unwrap();
+            let (k1, v1, k2, v2) = (mk(), mk(), mk(), mk());
+            let q1 = be.qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6).unwrap();
+            // составной путь из тех же примитивов (как default трейта)
+            let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
+            let part = |w: usize, off: usize| {
+                let y = be.zeros(vec![t, w]).unwrap();
+                be.slice_last(&rows, &y, off).unwrap();
+                y.view(vec![1, t, w])
+            };
+            let q2 = be.rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6).unwrap();
+            let kr = be.rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6).unwrap();
+            be.kv_update(&k2, &kr, pos).unwrap();
+            be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
+            close(&be.to_cpu_f32(&q1).unwrap(), &be.to_cpu_f32(&q2).unwrap(), 1e-6, "fused q");
+            close(&be.to_cpu_f32(&k1).unwrap(), &be.to_cpu_f32(&k2).unwrap(), 1e-6, "fused k в кэше");
+            close(&be.to_cpu_f32(&v1).unwrap(), &be.to_cpu_f32(&v2).unwrap(), 1e-6, "fused v в кэше");
+        }
+    }
+
     /// Decode-attention (Tq=1, без маски): ключи делятся между simdgroup'ами
     /// — длины KV меньше и не кратные их числу, hd 64/128/256, GQA.
     #[test]

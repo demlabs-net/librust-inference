@@ -3559,3 +3559,175 @@ kernel void attn_prefill_fa4_f32(
         }
     }
 }
+
+// ── Flash-attention промпта с разбиением ключей (Ф8.2e, сплит-K) ─────────────
+// Узкое место длинного промпта — ЛАТЕНТНОСТЬ: один threadgroup последовательно
+// проходит все Tkv ключей (декодный кернел ровно эту проблему решает
+// разбиением, 12× на длинном контексте). Здесь то же для промпта: threadgroup
+// (2 simdgroup'а, 16 запросов одной головы) обрабатывает СВОЙ участок ключей и
+// пишет частичный online-softmax (m, l, acc) в глобальный буфер; combine-кернел
+// сливает части. Частицы — f32 (точность не хуже неразбитого пути),
+// раскладка [Tq, H, SPLIT, 2 + HD]: [0]=m, [1]=l, [2..]=acc.
+#define FAP_BQ 16u
+kernel void attn_prefill_partial_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* PART [[buffer(4)]],
+    constant uint& Tq [[buffer(5)]],
+    constant uint& Tkv [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    constant uint& SPLIT [[buffer(10)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpt3 [[thread_position_in_threadgroup]])
+{
+    const uint tpt = tpt3.x;
+    const uint lane = tpt % 32u;
+    const uint sg = tpt / 32u;
+    const uint h = tgpig.y;
+    const uint sp = tgpig.z;
+    const uint kvh = h / (H / KVH);
+    const uint q0 = tgpig.x * FAP_BQ + sg * 8u;
+    const uint D = H * HD, KD = KVH * HD;
+    const uint nf = HD / 8u;
+    const float scale = 1.0f / sqrt((float)HD);
+    const uint per = (Tkv + SPLIT - 1u) / SPLIT;
+    const uint k0 = sp * per;
+    const uint k1 = min(Tkv, k0 + per);
+    threadgroup float shS[2u * 8u * 32u];
+    threadgroup float shD[2u * 64u];
+    threadgroup float* myS = shS + sg * 256u;
+    threadgroup float* myD = shD + sg * 64u;
+    simdgroup_float8x8 qa[16];
+    for (uint f = 0; f < nf; ++f) {
+        if (q0 + 8u <= Tq) {
+            simdgroup_load(qa[f], Q + (ulong)q0 * D + h * HD + f * 8u, D);
+        } else {
+            qa[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
+    }
+    simdgroup_float8x8 o[16];
+    for (uint f = 0; f < nf; ++f) o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    float m_run = -INFINITY, l_run = 0.0f;
+    for (uint kb = k0; kb < k1; kb += 32u) {
+        for (uint j = 0; j < 4u; ++j) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+            const uint kj = min(kb + j * 8u, Tkv - 1u);   // хвост — те же данные, маска отсечёт
+            for (uint f = 0; f < nf; ++f) {
+                simdgroup_float8x8 kf;
+                simdgroup_load(kf, K + (ulong)kj * KD + kvh * HD + f * 8u, KD, 0, true);
+                simdgroup_multiply_accumulate(s, qa[f], kf, s);
+            }
+            simdgroup_store(s, myS + j * 8u, 32u);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8u) {
+            const uint qi = q0 + lane;
+            float mx = m_run;
+            for (uint j = 0; j < 32u; ++j) {
+                const uint kj = kb + j;
+                float v = myS[lane * 32u + j] * scale;
+                // kj >= k1 — хвост последнего блока участка: диапазоны
+                // разбиений не кратны 32, и без этой границы ключи на стыке
+                // считались бы ДВАЖДЫ (в своём участке и в соседнем).
+                if (kj >= k1 || kj >= Tkv || qi >= Tq) v = -INFINITY;
+                else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
+                myS[lane * 32u + j] = v;
+                mx = max(mx, v);
+            }
+            float l = 0.0f;
+            for (uint j = 0; j < 32u; ++j) {
+                const float v = myS[lane * 32u + j];
+                const float p = (v == -INFINITY) ? 0.0f : exp(v - mx);
+                myS[lane * 32u + j] = p;
+                l += p;
+            }
+            const float corr = (m_run == -INFINITY) ? 0.0f : exp(m_run - mx);
+            l_run = l_run * corr + l;
+            m_run = mx;
+            for (uint c = 0; c < 8u; ++c) myD[lane * 8u + c] = (c == lane) ? corr : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 cd;
+        simdgroup_load(cd, myD, 8u);
+        for (uint f = 0; f < nf; ++f) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
+            simdgroup_multiply(acc, cd, o[f]);
+            for (uint j = 0; j < 4u; ++j) {
+                const uint kj = min(kb + j * 8u, Tkv - 1u);
+                simdgroup_float8x8 pa, vb;
+                simdgroup_load(pa, myS + j * 8u, 32u);
+                simdgroup_load(vb, V + (ulong)kj * KD + kvh * HD + f * 8u, KD);
+                simdgroup_multiply_accumulate(acc, pa, vb, acc);
+            }
+            o[f] = acc;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // частичный softmax: [m, l, acc] в [Tq, H, SPLIT, 2+HD]
+    if (lane < 8u) {
+        const uint qi = q0 + lane;
+        if (qi < Tq) {
+            device float* rowp = PART + (((ulong)qi * H + h) * SPLIT + sp) * (2u + HD);
+            rowp[0] = m_run;
+            rowp[1] = l_run;
+        }
+    }
+    for (uint f = 0; f < nf; ++f) {
+        simdgroup_store(o[f], myS + (f % 4u) * 8u, 32u);
+        if (f % 4u == 3u || f + 1u == nf) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint fbase = (f / 4u) * 4u;
+            const uint fcount = f - fbase + 1u;
+            for (uint e = lane; e < 8u * fcount * 8u; e += 32u) {
+                const uint c = e % 8u;
+                const uint t1 = e / 8u;
+                const uint fi = t1 % fcount;
+                const uint r = t1 / fcount;
+                const uint qi = q0 + r;
+                if (qi < Tq) {
+                    device float* rowp = PART + (((ulong)qi * H + h) * SPLIT + sp) * (2u + HD);
+                    rowp[2u + (fbase + fi) * 8u + c] = myS[r * 32u + fi * 8u + c];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Слияние частичных softmax: out = Σ acc_s·e^{m_s−M} / Σ l_s·e^{m_s−M}.
+// Threadgroup на строку (запрос, голова), лейн ведёт свои float4 колонки.
+kernel void attn_prefill_combine_f32(
+    device const float* PART [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& TqH [[buffer(2)]],
+    constant uint& HD [[buffer(3)]],
+    constant uint& SPLIT [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]])
+{
+    if (row >= TqH) return;
+    const ulong rs = (ulong)row * SPLIT;
+    float gm = -INFINITY;
+    for (uint sp = 0; sp < SPLIT; ++sp) gm = max(gm, PART[(rs + sp) * (2u + HD)]);
+    float l = 0.0f;
+    for (uint sp = 0; sp < SPLIT; ++sp) {
+        device const float* rowp = PART + (rs + sp) * (2u + HD);
+        const float w = (rowp[0] == -INFINITY) ? 0.0f : exp(rowp[0] - gm);
+        l += rowp[1] * w;
+    }
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    const uint n4 = HD / 4u;
+    for (uint c = lane; c < n4; c += 32u) {
+        float4 acc = float4(0.0f);
+        for (uint sp = 0; sp < SPLIT; ++sp) {
+            device const float* rowp = PART + (rs + sp) * (2u + HD);
+            const float w = (rowp[0] == -INFINITY) ? 0.0f : exp(rowp[0] - gm);
+            acc += w * *(device const float4*)(rowp + 2u + c * 4u);
+        }
+        *(device float4*)(Y + (ulong)row * HD + c * 4u) = acc * inv;
+    }
+}

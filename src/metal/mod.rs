@@ -2272,6 +2272,75 @@ impl MetalCtx {
         // Матричные блоки окупаются при hd ≤ 128 (1.5× на Qwen3); при hd=256
         // (Qwen3.5, 16 голов) фрагментов O вдвое больше, а threadgroup'ов
         // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).
+        // Сплит-K (Ф8.2e) — ВЫКЛЮЧЕН по умолчанию: верен (покрыт тестом
+        // prefill_attention_matches_reference), но медленнее прежнего пути
+        // (43 против 28 мс на слой при Tq=512, контексте 4.6k). Причина:
+        // частичные softmax весят столько же, сколько выход, то есть при
+        // SPLIT=16 трафик частичных (запись+чтение) в 32 раза больше выхода
+        // и перекрывает выигрыш от укорочения цепочки ключей. Задел на
+        // случай, когда частичные можно будет держать в разделяемой памяти
+        // (при SPLIT=4 и hd=128 это 4×(2+128)×8 запросов ≈ 16 КБ).
+        // Включается INFER_ATTN_SPLIT=1.
+        if b == 1
+            && tq >= 32
+            && hd.is_multiple_of(8)
+            && hd <= 128
+            && n_heads.is_multiple_of(kv_heads)
+            && std::env::var("INFER_ATTN_LEGACY").is_err()
+            && std::env::var("INFER_ATTN_SPLIT").as_deref() == Ok("1")
+        {
+            let split = ((tkv + 127) / 128).clamp(1, 16);
+            if split >= 2 {
+                let (tq32, tkv32, h32, kvh32, hd32, sp32) = (
+                    tq as u32,
+                    tkv as u32,
+                    n_heads as u32,
+                    kv_heads as u32,
+                    hd as u32,
+                    split as u32,
+                );
+                let part = GpuTensor::zeros(&self.device, vec![tq, n_heads, split, 2 + hd])?;
+                let (pg, qg, kg, vg, yg) = (&part, q, k, v, y);
+                // частичные: (запросы/16) × голов × splits, threadgroup 64
+                self.run(
+                    "attn_prefill_partial_f32",
+                    MTLSize::new((tq.div_ceil(16) * 64) as u64, n_heads as u64, split as u64),
+                    MTLSize::new(64, 1, 1),
+                    |enc| {
+                        enc.set_buffer(0, Some(&qg.buffer), qg.offset as u64);
+                        enc.set_buffer(1, Some(&kg.buffer), kg.offset as u64);
+                        enc.set_buffer(2, Some(&vg.buffer), vg.offset as u64);
+                        enc.set_buffer(
+                            3,
+                            mask.map(|m| &*m.buffer),
+                            mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+                        );
+                        enc.set_buffer(4, Some(&pg.buffer), pg.offset as u64);
+                        enc.set_bytes(5, 4, (&tq32 as *const u32).cast());
+                        enc.set_bytes(6, 4, (&tkv32 as *const u32).cast());
+                        enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+                        enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+                        enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+                        enc.set_bytes(10, 4, (&sp32 as *const u32).cast());
+                    },
+                )?;
+                // слияние: threadgroup на строку (запрос, голова)
+                let (tqh32, hd32b) = ((tq * n_heads) as u32, hd as u32);
+                self.run(
+                    "attn_prefill_combine_f32",
+                    MTLSize::new((tq * n_heads * 32) as u64, 1, 1),
+                    MTLSize::new(32, 1, 1),
+                    |enc| {
+                        enc.set_buffer(0, Some(&pg.buffer), pg.offset as u64);
+                        enc.set_buffer(1, Some(&yg.buffer), yg.offset as u64);
+                        enc.set_bytes(2, 4, (&tqh32 as *const u32).cast());
+                        enc.set_bytes(3, 4, (&hd32b as *const u32).cast());
+                        enc.set_bytes(4, 4, (&sp32 as *const u32).cast());
+                    },
+                )?;
+                return Ok(());
+            }
+        }
         // Полу-тайловый путь (Ф8.2e) — ВЫКЛЮЧЕН по умолчанию: он верен
         // (тесты prefill_attention_matches_reference и
         // tiled_attention_layout_probe), но на M3 медленнее варианта с

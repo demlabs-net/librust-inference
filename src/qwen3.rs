@@ -635,13 +635,24 @@ impl Qwen3Model {
             return self.prefill_last_one(backend, ids);
         }
         // Длинный промпт — блоками (см. prefill_chunk): маска блока
-        // O(chunk·Tkv) вместо O(T²), KV растёт как обычно.
-        backend.begin_batch()?;
+        // O(chunk·Tkv) вместо O(T²), KV растёт как обычно. Батч ЗАКРЫВАЕТСЯ
+        // на каждом блоке: освобождённые буферы блока уходят в пул (лимит
+        // пула), иначе отложенный список копил промежуточные тензоры ВСЕХ
+        // блоков до конца префилла (14k токенов уводили систему в своп, и
+        // процесс получал SIGKILL).
         let r = (|| {
+            // Резерв под весь промпт: без него KV растёт удвоениями, и каждая
+            // ступень копирует весь кэш (при 14k токенов это +2.4 ГБ пика и
+            // лишний трафик). Резерв ограничен потолком окна.
+            let want = (self.pos_rope + ids.len()).min(self.cfg.rope_max_seq);
+            for c in self.caches.iter_mut() {
+                c.ensure(backend, want)?;
+            }
             let mut done = 0usize;
             let mut logits = None;
             let trace = std::env::var("INFER_PREFILL_TRACE").is_ok();
             while done < ids.len() {
+                backend.begin_batch()?;
                 let end = (done + chunk).min(ids.len());
                 let part = &ids[done..end];
                 let t = part.len();
@@ -667,12 +678,12 @@ impl Qwen3Model {
                 // каждый блок считался бы от исходной позиции (rope-сдвиг,
                 // поймано тестом prefill_last_chunked_equals_single_pass).
                 self.pos_rope = self.caches[0].pos;
+                backend.end_batch()?;
                 done = end;
             }
             self.pos_rope = self.caches[0].pos;
             logits.ok_or_else(|| BackendError::Shape("prefill_last: пустой промпт".into()))
         })();
-        backend.end_batch()?;
         r
     }
 

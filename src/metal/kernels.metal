@@ -3033,7 +3033,7 @@ kernel void gemm_nt_q8_0_mm(
 // j ≡ g (mod NSG), ведёт свои (max, sum, acc) online-softmax, в конце
 // частичные результаты сливаются через threadgroup-память (как
 // flash-decoding). HD ≤ 256, кратно 4; лейн держит HD/128 float4.
-#define AD_NSG 8u
+#define AD_NSG_MAX 32u
 kernel void attn_decode_split_f32(
     device const float* Q [[buffer(0)]],     // [1, H*HD]
     device const float* K [[buffer(1)]],     // [Tkv, KVH*HD]
@@ -3043,7 +3043,8 @@ kernel void attn_decode_split_f32(
     constant uint& H [[buffer(5)]],
     constant uint& KVH [[buffer(6)]],
     constant uint& HD [[buffer(7)]],
-    threadgroup float* sh [[threadgroup(0)]],   // AD_NSG × (2 + HD)
+    constant uint& NSG [[buffer(8)]],           // число разбиений ключей
+    threadgroup float* sh [[threadgroup(0)]],   // NSG × (2 + HD)
     uint h [[threadgroup_position_in_grid]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]])
@@ -3062,7 +3063,7 @@ kernel void attn_decode_split_f32(
         acc[c] = float4(0.0f);
     }
     float m = -INFINITY, s = 0.0f;
-    for (uint j = sgitg; j < Tkv; j += AD_NSG) {
+    for (uint j = sgitg; j < Tkv; j += NSG) {
         device const float4* k4 = (device const float4*)(K + (ulong)j * KD + kvh * HD);
         float dot = 0.0f;
         for (uint c = 0; c < nc; ++c) {
@@ -3094,10 +3095,10 @@ kernel void attn_decode_split_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sgitg != 0u) return;
     float gm = -INFINITY;
-    for (uint g = 0; g < AD_NSG; ++g) gm = max(gm, sh[g * (2u + HD)]);
+    for (uint g = 0; g < NSG; ++g) gm = max(gm, sh[g * (2u + HD)]);
     float gs = 0.0f;
     float4 out[2] = {float4(0.0f), float4(0.0f)};
-    for (uint g = 0; g < AD_NSG; ++g) {
+    for (uint g = 0; g < NSG; ++g) {
         threadgroup float* part = sh + g * (2u + HD);
         const float w = (part[0] == -INFINITY) ? 0.0f : exp(part[0] - gm);
         gs += part[1] * w;
@@ -3391,5 +3392,8 @@ kernel void attn_prefill_mma_f32(
         if (qi < Tq) Y[(ulong)qi * D + h * HD + c] = sQ[e] * sC[r];
     }
 }
+
+
+
 
 

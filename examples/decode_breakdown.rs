@@ -22,7 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let be = MetalBackend::new()?;
     let mut m = Qwen3Model::load(&be, &wm, Qwen3Config::from_gguf(&gf, tok.vocab_size())?)?;
     let n = 32;
-    CausalLm::prefill(&mut m, &be, &[1, 2, 3, 4])?;
+    // Контекст для декода: DEC_CTX токенов (по умолчанию 4).
+    let ctx: usize = std::env::var("DEC_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let prompt: Vec<u32> = (0..ctx as u32).map(|i| 100 + (i * 7) % 5000).collect();
+    let tl = std::time::Instant::now();
+    let _ = CausalLm::prefill_last(&mut m, &be, &prompt)?;
+    eprintln!("префилл {ctx} ток.: {:.2} с", tl.elapsed().as_secs_f64());
     for _ in 0..4 {
         let l = CausalLm::decode(&mut m, &be, 5)?;
         be.to_cpu_f32(&l)?;

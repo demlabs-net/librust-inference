@@ -25,6 +25,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pp: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(128);
     let tg: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(64);
     let reps: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(3);
+    // ctx — длина контекста ПЕРЕД замером tg (как llama-bench -p N -n M:
+    // декод с длинным KV). 0 — без контекста.
+    let ctx: usize = std::env::var("LLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
 
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -68,6 +71,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         let lg = model.prefill_last(&be, &prompt)?;
         let _ = be.to_cpu_f32(&lg)?;
         pp_ts.push(pp as f64 / t0.elapsed().as_secs_f64());
+        // Контекст для декода (llama-bench -p N -n M): префилл ctx токенов.
+        if ctx > 0 {
+            let long: Vec<u32> = (0..ctx).map(|_| next_id()).collect();
+            let lg = model.prefill_last(&be, &long)?;
+            let _ = be.to_cpu_f32(&lg)?;
+        }
 
         let t0 = Instant::now();
         let mut id = next_id();
@@ -85,6 +94,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     println!("{name} pp{pp} {:.1} tok/s", avg(&pp_ts));
-    println!("{name} tg{tg} {:.1} tok/s", avg(&tg_ts));
+    if ctx > 0 {
+        println!("{name} tg{tg}@{ctx} {:.1} tok/s", avg(&tg_ts));
+    } else {
+        println!("{name} tg{tg} {:.1} tok/s", avg(&tg_ts));
+    }
     Ok(())
 }

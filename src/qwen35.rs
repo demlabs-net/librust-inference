@@ -518,23 +518,31 @@ impl Qwen35Model {
             return Err(BackendError::Shape("qwen35 prefill: пустой промпт".into()));
         }
         let chunk = crate::qwen3::Qwen3Model::prefill_chunk();
-        backend.begin_batch()?;
+        // Батч закрывается на КАЖДОМ блоке: освобождённые буферы блока
+        // возвращаются в пул (с его лимитом), иначе отложенный список копил
+        // промежуточные тензоры всех блоков до конца префилла.
         let r = (|| {
+            // Резерв под весь промпт (см. Qwen3Model::prefill_last_chunked):
+            // KV-слои растут один раз, без ступеней-копий.
+            for c in self.caches.iter_mut().flatten() {
+                c.ensure(backend, (self.pos + ids.len()).min(self.cfg.max_seq))?;
+            }
             let mut done = 0usize;
             let mut out = None;
             while done < ids.len() {
                 let end = (done + chunk).min(ids.len());
                 let part = &ids[done..end];
                 self.last_only = end == ids.len();
-                out = Some(self.forward(backend, part, &[], &mut Vec::new())?);
-                // позиция следующего блока — из состояния (pos растёт в forward)
+                backend.begin_batch()?;
+                let one = self.forward(backend, part, &[], &mut Vec::new());
+                self.last_only = false;
+                backend.end_batch()?;
+                out = Some(one?);
                 done = end;
             }
-            self.last_only = false;
             out.ok_or_else(|| BackendError::Shape("qwen35 prefill: пустой промпт".into()))
         })();
         self.last_only = false;
-        backend.end_batch()?;
         r
     }
 
@@ -1020,6 +1028,11 @@ mod tests {
             (19, 40, 4, 2, 128),
             (19, 11, 4, 1, 256),
             (19, 40, 4, 1, 256),
+            // крупные tq (хвосты блоков 16 запросов, длинный контекст)
+            (64, 0, 4, 2, 128),
+            (65, 7, 4, 1, 128),
+            (128, 64, 4, 2, 128),
+            (200, 0, 4, 4, 128),
         ] {
             let tkv = past + tq;
             let mut r = rng((tq * 1000 + hd) as u64);

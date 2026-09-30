@@ -2272,6 +2272,15 @@ impl MetalCtx {
         // Матричные блоки окупаются при hd ≤ 128 (1.5× на Qwen3); при hd=256
         // (Qwen3.5, 16 голов) фрагментов O вдвое больше, а threadgroup'ов
         // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).
+        // Промпт: матричные блоки 8×8 (1.5× против прежнего кернела).
+        // Пробованы: блок 64 запроса на голову и тайлы K/V в разделяемой
+        // памяти с half-блоками (вчетверо меньше трафика K/V и вдвое быстрее
+        // блоки) — на всех формах верного результата получить не удалось,
+        // оставлен проверенный вариант. Длинный промпт (тысячи токенов)
+        // поэтому упирается во внимание: см. bench/README (Ф8.2e).
+        // Матричные блоки окупаются при hd ≤ 128 (1.5× на Qwen3); при hd=256
+        // (Qwen3.5, 16 голов) фрагментов O вдвое больше, а threadgroup'ов
+        // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).
         if b == 1
             && tq >= 16
             && hd.is_multiple_of(8)
@@ -2315,9 +2324,16 @@ impl MetalCtx {
             && std::env::var("INFER_ATTN_LEGACY").is_err()
         {
             let (tkv32, h32, kvh32, hd32) = (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
-            let bytes = (8 * (2 + hd) * 4).div_ceil(16) * 16;
-            let grid = MTLSize::new((n_heads * 256) as u64, 1, 1);
-            let group = MTLSize::new(256, 1, 1);
+            // Разбиение ключей: на длинном контексте 8 групп оставляли всего
+            // 32 threadgroup'а — каждый лейн тянул цепочку из сотен ключей
+            // последовательно (декод на 4k контекста падал до 1.3 ток/с).
+            // Число групп растёт с длиной KV: одна группа на ~64 ключа,
+            // не больше 32 (память слияния 32×(2+hd)×4 ≤ 16.6 КБ при hd=128).
+            let nsg = ((tkv + 63) / 64).clamp(1, 32);
+            let nsg32 = nsg as u32;
+            let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
+            let grid = MTLSize::new((n_heads * nsg * 32) as u64, 1, 1);
+            let group = MTLSize::new((nsg * 32) as u64, 1, 1);
             return self.run("attn_decode_split_f32", grid, group, |enc| {
                 enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
                 enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
@@ -2327,6 +2343,7 @@ impl MetalCtx {
                 enc.set_bytes(5, 4, (&h32 as *const u32).cast());
                 enc.set_bytes(6, 4, (&kvh32 as *const u32).cast());
                 enc.set_bytes(7, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&nsg32 as *const u32).cast());
                 enc.set_threadgroup_memory_length(0, bytes as u64);
             });
         }

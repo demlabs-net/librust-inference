@@ -433,6 +433,23 @@ impl Qwen3Model {
         }
     }
 
+    /// Формат хранилища KV, который выберет [`Self::load`] (Ф8.2f) — одна
+    /// точка правды для загрузки модели и для оценки памяти сервисом
+    /// (`infer-core::resources::kv_estimate_mb_fmt`): f16 обслуживают свои
+    /// кернелы только при hd ≤ 128, обычном RoPE и наличии QK-norm (иначе
+    /// KV пишется f32-кернелами). INFER_KV_F32/INFER_KV_F16 — A/B-рычаги.
+    pub fn kv_format_for(cfg: &Qwen3Config, has_qk_norm: bool) -> crate::dtype::KvFormat {
+        let force_f32 = std::env::var("INFER_KV_F32").is_ok();
+        let force_f16 = std::env::var("INFER_KV_F16").is_ok();
+        if !force_f32
+            && (force_f16 || (cfg.head_dim <= 128 && cfg.mrope_sections.is_none() && has_qk_norm))
+        {
+            crate::dtype::KvFormat::F16
+        } else {
+            crate::dtype::KvFormat::F32
+        }
+    }
+
     pub fn load(
         backend: &dyn Backend,
         w: &WeightsMap<'_>,
@@ -479,6 +496,9 @@ impl Qwen3Model {
             } else {
                 None
             };
+            // fused-путь (norm+RoPE+запись) требует QK-norm у обоих — от
+            // этого же зависит доступность f16-хранилища KV (см. ниже).
+            let has_qk_norm = q_norm.is_some() && k_norm.is_some();
             let qkv_bias = if w.get(&p("attn_q.bias")).is_some() {
                 let mut b = t(&p("attn_q.bias"))?;
                 b.extend(t(&p("attn_k.bias"))?);
@@ -532,17 +552,19 @@ impl Qwen3Model {
                 ffn,
             });
             // N (iter-10): KV запрашивается в f16 — вдвое меньше трафик
-            // attention и VRAM кэша. Настоящий f16-KV есть только на CUDA
-            // (кернелы attn_ar_v4_f16f16, тест kv_f16.rs); `KvCache::new`
-            // приводит формат к тому, что реально умеет бэкенд
-            // (`Backend::supported_kv_format`) — Metal только f32, иначе
-            // f32-данные не влезали в f16-аллокацию (половина байт).
+            // attention и VRAM кэша. `KvCache::new` приводит формат к тому,
+            // что реально умеет бэкенд (`Backend::supported_kv_format`).
+            // Ф8.2f: на Metal f16-хранилище обслуживают свои кернелы, но
+            // только при hd ≤ 128 и на fused-пути (norm+RoPE+запись одним
+            // кернелом) — он же требует QK-norm и обычного RoPE. Иначе
+            // остаёмся на f32 (у Qwen3.5 hd=256, у Omni — mrope/без QK-norm).
+            let fmt = Self::kv_format_for(&cfg, has_qk_norm);
             caches.push(KvCache::new(
                 backend,
                 cfg.n_kv_heads,
                 cfg.head_dim,
-                crate::dtype::KvFormat::F16,
-                crate::dtype::KvFormat::F16,
+                fmt,
+                fmt,
                 cfg.rope_theta,
                 cfg.mrope_sections,
             )?);
@@ -1465,10 +1487,12 @@ impl Qwen3Model {
         // norm/rope ×2, kv_update ×2 — у малых моделей мелкие кернелы
         // стоили больше матвеков). Прочие случаи (M-RoPE, DFlash cache_at,
         // модели без QK-norm, f16/q8-KV) — прежним путём.
+        // f16-хранилище обслуживается тем же fused-путём (qkv_norm_rope_kv
+        // сам выбирает кернел по типу k-буфера и пишет q в half).
         let fused = cache_at.is_none()
             && mrope.is_none()
             && cfg.mrope_sections.is_none()
-            && cache.is_f32()
+            && (cache.is_f32() || cache.is_f16())
             && std::env::var("INFER_QKV_UNFUSED").is_err();
         let (q, t_norm, t_upd_d) = if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
             let t_upd = std::time::Instant::now();

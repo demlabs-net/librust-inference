@@ -475,6 +475,21 @@ impl KvCache {
 
     /// KV-объект (7.8): геометрия кэша — нужна импортёру, чтобы собрать
     /// такой же кэш (и отказаться, если KV от другой модели).
+    /// Форматы, в которых k и v лежат РЕАЛЬНО (после `supported_kv_format`):
+    /// f16-запрос на бэкенде без f16-кернелов деградировал бы к f32 молча —
+    /// геттер делает это видимым снаружи (тесты/сервис).
+    pub fn stored_formats(&self) -> (crate::dtype::KvFormat, crate::dtype::KvFormat) {
+        (self.k_format, self.v_format)
+    }
+
+    /// Байты, занятые хранилищем k+v ЦЕЛИКОМ (по ёмкости, не по pos):
+    /// отчёт о памяти под контекст (f16 вдвое меньше f32) и проверка формата.
+    pub fn storage_bytes(&self) -> usize {
+        let bpe = |f: crate::dtype::KvFormat| f.bytes_per_elem() as f64;
+        (self.k.numel() as f64 * bpe(self.k_format) + self.v.numel() as f64 * bpe(self.v_format))
+            as usize
+    }
+
     pub fn geometry(&self) -> KvGeometry {
         KvGeometry {
             n_kv_heads: self.k.shape()[2] / self.head_dim,
@@ -679,6 +694,12 @@ impl KvCache {
     /// Хранилище k и v — f32 (прямая запись fused-кернелом допустима).
     pub(crate) fn is_f32(&self) -> bool {
         self.k_format == crate::dtype::KvFormat::F32 && self.v_format == crate::dtype::KvFormat::F32
+    }
+
+    /// Ф8.2f: оба хранилища — f16 (у Metal свой fused-кернел записи и свои
+    /// кернелы внимания; см. `MetalBackend::supported_kv_format`).
+    pub(crate) fn is_f16(&self) -> bool {
+        self.k_format == crate::dtype::KvFormat::F16 && self.v_format == crate::dtype::KvFormat::F16
     }
 
     /// View of the first `pos` rows (same buffer, restricted shape).

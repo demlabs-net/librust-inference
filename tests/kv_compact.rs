@@ -13,6 +13,25 @@ fn backend() -> Option<std::sync::Arc<dyn Backend>> {
     default_backend().ok()
 }
 
+/// Чтение хранилища KV в f32 независимо от формата: Metal с Ф8.2f держит
+/// f16-кэш НАСТОЯЩИМ half (to_cpu_f32 такой тензор отвергает — читаем
+/// to_cpu_f16 и расширяем). Формат — по типу тензора, не по запрошенному:
+/// CPU-бэкенд, например, приводил бы f16-запрос к f32-хранилищу.
+fn read_kv_f32(b: &dyn Backend, t: &Tensor) -> Vec<f32> {
+    match t.dtype() {
+        rust_inference::dtype::Dtype::F16 => b
+            .to_cpu_f16(t)
+            .unwrap()
+            .iter()
+            .map(|&h| f32::from(h))
+            .collect(),
+        other => {
+            assert_eq!(other, rust_inference::dtype::Dtype::F32, "KV dtype {other:?}");
+            b.to_cpu_f32(t).unwrap()
+        }
+    }
+}
+
 /// Standard rope for one (1, 1, D) tensor at an absolute position.
 fn rope(b: &dyn Backend, x: &Tensor, pos: usize, hd: usize, theta: f32) -> Tensor {
     b.rope_standard(x, pos, hd, theta).expect("rope")
@@ -203,7 +222,7 @@ fn compact_rolls_quantized_formats() {
                 .expect("update");
         }
         assert_eq!(a.pos, 8, "{name}: window pos after the roll");
-        let av = b.to_cpu_f32(&a.view_v()).unwrap();
+        let av = read_kv_f32(b.as_ref(), &a.view_v());
         for j in 0..8 {
             // The values are a pure move: slot j == slot j+4 of the ORIGINAL
             // sequence — the exactness holds across the storage formats (the

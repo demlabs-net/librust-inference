@@ -1076,7 +1076,51 @@ kernel void codebook_search_f32(
     idx[r] = bi;
 }
 
+// ── f32 → f16 (приведение Q к типу f16-кэша; Ф8.2f) ────────────────────────
+kernel void cast_f32_f16(
+    device const float* SRC [[buffer(0)]],
+    device half* DST [[buffer(1)]],
+    constant uint& N4 [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < N4) ((device half4*)DST)[gid] = half4(((device const float4*)SRC)[gid]);
+}
+
 // ── KV-cache update: dst (B, cap, D)[b, pos+t, d] = src (B, Tq, D)[b, t, d] ─
+// Запись в f16-кэш (Ф8.2f): значения квантизуются на записи (как в llama.cpp,
+// где KV по умолчанию f16) — вдвое меньше памяти под контекст и вдвое меньше
+// трафика внимания.
+kernel void kv_update_f16_f32(
+    device half* dst [[buffer(0)]],
+    device const float* src [[buffer(1)]],
+    constant uint& B [[buffer(2)]],
+    constant uint& Tq [[buffer(3)]],
+    constant uint& pos [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    constant uint& cap [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x, t = gid.y, d = gid.z;
+    if (b >= B || t >= Tq || d >= D) return;
+    dst[(b * cap + pos + t) * D + d] = (half)src[(b * Tq + t) * D + d];
+}
+
+// Копия half→half (рост ёмкости f16-кэша, Ф8.2f).
+kernel void kv_copy_f16(
+    device half* dst [[buffer(0)]],
+    device const half* src [[buffer(1)]],
+    constant uint& B [[buffer(2)]],
+    constant uint& Tq [[buffer(3)]],
+    constant uint& pos [[buffer(4)]],
+    constant uint& D [[buffer(5)]],
+    constant uint& cap [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x, t = gid.y, d = gid.z;
+    if (b >= B || t >= Tq || d >= D) return;
+    dst[(b * cap + pos + t) * D + d] = src[(b * Tq + t) * D + d];
+}
+
 kernel void kv_update_f32(
     device float* dst [[buffer(0)]],
     device const float* src [[buffer(1)]],
@@ -3729,5 +3773,362 @@ kernel void attn_prefill_combine_f32(
             acc += w * *(device const float4*)(rowp + 2u + c * 4u);
         }
         *(device float4*)(Y + (ulong)row * HD + c * 4u) = acc * inv;
+    }
+}
+
+// ═══════════════ Ф8.2f: f16-KV — кернелы (вдвое меньше памяти и трафика) ══════
+// llama.cpp держит KV в f16 по умолчанию; у нас кэш был f32 (память под
+// контекст вдвое больше, трафик внимания вдвое выше). Здесь f16-варианты
+// трёх кернелов: слитый разбор qkv (пишет half Q/K/V), декодное внимание
+// (half4-чтения) и предфилл-внимание (half-фрагменты 8×8, накопление float).
+
+// Слитый qkv: Q (half) + K/V прямо в f16-кэш.
+kernel void qkv_norm_rope_kv_f16_f32(
+    device const float* QKV [[buffer(0)]],
+    device const float* WQ [[buffer(1)]],
+    device const float* WK [[buffer(2)]],
+    device half* Q [[buffer(3)]],
+    device half* KBUF [[buffer(4)]],
+    device half* VBUF [[buffer(5)]],
+    constant uint& T [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    constant uint& rope_pos [[buffer(10)]],
+    constant uint& pos_kv [[buffer(11)]],
+    constant float& theta [[buffer(12)]],
+    constant float& eps [[buffer(13)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint NHT = H + 2u * KVH;
+    const uint head = gid / 32u, lane = gid % 32u;
+    if (head >= T * NHT) return;
+    const uint t = head / NHT, hh = head % NHT;
+    device const float* x = QKV + (ulong)t * NHT * HD + (ulong)hh * HD;
+    if (hh >= H + KVH) {
+        device half* y = VBUF + ((ulong)(pos_kv + t) * KVH + (hh - H - KVH)) * HD;
+        for (uint i = lane; i < HD; i += 32u) y[i] = (half)x[i];
+        return;
+    }
+    const bool is_q = hh < H;
+    device const float* W = is_q ? WQ : WK;
+    device half* y = is_q ? Q + ((ulong)t * H + hh) * HD
+                          : KBUF + ((ulong)(pos_kv + t) * KVH + (hh - H)) * HD;
+    float s = 0.0f;
+    for (uint i = lane; i < HD; i += 32u) s += x[i] * x[i];
+    const float inv = rsqrt(simd_sum(s) / (float)HD + eps);
+    const float p = (float)(rope_pos + t);
+    const uint half_hd = HD / 2u;
+    for (uint i = lane; i < half_hd; i += 32u) {
+        const float fr = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
+        const float c = cos(p * fr), sn = sin(p * fr);
+        const float x0 = x[i] * inv * W[i];
+        const float x1 = x[i + half_hd] * inv * W[i + half_hd];
+        y[i] = (half)(x0 * c - x1 * sn);
+        y[i + half_hd] = (half)(x1 * c + x0 * sn);
+    }
+}
+
+// Декодное внимание по f16-кэшу: K/V читаются half4 (вдвое меньше трафика).
+kernel void attn_decode_split_f16(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& Tkv [[buffer(4)]],
+    constant uint& H [[buffer(5)]],
+    constant uint& KVH [[buffer(6)]],
+    constant uint& HD [[buffer(7)]],
+    constant uint& NSG [[buffer(8)]],
+    threadgroup float* sh [[threadgroup(0)]],
+    uint h [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    if (h >= H) return;
+    const uint kvh = h / (H / KVH);
+    const uint KD = KVH * HD;
+    const uint n4 = HD / 4u;
+    const uint nc = (n4 + 31u) / 32u;
+    const float scale = 1.0f / sqrt((float)HD);
+    device const half4* q4 = (device const half4*)(Q + h * HD);
+    float4 qv[2], acc[2];
+    for (uint c = 0; c < 2u; ++c) {
+        const uint d4 = lane + 32u * c;
+        float4 qq = (c < nc && d4 < n4) ? float4(q4[d4]) : float4(0.0f);
+        qv[c] = qq * scale;
+        acc[c] = float4(0.0f);
+    }
+    float m = -INFINITY, s = 0.0f;
+    for (uint j = sgitg; j < Tkv; j += NSG) {
+        device const half4* k4 = (device const half4*)(K + (ulong)j * KD + kvh * HD);
+        float dot = 0.0f;
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) {
+                const float4 kk = float4(k4[d4]);
+                dot += qv[c].x * kk.x + qv[c].y * kk.y + qv[c].z * kk.z + qv[c].w * kk.w;
+            }
+        }
+        const float sc = simd_sum(dot);
+        const float mn = max(m, sc);
+        const float corr = exp(m - mn);
+        const float p = exp(sc - mn);
+        s = s * corr + p;
+        device const half4* v4 = (device const half4*)(V + (ulong)j * KD + kvh * HD);
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) acc[c] = acc[c] * corr + p * float4(v4[d4]);
+        }
+        m = mn;
+    }
+    threadgroup float* mine = sh + sgitg * (2u + HD);
+    if (lane == 0u) { mine[0] = m; mine[1] = s; }
+    for (uint c = 0; c < nc; ++c) {
+        const uint d4 = lane + 32u * c;
+        if (d4 < n4) *((threadgroup float4*)(mine + 2u) + d4) = acc[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg != 0u) return;
+    float gm = -INFINITY;
+    for (uint g = 0; g < NSG; ++g) gm = max(gm, sh[g * (2u + HD)]);
+    float gs = 0.0f;
+    float4 out[2] = {float4(0.0f), float4(0.0f)};
+    for (uint g = 0; g < NSG; ++g) {
+        threadgroup float* part = sh + g * (2u + HD);
+        const float w = (part[0] == -INFINITY) ? 0.0f : exp(part[0] - gm);
+        gs += part[1] * w;
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) out[c] += *((threadgroup float4*)(part + 2u) + d4) * w;
+        }
+    }
+    const float inv = (gs > 0.0f) ? 1.0f / gs : 0.0f;
+    device float4* y4 = (device float4*)(Y + h * HD);
+    for (uint c = 0; c < nc; ++c) {
+        const uint d4 = lane + 32u * c;
+        if (d4 < n4) y4[d4] = out[c] * inv;
+    }
+}
+
+// Общий f16-путь внимания (любые Tq, маска): port attn_ar_f32_fused с
+// half4-чтением Q/K/V (голова = 32 лейна, online-softmax). Хвостовые
+// чанки промпта (Tq < 16) и короткие промпты матричных кернелов не имеют.
+kernel void attn_ar_f16_fused(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    constant uint& Tq [[buffer(6)]],
+    constant uint& Tkv [[buffer(7)]],
+    constant uint& H [[buffer(8)]],
+    constant uint& KVH [[buffer(9)]],
+    constant uint& HD [[buffer(10)]],
+    constant uint& n_rep [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.x;
+    uint n4 = HD / 4u;
+    uint h = gid.y / 32u;
+    uint lane = gid.y % 32u;
+    uint t = gid.z;
+    if (b >= B || h >= H || t >= Tq) return;
+    uint kvh = h / n_rep;
+    uint D = H * HD;
+    uint KVD = KVH * HD;
+    const float scale = 1.0f / sqrt((float)HD);
+    uint nc = (n4 + 31u) / 32u;
+    const uint MAXC = 4u;
+    const device half4* qrow4 = (const device half4*)(Q + (b * Tq + t) * D + h * HD);
+    float4 q4[MAXC];
+    float4 y4[MAXC];
+    for (uint c = 0u; c < MAXC; ++c) {
+        uint d4 = lane + 32u * c;
+        q4[c] = (c < nc && d4 < n4) ? float4(qrow4[d4]) : float4(0.0f);
+        y4[c] = float4(0.0f);
+    }
+    const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;
+    float m = -INFINITY;
+    float ssum_local = 0.0f;
+    for (uint j = 0u; j < Tkv; ++j) {
+        const device half4* krow4 = (const device half4*)(K + (b * Tkv + j) * KVD + kvh * HD);
+        float acc = 0.0f;
+        for (uint c = 0u; c < nc; ++c) {
+            uint d4 = lane + 32u * c;
+            if (d4 < n4) {
+                float4 k4 = float4(krow4[d4]);
+                acc += q4[c].x * k4.x + q4[c].y * k4.y + q4[c].z * k4.z + q4[c].w * k4.w;
+            }
+        }
+        float s = simd_sum(acc) * scale;
+        if (maskrow != nullptr) s += maskrow[j];
+        if (s == -INFINITY) continue;
+        if (s > m) {
+            float e = exp(m - s);
+            for (uint c = 0u; c < nc; ++c) y4[c] *= e;
+            ssum_local *= e;
+            m = s;
+        }
+        float w = exp(s - m);
+        ssum_local += w;
+        const device half4* vrow4 = (const device half4*)(V + (b * Tkv + j) * KVD + kvh * HD);
+        for (uint c = 0u; c < nc; ++c) {
+            uint d4 = lane + 32u * c;
+            if (d4 < n4) y4[c] += w * float4(vrow4[d4]);
+        }
+    }
+    float inv = (ssum_local > 0.0f) ? 1.0f / ssum_local : 0.0f;
+    device float4* yrow4 = (device float4*)(Y + (b * Tq + t) * D + h * HD);
+    if (n4 < 32u) {
+        uint d4 = lane % n4;
+        if (lane < n4) yrow4[d4] = y4[0] * inv;
+    } else {
+        for (uint c = 0u; c < nc; ++c) {
+            uint d4 = lane + 32u * c;
+            if (d4 < n4) yrow4[d4] = y4[c] * inv;
+        }
+    }
+}
+
+// Предфилл-внимание по f16-кэшу: Q/K/V — half-фрагменты 8×8, накопление float.
+kernel void attn_prefill_mma_f16(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& Tq [[buffer(5)]],
+    constant uint& Tkv [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    threadgroup char* shm [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tpt [[thread_position_in_threadgroup]])
+{
+    threadgroup float* sS = (threadgroup float*)shm;             // 2×(8×32) float
+    threadgroup half* sP = (threadgroup half*)(sS + 2u * 8u * 32u);
+    threadgroup float* sD = (threadgroup float*)(sP + 2u * 8u * 32u);
+    threadgroup float* sL = sD + 2u * 64u;
+    threadgroup half* sQh = (threadgroup half*)(sL + 16u);       // 16×HD half
+    const uint lane = tpt.x % 32u;
+    const uint sg = tpt.x / 32u;
+    const uint h = tgpig.y;
+    const uint kvh = h / (H / KVH);
+    // База БЛОКА строк threadgroup'а (16 строк) — не путать с базой строк
+    // simdgroup'а (qtg + sg*8): Q-тайл общий на threadgroup.
+    const uint qtg = tgpig.x * 16u;
+    const uint D = H * HD, KD = KVH * HD;
+    const uint nf = HD / 8u;
+    const float scale = 1.0f / sqrt((float)HD);
+    threadgroup float* myS = sS + sg * 8u * 32u;
+    threadgroup float* myD = sD + sg * 64u;
+    // Q — через разделяемую память с построчной защитой: хвостовой блок
+    // (Tq не кратно 16) обязан сохранить СВОИ строки, а не обнулить весь
+    // 8-строчный фрагмент (иначе последние 1–7 запросов промпта считаются
+    // по нулевому Q — было: tq=37, past=11 давало 10 % ошибки).
+    for (uint e = tpt.x; e < 16u * HD; e += 64u) {
+        const uint r = e / HD, c = e % HD;
+        const uint qi = qtg + r;
+        sQh[e] = (qi < Tq) ? Q[(ulong)qi * D + h * HD + c] : (half)0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qa[16];
+    for (uint f = 0; f < nf; ++f) {
+        simdgroup_load(qa[f], sQh + sg * 8u * HD + f * 8u, HD);
+    }
+    simdgroup_float8x8 o[16];
+    for (uint f = 0; f < nf; ++f) o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    float m_run = -INFINITY, l_run = 0.0f;
+    for (uint kb = 0; kb < Tkv; kb += 32u) {
+        for (uint j = 0; j < 4u; ++j) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+            // Хвост Tkv не кратен 8: адрес прижимается к последней строке —
+            // строки фрагмента за концом окна отсекаются маской softmax (их P
+            // ровно 0), а чтение остаётся внутри аллокации кэша (cap ≥ 256).
+            const uint kj = min(kb + j * 8u, Tkv - 1u);
+            for (uint f = 0; f < nf; ++f) {
+                simdgroup_half8x8 kf;
+                simdgroup_load(kf, K + (ulong)kj * KD + kvh * HD + f * 8u, KD, 0, true);
+                simdgroup_multiply_accumulate(s, qa[f], kf, s);
+            }
+            simdgroup_store(s, myS + j * 8u, 32u);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8u) {
+            const uint qi = qtg + sg * 8u + lane;
+            float mx = m_run;
+            for (uint j = 0; j < 32u; ++j) {
+                const uint kj = kb + j;
+                float v = myS[lane * 32u + j] * scale;
+                if (kj >= Tkv || qi >= Tq) v = -INFINITY;
+                else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
+                myS[lane * 32u + j] = v;
+                mx = max(mx, v);
+            }
+            float l = 0.0f;
+            for (uint j = 0; j < 32u; ++j) {
+                const float v = myS[lane * 32u + j];
+                const float p = (v == -INFINITY) ? 0.0f : exp(v - mx);
+                sP[(sg * 8u + lane) * 32u + j] = (half)p;
+                l += p;
+            }
+            const float corr = (m_run == -INFINITY) ? 0.0f : exp(m_run - mx);
+            l_run = l_run * corr + l;
+            m_run = mx;
+            for (uint c = 0; c < 8u; ++c) myD[lane * 8u + c] = (c == lane) ? corr : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 cd;
+        simdgroup_load(cd, myD, 8u);
+        for (uint f = 0; f < nf; ++f) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
+            simdgroup_multiply(acc, cd, o[f]);
+            for (uint j = 0; j < 4u; ++j) {
+                const uint kj = min(kb + j * 8u, Tkv - 1u);
+                simdgroup_half8x8 pa, vb;
+                simdgroup_load(pa, sP + (sg * 8u) * 32u + j * 8u, 32u);
+                simdgroup_load(vb, V + (ulong)kj * KD + kvh * HD + f * 8u, KD);
+                simdgroup_multiply_accumulate(acc, pa, vb, acc);
+            }
+            o[f] = acc;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < 8u) sL[sg * 8u + lane] = (l_run > 0.0f) ? 1.0f / l_run : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8u) {
+        const float inv = sL[sg * 8u + lane];
+        for (uint c = 0; c < 8u; ++c) myD[lane * 8u + c] = (c == lane) ? inv : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dinv;
+    simdgroup_load(dinv, myD, 8u);
+    for (uint f = 0; f < nf; ++f) {
+        simdgroup_float8x8 res;
+        simdgroup_multiply(res, dinv, o[f]);
+        simdgroup_store(res, myS + (f % 4u) * 8u, 32u);
+        if (f % 4u == 3u || f + 1u == nf) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint fbase = (f / 4u) * 4u;
+            const uint fcount = f - fbase + 1u;
+            for (uint e = lane; e < 8u * fcount * 8u; e += 32u) {
+                const uint c = e % 8u;
+                const uint t1 = e / 8u;
+                const uint fi = t1 % fcount;
+                const uint r = t1 / fcount;
+                // Строка ВСЕГО threadgroup: свой блок строк этого simdgroup'а
+                // — sg*8 + r (без sg*8 оба писали строки q0..q0+7: строки
+                // 8..15 оставались нулями, «верхние» затирали верные).
+                const uint qi = qtg + sg * 8u + r;
+                if (qi < Tq) {
+                    for (uint cc = 0; cc < 8u; ++cc)
+                        Y[(ulong)qi * D + h * HD + (fbase + fi) * 8u + cc] = myS[r * 32u + fi * 8u + cc];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 }

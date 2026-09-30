@@ -320,6 +320,25 @@ impl GpuTensor {
         })
     }
 
+    /// Zero-filled f16 buffer (f16-KV/активации, Ф8.2f).
+    pub fn zeros_f16(device: &Device, shape: Vec<usize>) -> Result<Self, MetalError> {
+        let bytes = shape.iter().product::<usize>() * 2;
+        let buffer = with_pool(|p| p.acquire(device, bytes));
+        if buffer.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        unsafe {
+            std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, bytes);
+        }
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F16,
+            offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
+        })
+    }
+
     /// Upload fp16 GEMM weights (2 bytes/element; the gemm kernels decode
     /// and accumulate in fp32).
     pub fn from_cpu_f16(
@@ -2251,6 +2270,139 @@ impl MetalCtx {
 
     /// y (B,Tq,H*HD). Mask (B,Tq,Tkv) or None (generation, causal).
     #[allow(clippy::too_many_arguments)]
+    /// Внимание по f16-кэшу (Ф8.2f). Требует f16 у всех трёх входов: fused
+    /// `qkv_norm_rope_kv` пишет Q сразу в half, поэтому смешанных форматов
+    /// на этом пути нет (не-fused ветки модель для f16-кэша не выбирает).
+    fn attn_ar_f16(
+        &self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        mask: Option<&GpuTensor>,
+        y: &GpuTensor,
+        n_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Result<(), MetalError> {
+        let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
+        let tkv = k.shape[1];
+        if v.dtype != GpuDtype::F16 {
+            return Err(MetalError::Shape(format!(
+                "attn_ar: V не f16 при f16-K: q {:?}, k {:?}, v {:?}",
+                q.dtype, k.dtype, v.dtype
+            )));
+        }
+        // Q бывает f32 (ветки без fused qkv — DFlash-драфтер): приводим к f16
+        // отдельным проходом; тензор запроса мал (Tq×H·HD).
+        let qh_store;
+        let q = match q.dtype {
+            GpuDtype::F16 => q,
+            GpuDtype::F32 => {
+                let n: usize = q.shape.iter().product();
+                if !n.is_multiple_of(4) {
+                    return Err(MetalError::Shape(format!(
+                        "attn_ar f16: число элементов Q ({n}) не кратно 4"
+                    )));
+                }
+                let dst = GpuTensor::zeros_f16(&self.device, q.shape.clone())?;
+                let n4 = (n / 4) as u32;
+                self.run(
+                    "cast_f32_f16",
+                    MTLSize::new((n / 4) as u64, 1, 1),
+                    MTLSize::new(64, 1, 1),
+                    |enc| {
+                        enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                        enc.set_buffer(1, Some(&dst.buffer), dst.offset as u64);
+                        enc.set_bytes(2, 4, (&n4 as *const u32).cast());
+                    },
+                )?;
+                qh_store = dst;
+                &qh_store
+            }
+            other => {
+                return Err(MetalError::Shape(format!(
+                    "attn_ar f16: тип Q {other:?} не поддержан"
+                )));
+            }
+        };
+        if !n_heads.is_multiple_of(kv_heads) || !hd.is_multiple_of(4) {
+            return Err(MetalError::Shape(format!(
+                "attn_ar f16: H={n_heads} не делится на KVH={kv_heads} или HD={hd} не кратен 4"
+            )));
+        }
+        // Предфилл: half×half матричные блоки (16 запросов/threadgroup).
+        if b == 1 && tq >= 16 && hd.is_multiple_of(8) && hd <= 128 {
+            let (tq32, tkv32, h32, kvh32, hd32) =
+                (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            // S float 2×8×32 + P half 2×8×32 + диаг float 2×64 + 1/l 2×8
+            // + Q half 16×HD (стейджинг с построчной защитой хвоста).
+            let bytes: u64 =
+                (2 * 8 * 32 * 4 + 2 * 8 * 32 * 2 + 2 * 64 * 4 + 2 * 8 * 4 + 16 * hd * 2) as u64;
+            let grid = MTLSize::new((tq.div_ceil(16) * 64) as u64, n_heads as u64, 1);
+            let group = MTLSize::new(64, 1, 1);
+            return self.run("attn_prefill_mma_f16", grid, group, |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(
+                    3,
+                    mask.map(|m| &*m.buffer),
+                    mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+                );
+                enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(5, 4, (&tq32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&tkv32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+                enc.set_threadgroup_memory_length(0, bytes);
+            });
+        }
+        // Декод (один запрос, без маски): split-K, half4-чтения.
+        if b == 1 && tq == 1 && mask.is_none() && hd <= 256 {
+            let (tkv32, h32, kvh32, hd32) =
+                (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            let nsg = ((tkv + 63) / 64).clamp(1, 32);
+            let nsg32 = nsg as u32;
+            let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
+            let grid = MTLSize::new((n_heads * nsg * 32) as u64, 1, 1);
+            let group = MTLSize::new((nsg * 32) as u64, 1, 1);
+            return self.run("attn_decode_split_f16", grid, group, |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(4, 4, (&tkv32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&nsg32 as *const u32).cast());
+                enc.set_threadgroup_memory_length(0, bytes as u64);
+            });
+        }
+        // Общий путь: любые Tq (в т.ч. хвостовой чанк), маска, hd до 512.
+        let n_rep = n_heads / kv_heads;
+        let grid = MTLSize::new(b as u64, (n_heads * 32) as u64, tq as u64);
+        let group = MTLSize::new(1, 32, 1);
+        self.run("attn_ar_f16_fused", grid, group, |enc| {
+            enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+            enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+            enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(
+                3,
+                mask.map(|m| &*m.buffer),
+                mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+            );
+            enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
+            for (i, v) in [b, tq, tkv, n_heads, kv_heads, hd, n_rep]
+                .iter()
+                .enumerate()
+            {
+                enc.set_bytes((5 + i) as u64, 8, (v as *const usize).cast());
+            }
+        })
+    }
+
     pub fn attn_ar_f32(
         &self,
         q: &GpuTensor,
@@ -2262,6 +2414,12 @@ impl MetalCtx {
         kv_heads: usize,
         hd: usize,
     ) -> Result<(), MetalError> {
+        // f16-KV (Ф8.2f): K/V (а с fused-путём и Q) — half. Диспетчер:
+        // предфилл — матричные half-блоки, декод — split-K по half4, прочее
+        // (хвосты чанков Tq<16, короткие промпты) — общий f16-кернел.
+        if k.dtype == GpuDtype::F16 {
+            return self.attn_ar_f16(q, k, v, mask, y, n_heads, kv_heads, hd);
+        }
         let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
         let tkv = k.shape[1];
         let n_rep = n_heads / kv_heads;
@@ -2726,6 +2884,34 @@ impl MetalCtx {
         src: &GpuTensor,
         pos: usize,
     ) -> Result<(), MetalError> {
+        // f16-хранилище — свой кернел (квантизация на записи); f32→f32 и
+        // f16→f16 (рост кэша копией) обслуживаются дальше по типу.
+        if dst.dtype == GpuDtype::F16 && src.dtype == GpuDtype::F32 {
+            let (b, tq, d) = (src.shape[0], src.shape[1], src.shape[2]);
+            let cap = dst.shape[1];
+            let grid = MTLSize::new(b as u64, tq as u64, d as u64);
+            let group = MTLSize::new(1, 4, 4);
+            return self.run("kv_update_f16_f32", grid, group, |enc| {
+                enc.set_buffer(0, Some(&dst.buffer), dst.offset as u64);
+                enc.set_buffer(1, Some(&src.buffer), src.offset as u64);
+                for (i, v) in [b, tq, pos, d, cap].iter().enumerate() {
+                    enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
+                }
+            });
+        }
+        if dst.dtype == GpuDtype::F16 && src.dtype == GpuDtype::F16 {
+            let (b, tq, d) = (src.shape[0], src.shape[1], src.shape[2]);
+            let cap = dst.shape[1];
+            let grid = MTLSize::new(b as u64, tq as u64, d as u64);
+            let group = MTLSize::new(1, 4, 4);
+            return self.run("kv_copy_f16", grid, group, |enc| {
+                enc.set_buffer(0, Some(&dst.buffer), dst.offset as u64);
+                enc.set_buffer(1, Some(&src.buffer), src.offset as u64);
+                for (i, v) in [b, tq, pos, d, cap].iter().enumerate() {
+                    enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
+                }
+            });
+        }
         let (b, tq, d) = (src.shape[0], src.shape[1], src.shape[2]);
         let cap = dst.shape[1];
         let grid = MTLSize::new(b as u64, tq as u64, d as u64);
@@ -3009,6 +3195,49 @@ impl crate::backend::Backend for MetalBackend {
         eps: f32,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         let t = qkv.numel() / ((h + 2 * kvh) * hd);
+        // f16-KV (Ф8.2f): Q тоже пишется в half — внимание тогда идёт
+        // f16-кернелами (half-фрагменты 8×8 и half4-чтения, вдвое меньше
+        // трафика). Выбор по типу k-буфера: f16-кэш ⇒ f16-путь.
+        if kbuf.dtype() == crate::dtype::Dtype::F16 {
+            if vbuf.dtype() != crate::dtype::Dtype::F16 {
+                return Err(crate::error::BackendError::Shape(
+                    "qkv_norm_rope_kv: k-буфер f16, v-буфер не f16".into(),
+                ));
+            }
+            let (kg, vg) = (kbuf.as_gpu(), vbuf.as_gpu());
+            let qh = GpuTensor::from_cpu_f16(
+                &self.ctx.device,
+                &vec![half::f16::from_f32(0.0); t * h * hd],
+                vec![1, t, h * hd],
+            )?;
+            let (xg, wq, wk) = (qkv.as_gpu(), q_norm.as_gpu(), k_norm.as_gpu());
+            let (t32, h32, kvh32, hd32, rp32, pk32) = (
+                t as u32,
+                h as u32,
+                kvh as u32,
+                hd as u32,
+                rope_pos as u32,
+                pos_kv as u32,
+            );
+            let grid = MTLSize::new((t * (h + 2 * kvh) * 32) as u64, 1, 1);
+            self.ctx.run("qkv_norm_rope_kv_f16_f32", grid, MTLSize::new(64, 1, 1), |enc| {
+                enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+                enc.set_buffer(1, Some(&wq.buffer), wq.offset as u64);
+                enc.set_buffer(2, Some(&wk.buffer), wk.offset as u64);
+                enc.set_buffer(3, Some(&qh.buffer), qh.offset as u64);
+                enc.set_buffer(4, Some(&kg.buffer), kg.offset as u64);
+                enc.set_buffer(5, Some(&vg.buffer), vg.offset as u64);
+                enc.set_bytes(6, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(10, 4, (&rp32 as *const u32).cast());
+                enc.set_bytes(11, 4, (&pk32 as *const u32).cast());
+                enc.set_bytes(12, 4, (&theta as *const f32).cast());
+                enc.set_bytes(13, 4, (&eps as *const f32).cast());
+            })?;
+            return Ok(crate::backend::Tensor::from_gpu(qh));
+        }
         let (kg, vg) = (kbuf.as_gpu(), vbuf.as_gpu());
         // KV-буферы обязаны быть f32 и вмещать строки [pos_kv, pos_kv + t).
         let cap = kg.shape[kg.shape.len() - 2];
@@ -3326,15 +3555,12 @@ impl crate::backend::Backend for MetalBackend {
         Ok(crate::backend::Tensor::from_gpu(y))
     }
 
-    /// Metal's KV kernels are f32-only (`kv_update_f32`/`attn_ar_f32`; the
-    /// true f16 KV kernels — `attn_ar_v4_f16f16` — are CUDA's). An f16-typed
-    /// KV allocation therefore stores f32 values with half the bytes they
-    /// need: the attention ran past the end of the buffer from ~cap/2 rows on
-    /// (garbage/NaN in long contexts) and every host-side read of the cache
-    /// (the window roll) either refused or read halfs of f32 words. Coerce to
-    /// f32 until real f16 KV kernels exist here.
-    fn supported_kv_format(&self, _fmt: crate::dtype::KvFormat) -> crate::dtype::KvFormat {
-        crate::dtype::KvFormat::F32
+    /// f16-KV (Ф8.2f): запись — `kv_update_f16_f32` (квантизация на записи),
+    /// внимание — f16-варианты кернелов (см. attn_*_f16). Формат запрашивает
+    /// модель (hd ≤ 128: у кернелов для hd=256 f16-варианта нет); при
+    /// хранилище f32 всё идёт прежним путём.
+    fn supported_kv_format(&self, fmt: crate::dtype::KvFormat) -> crate::dtype::KvFormat {
+        fmt
     }
 
     fn begin_batch(&self) -> Result<(), crate::error::BackendError> {

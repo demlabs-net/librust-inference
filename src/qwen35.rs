@@ -387,12 +387,20 @@ impl Qwen35Model {
                 caches.push(None);
                 states.push(Some(Self::fresh_state(backend, &cfg)?));
             } else {
+                // Ф8.2f: KV гибрида тоже в f16 (half-кэш; y слоёв полного
+                // внимания — доля меньшая, но трафик внимания вдвое ниже).
+                // INFER_KV_F32=1 — A/B-рычаг, как у Qwen3.
+                let fmt = if std::env::var("INFER_KV_F32").is_ok() {
+                    crate::dtype::KvFormat::F32
+                } else {
+                    crate::dtype::KvFormat::F16
+                };
                 let mut kv = KvCache::new(
                     backend,
                     cfg.n_kv_heads,
                     hd,
-                    crate::dtype::KvFormat::F16,
-                    crate::dtype::KvFormat::F16,
+                    fmt,
+                    fmt,
                     cfg.rope_theta,
                     Some(cfg.rope_sections),
                 )?;
@@ -1083,6 +1091,147 @@ mod tests {
                 tol,
                 &format!("prefill attn tq={tq} past={past} kv={nkv} hd={hd}"),
             );
+        }
+    }
+
+    /// f16-KV (Ф8.2f): внимание по half-кэшу == CPU-референс, посчитанный по
+    /// ПОЛУ-ОКРУГЛЁННЫМ k/v (та же потеря точности, что и в кэше). Покрывает
+    /// все ветки диспетчера: декод (split-K), предфилл (half-матрицы 8×8) и
+    /// общий путь для хвостов Tq < 16; Q подаётся в f32 — ветка приведения.
+    #[test]
+    fn f16_kv_attention_matches_reference() {
+        let be = MetalBackend::new().unwrap();
+        for &(tq, past, nh, nkv, hd) in &[
+            (1usize, 0usize, 1usize, 1usize, 8usize),
+            (1, 0, 4, 2, 128),
+            (1, 299, 4, 2, 128), // split-K: nsg > 1
+            (1, 1000, 4, 2, 128),
+            (1, 40, 4, 1, 64),
+            (7, 0, 4, 2, 128), // общий путь (Tq < 16)
+            (7, 33, 4, 1, 128),
+            (15, 17, 2, 1, 128),
+            (16, 0, 4, 2, 128), // предфилл: half-матрицы
+            (37, 11, 4, 2, 128),
+            (64, 64, 4, 1, 128),
+            (128, 0, 4, 4, 128),
+        ] {
+            let tkv = past + tq;
+            let mut r = rng((tq * 7919 + past) as u64);
+            let q = rand(tq * nh * hd, &mut r);
+            let kh: Vec<half::f16> = rand(tkv * nkv * hd, &mut r)
+                .iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect();
+            let vh: Vec<half::f16> = rand(tkv * nkv * hd, &mut r)
+                .iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect();
+            let mask = if tq > 1 {
+                Some(crate::nn::build_causal_mask(&be, tq, tkv, past, None).unwrap())
+            } else {
+                None
+            };
+            let out = be.zeros(vec![1, tq, nh * hd]).unwrap();
+            be.attn_ar(
+                &be.from_cpu_f32(&q, vec![1, tq, nh * hd]).unwrap(),
+                &be.from_cpu_f16(&kh, vec![1, tkv, nkv * hd]).unwrap(),
+                &be.from_cpu_f16(&vh, vec![1, tkv, nkv * hd]).unwrap(),
+                mask.as_ref(),
+                &out,
+                nh,
+                nkv,
+                hd,
+            )
+            .unwrap();
+            let k: Vec<f32> = kh.iter().map(|&h| f32::from(h)).collect();
+            let v: Vec<f32> = vh.iter().map(|&h| f32::from(h)).collect();
+            let mut ro = vec![0.0f32; tq * nh * hd];
+            for t in 0..tq {
+                for h in 0..nh {
+                    let khd = h / (nh / nkv);
+                    let qr = &q[(t * nh + h) * hd..][..hd];
+                    let lim = past + t + 1;
+                    let sc: Vec<f32> = (0..lim)
+                        .map(|j| {
+                            let kr = &k[(j * nkv + khd) * hd..][..hd];
+                            qr.iter().zip(kr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()
+                        })
+                        .collect();
+                    let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                    let sum: f32 = e.iter().sum();
+                    for d in 0..hd {
+                        ro[(t * nh + h) * hd + d] =
+                            (0..lim).map(|j| e[j] / sum * v[(j * nkv + khd) * hd + d]).sum();
+                    }
+                }
+            }
+            // K/V хранятся в half — допуск с запасом на округление.
+            close(
+                &be.to_cpu_f32(&out).unwrap(),
+                &ro,
+                3e-3,
+                &format!("f16 attn tq={tq} past={past} kv={nkv} hd={hd}"),
+            );
+        }
+    }
+
+    /// f16-вариант fused-разбора qkv: Q на выходе — half (сравнение с
+    /// f32-композитом в допуске округления), k/v в f16-кэше равны
+    /// полу-округлённому композиту, а хвост кэша после pos не тронут.
+    #[test]
+    fn fused_qkv_f16_matches_composite() {
+        let be = MetalBackend::new().unwrap();
+        for &(t, h, kvh, hd, pos) in &[
+            (1usize, 16usize, 8usize, 128usize, 37usize),
+            (5, 4, 2, 64, 0),
+            (19, 4, 1, 128, 3),
+        ] {
+            let mut r = rng((t * 31 + hd) as u64);
+            let qkv = be
+                .from_cpu_f32(
+                    &rand(t * (h + 2 * kvh) * hd, &mut r),
+                    vec![1, t, (h + 2 * kvh) * hd],
+                )
+                .unwrap();
+            let qn = be.from_cpu_f32(&rand(hd, &mut r), vec![hd]).unwrap();
+            let kn = be.from_cpu_f32(&rand(hd, &mut r), vec![hd]).unwrap();
+            let cap = pos + t + 3;
+            let z16 = |be: &MetalBackend, n: usize| {
+                be.from_cpu_f16(&vec![half::f16::from_f32(0.0); n], vec![1, cap, kvh * hd])
+                    .unwrap()
+            };
+            let (k1, v1, k2, v2) = (z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd));
+            let q1 = be
+                .qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6)
+                .unwrap();
+            assert_eq!(q1.dtype(), crate::dtype::Dtype::F16);
+            // f32-композит (как default трейта) → полу-округление на записи
+            let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
+            let part = |w: usize, off: usize| {
+                let y = be.zeros(vec![t, w]).unwrap();
+                be.slice_last(&rows, &y, off).unwrap();
+                y.view(vec![1, t, w])
+            };
+            let q2 = be
+                .rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6)
+                .unwrap();
+            let kr = be
+                .rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6)
+                .unwrap();
+            be.kv_update(&k2, &kr, pos).unwrap();
+            be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
+            let f16v = |x: &[f32]| -> Vec<f32> {
+                x.iter().map(|&v| f32::from(half::f16::from_f32(v))).collect()
+            };
+            let q1f: Vec<f32> = be.to_cpu_f16(&q1).unwrap().iter().map(|&x| f32::from(x)).collect();
+            close(&q1f, &f16v(&be.to_cpu_f32(&q2).unwrap()), 1e-3, "fused f16 q");
+            let k1f: Vec<f32> = be.to_cpu_f16(&k1).unwrap().iter().map(|&x| f32::from(x)).collect();
+            let k2f: Vec<f32> = be.to_cpu_f16(&k2).unwrap().iter().map(|&x| f32::from(x)).collect();
+            let v1f: Vec<f32> = be.to_cpu_f16(&v1).unwrap().iter().map(|&x| f32::from(x)).collect();
+            let v2f: Vec<f32> = be.to_cpu_f16(&v2).unwrap().iter().map(|&x| f32::from(x)).collect();
+            close(&k1f, &k2f, 1e-6, "fused f16 k в кэше");
+            close(&v1f, &v2f, 1e-6, "fused f16 v в кэше");
         }
     }
 

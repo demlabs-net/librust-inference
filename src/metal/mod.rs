@@ -2262,6 +2262,45 @@ impl MetalCtx {
         let (b, tq, _d) = (q.shape[0], q.shape[1], q.shape[2]);
         let tkv = k.shape[1];
         let n_rep = n_heads / kv_heads;
+        // Промпт (Tq ≥ 16, одна последовательность): flash-attention на
+        // матричных блоках simdgroup — K/V фрагментами прямо из device-памяти,
+        // 16 запросов одной головы на threadgroup. INFER_ATTN_LEGACY=1 —
+        // прежний кернел для сверки.
+        // Матричные блоки окупаются при hd ≤ 128 (1.5× на Qwen3); при hd=256
+        // (Qwen3.5, 16 голов) фрагментов O вдвое больше, а threadgroup'ов
+        // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).
+        if b == 1
+            && tq >= 16
+            && hd.is_multiple_of(8)
+            && hd <= 128
+            && n_heads.is_multiple_of(kv_heads)
+            && std::env::var("INFER_ATTN_LEGACY").is_err()
+        {
+            let (tq32, tkv32, h32, kvh32, hd32) =
+                (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            // [16][HD] Q (он же выход) + [16][32] S + [16][8] диаг + [16] 1/l
+            let floats = 16 * hd + 16 * 32 + 16 * 8 + 16;
+            let bytes = (floats * 4).div_ceil(16) * 16;
+            let grid = MTLSize::new((tq.div_ceil(16) * 64) as u64, n_heads as u64, 1);
+            let group = MTLSize::new(64, 1, 1);
+            return self.run("attn_prefill_mma_f32", grid, group, |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(
+                    3,
+                    mask.map(|m| &*m.buffer),
+                    mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+                );
+                enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(5, 4, (&tq32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&tkv32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+                enc.set_threadgroup_memory_length(0, bytes as u64);
+            });
+        }
         // Decode (один запрос, без маски): голова = threadgroup из 8
         // simdgroup'ов, ключи делятся между ними (flash-decoding).
         if b == 1
@@ -2442,9 +2481,16 @@ impl MetalCtx {
         s: usize,
     ) -> Result<(), MetalError> {
         let (t32, hk32, hv32, s32) = (t as u32, hk as u32, hv as u32, s as u32);
-        // S кратно 32 и ≤ 256 — simdgroup-параллельный вариант (4 строки
-        // стейта на threadgroup, строка на simdgroup); иначе — поток на строку.
-        let (kernel, grid, group) = if s.is_multiple_of(32) && s <= 256 && (hv * s).is_multiple_of(4) {
+        // S = 128: блок токенов в threadgroup-память — k/q/v блока читаются
+        // один раз на threadgroup (а не на каждый токен каждой группой строк).
+        // INFER_GDN_LEGACY=1 — прежний путь для сверки.
+        let (kernel, grid, group) = if s == 128 && std::env::var("INFER_GDN_LEGACY").is_err() {
+            (
+                "gdn_delta_rule_chunk_f32",
+                MTLSize::new((s / 16 * 32) as u64, (hv * 16) as u64, 1),
+                MTLSize::new(32, 16, 1),
+            )
+        } else if s.is_multiple_of(32) && s <= 256 && (hv * s).is_multiple_of(4) {
             (
                 "gdn_delta_rule_sg_f32",
                 MTLSize::new((hv * s / 4 * 128) as u64, 1, 1),

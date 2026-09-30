@@ -987,7 +987,10 @@ mod tests {
     fn prefill_attention_matches_reference() {
         let be = MetalBackend::new().unwrap();
         for &(tq, past, nh, nkv, hd) in &[
-            (37usize, 11usize, 4usize, 2usize, 128usize),
+            (16usize, 0usize, 1usize, 1usize, 8usize),
+            (16, 0, 1, 1, 128),
+            (16, 16, 1, 1, 128),
+            (37, 11, 4, 2, 128),
             (19, 40, 4, 1, 128),
             (19, 40, 4, 2, 128),
             (19, 11, 4, 1, 256),

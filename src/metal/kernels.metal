@@ -3165,3 +3165,229 @@ kernel void qkv_norm_rope_kv_f32(
         y[i + half_hd] = x1 * c + x0 * sn;
     }
 }
+
+// ── Gated delta rule, prefill: блок токенов в threadgroup-памяти (Ф8.2c) ─────
+// Прежний sg-кернел читает k/q-строки из глобальной памяти на КАЖДЫЙ токен и
+// КАЖДОЙ группой строк: при T=128 это ~0.5 ГБ трафика на слой (упор в полосу).
+// Здесь блок из GDN_C токенов грузится в threadgroup-память один раз на
+// threadgroup, и все GDN_ROWS строк стейта работают из неё: трафик падает в
+// GDN_ROWS раз. Раскладка элементов — как у прежнего кернела (lane + e·32):
+// соседние лейны читают соседние слова, банковых конфликтов нет (раскладка
+// «4 подряд на лейн» давала 4-кратный конфликт и была медленнее).
+// Порядок операций на токен — как в ggml gated_delta_net:
+//   s *= e^g; delta = (v − s·k)·β; s += k·delta; out = s·q/√S.
+#define GDN_S 128u
+#define GDN_E 4u               // элементов строки на лейн (S/32)
+#define GDN_C 16u              // токенов в блоке
+#define GDN_ROWS 16u           // строк стейта на threadgroup
+#define GDN_NTH (32u * GDN_ROWS)
+kernel void gdn_delta_rule_chunk_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* Kx [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* G [[buffer(3)]],
+    device const float* B [[buffer(4)]],
+    device float* STATE [[buffer(5)]],
+    device float* OUT [[buffer(6)]],
+    constant uint& T [[buffer(7)]],
+    constant uint& Hk [[buffer(8)]],
+    constant uint& Hv [[buffer(9)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tpt [[thread_position_in_threadgroup]])
+{
+    // [C][S] с раскладкой lane + e*32; индексация — по (lane, e)
+    // Тайлы только для k/q (v читается по одному элементу на строку —
+    // широковещательно, трафик ничтожен; тайл v только съедал память).
+    threadgroup float kt[GDN_C * GDN_S];
+    threadgroup float qt[GDN_C * GDN_S];
+    threadgroup float gb[2u * GDN_C];
+    const uint lane = tpt.x, ty = tpt.y;
+    const uint tid = ty * 32u + lane;
+    const uint h = tgpig.y;
+    const uint row = tgpig.x * GDN_ROWS + ty;
+    if (h >= Hv || row >= GDN_S) return;
+    const uint hk = h % Hk;
+    const float scale = 1.0f / sqrt((float)GDN_S);
+    device float* srow = STATE + ((ulong)h * GDN_S + row) * GDN_S;
+    // элементы строки в регистрах лейна: индексы lane + e*32
+    float ls0 = srow[lane], ls1 = srow[lane + 32u], ls2 = srow[lane + 64u], ls3 = srow[lane + 96u];
+    for (uint t0 = 0; t0 < T; t0 += GDN_C) {
+        const uint c = min(GDN_C, T - t0);
+        // кооперативная загрузка блока: индекс e = tt·S + (lane + ee·32),
+        // кладём так же — соседние лейны пишут соседние слова
+        for (uint i = tid; i < GDN_C * GDN_S; i += GDN_NTH) {
+            const uint tt = i / GDN_S, rest = i % GDN_S;
+            const uint l = rest % 32u, ee = rest / 32u;
+            const uint off = tt * GDN_S + l + ee * 32u;
+            if (tt < c) {
+                kt[off] = Kx[((ulong)(t0 + tt) * Hk + hk) * GDN_S + ee * 32u + l];
+                qt[off] = Q[((ulong)(t0 + tt) * Hk + hk) * GDN_S + ee * 32u + l];
+            } else {
+                kt[off] = 0.0f;
+                qt[off] = 0.0f;
+            }
+        }
+        if (tid < GDN_C) {
+            const bool ok = tid < c;
+            gb[tid] = ok ? G[(t0 + tid) * Hv + h] : 0.0f;
+            gb[GDN_C + tid] = ok ? B[(t0 + tid) * Hv + h] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint tt = 0; tt < c; ++tt) {
+            const float eg = exp(gb[tt]);
+            const float beta = gb[GDN_C + tt];
+            const uint tb = tt * GDN_S;
+            ls0 *= eg; ls1 *= eg; ls2 *= eg; ls3 *= eg;
+            float kv = ls0 * kt[tb + lane] + ls1 * kt[tb + lane + 32u]
+                     + ls2 * kt[tb + lane + 64u] + ls3 * kt[tb + lane + 96u];
+            kv = simd_sum(kv);
+            const float delta = (V[((ulong)(t0 + tt) * Hv + h) * GDN_S + row] - kv) * beta;
+            ls0 += kt[tb + lane] * delta;
+            ls1 += kt[tb + lane + 32u] * delta;
+            ls2 += kt[tb + lane + 64u] * delta;
+            ls3 += kt[tb + lane + 96u] * delta;
+            float y = ls0 * qt[tb + lane] + ls1 * qt[tb + lane + 32u]
+                    + ls2 * qt[tb + lane + 64u] + ls3 * qt[tb + lane + 96u];
+            y = simd_sum(y);
+            if (lane == 0u) OUT[((ulong)(t0 + tt) * Hv + h) * GDN_S + row] = y * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    srow[lane] = ls0;
+    srow[lane + 32u] = ls1;
+    srow[lane + 64u] = ls2;
+    srow[lane + 96u] = ls3;
+}
+
+// ── Flash-attention промпта на матричных блоках simdgroup (Ф8.2c) ────────────
+// Прежний prefill-кернел: simdgroup на (голову, запрос) и simd_sum на КАЖДЫЙ
+// ключ — 128 ключей × 32 головы × 128 запросов пересчётов-редукций на слой.
+// Здесь threadgroup (2 simdgroup'а) ведёт 16 запросов одной головы, а блок из
+// 32 ключей обрабатывается матричными операциями:
+//   S = Q·Kᵀ (8×8-фрагменты) → online-softmax по строкам (маска, коррекция)
+//   → O = diag(corr)·O + P·V.
+// K и V читаются ПРЯМО из device-памяти фрагментами (simdgroup_load с шагом
+// строк) — тайлы K/V в threadgroup-памяти не нужны (лимит 32 КБ: у Qwen3.5
+// hd=256 f32-тайлы K/V/Q не помещались). Аккумулятор O — в регистрах,
+// коррекция строк — умножением на диагональный фрагмент.
+#define FA_BQ 16u      // запросов на threadgroup (2 simdgroup'а × 8)
+#define FA_BK 32u      // ключей на шаг
+kernel void attn_prefill_mma_f32(
+    device const float* Q [[buffer(0)]],     // [Tq, H*HD]
+    device const float* K [[buffer(1)]],     // [Tkv, KVH*HD]
+    device const float* V [[buffer(2)]],     // [Tkv, KVH*HD]
+    device const float* MASK [[buffer(3)]],  // [Tq, Tkv] или nullptr
+    device float* Y [[buffer(4)]],           // [Tq, H*HD]
+    constant uint& Tq [[buffer(5)]],
+    constant uint& Tkv [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    threadgroup float* sh [[threadgroup(0)]],   // [FA_BQ][HD] Q + [FA_BQ][FA_BK] S + [FA_BQ][8] диаг
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tpt [[thread_position_in_threadgroup]])
+{
+    threadgroup float* sQ = sh;
+    threadgroup float* sS = sh + FA_BQ * HD;
+    threadgroup float* sC = sS + FA_BQ * FA_BK;
+    // Threadgroup одномерный (64 = 2×32): номер simdgroup'а — из позиции,
+    // не из tpt.y (он для 1-D группы всегда 0 — второй simdgroup тогда считал
+    // те же строки 0..7).
+    const uint lane = tpt.x % 32u;
+    const uint sg = tpt.x / 32u;
+    const uint tid = tpt.x;
+    const uint h = tgpig.y;
+    const uint kvh = h / (H / KVH);
+    const uint q0 = tgpig.x * FA_BQ;
+    const uint D = H * HD, KD = KVH * HD;
+    const float scale = 1.0f / sqrt((float)HD);
+    for (uint e = tid; e < FA_BQ * HD; e += 64u) {
+        const uint r = e / HD, c = e % HD;
+        const uint qi = q0 + r;
+        sQ[e] = (qi < Tq) ? Q[(ulong)qi * D + h * HD + c] * scale : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint nf = HD / 8u;
+    // Фрагменты выхода — в регистрах: циклы по фрагментам разворачиваются с
+    // константной границей (32), иначе динамическая индексация o[] уводит
+    // массив в локальную память (hd=256 был медленнее прежнего кернела).
+    simdgroup_float8x8 o[32];
+    #pragma unroll
+    for (uint f = 0; f < 32u; ++f) {
+        if (f >= nf) break;
+        o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+    float m_run = -INFINITY, l_run = 0.0f;
+    for (uint k0 = 0; k0 < Tkv; k0 += FA_BK) {
+        // S[8][32] этого simdgroup'а = Q[8][HD] · K[32][HD]ᵀ
+        for (uint j = 0; j < FA_BK / 8u; ++j) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+            #pragma unroll
+            for (uint kk = 0; kk < 32u; ++kk) {
+                if (kk >= nf) break;
+                simdgroup_float8x8 qa, kb;
+                simdgroup_load(qa, sQ + (sg * 8u) * HD + kk * 8u, HD);
+                simdgroup_load(kb, K + (ulong)(k0 + j * 8u) * KD + kvh * HD + kk * 8u, KD, 0, true);
+                simdgroup_multiply_accumulate(s, qa, kb, s);
+            }
+            simdgroup_store(s, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // softmax: строка на лейн (строк FA_BQ, лейнов в threadgroup 64)
+        if (lane < 8u) {
+            const uint row = sg * 8u + lane;      // строка FA_BQ этого лейна
+            const uint qi = q0 + row;
+            float mx = m_run;
+            for (uint j = 0; j < FA_BK; ++j) {
+                const uint kj = k0 + j;
+                float v = sS[row * FA_BK + j];
+                if (kj >= Tkv || qi >= Tq) v = -INFINITY;
+                else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
+                sS[row * FA_BK + j] = v;
+                mx = max(mx, v);
+            }
+            float l = 0.0f;
+            for (uint j = 0; j < FA_BK; ++j) {
+                const float v = sS[row * FA_BK + j];
+                const float p = (v == -INFINITY) ? 0.0f : exp(v - mx);
+                sS[row * FA_BK + j] = p;
+                l += p;
+            }
+            const float corr = (m_run == -INFINITY) ? 0.0f : exp(m_run - mx);
+            l_run = l_run * corr + l;
+            m_run = mx;
+            for (uint c = 0; c < 8u; ++c) sC[row * 8u + c] = (c == lane) ? corr : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 cd;
+        simdgroup_load(cd, sC + (sg * 8u) * 8u, 8);
+        #pragma unroll
+        for (uint f = 0; f < 32u; ++f) {
+            if (f >= nf) break;
+            simdgroup_float8x8 acc;
+            simdgroup_multiply(acc, cd, o[f]);
+            for (uint j = 0; j < FA_BK / 8u; ++j) {
+                simdgroup_float8x8 pa, vb;
+                simdgroup_load(pa, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
+                simdgroup_load(vb, V + (ulong)(k0 + j * 8u) * KD + kvh * HD + f * 8u, KD);
+                simdgroup_multiply_accumulate(acc, pa, vb, acc);
+            }
+            o[f] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Выход: O — в освободившийся тайл Q, затем нормировка 1/l и запись.
+    if (lane < 8u) sC[8u * FA_BK * 0u + (sg * 8u + lane)] = (l_run > 0.0f) ? 1.0f / l_run : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma unroll
+    for (uint f = 0; f < 32u; ++f) {
+        if (f >= nf) break;
+        simdgroup_store(o[f], sQ + (sg * 8u) * HD + f * 8u, HD);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < FA_BQ * HD; e += 64u) {
+        const uint r = e / HD, c = e % HD;
+        const uint qi = q0 + r;
+        if (qi < Tq) Y[(ulong)qi * D + h * HD + c] = sQ[e] * sC[r];
+    }
+}

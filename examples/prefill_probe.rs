@@ -18,10 +18,11 @@ fn q8(n: usize, k: usize) -> Vec<u8> {
 }
 
 fn time<F: FnMut()>(be: &MetalBackend, name: &str, flops: f64, mut f: F) {
+    // 200 повторов: одиночный вызов (0.5–2 мс) тонет в шуме фоновой нагрузки.
     be.begin_batch().unwrap();
     f();
     be.end_batch().unwrap();
-    let n = 20;
+    let n = 200;
     let t0 = Instant::now();
     be.begin_batch().unwrap();
     for _ in 0..n {
@@ -74,11 +75,14 @@ fn main() {
             let _ = be.gdn_conv(&x, &w, &cs).unwrap();
         });
     }
-    let q = be.zeros(vec![1, m, 4096]).unwrap();
-    let kv = be.zeros(vec![1, m, 1024]).unwrap();
-    let o = be.zeros(vec![1, m, 4096]).unwrap();
-    let mask = rust_inference::nn::build_causal_mask(&be, m, m, 0, None).unwrap();
-    time(&be, &format!("attn_ar T={m}"), 4.0 * (m * m * 4096) as f64, || {
-        be.attn_ar(&q, &kv, &kv, Some(&mask), &o, 32, 8, 128).unwrap()
-    });
+    // Внимание промпта для двух размеров головы (Qwen3: 128, Qwen3.5: 256)
+    for (nh, nkv, hd) in [(32usize, 8usize, 128usize), (16, 4, 256)] {
+        let q = be.zeros(vec![1, m, nh * hd]).unwrap();
+        let kv = be.zeros(vec![1, m, nkv * hd]).unwrap();
+        let o = be.zeros(vec![1, m, nh * hd]).unwrap();
+        let mask = rust_inference::nn::build_causal_mask(&be, m, m, 0, None).unwrap();
+        time(&be, &format!("attn T={m} nh={nh} hd={hd}"), 4.0 * (m * m * nh * hd) as f64, || {
+            be.attn_ar(&q, &kv, &kv, Some(&mask), &o, nh, nkv, hd).unwrap()
+        });
+    }
 }

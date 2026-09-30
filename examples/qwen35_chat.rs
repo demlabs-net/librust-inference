@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let vocab = model.cfg.vocab_size;
     let t1 = Instant::now();
-    let mut logits = model.prefill(&backend, &ids)?;
+    let mut logits = model.prefill_last(&backend, &ids)?;
     eprintln!("prefill {} ток. за {:.2}s", ids.len(), t1.elapsed().as_secs_f32());
     let mut dec = IncrementalDecoder::new();
     print!("{prompt}");

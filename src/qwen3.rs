@@ -101,7 +101,20 @@ impl Qwen3Config {
             ffn_dim,
             vocab_size,
             rope_theta: theta,
-            rope_max_seq: 8192,
+            // Окно контекста — из метаданных модели (Qwen3-8B: 32768), а не
+            // жёсткие 8192: KV растёт по мере надобности, потолок = обученный
+            // контекст. INFER_LLM_CTX переопределяет (меньше — экономия
+            // памяти, больше — только если модель обучена на большее).
+            rope_max_seq: std::env::var("INFER_LLM_CTX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or_else(|| {
+                    file.get(&p("context_length"))
+                        .and_then(GgufValue::as_u32)
+                        .map(|v| v as usize)
+                        .unwrap_or(8192)
+                }),
             norm_eps: eps,
             swa_window: file
                 .get(&p("attention.sliding_window"))
@@ -587,11 +600,83 @@ impl Qwen3Model {
         r
     }
 
+    /// Размер блока префилла (токенов за один forward). Маска внимания у нас
+    /// ПЛОТНАЯ [Tq, Tkv]: при T=14k это 0.8 ГБ на маску, при 32k — 4 ГБ (и
+    /// столько же на её построение). llama.cpp режет промпт на ubatch'и по
+    /// той же причине. INFER_PREFILL_CHUNK переопределяет.
+    pub(crate) fn prefill_chunk() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("INFER_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(512)
+        })
+    }
+
     /// Prefill, у которого нужны логиты только ПОСЛЕДНЕЙ позиции ([1, 1, V]) —
     /// генерация читает лишь их. lm_head (самая большая матрица: V×D) идёт
     /// по одной строке вместо T: на промпте 128 токенов у Qwen3-8B это
     /// ~1/4 всей prefill-работы. Кэш и позиции — как у [`Self::prefill`].
     pub fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+        self.prefill_last_chunked(backend, ids, Self::prefill_chunk())
+    }
+
+    /// То же с явным размером блока (тесты: блочный путь против одного прохода).
+    pub fn prefill_last_chunked(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        chunk: usize,
+    ) -> Result<Tensor, BackendError> {
+        let chunk = chunk.max(1);
+        if ids.len() <= chunk {
+            return self.prefill_last_one(backend, ids);
+        }
+        // Длинный промпт — блоками (см. prefill_chunk): маска блока
+        // O(chunk·Tkv) вместо O(T²), KV растёт как обычно.
+        backend.begin_batch()?;
+        let r = (|| {
+            let mut done = 0usize;
+            let mut logits = None;
+            let trace = std::env::var("INFER_PREFILL_TRACE").is_ok();
+            while done < ids.len() {
+                let end = (done + chunk).min(ids.len());
+                let part = &ids[done..end];
+                let t = part.len();
+                let first = done == 0;
+                let tc = std::time::Instant::now();
+                let x = self.embed.forward(backend, part, t)?;
+                let _ = first;
+                let h = self.forward_layers_range(backend, x, t, None, None, 0, None, true)?;
+                if end == ids.len() {
+                    let d = self.cfg.dim;
+                    let last = h.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d);
+                    logits = Some(self.lm_head(backend, &last)?);
+                }
+                if trace {
+                    // GPU-время блока: синхронизация только в трассировке.
+                    backend.to_cpu_f32(&h.view_restricted(vec![1]))?;
+                    eprintln!(
+                        "PREFILL_CHUNK t={t} pos={done}..{end}: {:.1} мс",
+                        tc.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                // Позиция rope/маски следующего блока — от кэша: без этого
+                // каждый блок считался бы от исходной позиции (rope-сдвиг,
+                // поймано тестом prefill_last_chunked_equals_single_pass).
+                self.pos_rope = self.caches[0].pos;
+                done = end;
+            }
+            self.pos_rope = self.caches[0].pos;
+            logits.ok_or_else(|| BackendError::Shape("prefill_last: пустой промпт".into()))
+        })();
+        backend.end_batch()?;
+        r
+    }
+
+    fn prefill_last_one(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         backend.begin_batch()?;
         let r = (|| {
             let t = ids.len();
@@ -2186,6 +2271,26 @@ mod tests {
     }
 
     /// совпадает с prefill-логитами на позиции k (при том же состоянии KV).
+    /// Блочный префилл (длинный промпт) == один проход: логиты последней
+    /// позиции и позиция кэша. Маска блока строится по растущему кэшу —
+    /// ошибка в ней дала бы расхождение уже на 2-3 токенах.
+    #[test]
+    fn prefill_last_chunked_equals_single_pass() {
+        let (backend, mut a) = mini_model();
+        let (_, mut b) = mini_model();
+        let ids: Vec<u32> = (0..23u32).map(|i| i % 8).collect();
+        let one = backend.to_cpu_f32(&a.prefill_last(&backend, &ids).unwrap()).unwrap();
+        for chunk in [1usize, 2, 5, 7, 11] {
+            b.reset_cache(&backend).unwrap();
+            let many = backend
+                .to_cpu_f32(&b.prefill_last_chunked(&backend, &ids, chunk).unwrap())
+                .unwrap();
+            let worst = one.iter().zip(&many).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "chunk={chunk}: max |Δ| {worst}");
+            assert_eq!(a.caches[0].pos, b.caches[0].pos, "chunk={chunk}: позиция кэша");
+        }
+    }
+
     #[test]
     fn prefill_last_equals_last_row_of_prefill() {
         let (backend, mut a) = mini_model();

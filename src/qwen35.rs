@@ -168,9 +168,19 @@ impl Qwen35Config {
             n_rot,
             rope_sections,
             norm_eps: f(&p("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6),
-            // Окно контекста движка (как у Qwen3Model): KV растёт до него,
-            // дальше — громкая ошибка (у GDN-стейта окна нет вовсе).
-            max_seq: 8192,
+            // Окно контекста — из метаданных (Qwen3.5-4B: 262144); KV-слои
+            // растут по мере надобности до этого потолка, у GDN-слоёв стейт
+            // фиксированный. INFER_LLM_CTX переопределяет.
+            max_seq: std::env::var("INFER_LLM_CTX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or_else(|| {
+                    file.get(&p("context_length"))
+                        .and_then(GgufValue::as_u32)
+                        .map(|v| v as usize)
+                        .unwrap_or(8192)
+                }),
             conv_kernel: u(&p("ssm.conv_kernel"))?,
             ssm_state,
             ssm_k_heads,
@@ -501,13 +511,28 @@ impl Qwen35Model {
 
     /// Prefill с логитами только последней позиции ([1, 1, V]) — генерация
     /// читает лишь их; lm_head (V=248K строк!) идёт по одной строке вместо T.
+    /// Длинный промпт режется на блоки: маска внимания плотная [Tq, Tkv],
+    /// при 14k токенов это 0.8 ГБ на маску, при 32k — 4 ГБ.
     pub fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         if ids.is_empty() {
             return Err(BackendError::Shape("qwen35 prefill: пустой промпт".into()));
         }
+        let chunk = crate::qwen3::Qwen3Model::prefill_chunk();
         backend.begin_batch()?;
-        self.last_only = true;
-        let r = self.forward(backend, ids, &[], &mut Vec::new());
+        let r = (|| {
+            let mut done = 0usize;
+            let mut out = None;
+            while done < ids.len() {
+                let end = (done + chunk).min(ids.len());
+                let part = &ids[done..end];
+                self.last_only = end == ids.len();
+                out = Some(self.forward(backend, part, &[], &mut Vec::new())?);
+                // позиция следующего блока — из состояния (pos растёт в forward)
+                done = end;
+            }
+            self.last_only = false;
+            out.ok_or_else(|| BackendError::Shape("qwen35 prefill: пустой промпт".into()))
+        })();
         self.last_only = false;
         backend.end_batch()?;
         r

@@ -1398,6 +1398,9 @@ impl MetalCtx {
             let (m32, k32, n32) = (m as u32, k as u32, n as u32);
             // Схема ggml kernel_mul_mm: threadgroup 128 потоков на тайл
             // 32 (M) × 64 (N); grid — (M-тайлы, N-тайлы) threadgroup'ов.
+            // Тайл 64×128 пробовался (вчетверо меньше перечитывания
+            // активаций) — в пределах шума: 5.1–6.7 против 5.7–6.7 TFLOPS,
+            // при M=256 даже хуже (меньше threadgroup'ов в полёте).
             let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
             let group = MTLSize::new(128, 1, 1);
             return self.run("gemm_nt_q8_0_mm", grid, group, |enc| {

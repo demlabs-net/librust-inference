@@ -3391,3 +3391,5 @@ kernel void attn_prefill_mma_f32(
         if (qi < Tq) Y[(ulong)qi * D + h * HD + c] = sQ[e] * sC[r];
     }
 }
+
+

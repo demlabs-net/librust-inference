@@ -25,10 +25,17 @@ use rust_inference::weights_map::WeightsMap;
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).ok_or("usage: llm_chat <model.gguf> [prompt]")?;
-    let prompt = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "Привет! Коротко: кто ты?".into());
+    // Промпт: аргумент или файл (LLM_PROMPT_FILE) — длинные контексты
+    // (тысячи токенов) в argv неудобны.
+    let prompt = match std::env::var("LLM_PROMPT_FILE") {
+        Ok(f) if std::path::Path::new(&f).is_file() => {
+            std::fs::read_to_string(&f).map_err(|e| format!("prompt file: {e}"))?
+        }
+        _ => args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "Привет! Коротко: кто ты?".into()),
+    };
 
     let file = File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -164,7 +171,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let t0 = Instant::now();
     let logits = if std::env::var("LLM_BATCH").is_ok() {
-        model.prefill(&*backend, &ids)?
+        model.prefill_last(&*backend, &ids)?
     } else {
         let mut l = model.decode(&*backend, ids[0])?;
         for &id in &ids[1..] {

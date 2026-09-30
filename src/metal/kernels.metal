@@ -3397,3 +3397,165 @@ kernel void attn_prefill_mma_f32(
 
 
 
+
+// ── Flash-attention промпта: half-тайлы K/V в разделяемой памяти (Ф8.2e) ─────
+// Замеры: half-матричные блоки дают 8.4 TFLOPS против 3.5 у float (микробенч),
+// а прежний кернел читал K/V-фрагменты из device-памяти КАЖДОЙ подгруппой
+// заново (при Tq=512 и контексте 4.6k ~9 ГБ трафика на слой). Здесь блок K и
+// V грузится в разделяемую память ОДИН раз на threadgroup и конвертируется в
+// half: устройство читается вчетверо реже, блоки — half-скорости.
+// Раскладка (hd=128, BQ=32, BK=32, байты): Q half 8 КБ, K half 8 КБ (как есть,
+// [key][d]), V half 8 КБ, S float 4 КБ (своя область на подгруппу), P half
+// 2 КБ (отдельно: half-раскладка вдвое плотнее float и «поверх S» наезжает на
+// чужие строки), диагонали 1 КБ (своя на подгруппу), 1/l 128 Б = 31.1 КБ.
+// Выгрузка — через область S, но не более 32 колонок на проход (шаг строки
+// области 32: восемь фрагментов за проход залезали в соседние строки — на этом
+// падал предыдущий вариант кернела).
+#define FA4_BQ 32u
+// BK=16: тайлы K/V вдвое меньше (4 КБ каждый при hd=128), вся группа уходит
+// в ~16 КБ — на ядро помещаются ДВЕ группы (лимит 32 КБ), что важнее
+// удвоенного числа барьеров (замер).
+#define FA4_BK 16u
+kernel void attn_prefill_fa4_f32(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device const float* MASK [[buffer(3)]],
+    device float* Y [[buffer(4)]],
+    constant uint& Tq [[buffer(5)]],
+    constant uint& Tkv [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& KVH [[buffer(8)]],
+    constant uint& HD [[buffer(9)]],
+    threadgroup char* shm [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint2 tpt [[thread_position_in_threadgroup]])
+{
+    threadgroup half* sQh = (threadgroup half*)shm;
+    threadgroup half* sKh = sQh + FA4_BQ * HD;
+    threadgroup half* sVh = sKh + FA4_BK * HD;
+    threadgroup float* sS = (threadgroup float*)(sVh + FA4_BK * HD);
+    threadgroup half* sP = (threadgroup half*)(sS + 4u * 8u * FA4_BK);
+    threadgroup float* sD = (threadgroup float*)(sP + 4u * 8u * FA4_BK);
+    threadgroup float* sL = sD + 4u * 64u;
+    const uint lane = tpt.x % 32u;
+    const uint sg = tpt.x / 32u;
+    const uint tid = tpt.x;
+    const uint h = tgpig.y;
+    const uint kvh = h / (H / KVH);
+    const uint q0 = tgpig.x * FA4_BQ;
+    const uint D = H * HD, KD = KVH * HD;
+    const uint nf = HD / 8u;
+    const float scale = 1.0f / sqrt((float)HD);
+    threadgroup float* myS = sS + sg * 8u * FA4_BK;
+    threadgroup float* myD = sD + sg * 64u;
+    for (uint e = tid; e < FA4_BQ * HD; e += 128u) {
+        const uint r = e / HD, c = e % HD;
+        const uint qi = q0 + r;
+        sQh[e] = (qi < Tq) ? (half)Q[(ulong)qi * D + h * HD + c] : (half)0.0h;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qa[16];
+    for (uint f = 0; f < nf; ++f)
+        simdgroup_load(qa[f], sQh + (sg * 8u) * HD + f * 8u, HD);
+    simdgroup_float8x8 o[16];
+    for (uint f = 0; f < nf; ++f) o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    float m_run = -INFINITY, l_run = 0.0f;
+    for (uint k0 = 0; k0 < Tkv; k0 += FA4_BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < FA4_BK * HD; e += 128u) {
+            const uint r = e / HD, c = e % HD;
+            const uint kj = k0 + r;
+            const bool ok = kj < Tkv;
+            sKh[e] = ok ? (half)K[(ulong)kj * KD + kvh * HD + c] : (half)0.0h;
+            sVh[e] = ok ? (half)V[(ulong)kj * KD + kvh * HD + c] : (half)0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < FA4_BK / 8u; ++j) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+            for (uint f = 0; f < nf; ++f) {
+                simdgroup_half8x8 kb;
+                simdgroup_load(kb, sKh + (j * 8u) * HD + f * 8u, HD, 0, true);
+                simdgroup_multiply_accumulate(s, qa[f], kb, s);
+            }
+            simdgroup_store(s, myS + j * 8u, FA4_BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8u) {
+            const uint qi = q0 + sg * 8u + lane;
+            float mx = m_run;
+            for (uint j = 0; j < FA4_BK; ++j) {
+                const uint kj = k0 + j;
+                float v = myS[lane * FA4_BK + j] * scale;
+                if (kj >= Tkv || qi >= Tq) v = -INFINITY;
+                else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
+                myS[lane * FA4_BK + j] = v;
+                mx = max(mx, v);
+            }
+            float l = 0.0f;
+            for (uint j = 0; j < FA4_BK; ++j) {
+                const float v = myS[lane * FA4_BK + j];
+                const float p = (v == -INFINITY) ? 0.0f : exp(v - mx);
+                sP[(sg * 8u + lane) * FA4_BK + j] = (half)p;
+                l += p;
+            }
+            const float corr = (m_run == -INFINITY) ? 0.0f : exp(m_run - mx);
+            l_run = l_run * corr + l;
+            m_run = mx;
+            for (uint c = 0; c < 8u; ++c) myD[lane * 8u + c] = (c == lane) ? corr : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 cd;
+        simdgroup_load(cd, myD, 8u);
+        for (uint f = 0; f < nf; ++f) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
+            simdgroup_multiply(acc, cd, o[f]);
+            for (uint j = 0; j < FA4_BK / 8u; ++j) {
+                simdgroup_half8x8 pa, vb;
+                simdgroup_load(pa, sP + (sg * 8u) * FA4_BK + j * 8u, FA4_BK);
+                simdgroup_load(vb, sVh + (j * 8u) * HD + f * 8u, HD);
+                simdgroup_multiply_accumulate(acc, pa, vb, acc);
+            }
+            o[f] = acc;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < 8u) sL[sg * 8u + lane] = (l_run > 0.0f) ? 1.0f / l_run : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8u) {
+        const float inv = sL[sg * 8u + lane];
+        for (uint c = 0; c < 8u; ++c) myD[lane * 8u + c] = (c == lane) ? inv : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dinv;
+    simdgroup_load(dinv, myD, 8u);
+    // Выгрузка: не более 4 фрагментов (32 колонки) на проход — шаг строки
+    // области S равен FA4_BK, восемь фрагментов ушли бы в соседние строки.
+    for (uint f = 0; f < nf; ++f) {
+        simdgroup_float8x8 res;
+        simdgroup_multiply(res, dinv, o[f]);
+        // Порция выгрузки = ровно одна строка области S в колонках:
+        // FA4_BK/8 фрагментов по 8 колонок (при BK=32 — четыре фрагмента,
+        // при BK=16 — два; больше колонок, чем шаг строки, залезает в
+        // соседние строки — на этом падал предыдущий вариант).
+        const uint fph = FA4_BK / 8u;
+        simdgroup_store(res, myS + (f % fph) * 8u, FA4_BK);
+        if (f % fph == fph - 1u || f + 1u == nf) {
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint fbase = (f / fph) * fph;
+            const uint fcount = f - fbase + 1u;   // ≤ fph
+            // (строка, фрагмент, столбец) — три измерения: раньше строка
+            // считалась как e/8, и при fcount < 8 писались только первые
+            // fcount строк (прочие оставались с мусором от маски).
+            for (uint e = lane; e < 8u * fcount * 8u; e += 32u) {
+                const uint c = e % 8u;
+                const uint t1 = e / 8u;
+                const uint fi = t1 % fcount;
+                const uint r = t1 / fcount;
+                const uint qi = q0 + sg * 8u + r;
+                if (qi < Tq) Y[(ulong)qi * D + h * HD + (fbase + fi) * 8u + c] = myS[r * FA4_BK + fi * 8u + c];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}

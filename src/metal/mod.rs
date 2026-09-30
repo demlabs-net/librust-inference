@@ -2272,12 +2272,50 @@ impl MetalCtx {
         // Матричные блоки окупаются при hd ≤ 128 (1.5× на Qwen3); при hd=256
         // (Qwen3.5, 16 голов) фрагментов O вдвое больше, а threadgroup'ов
         // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).
-        // Промпт: матричные блоки 8×8 (1.5× против прежнего кернела).
-        // Пробованы: блок 64 запроса на голову и тайлы K/V в разделяемой
-        // памяти с half-блоками (вчетверо меньше трафика K/V и вдвое быстрее
-        // блоки) — на всех формах верного результата получить не удалось,
-        // оставлен проверенный вариант. Длинный промпт (тысячи токенов)
-        // поэтому упирается во внимание: см. bench/README (Ф8.2e).
+        // Полу-тайловый путь (Ф8.2e) — ВЫКЛЮЧЕН по умолчанию: он верен
+        // (тесты prefill_attention_matches_reference и
+        // tiled_attention_layout_probe), но на M3 медленнее варианта с
+        // фрагментами из device-памяти: группа просит 16–31 КБ разделяемой
+        // памяти, а на ядро её 32 КБ — в полёте вдвое-вчетверо меньше групп
+        // и задержки не перекрываются (замер: 38 против 27 мс на слой при
+        // Tq=512/контексте 4.6k, 0.36 против 0.25 мс при Tq=128). Включается
+        // INFER_ATTN_TILES=1 — задел под конвейеризацию (двойная буферизация
+        // тайлов и асинхронные копии), где запас есть.
+        if b == 1
+            && tq >= 32
+            && hd.is_multiple_of(8)
+            && hd <= 128
+            && n_heads.is_multiple_of(kv_heads)
+            && std::env::var("INFER_ATTN_LEGACY").is_err()
+            && std::env::var("INFER_ATTN_TILES").as_deref() == Ok("1")
+        {
+            let (tq32, tkv32, h32, kvh32, hd32) =
+                (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            // Q half 32×HD + K/V half 16×HD + S float 4×8×16 + P half 4×8×16
+            // + диагонали 1 КБ + 1/l ≈ 16.1 КБ при hd=128 — две группы на ядро.
+            let bytes = (32 * hd * 2 + 2 * 16 * hd * 2 + 4 * 8 * 16 * 4 + 4 * 8 * 16 * 2
+                + 4 * 64 * 4
+                + 32 * 4) as u64;
+            let grid = MTLSize::new((tq.div_ceil(32) * 128) as u64, n_heads as u64, 1);
+            let group = MTLSize::new(128, 1, 1);
+            return self.run("attn_prefill_fa4_f32", grid, group, |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(
+                    3,
+                    mask.map(|m| &*m.buffer),
+                    mask.as_ref().map(|m| m.offset as u64).unwrap_or(0),
+                );
+                enc.set_buffer(4, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(5, 4, (&tq32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&tkv32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+                enc.set_threadgroup_memory_length(0, bytes);
+            });
+        }
         // Матричные блоки окупаются при hd ≤ 128 (1.5× на Qwen3); при hd=256
         // (Qwen3.5, 16 голов) фрагментов O вдвое больше, а threadgroup'ов
         // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).

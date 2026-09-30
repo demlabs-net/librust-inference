@@ -1073,10 +1073,14 @@ mod tests {
                     }
                 }
             }
+            // Допуск: тайловый путь хранит K/V/P в half (как flash-attention
+            // llama.cpp) — относительная ошибка ~1e-4…1e-3; путь с float-
+            // фрагментами держит 1e-4.
+            let tol = if hd <= 128 && tq >= 32 { 2e-3 } else { 1e-4 };
             close(
                 &be.to_cpu_f32(&out).unwrap(),
                 &ro,
-                1e-4,
+                tol,
                 &format!("prefill attn tq={tq} past={past} kv={nkv} hd={hd}"),
             );
         }
@@ -1159,6 +1163,45 @@ mod tests {
                 }
             }
             close(&be.to_cpu_f32(&out).unwrap(), &ro, 1e-4, &format!("decode attn tkv={tkv} hd={hd}"));
+        }
+    }
+
+    /// Диагностика раскладок в тайловом внимании (Ф8.2e): Q = 0 → внимание
+    /// равномерно по причинно видимым ключам; V — базисные векторы. Тогда
+    /// выход строки t = доля единиц по видимым строкам V: любая перепутанная
+    /// строка/столбец видна сразу.
+    #[test]
+    fn tiled_attention_layout_probe() {
+        let be = MetalBackend::new().unwrap();
+        let (tq, tkv, nh, nkv, hd) = (32usize, 32usize, 1usize, 1usize, 8usize);
+        let q = vec![0.0f32; tq * nh * hd];
+        let k = vec![0.0f32; tkv * nkv * hd];
+        let mut v = vec![0.0f32; tkv * nkv * hd];
+        for t in 0..tkv {
+            v[t * hd + (t % hd)] = 1.0;
+        }
+        let mask = crate::nn::build_causal_mask(&be, tq, tkv, 0, None).unwrap();
+        let out = be.zeros(vec![1, tq, nh * hd]).unwrap();
+        be.attn_ar(
+            &be.from_cpu_f32(&q, vec![1, tq, nh * hd]).unwrap(),
+            &be.from_cpu_f32(&k, vec![1, tkv, nkv * hd]).unwrap(),
+            &be.from_cpu_f32(&v, vec![1, tkv, nkv * hd]).unwrap(),
+            Some(&mask),
+            &out,
+            nh,
+            nkv,
+            hd,
+        )
+        .unwrap();
+        let got = be.to_cpu_f32(&out).unwrap();
+        for t in [0usize, 1, 2, 7, 8, 9, 16, 31] {
+            let mut exp = vec![0.0f32; hd];
+            for j in 0..=t {
+                exp[j % hd] += 1.0 / (t + 1) as f32;
+            }
+            let row = &got[t * hd..(t + 1) * hd];
+            let worst = row.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "строка {t}: получили {row:?}, ждали {exp:?}");
         }
     }
 

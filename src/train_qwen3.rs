@@ -1465,39 +1465,17 @@ pub fn chat_prompt_ids(
     if let Some(pad) = tok.pad {
         specials.insert("pad_token".into(), tok.decode_piece(pad));
     }
-    // сложные конструкции (namespace/tools) — классический фоллбэк
-    let template = crate::chat_template::Template::compile(tpl, specials).ok();
-    let mut messages = Vec::new();
+    let template = crate::chat_template::Template::compile(tpl, specials)
+        .map_err(|e| BackendError::Shape(format!("qwen3-lora: {e}")))?;
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
     if let Some(sys) = system {
-        messages.push(std::collections::HashMap::from([
-            ("role".to_string(), "system".to_string()),
-            ("content".to_string(), sys.to_string()),
-        ]));
+        pairs.push(("system", sys));
     }
-    messages.push(std::collections::HashMap::from([
-        ("role".to_string(), "user".to_string()),
-        ("content".to_string(), user.to_string()),
-    ]));
-    let mut ctx = crate::chat_template::TemplateContext {
-        messages,
-        extra: Default::default(),
-    };
-    ctx.extra
-        .insert("add_generation_prompt".into(), "true".into());
-    let prompt = match template.and_then(|t| t.render(&ctx).ok()) {
-        Some(p) => p,
-        // Qwen3-шаблон использует namespace/tools — неподдерживаемые
-        // конструкции; классический формат эквивалентен для простых чатов.
-        None => {
-            let mut p = String::new();
-            if let Some(sys) = system {
-                p.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
-            }
-            p.push_str(&format!("<|im_start|>user\n{user}<|im_end|>\n"));
-            p.push_str("<|im_start|>assistant\n");
-            p
-        }
-    };
+    pairs.push(("user", user));
+    let ctx = crate::chat_template::TemplateContext::from_pairs(&pairs).add_generation_prompt(true);
+    let prompt = template
+        .render(&ctx)
+        .map_err(|e| BackendError::Shape(format!("qwen3-lora: {e}")))?;
     Ok(tok.encode(&prompt))
 }
 

@@ -71,28 +71,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         // базовые модели не следуют чат-шаблону — чистое продолжение текста
         prompt.clone()
     } else {
-        match Template::compile(tpl_src, special) {
-            Ok(tpl) => {
-                let ctx = TemplateContext {
-                    messages: vec![std::collections::HashMap::from([
-                        ("role".to_string(), "user".to_string()),
-                        ("content".to_string(), prompt.clone()),
-                    ])],
-                    extra: std::collections::HashMap::new(),
-                }
-                .add_generation_prompt(true);
-                tpl.render(&ctx)?
-            }
-            Err(rust_inference::chat_template::TemplateError::Unsupported(_)) => {
-                // Реальный Qwen3-шаблон использует {% set ns = namespace(...) %}
-                // (tool-calling-обвязка) — вне minja-подмножества v1; классический
-                // im_start-формат эквивалентен для валидации движка (Ф1.7).
-                format!(
-                    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-                )
-            }
-            Err(e) => return Err(e.into()),
+        // Шаблон модели из GGUF; LLM_SYSTEM — системное сообщение,
+        // LLM_THINK=0/1 — enable_thinking шаблонов Qwen3/3.5.
+        let tpl = Template::compile(tpl_src, special)?;
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        let system = std::env::var("LLM_SYSTEM").ok();
+        if let Some(sys) = system.as_deref() {
+            pairs.push(("system", sys));
         }
+        pairs.push(("user", prompt.as_str()));
+        let mut ctx = TemplateContext::from_pairs(&pairs).add_generation_prompt(true);
+        ctx.enable_thinking = std::env::var("LLM_THINK").map(|v| v != "0").unwrap_or(true);
+        tpl.render(&ctx)?
     };
     let ids = tok.encode(&prompt_text);
     eprintln!(

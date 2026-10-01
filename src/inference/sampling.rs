@@ -93,6 +93,9 @@ pub struct SamplingParams {
     /// Пользовательский сид потока — НЕ состояние LCG: материализуется через
     /// [`state_from_seed`] (сырое значение как состояние даёт поток нулей).
     pub seed: Option<u64>,
+    /// min-p (llama.cpp): отбрасываются токены с вероятностью меньше
+    /// `min_p × p_max` (после top-k/top-p). 0 — выключено.
+    pub min_p: f32,
 }
 
 impl Default for SamplingParams {
@@ -103,8 +106,20 @@ impl Default for SamplingParams {
             top_k: 0,
             repetition_penalty: 1.1,
             seed: None,
+            min_p: 0.0,
         }
     }
+}
+
+/// min-p поверх уже отсортированного по убыванию окна: оставить токены с
+/// p ≥ min_p · p_max (первый — всегда).
+fn apply_min_p(window: &[(usize, f32)], min_p: f32) -> &[(usize, f32)] {
+    if min_p <= 0.0 || window.is_empty() {
+        return window;
+    }
+    let thr = window[0].1 * min_p;
+    let keep = window.iter().take_while(|(_, p)| *p >= thr).count().max(1);
+    &window[..keep]
 }
 
 /// Top-p sample over a CPU logits vector (temperature + repetition penalty
@@ -164,8 +179,8 @@ pub fn top_p_sample_vec_history(
                 break;
             }
         }
-        let top_tokens: Vec<(usize, f32)> = window[..cutoff].to_vec();
-        return sample_from(&top_tokens, rng_state);
+        let top_tokens = apply_min_p(&window[..cutoff], params.min_p);
+        return sample_from(top_tokens, rng_state);
     }
 
     indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
@@ -180,8 +195,8 @@ pub fn top_p_sample_vec_history(
         }
     }
 
-    let top_tokens: Vec<(usize, f32)> = indexed[..cutoff].to_vec();
-    sample_from(&top_tokens, rng_state)
+    let top_tokens = apply_min_p(&indexed[..cutoff], params.min_p);
+    sample_from(top_tokens, rng_state)
 }
 
 /// Старое API (без истории) — speech-крейт и прежние вызовы. Без истории
@@ -310,6 +325,30 @@ mod tests {
     /// M15 regression: the top_k path sliced head[..k] where head is k-1
     /// long (select_nth puts the k-th element in the pivot) — k=1 panicked
     /// with "range end index out of range".
+    /// min-p: токены с p < min_p · p_max не выпадают никогда; при min_p = 0
+    /// они выпадают (контроль, что тест различает режимы).
+    #[test]
+    fn min_p_cuts_low_probability_tail() {
+        // p ≈ [0.70, 0.20, 0.10·(малая доля)…]: третий токен < 0.5 · p_max
+        let logits = [2.0f32, 0.75, -0.5, -0.5, -0.5];
+        let run = |min_p: f32| -> std::collections::HashSet<u32> {
+            let params = SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                seed: None,
+                min_p,
+            };
+            let mut rng = Some(state_from_seed(11));
+            (0..400).map(|_| top_p_sample_vec(&logits, &params, &mut rng)).collect()
+        };
+        let cut = run(0.25);
+        assert!(cut.iter().all(|&t| t <= 1), "min_p=0.25 пропустил хвост: {cut:?}");
+        let all = run(0.0);
+        assert!(all.iter().any(|&t| t >= 2), "без min_p хвост обязан встречаться: {all:?}");
+    }
+
     #[test]
     fn top_k_one_does_not_panic() {
         let logits = [1.0f32, 2.0, 3.0, 0.5, -1.0];
@@ -319,6 +358,7 @@ mod tests {
             top_k: 1,
             repetition_penalty: 1.0,
             seed: Some(42),
+            min_p: 0.0,
         };
         let mut rng = None;
         // Must return the argmax (index 2) and not panic.
@@ -335,6 +375,7 @@ mod tests {
             top_k,
             repetition_penalty: 1.0,
             seed: Some(7),
+            min_p: 0.0,
         };
         // Three largest logits are 0.9 (id 1), 0.8 (id 6), 0.7 (id 3).
         const TOP3: [usize; 3] = [1, 6, 3];
@@ -375,6 +416,7 @@ mod tests {
             top_k: 1,
             repetition_penalty: rp,
             seed: Some(11),
+            min_p: 0.0,
         };
         // Без истории: argmax = 0 (top_k=1 — только он в окне).
         let mut rng = None;
@@ -434,6 +476,7 @@ mod tests {
             top_k: 1,
             repetition_penalty: 2.0,
             seed: Some(3),
+            min_p: 0.0,
         };
         let mut rng = None;
         // Штраф: [1.0, 1.5, 0.9, 0.1]; температура: [2.0, 3.0, 1.8, 0.2]
@@ -478,6 +521,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             seed: None,
+            min_p: 0.0,
         };
         let mut st = Some(987_654_321u64);
         let (mut first, mut second) = (0u32, 0u32);

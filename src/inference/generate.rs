@@ -100,6 +100,8 @@ pub struct GenerateParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
+    /// min-p (llama.cpp): отсечь токены с p < min_p · p_max. 0 — выключено.
+    pub min_p: f32,
     pub repeat_penalty: f32,
     /// Сид сэмплинга: `Some` — детерминированный поток (материализуется через
     /// [`crate::inference::sampling::state_from_seed`]), `None` — от часов.
@@ -122,6 +124,7 @@ impl Default for GenerateParams {
             temperature: 0.8,
             top_p: 0.8,
             top_k: 0,
+            min_p: 0.0,
             repeat_penalty: 1.0,
             seed: None,
             stop_strings: Vec::new(),
@@ -536,6 +539,7 @@ fn sample_next(
             // Поток несёт `rng_state` (сид уже материализован) — второй
             // источник сида дал бы двойной шаг LCG.
             seed: None,
+            min_p: params.min_p,
         };
         top_p_sample_vec_history(last, &sp, history, rng_state)
     })

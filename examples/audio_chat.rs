@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cw0 = backend.to_cpu_f32(&model.tower.conv1_w)?;
         eprintln!(
             "OMNI_REF after_load conv1_w[1,5,:3]={:?}",
-            &cw0[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]
+            conv3(&cw0, 1, 5)
         );
     }
     let tok = omni::tokenizer_from_json(Path::new(dir))?;
@@ -84,12 +84,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cw1 = backend.to_cpu_f32(&model.tower.conv1_w)?;
         eprintln!(
             "OMNI_REF after_tower conv1_w[1,5,:3]={:?}",
-            &cw1[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]
+            conv3(&cw1, 1, 5)
         );
         eprintln!("OMNI_REF after_tower conv1_w[0,0,:3]={:?}", &cw1[..3]);
         eprintln!(
             "OMNI_REF after_tower conv1_w[5,0,:3]={:?}",
-            &cw1[(5 * 128 + 0) * 3..(5 * 128 + 0) * 3 + 3]
+            conv3(&cw1, 5, 0)
         );
     }
     if std::env::var("OMNI_REF").is_ok() && !std::env::var("AUDIO_CHAT_NO_AUDIO").is_ok() {
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("OMNI_REF our_conv1_b[:8]={:?}", &cb[..8.min(cb.len())]);
         let w1: f64 = (0..128)
             .map(|ci| {
-                cw[(1 * 128 + ci) * 3..(1 * 128 + ci) * 3 + 3]
+                conv3(&cw, 1, ci)
                     .iter()
                     .map(|&v| v as f64)
                     .sum::<f64>()
@@ -124,18 +124,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             .sum();
         let w7: f64 = (0..128)
             .map(|ci| {
-                cw[(7 * 128 + ci) * 3..(7 * 128 + ci) * 3 + 3]
+                conv3(&cw, 7, ci)
                     .iter()
                     .map(|&v| v as f64)
                     .sum::<f64>()
             })
             .sum();
         eprintln!("OMNI_REF our_w1_sum={w1} our_w7_sum={w7}");
-        let m30 = &mel_c[(0) * t_c + 30..(0) * t_c + 36];
+        let m30 = &mel_c[30..36];
         eprintln!("OMNI_REF mel[0][30..36]={m30:?}");
         eprintln!(
             "OMNI_REF our_w[5,0,:3]={:?}",
-            &cw[(5 * 128 + 0) * 3..(5 * 128 + 0) * 3 + 3]
+            conv3(&cw, 5, 0)
         );
         eprintln!("OMNI_REF after_prefill conv1_w[0,0,:3]={:?}", &cw[..3]);
         let af = backend.to_cpu_f32(&audio_features)?;
@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(i, _)| i as u32)
             .unwrap();
-        if tok.eos == Some(next) {
+        if tok.is_eog(next) {
             break;
         }
         let text = decoder.push(tok.decode_piece(next).as_bytes());
@@ -237,4 +237,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     eprintln!("--- output ---\n{out}");
     Ok(())
+}
+
+/// Срез conv1-весов [out, in=128, k=3] в точке (out, in): три коэффициента ядра.
+fn conv3(w: &[f32], out: usize, ci: usize) -> &[f32] {
+    let base = (out * 128 + ci) * 3;
+    &w[base..base + 3]
 }

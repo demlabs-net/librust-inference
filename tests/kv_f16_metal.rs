@@ -3,7 +3,6 @@
 //! тензора), а не по RSS: RSS прячет Metal-буферы (они не в куче процесса).
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
-use rust_inference::backend::Backend;
 use rust_inference::dtype::KvFormat;
 use rust_inference::metal::MetalBackend;
 use rust_inference::nn::KvCache;

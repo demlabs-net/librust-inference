@@ -3365,17 +3365,45 @@ kernel void attn_prefill_mma_f32(
     float m_run = -INFINITY, l_run = 0.0f;
     for (uint k0 = 0; k0 < Tkv; k0 += FA_BK) {
         // S[8][32] этого simdgroup'а = Q[8][HD] · K[32][HD]ᵀ
-        for (uint j = 0; j < FA_BK / 8u; ++j) {
-            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
-            #pragma unroll
-            for (uint kk = 0; kk < 32u; ++kk) {
-                if (kk >= nf) break;
-                simdgroup_float8x8 qa, kb;
-                simdgroup_load(qa, sQ + (sg * 8u) * HD + kk * 8u, HD);
-                simdgroup_load(kb, K + (ulong)(k0 + j * 8u) * KD + kvh * HD + kk * 8u, KD, 0, true);
-                simdgroup_multiply_accumulate(s, qa, kb, s);
+        // Последний неполный блок ключей (Tkv не кратно 32) — отдельной
+        // веткой: 8-строчный фрагмент, пересекающий Tkv, читал строки за
+        // концом тензора (вне KV-кэша — мусор или NaN за концом MTLBuffer, а
+        // 0·NaN в P·V портит весь столбец выхода). Здесь фрагменты после Tkv
+        // пропускаются, а пересекающий сдвигается назад к Tkv-8 (его первые
+        // столбцы дублируют ключи предыдущего фрагмента — их отсекает
+        // softmax). Горячий цикл полных блоков не тронут: ветвление внутри
+        // развёрнутых циклов стоило +40 % времени внимания.
+        const bool tail = k0 + FA_BK > Tkv;
+        if (!tail) {
+            for (uint j = 0; j < FA_BK / 8u; ++j) {
+                simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+                #pragma unroll
+                for (uint kk = 0; kk < 32u; ++kk) {
+                    if (kk >= nf) break;
+                    simdgroup_float8x8 qa, kb;
+                    simdgroup_load(qa, sQ + (sg * 8u) * HD + kk * 8u, HD);
+                    simdgroup_load(kb, K + (ulong)(k0 + j * 8u) * KD + kvh * HD + kk * 8u, KD, 0, true);
+                    simdgroup_multiply_accumulate(s, qa, kb, s);
+                }
+                simdgroup_store(s, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
             }
-            simdgroup_store(s, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
+        } else {
+            for (uint j = 0; j < FA_BK / 8u; ++j) {
+                simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+                const uint kf = k0 + j * 8u;
+                if (kf < Tkv) {
+                    const uint ks = min(kf, Tkv - 8u);
+                    #pragma unroll
+                    for (uint kk = 0; kk < 32u; ++kk) {
+                        if (kk >= nf) break;
+                        simdgroup_float8x8 qa, kb;
+                        simdgroup_load(qa, sQ + (sg * 8u) * HD + kk * 8u, HD);
+                        simdgroup_load(kb, K + (ulong)ks * KD + kvh * HD + kk * 8u, KD, 0, true);
+                        simdgroup_multiply_accumulate(s, qa, kb, s);
+                    }
+                }
+                simdgroup_store(s, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
+            }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         // softmax: строка на лейн (строк FA_BQ, лейнов в threadgroup 64)
@@ -3384,9 +3412,12 @@ kernel void attn_prefill_mma_f32(
             const uint qi = q0 + row;
             float mx = m_run;
             for (uint j = 0; j < FA_BK; ++j) {
-                const uint kj = k0 + j;
+                // ключ столбца: в хвостовом блоке фрагмент мог быть сдвинут
+                // к Tkv-8 (столбцы до начала фрагмента kf — дубли)
+                const uint kf = k0 + (j & ~7u);
+                const uint kj = tail ? min(kf, Tkv - 8u) + (j & 7u) : k0 + j;
                 float v = sS[row * FA_BK + j];
-                if (kj >= Tkv || qi >= Tq) v = -INFINITY;
+                if (kf >= Tkv || kj < kf || kj >= Tkv || qi >= Tq) v = -INFINITY;
                 else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
                 sS[row * FA_BK + j] = v;
                 mx = max(mx, v);
@@ -3406,18 +3437,36 @@ kernel void attn_prefill_mma_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 cd;
         simdgroup_load(cd, sC + (sg * 8u) * 8u, 8);
-        #pragma unroll
-        for (uint f = 0; f < 32u; ++f) {
-            if (f >= nf) break;
-            simdgroup_float8x8 acc;
-            simdgroup_multiply(acc, cd, o[f]);
-            for (uint j = 0; j < FA_BK / 8u; ++j) {
-                simdgroup_float8x8 pa, vb;
-                simdgroup_load(pa, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
-                simdgroup_load(vb, V + (ulong)(k0 + j * 8u) * KD + kvh * HD + f * 8u, KD);
-                simdgroup_multiply_accumulate(acc, pa, vb, acc);
+        if (!tail) {
+            #pragma unroll
+            for (uint f = 0; f < 32u; ++f) {
+                if (f >= nf) break;
+                simdgroup_float8x8 acc;
+                simdgroup_multiply(acc, cd, o[f]);
+                for (uint j = 0; j < FA_BK / 8u; ++j) {
+                    simdgroup_float8x8 pa, vb;
+                    simdgroup_load(pa, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
+                    simdgroup_load(vb, V + (ulong)(k0 + j * 8u) * KD + kvh * HD + f * 8u, KD);
+                    simdgroup_multiply_accumulate(acc, pa, vb, acc);
+                }
+                o[f] = acc;
             }
-            o[f] = acc;
+        } else {
+            #pragma unroll
+            for (uint f = 0; f < 32u; ++f) {
+                if (f >= nf) break;
+                simdgroup_float8x8 acc;
+                simdgroup_multiply(acc, cd, o[f]);
+                for (uint j = 0; j < FA_BK / 8u; ++j) {
+                    const uint kf = k0 + j * 8u;
+                    if (kf >= Tkv) break;
+                    simdgroup_float8x8 pa, vb;
+                    simdgroup_load(pa, sS + (sg * 8u) * FA_BK + j * 8u, FA_BK);
+                    simdgroup_load(vb, V + (ulong)min(kf, Tkv - 8u) * KD + kvh * HD + f * 8u, KD);
+                    simdgroup_multiply_accumulate(acc, pa, vb, acc);
+                }
+                o[f] = acc;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -3643,27 +3692,40 @@ kernel void attn_prefill_partial_f32(
     const uint k1 = min(Tkv, k0 + per);
     threadgroup float shS[2u * 8u * 32u];
     threadgroup float shD[2u * 64u];
+    threadgroup float shQ[16u * 128u];   // строки Q группы (hd ≤ 128)
     threadgroup float* myS = shS + sg * 256u;
     threadgroup float* myD = shD + sg * 64u;
+    // Q — построчно с защитой хвоста: обнуление ЦЕЛОГО 8-строчного
+    // фрагмента при q0+8 > Tq теряло последние 1–7 запросов промпта.
+    const uint qtg = tgpig.x * FAP_BQ;
+    for (uint e = tpt; e < 16u * HD; e += 64u) {
+        const uint r = e / HD, c = e % HD;
+        const uint qi = qtg + r;
+        shQ[e] = (qi < Tq) ? Q[(ulong)qi * D + h * HD + c] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 qa[16];
     for (uint f = 0; f < nf; ++f) {
-        if (q0 + 8u <= Tq) {
-            simdgroup_load(qa[f], Q + (ulong)q0 * D + h * HD + f * 8u, D);
-        } else {
-            qa[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
-        }
+        simdgroup_load(qa[f], shQ + (sg * 8u) * HD + f * 8u, HD);
     }
     simdgroup_float8x8 o[16];
     for (uint f = 0; f < nf; ++f) o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
     float m_run = -INFINITY, l_run = 0.0f;
     for (uint kb = k0; kb < k1; kb += 32u) {
+        // Конец тензора — Tkv (строки за k1 внутри тензора валидны, их
+        // отсекает маска kj >= k1); фрагмент, пересекающий Tkv, сдвигается
+        // к Tkv-8 — как в attn_prefill_mma_f32.
+        const bool tail = kb + 32u > Tkv;
         for (uint j = 0; j < 4u; ++j) {
             simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
-            const uint kj = min(kb + j * 8u, Tkv - 1u);   // хвост — те же данные, маска отсечёт
-            for (uint f = 0; f < nf; ++f) {
-                simdgroup_float8x8 kf;
-                simdgroup_load(kf, K + (ulong)kj * KD + kvh * HD + f * 8u, KD, 0, true);
-                simdgroup_multiply_accumulate(s, qa[f], kf, s);
+            const uint kfr = kb + j * 8u;
+            if (kfr < Tkv) {
+                const uint ks = tail ? min(kfr, Tkv - 8u) : kfr;
+                for (uint f = 0; f < nf; ++f) {
+                    simdgroup_float8x8 kf;
+                    simdgroup_load(kf, K + (ulong)ks * KD + kvh * HD + f * 8u, KD, 0, true);
+                    simdgroup_multiply_accumulate(s, qa[f], kf, s);
+                }
             }
             simdgroup_store(s, myS + j * 8u, 32u);
         }
@@ -3672,12 +3734,14 @@ kernel void attn_prefill_partial_f32(
             const uint qi = q0 + lane;
             float mx = m_run;
             for (uint j = 0; j < 32u; ++j) {
-                const uint kj = kb + j;
+                const uint kfr = kb + (j & ~7u);
+                const uint kj = tail ? min(kfr, Tkv - 8u) + (j & 7u) : kb + j;
                 float v = myS[lane * 32u + j] * scale;
                 // kj >= k1 — хвост последнего блока участка: диапазоны
                 // разбиений не кратны 32, и без этой границы ключи на стыке
                 // считались бы ДВАЖДЫ (в своём участке и в соседнем).
-                if (kj >= k1 || kj >= Tkv || qi >= Tq) v = -INFINITY;
+                // kj < kfr — дубли сдвинутого хвостового фрагмента.
+                if (kfr >= Tkv || kj < kfr || kj >= k1 || kj >= Tkv || qi >= Tq) v = -INFINITY;
                 else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
                 myS[lane * 32u + j] = v;
                 mx = max(mx, v);
@@ -3701,10 +3765,12 @@ kernel void attn_prefill_partial_f32(
             simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
             simdgroup_multiply(acc, cd, o[f]);
             for (uint j = 0; j < 4u; ++j) {
-                const uint kj = min(kb + j * 8u, Tkv - 1u);
+                const uint kfr = kb + j * 8u;
+                if (kfr >= Tkv) break;
+                const uint ks = tail ? min(kfr, Tkv - 8u) : kfr;
                 simdgroup_float8x8 pa, vb;
                 simdgroup_load(pa, myS + j * 8u, 32u);
-                simdgroup_load(vb, V + (ulong)kj * KD + kvh * HD + f * 8u, KD);
+                simdgroup_load(vb, V + (ulong)ks * KD + kvh * HD + f * 8u, KD);
                 simdgroup_multiply_accumulate(acc, pa, vb, acc);
             }
             o[f] = acc;
@@ -4043,27 +4109,49 @@ kernel void attn_prefill_mma_f16(
     for (uint f = 0; f < nf; ++f) o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
     float m_run = -INFINITY, l_run = 0.0f;
     for (uint kb = 0; kb < Tkv; kb += 32u) {
-        for (uint j = 0; j < 4u; ++j) {
-            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
-            // Хвост Tkv не кратен 8: адрес прижимается к последней строке —
-            // строки фрагмента за концом окна отсекаются маской softmax (их P
-            // ровно 0), а чтение остаётся внутри аллокации кэша (cap ≥ 256).
-            const uint kj = min(kb + j * 8u, Tkv - 1u);
-            for (uint f = 0; f < nf; ++f) {
-                simdgroup_half8x8 kf;
-                simdgroup_load(kf, K + (ulong)kj * KD + kvh * HD + f * 8u, KD, 0, true);
-                simdgroup_multiply_accumulate(s, qa[f], kf, s);
+        // Последний неполный блок ключей (Tkv не кратно 32) — отдельной
+        // веткой: 8-строчный фрагмент, пересекающий Tkv, читал строки за
+        // концом тензора (вне KV-кэша — мусор или NaN за концом MTLBuffer, а
+        // 0·NaN в P·V портит весь столбец выхода). Здесь фрагменты после Tkv
+        // пропускаются, а пересекающий сдвигается назад к Tkv-8 (его первые
+        // столбцы дублируют ключи предыдущего фрагмента — их отсекает
+        // softmax). Горячий цикл полных блоков не тронут: ветвление внутри
+        // развёрнутых циклов стоило +40 % времени внимания.
+        const bool tail = kb + 32u > Tkv;
+        if (!tail) {
+            for (uint j = 0; j < 4u; ++j) {
+                simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+                for (uint f = 0; f < nf; ++f) {
+                    simdgroup_half8x8 kf;
+                    simdgroup_load(kf, K + (ulong)(kb + j * 8u) * KD + kvh * HD + f * 8u, KD, 0, true);
+                    simdgroup_multiply_accumulate(s, qa[f], kf, s);
+                }
+                simdgroup_store(s, myS + j * 8u, 32u);
             }
-            simdgroup_store(s, myS + j * 8u, 32u);
+        } else {
+            for (uint j = 0; j < 4u; ++j) {
+                simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8>(0.f);
+                const uint kfr = kb + j * 8u;
+                if (kfr < Tkv) {
+                    const uint ks = min(kfr, Tkv - 8u);
+                    for (uint f = 0; f < nf; ++f) {
+                        simdgroup_half8x8 kf;
+                        simdgroup_load(kf, K + (ulong)ks * KD + kvh * HD + f * 8u, KD, 0, true);
+                        simdgroup_multiply_accumulate(s, qa[f], kf, s);
+                    }
+                }
+                simdgroup_store(s, myS + j * 8u, 32u);
+            }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         if (lane < 8u) {
             const uint qi = qtg + sg * 8u + lane;
             float mx = m_run;
             for (uint j = 0; j < 32u; ++j) {
-                const uint kj = kb + j;
+                const uint kf = kb + (j & ~7u);
+                const uint kj = tail ? min(kf, Tkv - 8u) + (j & 7u) : kb + j;
                 float v = myS[lane * 32u + j] * scale;
-                if (kj >= Tkv || qi >= Tq) v = -INFINITY;
+                if (kf >= Tkv || kj < kf || kj >= Tkv || qi >= Tq) v = -INFINITY;
                 else if (MASK != nullptr) v += MASK[(ulong)qi * Tkv + kj];
                 myS[lane * 32u + j] = v;
                 mx = max(mx, v);
@@ -4083,17 +4171,32 @@ kernel void attn_prefill_mma_f16(
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 cd;
         simdgroup_load(cd, myD, 8u);
-        for (uint f = 0; f < nf; ++f) {
-            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
-            simdgroup_multiply(acc, cd, o[f]);
-            for (uint j = 0; j < 4u; ++j) {
-                const uint kj = min(kb + j * 8u, Tkv - 1u);
-                simdgroup_half8x8 pa, vb;
-                simdgroup_load(pa, sP + (sg * 8u) * 32u + j * 8u, 32u);
-                simdgroup_load(vb, V + (ulong)kj * KD + kvh * HD + f * 8u, KD);
-                simdgroup_multiply_accumulate(acc, pa, vb, acc);
+        if (!tail) {
+            for (uint f = 0; f < nf; ++f) {
+                simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
+                simdgroup_multiply(acc, cd, o[f]);
+                for (uint j = 0; j < 4u; ++j) {
+                    simdgroup_half8x8 pa, vb;
+                    simdgroup_load(pa, sP + (sg * 8u) * 32u + j * 8u, 32u);
+                    simdgroup_load(vb, V + (ulong)(kb + j * 8u) * KD + kvh * HD + f * 8u, KD);
+                    simdgroup_multiply_accumulate(acc, pa, vb, acc);
+                }
+                o[f] = acc;
             }
-            o[f] = acc;
+        } else {
+            for (uint f = 0; f < nf; ++f) {
+                simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
+                simdgroup_multiply(acc, cd, o[f]);
+                for (uint j = 0; j < 4u; ++j) {
+                    const uint kfr = kb + j * 8u;
+                    if (kfr >= Tkv) break;
+                    simdgroup_half8x8 pa, vb;
+                    simdgroup_load(pa, sP + (sg * 8u) * 32u + j * 8u, 32u);
+                    simdgroup_load(vb, V + (ulong)min(kfr, Tkv - 8u) * KD + kvh * HD + f * 8u, KD);
+                    simdgroup_multiply_accumulate(acc, pa, vb, acc);
+                }
+                o[f] = acc;
+            }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }

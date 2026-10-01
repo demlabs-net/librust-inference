@@ -433,20 +433,23 @@ impl Qwen3Model {
         }
     }
 
-    /// Формат хранилища KV, который выберет [`Self::load`] (Ф8.2f) — одна
-    /// точка правды для загрузки модели и для оценки памяти сервисом
-    /// (`infer-core::resources::kv_estimate_mb_fmt`): f16 обслуживают свои
-    /// кернелы только при hd ≤ 128, обычном RoPE и наличии QK-norm (иначе
-    /// KV пишется f32-кернелами). INFER_KV_F32/INFER_KV_F16 — A/B-рычаги.
-    pub fn kv_format_for(cfg: &Qwen3Config, has_qk_norm: bool) -> crate::dtype::KvFormat {
-        let force_f32 = std::env::var("INFER_KV_F32").is_ok();
-        let force_f16 = std::env::var("INFER_KV_F16").is_ok();
-        if !force_f32
-            && (force_f16 || (cfg.head_dim <= 128 && cfg.mrope_sections.is_none() && has_qk_norm))
-        {
-            crate::dtype::KvFormat::F16
-        } else {
+    /// Формат хранилища KV, который выберет [`Self::load`] — одна точка
+    /// правды для загрузки модели и для оценки памяти сервисом
+    /// (`infer-core::resources::kv_estimate_mb_fmt`). f16 — для ЛЮБОЙ
+    /// геометрии: на Metal fused-путь пишет через `qkv_norm_rope_kv_f16_f32`,
+    /// прочие (mrope, без QK-norm) — через `kv_update_f16_f32`, внимание —
+    /// `attn_ar_f16` (hd до 512); на CUDA — свои f16-кернелы. Прежний гейт
+    /// (f16 только при hd ≤ 128, без mrope и с QK-norm) отнимал f16-KV у
+    /// Qwen3-VL и Omni. `INFER_KV_F32=1` — A/B-рычаг.
+    pub fn kv_format_for(_cfg: &Qwen3Config, _has_qk_norm: bool) -> crate::dtype::KvFormat {
+        #[cfg(test)]
+        if test_util::FORCE_KV_F32.with(|c| c.get()) {
+            return crate::dtype::KvFormat::F32;
+        }
+        if std::env::var("INFER_KV_F32").is_ok() {
             crate::dtype::KvFormat::F32
+        } else {
+            crate::dtype::KvFormat::F16
         }
     }
 
@@ -496,8 +499,7 @@ impl Qwen3Model {
             } else {
                 None
             };
-            // fused-путь (norm+RoPE+запись) требует QK-norm у обоих — от
-            // этого же зависит доступность f16-хранилища KV (см. ниже).
+            // fused-путь (norm+RoPE+запись) требует QK-norm у обоих.
             let has_qk_norm = q_norm.is_some() && k_norm.is_some();
             let qkv_bias = if w.get(&p("attn_q.bias")).is_some() {
                 let mut b = t(&p("attn_q.bias"))?;
@@ -551,13 +553,9 @@ impl Qwen3Model {
                 ffn_norm,
                 ffn,
             });
-            // N (iter-10): KV запрашивается в f16 — вдвое меньше трафик
-            // attention и VRAM кэша. `KvCache::new` приводит формат к тому,
-            // что реально умеет бэкенд (`Backend::supported_kv_format`).
-            // Ф8.2f: на Metal f16-хранилище обслуживают свои кернелы, но
-            // только при hd ≤ 128 и на fused-пути (norm+RoPE+запись одним
-            // кернелом) — он же требует QK-norm и обычного RoPE. Иначе
-            // остаёмся на f32 (у Qwen3.5 hd=256, у Omni — mrope/без QK-norm).
+            // KV в f16 — вдвое меньше трафик внимания и память кэша;
+            // `KvCache::new` приводит формат к тому, что умеет бэкенд
+            // (`Backend::supported_kv_format`).
             let fmt = Self::kv_format_for(&cfg, has_qk_norm);
             caches.push(KvCache::new(
                 backend,
@@ -662,7 +660,7 @@ impl Qwen3Model {
         // пула), иначе отложенный список копил промежуточные тензоры ВСЕХ
         // блоков до конца префилла (14k токенов уводили систему в своп, и
         // процесс получал SIGKILL).
-        let r = (|| {
+        (|| {
             // Резерв под весь промпт: без него KV растёт удвоениями, и каждая
             // ступень копирует весь кэш (при 14k токенов это +2.4 ГБ пика и
             // лишний трафик). Резерв ограничен потолком окна.
@@ -705,8 +703,7 @@ impl Qwen3Model {
             }
             self.pos_rope = self.caches[0].pos;
             logits.ok_or_else(|| BackendError::Shape("prefill_last: пустой промпт".into()))
-        })();
-        r
+        })()
     }
 
     fn prefill_last_one(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
@@ -1878,10 +1875,22 @@ mod test_util {
         }
     }
 
+    thread_local! {
+        /// f32-KV для моделей, загружаемых в этом потоке (вместо общего на
+        /// процесс INFER_KV_F32 — параллельные тесты не влияют друг на друга).
+        pub static FORCE_KV_F32: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// Мини-Qwen3: случайные веса; WeightsMap строится поверх owned-буферов.
     /// Deterministic for a given config — two models built with the same `c`
     /// hold identical weights (the roll-equivalence test relies on this).
     pub fn build_model(backend: &dyn Backend, c: Qwen3Config) -> Qwen3Model {
+        build_model_opts(backend, c, true)
+    }
+
+    /// `qk_norm = false` — модель без attn_q_norm/attn_k_norm (как Qwen2.5-
+    /// Omni thinker): K/V идут не-fused путём (slice → RoPE → kv_update).
+    pub fn build_model_opts(backend: &dyn Backend, c: Qwen3Config, qk_norm: bool) -> Qwen3Model {
         let cfg = c.clone(); // входной конфиг (n_layers среза!) — не переопределять mini_cfg()
         let mut rng = rng_u64(0xC0FFEE);
         let mut storage: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
@@ -1907,7 +1916,11 @@ mod test_util {
                 ("ffn_down.weight", vec![c.dim, c.ffn_dim]),
             ] {
                 let numel = shape.iter().product::<usize>();
-                storage.push((p(n), rand_vec(numel, &mut rng), shape));
+                let data = rand_vec(numel, &mut rng);
+                if !qk_norm && n.contains("_norm.weight") && n.starts_with("attn_") && n != "attn_norm.weight" {
+                    continue; // тот же поток rng — прочие веса совпадают
+                }
+                storage.push((p(n), data, shape));
             }
         }
         storage.push((
@@ -1950,7 +1963,6 @@ mod test_util {
 #[cfg(all(test, any(feature = "cpu", feature = "cuda", feature = "metal")))]
 mod roll_tests {
     use super::test_util::{build_model, mini_cfg};
-    use super::*;
 
     /// Baseline: token-by-token decode (wide window, no roll) vs one prefill of
     /// the same ids — establishes that the two paths agree before any roll.
@@ -2057,7 +2069,7 @@ mod roll_tests {
 
 #[cfg(all(test, feature = "metal"))]
 mod tests {
-    use super::test_util::{build_model, mini_cfg, rand_vec, rng_u64};
+    use super::test_util::{build_model, mini_cfg};
     use super::*;
     use crate::metal::MetalBackend;
 
@@ -2074,6 +2086,40 @@ mod tests {
         let backend = MetalBackend::new().expect("metal backend");
         let model = build_model(&backend, c);
         (backend, model)
+    }
+
+    /// f16-KV на НЕ-fused путях (модель без QK-norm, M-RoPE): хранилище
+    /// действительно half, а логиты префилла и шагов декода совпадают с
+    /// f32-KV в пределах half-округления. Раньше гейт формата держал эти
+    /// модели на f32 (Qwen3-VL, Omni) — f16 на них не проверялся вовсе.
+    #[test]
+    fn f16_kv_matches_f32_on_unfused_paths() {
+        use super::test_util::build_model_opts;
+        let backend = MetalBackend::new().unwrap();
+        let mut mrope = mini_cfg();
+        // head_dim=4 → 2 пары на голову: секции [1,1,0,0] вращают обе пары
+        mrope.mrope_sections = Some([1, 1, 0, 0]);
+        for (name, c, qk) in [("без QK-norm", mini_cfg(), false), ("M-RoPE", mrope, true)] {
+            let run = |force_f32: bool| -> (Vec<f32>, crate::dtype::KvFormat) {
+                super::test_util::FORCE_KV_F32.with(|f| f.set(force_f32));
+                let mut m = build_model_opts(&backend, c.clone(), qk);
+                super::test_util::FORCE_KV_F32.with(|f| f.set(false));
+                let fmt = m.caches[0].stored_formats().0;
+                let ids: Vec<u32> = (0..19u32).map(|i| (i * 3) % 8).collect();
+                let mut out = backend.to_cpu_f32(&m.prefill(&backend, &ids).unwrap()).unwrap();
+                for t in [1u32, 5, 2] {
+                    out.extend(backend.to_cpu_f32(&m.decode(&backend, t).unwrap()).unwrap());
+                }
+                (out, fmt)
+            };
+            let (a, fa) = run(false);
+            let (b, fb) = run(true);
+            assert_eq!(fa, crate::dtype::KvFormat::F16, "{name}: KV обязан быть f16");
+            assert_eq!(fb, crate::dtype::KvFormat::F32, "{name}: рычаг INFER_KV_F32");
+            let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs() / (1.0 + y.abs())).fold(0.0f32, f32::max);
+            assert!(a.iter().all(|x| x.is_finite()), "{name}: NaN в логитах f16");
+            assert!(worst < 2e-2, "{name}: f16 против f32 — {worst}");
+        }
     }
 
     /// 7.8 (KV-объект): снимок KV переносится на ДРУГОЙ экземпляр модели, и
@@ -2280,7 +2326,7 @@ mod tests {
         let k = 2usize; // срез первых k слоёв (cfg() даёт 2 слоя)
         let mut cfg = full.cfg.clone();
         cfg.n_layers = k;
-        let (_, mut draft) = mini_model_with_cfg(cfg);
+        let (_, draft) = mini_model_with_cfg(cfg);
         let ids = [1u32, 2, 3, 4];
         // полная модель — скрытые после k слоёв (кэш пуст — как у DraftModel;
         // через batch-путь, как forward_hidden — исключить sync-vs-batch)
@@ -2519,7 +2565,7 @@ mod attn_tests {
                 for j in 0..tkv {
                     let mut acc = 0.0f32;
                     for dd in 0..hd {
-                        acc += qv[(t * d + hh * hd + dd)] * kv[(j * kvd + kvhi * hd + dd)];
+                        acc += qv[t * d + hh * hd + dd] * kv[j * kvd + kvhi * hd + dd];
                     }
                     scores[j] = acc * scale + mv[t * tkv + j];
                 }
@@ -2531,7 +2577,7 @@ mod attn_tests {
                 for dd in 0..hd {
                     let mut acc = 0.0f32;
                     for j in 0..tkv {
-                        acc += ((scores[j] - mx).exp() / sum) * vv[(j * kvd + kvhi * hd + dd)];
+                        acc += ((scores[j] - mx).exp() / sum) * vv[j * kvd + kvhi * hd + dd];
                     }
                     want[t * d + hh * hd + dd] = acc;
                 }

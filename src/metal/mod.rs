@@ -39,11 +39,44 @@ pub enum MetalError {
     Shape(String),
 }
 
+thread_local! {
+    /// Принудительный выбор пути внимания предфилла для ТЕКУЩЕГО потока
+    /// (тесты): переменные окружения общие на процесс и в параллельных
+    /// тестах переключали бы путь соседям.
+    static ATTN_PATH: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Выполнить `f`, принудительно выбрав путь внимания предфилла: `"tiles"`
+/// (INFER_ATTN_TILES), `"split"` (INFER_ATTN_SPLIT) или `"legacy"`
+/// (INFER_ATTN_LEGACY) — только в этом потоке.
+pub fn with_attn_path<R>(path: &'static str, f: impl FnOnce() -> R) -> R {
+    let prev = ATTN_PATH.with(|c| c.replace(Some(path)));
+    let r = f();
+    ATTN_PATH.with(|c| c.set(prev));
+    r
+}
+
+/// Включён ли вариант внимания: переопределение потока или переменная
+/// окружения (`INFER_ATTN_<NAME>=1`; для legacy — сам факт наличия).
+fn attn_opt(name: &'static str) -> bool {
+    if let Some(p) = ATTN_PATH.with(|c| c.get()) {
+        return p == name;
+    }
+    match name {
+        "legacy" => std::env::var("INFER_ATTN_LEGACY").is_ok(),
+        "split" => std::env::var("INFER_ATTN_SPLIT").as_deref() == Ok("1"),
+        "tiles" => std::env::var("INFER_ATTN_TILES").as_deref() == Ok("1"),
+        _ => false,
+    }
+}
+
 /// Storage dtype of a [`GpuTensor`]. Activations stay fp32; fp16/bf16 are
 /// GEMM weight formats (halved VRAM + weight-read traffic, fp32 accumulate
 /// in the kernels — the backend dtype contract). Q4_0/Q8_0/Q4_K/Q6_K —
 /// block-quantized GEMM weights (Ф1.3/1.4): dequant inside the kernel, raw
 /// block bytes in the buffer (ggml layouts).
+// Q4_K/Q6_K — имена форматов ggml (как в GGUF), не CamelCase.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuDtype {
     F32,
@@ -242,10 +275,10 @@ pub struct GpuTensor {
 
 impl Drop for GpuTensor {
     fn drop(&mut self) {
-        if let Some(tok) = self.pooled.as_ref() {
-            if Arc::strong_count(tok) == 1 {
-                with_pool(|p| p.push(&self.buffer));
-            }
+        if let Some(tok) = self.pooled.as_ref()
+            && Arc::strong_count(tok) == 1
+        {
+            with_pool(|p| p.push(&self.buffer));
         }
     }
 }
@@ -1350,6 +1383,22 @@ impl MetalCtx {
         }
         // B (the weight) may be stored fp16/bf16 — narrowed reads, fp32
         // accumulate; A/C stay fp32.
+        // f16-веса при m > 1 (префилл, LoRA-merged f16-модели): m8-кернел —
+        // столбец весов читается один раз на 8 строк активаций (half4), в
+        // 1.7× быстрее поэлементного gemm_nt_f16 при m ≥ 128 (замер
+        // 4096×4096: 3.4 против 5.9 мс). Требует K, кратного 4.
+        if b.dtype == GpuDtype::F16 && m > 1 && k.is_multiple_of(4) {
+            let grid = MTLSize::new(n as u64, m.div_ceil(8) as u64, 1);
+            let group = MTLSize::new(256, 1, 1);
+            return self.run("gemm_nt_f16_m8", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 8, (&m as *const usize).cast());
+                enc.set_bytes(4, 8, (&k as *const usize).cast());
+                enc.set_bytes(5, 8, (&n as *const usize).cast());
+            });
+        }
         let name = match b.dtype {
             GpuDtype::F32 => "gemm_nt_f32",
             GpuDtype::F16 => "gemm_nt_f16",
@@ -1434,13 +1483,13 @@ impl MetalCtx {
                 enc.set_threadgroup_memory_length(0, 8192);
             });
         }
-        // m>1: m8-кернелы (n-столбец × 8 m-строк, явные аккумуляторы) —
-        // B читается 1 раз на 8 строк; F16 — half4-чтения.
+        // m>1: m8-кернел (n-столбец × 8 m-строк, явные аккумуляторы) —
+        // B читается 1 раз на 8 строк. f16-веса сюда не попадают (они идут
+        // через gemm_nt_f32 → gemm_nt_f16_m8).
         if m > 1 {
-            let (kname, is_f16) = match b.dtype {
-                GpuDtype::Q8_0 => ("gemm_nt_q8_0_m8f4", false),
-                GpuDtype::F16 => ("gemm_nt_f16_m8", true),
-                _ => ("", false),
+            let kname = match b.dtype {
+                GpuDtype::Q8_0 => "gemm_nt_q8_0_m8f4",
+                _ => "",
             };
             if !kname.is_empty() {
                 let grid = MTLSize::new(n as u64, m.div_ceil(8) as u64, 1);
@@ -2331,7 +2380,8 @@ impl MetalCtx {
             )));
         }
         // Предфилл: half×half матричные блоки (16 запросов/threadgroup).
-        if b == 1 && tq >= 16 && hd.is_multiple_of(8) && hd <= 128 {
+        // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел)
+        if b == 1 && tq >= 16 && tkv >= 8 && hd.is_multiple_of(8) && hd <= 128 {
             let (tq32, tkv32, h32, kvh32, hd32) =
                 (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
             // S float 2×8×32 + P half 2×8×32 + диаг float 2×64 + 1/l 2×8
@@ -2362,7 +2412,7 @@ impl MetalCtx {
         if b == 1 && tq == 1 && mask.is_none() && hd <= 256 {
             let (tkv32, h32, kvh32, hd32) =
                 (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
-            let nsg = ((tkv + 63) / 64).clamp(1, 32);
+            let nsg = tkv.div_ceil(64).clamp(1, 32);
             let nsg32 = nsg as u32;
             let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
             let grid = MTLSize::new((n_heads * nsg * 32) as u64, 1, 1);
@@ -2441,13 +2491,14 @@ impl MetalCtx {
         // Включается INFER_ATTN_SPLIT=1.
         if b == 1
             && tq >= 32
+            && tkv >= 8
             && hd.is_multiple_of(8)
             && hd <= 128
             && n_heads.is_multiple_of(kv_heads)
-            && std::env::var("INFER_ATTN_LEGACY").is_err()
-            && std::env::var("INFER_ATTN_SPLIT").as_deref() == Ok("1")
+            && !attn_opt("legacy")
+            && attn_opt("split")
         {
-            let split = ((tkv + 127) / 128).clamp(1, 16);
+            let split = tkv.div_ceil(128).clamp(1, 16);
             if split >= 2 {
                 let (tq32, tkv32, h32, kvh32, hd32, sp32) = (
                     tq as u32,
@@ -2510,11 +2561,12 @@ impl MetalCtx {
         // тайлов и асинхронные копии), где запас есть.
         if b == 1
             && tq >= 32
+            && tkv >= 8
             && hd.is_multiple_of(8)
             && hd <= 128
             && n_heads.is_multiple_of(kv_heads)
-            && std::env::var("INFER_ATTN_LEGACY").is_err()
-            && std::env::var("INFER_ATTN_TILES").as_deref() == Ok("1")
+            && !attn_opt("legacy")
+            && attn_opt("tiles")
         {
             let (tq32, tkv32, h32, kvh32, hd32) =
                 (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
@@ -2548,10 +2600,11 @@ impl MetalCtx {
         // вдвое меньше — прежний кернел быстрее (замер: 0.44 против 0.34 мс).
         if b == 1
             && tq >= 16
+            && tkv >= 8
             && hd.is_multiple_of(8)
             && hd <= 128
             && n_heads.is_multiple_of(kv_heads)
-            && std::env::var("INFER_ATTN_LEGACY").is_err()
+            && !attn_opt("legacy")
         {
             let (tq32, tkv32, h32, kvh32, hd32) =
                 (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
@@ -2586,7 +2639,7 @@ impl MetalCtx {
             && hd.is_multiple_of(4)
             && hd <= 256
             && n_heads.is_multiple_of(kv_heads)
-            && std::env::var("INFER_ATTN_LEGACY").is_err()
+            && !attn_opt("legacy")
         {
             let (tkv32, h32, kvh32, hd32) = (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
             // Разбиение ключей: на длинном контексте 8 групп оставляли всего
@@ -2594,7 +2647,7 @@ impl MetalCtx {
             // последовательно (декод на 4k контекста падал до 1.3 ток/с).
             // Число групп растёт с длиной KV: одна группа на ~64 ключа,
             // не больше 32 (память слияния 32×(2+hd)×4 ≤ 16.6 КБ при hd=128).
-            let nsg = ((tkv + 63) / 64).clamp(1, 32);
+            let nsg = tkv.div_ceil(64).clamp(1, 32);
             let nsg32 = nsg as u32;
             let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
             let grid = MTLSize::new((n_heads * nsg * 32) as u64, 1, 1);
@@ -4353,13 +4406,6 @@ mod quant_gemm_tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {name}: {e}"))
     }
 
-    /// f32-веса источника (f16-фикстура — те же сиды, что у всех квантов).
-    fn source_f32(name: &str) -> Vec<f32> {
-        let buf = fixture(name);
-        let f = gguf::parse(&buf).unwrap();
-        let m = WeightsMap::from_gguf(&f).unwrap();
-        dequant_f32(m.get("token_embd.weight").unwrap())
-    }
 
     // Тестовые энкодеры Q4_K/Q6_K (K=256-синтетика; логика как в fixture-gen).
     /// Канонический Q4_K (ggml block_q4_K, 144 Б/256): d (f16), dmin (f16),
@@ -4469,7 +4515,7 @@ mod quant_gemm_tests {
     /// (bytes, shape[N,K], dtype, per-elem tol) — источники для GPU-теста.
     fn cases() -> Vec<(Vec<u8>, Vec<usize>, GpuDtype, f32)> {
         let src: Vec<f32> = (0..8 * 256)
-            .map(|i| ((i as f32 * 7919.0).sin() * 0.5))
+            .map(|i| (i as f32 * 7919.0).sin() * 0.5)
             .collect();
         // Q8_0 128×96 (синтетический): полные тайлы tiled-GEMM (64 по N,
         // 32 по M) и K из нескольких блоков — фикстура 64×32 их не задевает.
@@ -4479,7 +4525,7 @@ mod quant_gemm_tests {
                     .to_bits()
                     .to_le_bytes()
                     .to_vec();
-                blk.extend((0..32).map(|j| (((b * 37 + j * 11) % 255) as i32 - 127) as i8 as u8));
+                blk.extend((0..32).map(|j| (((b * 37 + j * 11) % 255) - 127) as i8 as u8));
                 blk
             })
             .collect();
@@ -4567,7 +4613,7 @@ mod quant_gemm_tests {
                 storage: vec![],
             };
             let bf = dequant_f32(&tmp.tensors[0]);
-            let a_data: Vec<f32> = (0..m * k).map(|i| ((i as f32 * 104729.0).sin())).collect();
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 104729.0).sin()).collect();
             let c_ref = cpu_ref(&a_data, m, k, &bf, n);
 
             let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![m, k]).unwrap();
@@ -4606,7 +4652,7 @@ mod quant_gemm_tests {
                 storage: vec![],
             };
             let bf = dequant_f32(&tmp.tensors[0]);
-            let a_data: Vec<f32> = (0..k).map(|i| ((i as f32 * 15485863.0).sin())).collect();
+            let a_data: Vec<f32> = (0..k).map(|i| (i as f32 * 15485863.0).sin()).collect();
             let c_ref = cpu_ref(&a_data, 1, k, &bf, n);
 
             let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![k]).unwrap();
@@ -4678,17 +4724,17 @@ mod batch_debug {
         // микро-бенч: attn_ar 9 токенов × 36 кэш × 32 головы
         {
             let q9 =
-                GpuTensor::from_cpu_f32(&ctx.device, &vec![0.1f32; 1 * 9 * 4096], vec![1, 9, 4096])
+                GpuTensor::from_cpu_f32(&ctx.device, &vec![0.1f32; 9 * 4096], vec![1, 9, 4096])
                     .unwrap();
             let k36 = GpuTensor::from_cpu_f32(
                 &ctx.device,
-                &vec![0.2f32; 1 * 36 * 1024],
+                &vec![0.2f32; 36 * 1024],
                 vec![1, 36, 1024],
             )
             .unwrap();
             let v36 = GpuTensor::from_cpu_f32(
                 &ctx.device,
-                &vec![0.3f32; 1 * 36 * 1024],
+                &vec![0.3f32; 36 * 1024],
                 vec![1, 36, 1024],
             )
             .unwrap();

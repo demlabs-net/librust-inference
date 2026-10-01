@@ -413,11 +413,11 @@ impl CausalLm for crate::qwen35::Qwen35Model {
 /// или None (продолжать). Вынесено отдельно — детерминированный юнит.
 pub fn check_stop(
     next: u32,
-    eos: Option<u32>,
+    is_eog: impl Fn(u32) -> bool,
     acc: &str,
     stop_strings: &[String],
 ) -> Option<FinishReason> {
-    if eos == Some(next) {
+    if is_eog(next) {
         return Some(FinishReason::Eog);
     }
     if stop_strings.iter().any(|s| acc.contains(s)) {
@@ -663,6 +663,16 @@ pub fn generate<M: CausalLm + ?Sized>(
         .map(crate::inference::sampling::state_from_seed);
     let mut decoder = IncrementalDecoder::new();
     let mut acc = String::new(); // накопленный текст (для stop-строк)
+    // Черновики выбираются так же, как их проверяет таргет: жадная проверка
+    // ⇒ argmax-черновики, иначе — то же распределение (температура, top-k).
+    let draft_sampling = if params.temperature <= 0.0 {
+        crate::spec::DraftSampling::Greedy
+    } else {
+        crate::spec::DraftSampling::Sample {
+            temperature: params.temperature,
+            top_k: params.top_k,
+        }
+    };
     // История для repetition penalty: промпт + уже порождённые токены
     // (раньше params.repeat_penalty молча игнорировался).
     let mut history: Vec<u32> = ids.to_vec();
@@ -683,7 +693,7 @@ pub fn generate<M: CausalLm + ?Sized>(
             Some(p) => p,
             None => sample_next(backend, &logits, vocab, params, &history, &mut rng_state)?,
         };
-        if let Some(r) = check_stop(next, tok.eos, &acc, &params.stop_strings) {
+        if let Some(r) = check_stop(next, |t| tok.is_eog(t), &acc, &params.stop_strings) {
             finish = Some(r);
             break;
         }
@@ -708,6 +718,7 @@ pub fn generate<M: CausalLm + ?Sized>(
         ) {
             let (draft_tokens, draft_probs) = {
                 let mut dr = drafter.lock().unwrap();
+                dr.set_sampling(draft_sampling);
                 dr.draft(backend, &history, params.spec_gamma)
             };
             if !draft_tokens.is_empty() {
@@ -746,7 +757,7 @@ pub fn generate<M: CausalLm + ?Sized>(
                     if generated.len() >= params.max_tokens {
                         break;
                     }
-                    if let Some(r) = check_stop(t, tok.eos, &acc, &params.stop_strings) {
+                    if let Some(r) = check_stop(t, |x| tok.is_eog(x), &acc, &params.stop_strings) {
                         finish = Some(r);
                         break;
                     }
@@ -939,18 +950,18 @@ mod tests {
         .unwrap();
         assert_eq!(gen_tokens.len(), 3, "max_tokens reached");
         assert_eq!(done, Some(FinishReason::MaxTokens));
-        assert!(deltas >= 0);
+        assert!(deltas > 0, "дельты текста не пришли");
     }
 
     #[test]
     fn check_stop_eog_and_stop_string() {
-        assert_eq!(check_stop(2, Some(2), "", &[]), Some(FinishReason::Eog));
-        assert_eq!(check_stop(1, Some(2), "", &[]), None);
+        assert_eq!(check_stop(2, |t| t == 2, "", &[]), Some(FinishReason::Eog));
+        assert_eq!(check_stop(1, |t| t == 2, "", &[]), None);
         assert_eq!(
-            check_stop(7, None, "hello world", &["world".into()]),
+            check_stop(7, |_| false, "hello world", &["world".into()]),
             Some(FinishReason::StopString)
         );
-        assert_eq!(check_stop(7, None, "hello", &["world".into()]), None);
+        assert_eq!(check_stop(7, |_| false, "hello", &["world".into()]), None);
     }
 
     #[test]

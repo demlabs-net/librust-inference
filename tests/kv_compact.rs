@@ -142,9 +142,7 @@ fn compact_rolls_and_rerotates() {
     let qb = rope(b.as_ref(), &qbase, 12, hd, theta);
     let mask_a = b.from_cpu_f32(&[0.0f32; 8], vec![1, 1, 8]).unwrap();
     let mut mb = vec![f32::NEG_INFINITY; 12];
-    for j in 4..12 {
-        mb[j] = 0.0;
-    }
+    mb[4..].fill(0.0);
     let mask_b = b.from_cpu_f32(&mb, vec![1, 1, 12]).unwrap();
     let ya = b.zeros(vec![1, 1, d]).unwrap();
     let yb = b.zeros(vec![1, 1, d]).unwrap();

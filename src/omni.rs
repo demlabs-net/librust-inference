@@ -835,9 +835,9 @@ mod tests {
         let hd = 8;
         let heads = 2;
         let d = heads * hd;
-        let q: Vec<f32> = rand_vec(1 * tq * d, &mut rng);
-        let k: Vec<f32> = rand_vec(1 * tq * d, &mut rng);
-        let v: Vec<f32> = rand_vec(1 * tq * d, &mut rng);
+        let q: Vec<f32> = rand_vec(tq * d, &mut rng);
+        let k: Vec<f32> = rand_vec(tq * d, &mut rng);
+        let v: Vec<f32> = rand_vec(tq * d, &mut rng);
 
         let mb = MetalBackend::new().expect("metal backend");
         let cpu = CpuBackend;
@@ -965,7 +965,7 @@ mod tests {
         let cwv = mb.to_cpu_f32(&m_tower.conv1_w).unwrap();
         eprintln!(
             "conv1d real: w[1,5,:3]={:?}",
-            &cwv[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]
+            &cwv[(128 + 5) * 3..(128 + 5) * 3 + 3]
         );
         eprintln!("conv1d real: w[0,0,:3]={:?}", &cwv[..3]);
 
@@ -1073,7 +1073,7 @@ mod tests {
     #[test]
     fn conv1d_metal_matches_cpu() {
         let mut rng = rng_u64(3);
-        let x: Vec<f32> = rand_vec(1 * 20 * 8, &mut rng);
+        let x: Vec<f32> = rand_vec(20 * 8, &mut rng);
         let w: Vec<f32> = rand_vec(16 * 8 * 3, &mut rng);
         let b: Vec<f32> = rand_vec(16, &mut rng);
 

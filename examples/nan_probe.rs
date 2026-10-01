@@ -18,7 +18,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Qwen3Config::from_gguf(&gf, tok.vocab_size())?;
     let dim = cfg.dim;
     let mut model = Qwen3Model::load(&be, &wm, cfg.clone())?;
-    use rust_inference::inference::generate::{GenerateEvent, GenerateParams, generate};
     for text in ["<|im_start|>user\nмассив<|im_end|>\n<|im_start|>assistant\n", "<|im_start|>user\nСкажи<|im_end|>\n<|im_start|>assistant\n"] {
         let ids = tok.encode(text);
         model.reset_cache(&be)?;
@@ -64,11 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (take, _) in [(1usize, 0u32), (5, 0), (10, 0), (20, 0), (40, 0)] {
             let p = ids[..take.min(ids.len())].to_vec();
             let _ = model.reset_cache(&be);
-            if let Ok(lp) = model.prefill(&be, &p) {
-                if let Ok(vp) = be.to_cpu_f32(&lp) {
-                    let nn = vp.iter().filter(|x| x.is_nan()).count();
-                    eprintln!("   prefix take={take}: nan={nn}");
-                }
+            if let Ok(lp) = model.prefill(&be, &p)
+                && let Ok(vp) = be.to_cpu_f32(&lp)
+            {
+                let nn = vp.iter().filter(|x| x.is_nan()).count();
+                eprintln!("   prefix take={take}: nan={nn}");
             }
         }
         let _ = teo;

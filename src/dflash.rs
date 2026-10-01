@@ -1039,13 +1039,19 @@ pub struct SelectResult {
 
 /// softmax-вероятность токена в ряду логгитов (честная q драфтера).
 fn softmax_row_prob(lg: &[f32], pos: usize, vocab: usize, tok: u32) -> f32 {
-    let row = &lg[pos * vocab..(pos + 1) * vocab];
+    softmax_row_prob_t(&lg[pos * vocab..(pos + 1) * vocab], tok, 1.0)
+}
+
+/// Вероятность токена в softmax(row / temperature) — q для rejection
+/// sampling обязана считаться по ТОМУ ЖЕ распределению, из которого
+/// черновик сэмплирован.
+fn softmax_row_prob_t(row: &[f32], tok: u32, temperature: f32) -> f32 {
     let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for &l in row {
-        sum += (l - max).exp();
+        sum += ((l - max) / temperature).exp();
     }
-    ((row[tok as usize] - max).exp()) / sum
+    ((row[tok as usize] - max) / temperature).exp() / sum
 }
 
 /// DFlash-драфтер (Ф2.5): диффузия блока [anchor, MASK×…] → селектор v2
@@ -1063,6 +1069,10 @@ pub struct DFlashDrafter {
     /// Сид сэмплинга (v1-диффузия: позиции блока симметричны без conv —
     /// top-1 вырождается; спека: "sample every block position").
     pub rng: u64,
+    /// Режим выбора черновиков — задаёт петля генерации под режим проверки
+    /// (см. [`crate::spec::DraftSampling`]). По умолчанию жадный: так
+    /// работает и эталон z-lab (`dflash_generate`: argmax при temperature 0).
+    pub sampling: crate::spec::DraftSampling,
 }
 
 impl DFlashDrafter {
@@ -1075,6 +1085,7 @@ impl DFlashDrafter {
             features: None,
             committed: std::collections::VecDeque::new(),
             rng: 0x85ebca6b,
+            sampling: crate::spec::DraftSampling::Greedy,
         }
     }
 
@@ -1082,13 +1093,9 @@ impl DFlashDrafter {
     /// Сэмпл из softmax-распределения строки (LCG, как sample_modified).
     /// LLM_TOP_K=N — сэмпл только из топ-N (эксперимент: совпадение с
     /// posterior чаще, если распределения совпадают на топах).
-    fn sample_row(&mut self, row: &[f32]) -> u32 {
-        let top_k = std::env::var("LLM_TOP_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+    fn sample_row(&mut self, row: &[f32], temperature: f32, top_k: usize) -> u32 {
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+        let mut w: Vec<f32> = row.iter().map(|&l| ((l - max) / temperature).exp()).collect();
         if top_k > 0 && top_k < w.len() {
             // оставить топ-N по весу, остальные — 0
             let mut idx: Vec<usize> = (0..w.len()).collect();
@@ -1123,6 +1130,10 @@ impl DFlashDrafter {
 }
 
 impl crate::spec::Drafter for DFlashDrafter {
+    fn set_sampling(&mut self, mode: crate::spec::DraftSampling) {
+        self.sampling = mode;
+    }
+
     fn target_layers(&self) -> &[usize] {
         &self.model.extract_layers
     }
@@ -1218,7 +1229,19 @@ impl crate::spec::Drafter for DFlashDrafter {
         // строки на тех же позициях. Раньше pos = history.len() были все
         // строки блока сдвинуты на 1 — row0 (якорь) крутился на позиции
         // num+1 вместо num (у неё и verify).
-        let block = self.model.block_size;
+        // Блок v1 = якорь + γ масок, а не полный обученный block_size: так
+        // draft-dflash llama.cpp (n_block_tokens = n_draft + 1). Полный блок
+        // из 16 давал приёмку на 5–20 п.п. ниже эталона (масок больше, чем
+        // проверяется, а внимание блока двунаправленное — лишние маски
+        // размывают ранние позиции), и диффузия считала 16 строк вместо γ+1.
+        // v2 (conv/selector) обучен на полной форме блока — для него полный.
+        let v2 = self.model.selector.is_some()
+            || self.model.layers.iter().any(|l| l.attn_conv.base.is_some());
+        let block = if v2 {
+            self.model.block_size
+        } else {
+            (gamma + 1).min(self.model.block_size)
+        };
         let pos = history.len().saturating_sub(1);
         let mut ids = vec![anchor];
         ids.resize(block, self.model.mask_token);
@@ -1259,16 +1282,18 @@ impl crate::spec::Drafter for DFlashDrafter {
                 }
             }
         } else {
-            // v1: сэмпл каждой MASK-позиции (спека: "sample every block
-            // position on the backend") + честные q (softmax-вероятность).
-            // z-lab model.py: при temperature=0 черновики = ARGMAX строк
-            // (dflash_generate: block_output_ids[:, 1:] = argmax(draft_logits));
-            // случайный LCG-сэмпл из полного ряда даёт q≈0 и приёмку 0%
-            // независимо от качества драфтера. LLM_DRAFT_ARGMX=1 включает
-            // argmax-режим (жёсткая генерация бенча).
-            let argmx = std::env::var("LLM_DRAFT_ARGMX")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+            // Режим черновиков — под режим проверки (set_sampling из петли
+            // generate). z-lab model.py: при temperature=0 черновики = ARGMAX
+            // строк (dflash_generate: block_output_ids[:, 1:] =
+            // argmax(draft_logits)). Раньше argmax включался только
+            // переменной LLM_DRAFT_ARGMX, которую сервис не ставил: при
+            // жадной проверке черновики сэмплировались — приёмка 7–12%.
+            let (argmx, temp, top_k) = match self.sampling {
+                crate::spec::DraftSampling::Greedy => (true, 1.0, 0),
+                crate::spec::DraftSampling::Sample { temperature, top_k } => {
+                    (false, temperature.max(1e-6), top_k)
+                }
+            };
             let (t, vocab) = (res.logits.shape()[1], res.logits.shape()[2]);
             let lg = match backend.to_cpu_f32(&res.logits) {
                 Ok(l) => l,
@@ -1292,10 +1317,10 @@ impl crate::spec::Drafter for DFlashDrafter {
                     }
                     best.0 as u32
                 } else {
-                    self.sample_row(row)
+                    self.sample_row(row, temp, top_k)
                 };
                 tokens.push(tok);
-                probs.push(softmax_row_prob(&lg, pos, vocab, tok));
+                probs.push(softmax_row_prob_t(row, tok, if argmx { 1.0 } else { temp }));
             }
             (tokens, probs)
         };
@@ -1687,7 +1712,7 @@ mod tests {
         // сдвиг ВНУТРИ блока (паддинг нулями на границах), coeff по группам.
         use crate::harness::Lcg;
         let backend = MetalBackend::new().unwrap();
-        let cpu = crate::cpu::CpuBackend::default();
+        let cpu = crate::cpu::CpuBackend;
         let (tokens, dim, kernel, group, block) = (9usize, 16usize, 3usize, 4usize, 4usize);
         let n_groups = dim / group; // 4
         let proj = n_groups * kernel * 2; // 24
@@ -2161,7 +2186,7 @@ mod tests {
             "Metal: hidden-строки позиций идентичны — диффузия вырождена"
         );
         // то же на CPU-бэкенде (отделяет логику от Metal-кернелов)
-        let cpu = crate::cpu::CpuBackend::default();
+        let cpu = crate::cpu::CpuBackend;
         let wm_c = crate::weights_map::WeightsMap {
             arch: "dflash".into(),
             tensors: wm.tensors.clone(),
@@ -2390,7 +2415,6 @@ mod env_matrix_tests {
 #[cfg(all(test, feature = "metal", feature = "cpu"))]
 mod real_dump_tests {
     use super::*;
-    use crate::dflash::DFlashDrafter;
     use crate::metal::MetalBackend;
 
     /// 4.2c-verify: первый блок диффузии на РЕАЛЬНЫХ моделях (8B-драфтер +
@@ -2401,7 +2425,6 @@ mod real_dump_tests {
     #[ignore = "реальные GGUF (~10 ГБ на GPU)"]
     fn dflash_real_block_dump() {
         use crate::gguf;
-        use crate::gguf::GgufValue;
         let backend = MetalBackend::new().unwrap();
         let home = std::env::var("HOME").unwrap();
         // Модели переехали в метарепу: models/ (реестр + gguf). Инф-переменная

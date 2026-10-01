@@ -113,14 +113,14 @@ fn main() -> Result<(), Box<dyn Error>> {
              <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         ))
     } else {
-        tok.encode(&format!(
+        tok.encode(
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
-             <|im_start|>user\n<|vision_start|>"
-        ))
+             <|im_start|>user\n<|vision_start|>",
+        )
     };
     let img_start = ids.len();
     if !text_only {
-        ids.extend(std::iter::repeat(IMAGE_PAD).take(n_img));
+        ids.extend(std::iter::repeat_n(IMAGE_PAD, n_img));
         ids.extend(tok.encode(&format!(
             "<|vision_end|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         )));
@@ -228,7 +228,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(128);
-        if tok.eos == Some(next) || generated >= max_tokens {
+        if tok.is_eog(next) || generated >= max_tokens {
             break;
         }
         let text = decoder.push(tok.decode_piece(next).as_bytes());

@@ -18,7 +18,7 @@ use crate::error::BackendError;
 /// Нарезка весов по СТРОКАМ (колоночный параллелизм: выходные каналы).
 /// Возвращает [rows/n, cols] — кусок, дающий свою часть выходных фич.
 pub fn split_rows(
-    backend: &dyn Backend,
+    _backend: &dyn Backend,
     w: &Tensor,
     shard: usize,
     n_shards: usize,

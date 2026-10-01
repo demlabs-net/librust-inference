@@ -60,6 +60,7 @@ pub mod qwen35;
 pub mod tp;
 pub mod spec;
 pub mod tokenizer;
+mod unicode_data;
 pub mod train;
 pub mod train_qwen3;
 pub mod vision;

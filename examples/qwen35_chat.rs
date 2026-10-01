@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i as u32)
             .ok_or("пустые логиты")?;
-        if tok.eos == Some(next) {
+        if tok.is_eog(next) {
             break;
         }
         print!("{}", dec.push(tok.decode_piece(next).as_bytes()));

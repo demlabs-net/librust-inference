@@ -1007,7 +1007,7 @@ mod tests {
             for h in 0..heads {
                 for i in 0..half {
                     let sector = i % sect;
-                    let rot = (sector % 3 == 0 && sector < 3 * sections[0])
+                    let rot = (sector.is_multiple_of(3) && sector < 3 * sections[0])
                         || (sector % 3 == 1 && sector < 3 * sections[1])
                         || (sector % 3 == 2 && sector < 3 * sections[2]);
                     let p = if rot { (pos + tt) as f32 } else { 0.0 };
@@ -1091,6 +1091,92 @@ mod tests {
                 tol,
                 &format!("prefill attn tq={tq} past={past} kv={nkv} hd={hd}"),
             );
+        }
+    }
+
+    /// Хвост ключей не кратен 8: матричные кернелы предфилла читали
+    /// 8-строчный фрагмент K/V за концом тензора. Здесь K/V — окно над
+    /// большим буфером, хвост которого заполнен NaN: выход обязан остаться
+    /// конечным и равным референсу. Покрыты f32 (mma, тайлы, сплит-K) и f16.
+    #[test]
+    fn prefill_attention_ignores_rows_past_tkv() {
+        let be = MetalBackend::new().unwrap();
+        for &(tq, past, nh, nkv, hd) in &[
+            (16usize, 3usize, 2usize, 1usize, 64usize),
+            (17, 4, 4, 2, 128),
+            (37, 12, 4, 2, 128),
+            (64, 69, 4, 1, 128),
+            (21, 300, 2, 2, 64),
+        ] {
+            let tkv = past + tq;
+            assert!(tkv % 8 != 0, "форма теста обязана давать неполный хвост");
+            let cap = tkv + 40; // строки tkv..cap — «чужие» данные (NaN)
+            let mut r = rng((tq * 131 + past) as u64);
+            let q = rand(tq * nh * hd, &mut r);
+            let mut k = rand(cap * nkv * hd, &mut r);
+            let mut v = rand(cap * nkv * hd, &mut r);
+            for x in k[tkv * nkv * hd..].iter_mut() {
+                *x = f32::NAN;
+            }
+            for x in v[tkv * nkv * hd..].iter_mut() {
+                *x = f32::NAN;
+            }
+            let mask = crate::nn::build_causal_mask(&be, tq, tkv, past, None).unwrap();
+            // референс по первым tkv строкам
+            let mut ro = vec![0.0f32; tq * nh * hd];
+            for t in 0..tq {
+                for h in 0..nh {
+                    let kh = h / (nh / nkv);
+                    let qr = &q[(t * nh + h) * hd..][..hd];
+                    let lim = past + t + 1;
+                    let sc: Vec<f32> = (0..lim)
+                        .map(|j| {
+                            let kr = &k[(j * nkv + kh) * hd..][..hd];
+                            qr.iter().zip(kr).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()
+                        })
+                        .collect();
+                    let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
+                    let sum: f32 = e.iter().sum();
+                    for d in 0..hd {
+                        ro[(t * nh + h) * hd + d] =
+                            (0..lim).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                    }
+                }
+            }
+            let run = |kt: &crate::backend::Tensor, vt: &crate::backend::Tensor| {
+                let out = be.zeros(vec![1, tq, nh * hd]).unwrap();
+                be.attn_ar(
+                    &be.from_cpu_f32(&q, vec![1, tq, nh * hd]).unwrap(),
+                    &kt.view_restricted(vec![1, tkv, nkv * hd]),
+                    &vt.view_restricted(vec![1, tkv, nkv * hd]),
+                    Some(&mask),
+                    &out,
+                    nh,
+                    nkv,
+                    hd,
+                )
+                .unwrap();
+                be.to_cpu_f32(&out).unwrap()
+            };
+            let k32 = be.from_cpu_f32(&k, vec![1, cap, nkv * hd]).unwrap();
+            let v32 = be.from_cpu_f32(&v, vec![1, cap, nkv * hd]).unwrap();
+            for path in ["mma", "tiles", "split"] {
+                let got = if path == "mma" {
+                    run(&k32, &v32)
+                } else {
+                    crate::metal::with_attn_path(path, || run(&k32, &v32))
+                };
+                assert!(got.iter().all(|x| x.is_finite()), "{path} tq={tq} past={past}: NaN в выходе");
+                let tol = if path == "mma" { 1e-4 } else { 3e-3 };
+                close(&got, &ro, tol, &format!("{path} f32 tq={tq} past={past} hd={hd}"));
+            }
+            let h16 = |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&a| half::f16::from_f32(a)).collect() };
+            let k16 = be.from_cpu_f16(&h16(&k), vec![1, cap, nkv * hd]).unwrap();
+            let v16 = be.from_cpu_f16(&h16(&v), vec![1, cap, nkv * hd]).unwrap();
+            let got = run(&k16, &v16);
+            assert!(got.iter().all(|x| x.is_finite()), "f16 tq={tq} past={past}: NaN в выходе");
+            close(&got, &ro, 3e-3, &format!("f16 tq={tq} past={past} hd={hd}"));
         }
     }
 

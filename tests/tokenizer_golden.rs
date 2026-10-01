@@ -126,3 +126,30 @@ fn eog_set_matches_llama_cpp_rules() {
     }
 }
 
+
+/// Стриминг по токенам (piece_bytes → IncrementalDecoder) собирает ровно
+/// исходный текст, даже когда символ разбит на несколько токенов (эмодзи,
+/// редкие иероглифы): раньше кусок токена проходил через from_utf8_lossy
+/// ДО декодера, и клиент получал «���» вместо 🦀.
+#[test]
+fn streaming_decode_keeps_split_characters() {
+    let Some((mmap, _)) = load("Qwen3-0.6B-Instruct-Q8_0.gguf").or_else(|| load("Qwen3-8B-Q8_0.gguf")) else {
+        eprintln!("нет Qwen3 GGUF — пропуск");
+        return;
+    };
+    let gf = gguf::parse(&mmap).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gf).expect("tokenizer");
+    let text = "Краб 🦀 и 𝔘 и 龘, эмодзи-флаг 🇷🇺 и 👩‍💻.";
+    let ids = tok.encode(text);
+    assert!(
+        ids.iter().any(|&i| std::str::from_utf8(&tok.piece_bytes(i)).is_err()),
+        "в тексте должен быть символ, разбитый на токены"
+    );
+    let mut dec = rust_inference::tokenizer::IncrementalDecoder::new();
+    let mut out = String::new();
+    for &i in &ids {
+        out.push_str(&dec.push(&tok.piece_bytes(i)));
+    }
+    out.push_str(&dec.finish());
+    assert_eq!(out, text);
+}

@@ -84,6 +84,9 @@ impl TemplateContext {
 /// Скомпилированный шаблон.
 pub struct Template {
     env: Environment<'static>,
+    /// Исходный текст шаблона: по нему определяется семейство (теги
+    /// рассуждений, формат вызовов инструментов) — как в llama.cpp.
+    source: String,
     /// `bos_token`/`eos_token` и т.п. — из метаданных GGUF.
     pub special_tokens: HashMap<String, String>,
 }
@@ -119,7 +122,11 @@ impl Template {
         env.add_filter("tojson", tojson);
         env.add_template_owned(NAME, src.to_string())
             .map_err(|e| TemplateError::Compile(error_chain(&e)))?;
-        Ok(Self { env, special_tokens })
+        Ok(Self { env, source: src.to_string(), special_tokens })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     pub fn render(&self, ctx: &TemplateContext) -> Result<String, TemplateError> {

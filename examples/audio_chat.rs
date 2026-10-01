@@ -223,7 +223,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if tok.is_eog(next) {
             break;
         }
-        let text = decoder.push(tok.decode_piece(next).as_bytes());
+        let text = decoder.push(&tok.piece_bytes(next));
         out.push_str(&text);
         print!("{text}");
         std::io::stdout().flush()?;

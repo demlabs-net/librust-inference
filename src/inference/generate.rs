@@ -5,6 +5,7 @@
 
 use crate::backend::Backend;
 use crate::error::BackendError;
+use crate::inference::reasoning_budget::ReasoningBudget;
 use crate::inference::sampling::{SamplingParams, top_p_sample_vec_history};
 use crate::qwen3::Qwen3Model;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -115,6 +116,12 @@ pub struct GenerateParams {
     pub vision: Option<VisionPrompt>,
     /// PP-разбиение (7.5): None — обычная локальная генерация.
     pub pp: Option<PpSplit>,
+    /// Бюджет рассуждений (Anthropic `thinking.budget_tokens`, llama.cpp
+    /// `reasoning_budget_tokens`): автомат [`ReasoningBudget`], заранее
+    /// прогнанный по генерационному префиксу промпта. По исчерпании петля
+    /// вставляет его принудительную последовательность (сообщение +
+    /// `</think>`), и модель переходит к ответу. None — без ограничения.
+    pub reasoning_budget: Option<ReasoningBudget>,
 }
 
 impl Default for GenerateParams {
@@ -132,6 +139,7 @@ impl Default for GenerateParams {
             spec_gamma: 0,
             vision: None,
             pp: None,
+            reasoning_budget: None,
         }
     }
 }
@@ -559,8 +567,9 @@ fn emit(
     acc: &mut String,
     on_event: &mut impl FnMut(GenerateEvent) -> bool,
 ) -> Emit {
-    let piece = tok.decode_piece(t);
-    let delta = decoder.push(piece.as_bytes());
+    // Сырые байты: токен может нести обрывок многобайтного символа —
+    // decode_piece превратил бы его в U+FFFD до декодера.
+    let delta = decoder.push(&tok.piece_bytes(t));
     if !delta.is_empty() {
         acc.push_str(&delta);
         if !on_event(GenerateEvent::Delta(delta)) {
@@ -689,14 +698,29 @@ pub fn generate<M: CausalLm + ?Sized>(
     // и оставлял DFlash-драфтер без фич этого токена (дыра в контексте).
     let mut pending: Option<u32> = None;
 
+    // Бюджет рассуждений (как сэмплер reasoning-budget llama.cpp): в
+    // FORCING следующий токен — принудительный (проходит через forward,
+    // попадает в вывод и историю как обычный); каждый выданный токен
+    // учитывается автоматом.
+    let mut budget = params.reasoning_budget.clone();
+
     // Лимит — по числу ВЫДАННЫХ токенов, а не итераций: спек-шаг выдаёт
     // до 1+γ токенов за итерацию, и счёт итераций пропускал лимит в разы
     // (64 запрошено — 98 выдано на Qwen3.5 с N-грамм-драфтером).
     while generated.len() < params.max_tokens {
+        // Якорь от отказа спек-окна — выбор модели, сделанный ДО того, как
+        // автомат потребовал вставку (окно обрезается по draft_room), так что
+        // принуждение его не отменяет.
         let next = match pending.take() {
             Some(p) => p,
-            None => sample_next(backend, &logits, vocab, params, &history, &mut rng_state)?,
+            None => match budget.as_ref().and_then(|b| b.forced_token()) {
+                Some(f) => f,
+                None => sample_next(backend, &logits, vocab, params, &history, &mut rng_state)?,
+            },
         };
+        if let Some(b) = budget.as_mut() {
+            b.accept_piece(next, &tok.piece_bytes(next));
+        }
         if let Some(r) = check_stop(next, |t| tok.is_eog(t), &acc, &params.stop_strings) {
             finish = Some(r);
             break;
@@ -716,15 +740,24 @@ pub fn generate<M: CausalLm + ?Sized>(
         // спек-декод несовместимы: верификация гоняет forward ЦЕЛИКОМ по
         // полному локальному KV, а в PP-режиме локально живут только слои
         // [0..from) — черновики проверялись бы по пустому кэшу.
+        // Бюджет рассуждений: черновики проверяются только до места, где
+        // автомат потребует вставку (принятые шли бы мимо неё); пока идёт
+        // сама вставка, окно не открывается.
+        let room = budget.as_ref().map(|b| b.forced_token().is_none());
         if let (Some(drafter), true) = (
             &params.drafter,
-            params.spec_gamma > 0 && params.pp.is_none(),
+            params.spec_gamma > 0 && params.pp.is_none() && room != Some(false),
         ) {
-            let (draft_tokens, draft_probs) = {
+            let (mut draft_tokens, mut draft_probs) = {
                 let mut dr = drafter.lock().unwrap();
                 dr.set_sampling(draft_sampling);
                 dr.draft(backend, &history, params.spec_gamma)
             };
+            if let Some(b) = budget.as_ref() {
+                let k = b.draft_room(&draft_tokens);
+                draft_tokens.truncate(k);
+                draft_probs.truncate(k);
+            }
             if !draft_tokens.is_empty() {
                 let tlayers: Vec<usize> = {
                     let dr = drafter.lock().unwrap();
@@ -760,6 +793,9 @@ pub fn generate<M: CausalLm + ?Sized>(
                 for &t in &out.accepted[1..n_ok] {
                     if generated.len() >= params.max_tokens {
                         break;
+                    }
+                    if let Some(b) = budget.as_mut() {
+                        b.accept_piece(t, &tok.piece_bytes(t));
                     }
                     if let Some(r) = check_stop(t, |x| tok.is_eog(x), &acc, &params.stop_strings) {
                         finish = Some(r);
@@ -955,6 +991,40 @@ mod tests {
         assert_eq!(gen_tokens.len(), 3, "max_tokens reached");
         assert_eq!(done, Some(FinishReason::MaxTokens));
         assert!(deltas > 0, "дельты текста не пришли");
+    }
+
+    /// Бюджет рассуждений: рассуждение открыто промптом (генпрефикс
+    /// прогнан через автомат), после N токенов петля вставляет
+    /// принудительную последовательность автомата (сообщение + «</think>»);
+    /// дальше — обычный ответ модели.
+    #[test]
+    fn reasoning_budget_forces_close() {
+        use crate::inference::reasoning_budget::ReasoningBudget;
+        let (backend, mut model) = mini_model();
+        // словарь 8 токенов: 0..4 — буквы, 5 — «<think>», 6 — «</think>», 7 — «\n»
+        let mut vocab: Vec<Vec<u8>> = (0..5).map(|i| vec![b'a' + i as u8]).collect();
+        vocab.push(b"<think>".to_vec());
+        vocab.push(b"</think>".to_vec());
+        vocab.push("\u{010A}".as_bytes().to_vec()); // byte-level «\n»
+        let mut tok = crate::tokenizer::Tokenizer::from_parts(vocab, vec![], None, None, None);
+        tok.add_special(b"<think>".to_vec(), 5);
+        tok.add_special(b"</think>".to_vec(), 6);
+        let mut budget = ReasoningBudget::for_tokenizer(&tok, "<think>", &["</think>"], "\n", 3).unwrap();
+        budget.prefill(&tok, &tok.encode("<think>\n"));
+        let params = GenerateParams {
+            max_tokens: 12,
+            temperature: 0.0,
+            reasoning_budget: Some(budget),
+            ..Default::default()
+        };
+        let out = generate(&mut model, &backend, &tok, &[1, 2], &params, |_| true).unwrap();
+        // «\n» генпрефикса после <think> уже съел 1 из 3 (как в llama.cpp:
+        // токены префикса проходят через автомат) — модели остаётся 2, затем
+        // «\n» «</think>» (случайная мини-модель сама не закроет), после —
+        // снова генерация модели
+        assert_eq!(&out[2..4], &[7, 6], "вставка после 2 токенов: {out:?}");
+        assert!(!out[..2].contains(&6), "{out:?}");
+        assert_eq!(out.len(), 12, "после вставки генерация продолжается: {out:?}");
     }
 
     #[test]

@@ -497,8 +497,16 @@ impl Tokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Кусок токена как текст (для стриминга): обратный byte-level.
+    /// Кусок токена как текст (обратный byte-level). Токен-обрывок
+    /// многобайтного символа даёт U+FFFD — для стриминга брать
+    /// [`Self::piece_bytes`] через `IncrementalDecoder`.
     pub fn decode_piece(&self, id: u32) -> String {
+        String::from_utf8_lossy(&self.piece_bytes(id)).into_owned()
+    }
+
+    /// Сырые байты текста токена (обратный byte-level): у эмодзи и редких
+    /// символов, разбитых на несколько токенов, это неполный UTF-8.
+    pub fn piece_bytes(&self, id: u32) -> Vec<u8> {
         let (_, utb) = unicode_tables();
         let mut bytes = Vec::new();
         for c in String::from_utf8_lossy(self.piece(id)).chars() {
@@ -509,7 +517,7 @@ impl Tokenizer {
                 bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
     }
 }
 

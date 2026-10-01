@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if tok.is_eog(next) {
             break;
         }
-        print!("{}", dec.push(tok.decode_piece(next).as_bytes()));
+        print!("{}", dec.push(&tok.piece_bytes(next)));
         std::io::stdout().flush()?;
         produced += 1;
         logits = model.decode(&backend, next)?;

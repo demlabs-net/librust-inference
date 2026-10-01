@@ -4,8 +4,15 @@
 //!   ~/.vassista-models/llm/Qwen3-8B-Q8_0.gguf "Привет, расскажи о себе"`
 //!
 //! Пайплайн: mmap GGUF → конфиг/токенайзер/чат-шаблон из метадаты → модель
-//! (f16-веса) → prefill + greedy decode → печать текста + метрики (tok/s,
-//! TTFT). Качество валидируется вручную; перф-цели — в бенч-гарнесе (Ф1.8).
+//! → generate (батч-префилл + декод) → печать текста + метрики: префилл и
+//! декод РАЗДЕЛЬНО, по событию Timings движка (семантика `timings`
+//! llama-server). Перед замером — прогрев на том же промпте (префилл + шаг
+//! декода, как прогрев llama-cli/llama-bench): первый forward процесса
+//! платит за создание Metal-пайплайнов и пул буферов (на 8B ≈1.7 с против
+//! 0.09 с тёплого префилла), это время печатается отдельно; `LLM_NO_WARMUP=1`
+//! — замер холодного старта. Диагностика первого шага (top-20, пробы
+//! токенов) — `LLM_TOP=1`; потокенный префилл вместо батча —
+//! `LLM_PREFILL_PER_TOKEN=1` (отладка кернелов декода).
 
 #![cfg(feature = "metal")]
 
@@ -155,60 +162,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend: Box<dyn rust_inference::backend::Backend> = Box::new(MetalBackend::new()?);
     let mut model = Qwen3Model::load(backend.as_ref(), &wm, cfg.clone())?;
 
-    // prefill + TTFT
     if std::env::var("INFER_LLM_DEBUG").is_ok() {
         eprintln!("INFER_DEBUG ids={ids:?}");
     }
-    let t0 = Instant::now();
-    let logits = if std::env::var("LLM_BATCH").is_ok() {
-        model.prefill_last(&*backend, &ids)?
-    } else {
-        let mut l = model.decode(&*backend, ids[0])?;
-        for &id in &ids[1..] {
-            l = model.decode(&*backend, id)?;
-        }
-        l
-    };
-    let ttft = t0.elapsed();
-    eprintln!(
-        "prefill {} tokens in {:.2}s (TTFT)",
-        ids.len(),
-        ttft.as_secs_f32()
-    );
-
-    // top-20 первого шага
-    let v0 = backend.to_cpu_f32(&logits)?;
-    let n = cfg.vocab_size;
-    let last = &v0[v0.len() - n..];
-    let mut top: Vec<(u32, f32)> = last
-        .iter()
-        .enumerate()
-        .map(|(i, &x)| (i as u32, x))
-        .collect();
-    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    eprintln!("top-20 first step:");
-    for (id, s) in top.iter().take(20) {
-        eprintln!(
-            "  {:>6} {:.4} {:?}",
-            id,
-            s,
-            String::from_utf8_lossy(tok.piece(*id))
-        );
-    }
-    // думающий канал Qwen3: <think>=151667, </think>=151668 — где они в наших логитах?
-    for probe in [151667u32, 151668, 27, 29, 26865, 151645] {
-        let rank = top.iter().position(|(id, _)| *id == probe);
-        let score = top
-            .iter()
-            .find(|(id, _)| *id == probe)
-            .map(|(_, s)| *s)
-            .unwrap_or(f32::NAN);
-        eprintln!(
-            "  probe {probe} ({:?}): rank={:?} score={:.4}",
-            String::from_utf8_lossy(tok.piece(probe)),
-            rank,
-            score
-        );
+    if std::env::var("LLM_TOP").is_ok() {
+        print_first_step(&mut model, backend.as_ref(), &tok, &ids, cfg.vocab_size)?;
+        model.reset_cache(backend.as_ref())?;
+    } else if std::env::var("LLM_NO_WARMUP").is_err() {
+        let t0 = Instant::now();
+        let logits = model.prefill_last(&*backend, &ids)?;
+        backend.to_cpu_f32(&logits)?;
+        model.decode(&*backend, ids[ids.len() - 1])?;
+        model.reset_cache(backend.as_ref())?;
+        eprintln!("прогрев (пайплайны, буферы): {:.2}s", t0.elapsed().as_secs_f32());
     }
 
     // Генерация — через БИБЛИОТЕЧНУЮ петлю inference::generate (та же, что
@@ -256,10 +222,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             None
         };
-    // Префилл выше уже прогнан (TTFT/top-20) — generate делает свой с
-    // чистого кэша (у DFlash первый блок обязан видеть фичи всего промпта).
-    model.reset_cache(backend.as_ref())?;
-    let _ = logits;
+    // Потокенный префилл (отладка): кэш заполняется декодом по одному
+    // токену, generate получает только последний токен промпта.
+    let per_token = std::env::var("LLM_PREFILL_PER_TOKEN").is_ok();
+    let gen_ids: Vec<u32> = if per_token && ids.len() > 1 {
+        let t0 = Instant::now();
+        for &id in &ids[..ids.len() - 1] {
+            model.decode(&*backend, id)?;
+        }
+        eprintln!(
+            "потокенный префилл {} токенов: {:.2}s",
+            ids.len() - 1,
+            t0.elapsed().as_secs_f32()
+        );
+        vec![ids[ids.len() - 1]]
+    } else {
+        ids.clone()
+    };
     let params = rust_inference::inference::generate::GenerateParams {
         max_tokens,
         temperature,
@@ -271,14 +250,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         spec_gamma: if drafter.is_some() { gamma } else { 0 },
         ..Default::default()
     };
-    let d0 = Instant::now();
     let mut out = String::new();
     let mut stats = None;
+    let mut timings = None;
     let toks = rust_inference::inference::generate::generate(
         &mut model,
         backend.as_ref(),
         &tok,
-        &ids,
+        &gen_ids,
         &params,
         |ev| {
             use rust_inference::inference::generate::GenerateEvent;
@@ -289,12 +268,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     out.push_str(&s);
                 }
                 GenerateEvent::SpecStats(st) => stats = Some(st),
+                GenerateEvent::Timings(t) => timings = Some(t),
                 _ => {}
             }
             true
         },
     )?;
-    let dt = d0.elapsed();
     eprintln!();
     if let Some(st) = stats {
         eprintln!(
@@ -304,12 +283,67 @@ fn main() -> Result<(), Box<dyn Error>> {
             st.acceptance().unwrap_or(0.0)
         );
     }
+    let t = timings.ok_or("generate не прислал Timings")?;
     eprintln!(
-        "generated {} tokens in {:.2}s → {:.1} tok/s (decode)",
+        "prefill {} tokens in {:.2}s → {:.1} tok/s (TTFT {:.0} ms)",
+        t.prompt_n,
+        t.prompt_ms / 1e3,
+        t.prompt_per_second(),
+        t.prompt_ms
+    );
+    eprintln!(
+        "decode {} tokens ({} steps) in {:.2}s → {:.1} tok/s",
         toks.len(),
-        dt.as_secs_f32(),
-        toks.len() as f32 / dt.as_secs_f32()
+        t.decode_steps(),
+        t.predicted_ms / 1e3,
+        t.predicted_per_second()
     );
     eprintln!("--- output ---\n{out}");
+    Ok(())
+}
+
+/// Диагностика первого шага (LLM_TOP=1): top-20 логитов после префилла и
+/// ранги служебных токенов Qwen3 (<think>, </think>, <|im_end|> …).
+fn print_first_step(
+    model: &mut Qwen3Model,
+    backend: &dyn rust_inference::backend::Backend,
+    tok: &Tokenizer,
+    ids: &[u32],
+    vocab: usize,
+) -> Result<(), Box<dyn Error>> {
+    let logits = model.prefill_last(backend, ids)?;
+    let v0 = backend.to_cpu_f32(&logits)?;
+    let n = vocab;
+    let last = &v0[v0.len() - n..];
+    let mut top: Vec<(u32, f32)> = last
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i as u32, x))
+        .collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("top-20 first step:");
+    for (id, s) in top.iter().take(20) {
+        eprintln!(
+            "  {:>6} {:.4} {:?}",
+            id,
+            s,
+            String::from_utf8_lossy(tok.piece(*id))
+        );
+    }
+    // думающий канал Qwen3: <think>=151667, </think>=151668 — где они в наших логитах?
+    for probe in [151667u32, 151668, 27, 29, 26865, 151645] {
+        let rank = top.iter().position(|(id, _)| *id == probe);
+        let score = top
+            .iter()
+            .find(|(id, _)| *id == probe)
+            .map(|(_, s)| *s)
+            .unwrap_or(f32::NAN);
+        eprintln!(
+            "  probe {probe} ({:?}): rank={:?} score={:.4}",
+            String::from_utf8_lossy(tok.piece(probe)),
+            rank,
+            score
+        );
+    }
     Ok(())
 }

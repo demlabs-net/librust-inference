@@ -79,8 +79,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..Default::default()
         };
         print!("{prompt}");
-        let t2 = Instant::now();
         let mut stats = None;
+        let mut timings = None;
         let out = generate(&mut model, &backend, &tok, &ids, &params, |ev| {
             match ev {
                 GenerateEvent::Delta(s) => {
@@ -88,16 +88,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let _ = std::io::stdout().flush();
                 }
                 GenerateEvent::SpecStats(st) => stats = Some(st),
+                GenerateEvent::Timings(t) => timings = Some(t),
                 _ => {}
             }
             true
         })?;
         println!();
-        let dt = t2.elapsed().as_secs_f32();
+        let t = timings.ok_or("generate не прислал Timings")?;
         eprintln!(
-            "spec {spec}: {} ток. за {dt:.2}s ({:.1} tok/s), {:?}",
+            "spec {spec}: префилл {} ток. за {:.2}s ({:.1} tok/s); декод {} ток. ({} шагов) за {:.2}s ({:.1} tok/s), {:?}",
+            t.prompt_n,
+            t.prompt_ms / 1e3,
+            t.prompt_per_second(),
             out.len(),
-            out.len() as f32 / dt.max(1e-6),
+            t.decode_steps(),
+            t.predicted_ms / 1e3,
+            t.predicted_per_second(),
             stats
         );
         return Ok(());

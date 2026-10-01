@@ -32,8 +32,44 @@ pub enum GenerateEvent {
     Token(u32),
     /// Спек-статистика (4.2b) — при включённом драфтере.
     SpecStats(SpecStats),
+    /// Времена префилла и декода раздельно (перед `Done`).
+    Timings(Timings),
     /// Генерация завершена.
     Done(FinishReason),
+}
+
+/// Времена генерации — как `timings` llama-server (server_slot_stats):
+/// префилл — от начала до логитов последней строки промпта (первый токен
+/// берётся из них и в декод не входит); декод — от конца префилла до
+/// последнего сэмплированного токена, скорость — по шагам декода
+/// (`predicted_n - 1`). `predicted_n` — как n_decoded llama-server: включая
+/// токен конца генерации (он сэмплирован из логитов последнего шага), хотя
+/// в текст и в возвращаемые токены он не попадает.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Timings {
+    pub prompt_n: usize,
+    pub prompt_ms: f64,
+    pub predicted_n: usize,
+    pub predicted_ms: f64,
+}
+
+impl Timings {
+    /// Шаги декода: первый токен «бесплатный» — из логитов префилла.
+    pub fn decode_steps(&self) -> usize {
+        self.predicted_n.saturating_sub(1)
+    }
+
+    pub fn prompt_per_second(&self) -> f64 {
+        if self.prompt_ms > 0.0 { self.prompt_n as f64 * 1e3 / self.prompt_ms } else { 0.0 }
+    }
+
+    pub fn predicted_per_second(&self) -> f64 {
+        if self.predicted_ms > 0.0 {
+            self.decode_steps() as f64 * 1e3 / self.predicted_ms
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Статистика спек-декодирования (Этап 4.2b).
@@ -593,6 +629,7 @@ pub fn generate<M: CausalLm + ?Sized>(
     params: &GenerateParams,
     mut on_event: impl FnMut(GenerateEvent) -> bool,
 ) -> Result<Vec<u32>, BackendError> {
+    let t_start = std::time::Instant::now();
     let mut spec_stats = SpecStats::default();
     // Vision-префилл (2.4b): картинка уже посчитана — идём через M-RoPE.
     let mut logits = if let Some(pp) = params.pp.clone() {
@@ -650,6 +687,11 @@ pub fn generate<M: CausalLm + ?Sized>(
         model.decode(backend, ids[0])?
     };
     let vocab = model.vocab_size();
+    // Логиты префилла — на GPU, их чтение (первый сэмплинг) уже часть декода;
+    // сам префилл синхронен (forward ждёт command buffer).
+    let t_prompt = t_start.elapsed();
+    let mut t_last_token = t_prompt;
+    let mut eog_sampled = 0usize;
 
     // Диагностика параметров (LLM_DBG_PARAMS=1): расхождения спек/жадной
     // генерации на живом сервисе искали именно сравнением эффективных
@@ -722,6 +764,10 @@ pub fn generate<M: CausalLm + ?Sized>(
             b.accept_piece(next, &tok.piece_bytes(next));
         }
         if let Some(r) = check_stop(next, |t| tok.is_eog(t), &acc, &params.stop_strings) {
+            if r == FinishReason::Eog {
+                eog_sampled = 1;
+                t_last_token = t_start.elapsed();
+            }
             finish = Some(r);
             break;
         }
@@ -731,6 +777,7 @@ pub fn generate<M: CausalLm + ?Sized>(
         }
         generated.push(next);
         history.push(next);
+        t_last_token = t_start.elapsed();
         if generated.len() >= params.max_tokens {
             break;
         }
@@ -798,6 +845,10 @@ pub fn generate<M: CausalLm + ?Sized>(
                         b.accept_piece(t, &tok.piece_bytes(t));
                     }
                     if let Some(r) = check_stop(t, |x| tok.is_eog(x), &acc, &params.stop_strings) {
+                        if r == FinishReason::Eog {
+                            eog_sampled = 1;
+                            t_last_token = t_start.elapsed();
+                        }
                         finish = Some(r);
                         break;
                     }
@@ -807,6 +858,7 @@ pub fn generate<M: CausalLm + ?Sized>(
                     }
                     generated.push(t);
                     history.push(t);
+                    t_last_token = t_start.elapsed();
                 }
                 if finish.is_some() {
                     break;
@@ -861,6 +913,12 @@ pub fn generate<M: CausalLm + ?Sized>(
         }
         on_event(GenerateEvent::SpecStats(spec_stats));
     }
+    on_event(GenerateEvent::Timings(Timings {
+        prompt_n: ids.len(),
+        prompt_ms: t_prompt.as_secs_f64() * 1e3,
+        predicted_n: generated.len() + eog_sampled,
+        predicted_ms: (t_last_token.saturating_sub(t_prompt)).as_secs_f64() * 1e3,
+    }));
     on_event(GenerateEvent::Done(finish.unwrap()));
     Ok(generated)
 }
@@ -1036,6 +1094,50 @@ mod tests {
             Some(FinishReason::StopString)
         );
         assert_eq!(check_stop(7, |_| false, "hello", &["world".into()]), None);
+    }
+
+    /// Timings: приходит перед Done; prompt_n — длина промпта; predicted_n
+    /// — выданные токены (+ сэмплированный EOG, как n_decoded llama-server);
+    /// декод не включает префилл.
+    #[test]
+    fn timings_split_prefill_and_decode() {
+        let (backend, mut model) = mini_model();
+        let mut events = Vec::new();
+        let params = GenerateParams { max_tokens: 5, temperature: 0.0, ..Default::default() };
+        let out = generate(&mut model, &backend, &tiny_tokenizer(), &[1, 2, 3], &params, |ev| {
+            events.push(ev);
+            true
+        })
+        .unwrap();
+        let pos_t = events.iter().position(|e| matches!(e, GenerateEvent::Timings(_))).expect("Timings");
+        let pos_d = events.iter().position(|e| matches!(e, GenerateEvent::Done(_))).expect("Done");
+        assert!(pos_t < pos_d, "Timings до Done");
+        let GenerateEvent::Timings(t) = events[pos_t] else { unreachable!() };
+        assert_eq!(t.prompt_n, 3);
+        assert_eq!(t.predicted_n, out.len(), "без EOG: predicted_n = выданные токены");
+        assert!(t.prompt_ms > 0.0 && t.predicted_ms > 0.0, "{t:?}");
+        assert_eq!(t.decode_steps(), out.len() - 1);
+
+        // EOG сэмплирован: в текст не попадает, но в predicted_n считается
+        // (жадный первый токен того же промпта объявлен eos)
+        let tok = crate::tokenizer::Tokenizer::from_parts(
+            (0..8).map(|i| vec![b'a' + i as u8]).collect(),
+            vec![],
+            None,
+            Some(out[0]),
+            None,
+        );
+        model.reset_cache(&backend).unwrap();
+        let mut timings = None;
+        let out2 = generate(&mut model, &backend, &tok, &[1, 2, 3], &params, |ev| {
+            if let GenerateEvent::Timings(t) = ev {
+                timings = Some(t);
+            }
+            true
+        })
+        .unwrap();
+        assert!(out2.is_empty(), "первый же токен — EOG: {out2:?}");
+        assert_eq!(timings.unwrap().predicted_n, 1);
     }
 
     #[test]

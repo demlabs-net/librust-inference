@@ -168,13 +168,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if std::env::var("LLM_TOP").is_ok() {
         print_first_step(&mut model, backend.as_ref(), &tok, &ids, cfg.vocab_size)?;
         model.reset_cache(backend.as_ref())?;
-    } else if std::env::var("LLM_NO_WARMUP").is_err() {
-        let t0 = Instant::now();
-        let logits = model.prefill_last(&*backend, &ids)?;
-        backend.to_cpu_f32(&logits)?;
-        model.decode(&*backend, ids[ids.len() - 1])?;
-        model.reset_cache(backend.as_ref())?;
-        eprintln!("прогрев (пайплайны, буферы): {:.2}s", t0.elapsed().as_secs_f32());
     }
 
     // Генерация — через БИБЛИОТЕЧНУЮ петлю inference::generate (та же, что
@@ -197,14 +190,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(4);
     let drafter: Option<std::sync::Arc<std::sync::Mutex<dyn rust_inference::spec::Drafter>>> =
         if let Ok(p) = std::env::var("LLM_SPEC_DFLASH") {
-            let ew = rust_inference::weights_map::dequant_f32(
-                wm.get("token_embd.weight").ok_or("token_embd.weight missing")?,
-            );
-            let embed_t = backend.from_cpu_f32(&ew, vec![cfg.vocab_size, cfg.dim])?;
+            // таблица эмбеддингов и lm_head — общие с таргетом (как в
+            // сервисе): своя f32-копия таблицы стоила 2.5 ГБ и ~7 с загрузки
             let d = rust_inference::dflash::load_drafter_gguf(
                 backend.as_ref(),
                 std::path::Path::new(&p),
-                embed_t,
+                model.token_embed_table().clone(),
                 model.output_projection().clone(),
                 cfg.vocab_size,
             )?;
@@ -222,6 +213,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             None
         };
+    // Прогрев — после загрузки драфтера: короткая генерация тем же путём
+    // (префилл промпта, при спеке — с фичами и окнами верификации).
+    // Первый forward процесса и первый после крупной загрузки ждут
+    // создания пайплайнов и подкачки весов; замер — по тёплому движку.
+    if std::env::var("LLM_NO_WARMUP").is_err() {
+        let t0 = Instant::now();
+        let warm = rust_inference::inference::generate::GenerateParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            drafter: drafter.clone(),
+            spec_gamma: if drafter.is_some() { gamma } else { 0 },
+            ..Default::default()
+        };
+        rust_inference::inference::generate::generate(
+            &mut model,
+            backend.as_ref(),
+            &tok,
+            &ids,
+            &warm,
+            |_| true,
+        )?;
+        model.reset_cache(backend.as_ref())?;
+        if let Some(d) = &drafter {
+            d.lock().unwrap().reset();
+        }
+        eprintln!("прогрев (пайплайны, буферы): {:.2}s", t0.elapsed().as_secs_f32());
+    }
     // Потокенный префилл (отладка): кэш заполняется декодом по одному
     // токену, generate получает только последний токен промпта.
     let per_token = std::env::var("LLM_PREFILL_PER_TOKEN").is_ok();

@@ -673,11 +673,20 @@ pub fn generate<M: CausalLm + ?Sized>(
             .map(|d| d.lock().unwrap().target_layers().to_vec());
         match tlayers {
             Some(tl) if !tl.is_empty() => {
+                let tp = std::time::Instant::now();
                 let (lg, extract) = model.prefill_extract(backend, ids, &tl)?;
+                let t_pf = tp.elapsed();
                 let n = ids.len();
                 if let Some(dr) = params.drafter.as_ref() {
                     let mut dr = dr.lock().unwrap();
                     let _ = dr.after_extract(backend, &extract, n, n);
+                }
+                if std::env::var("LLM_SPEC_PROF").is_ok() {
+                    eprintln!(
+                        "SPEC_PROF префилл: prefill_extract {:.0} мс, фичи драфтера {:.0} мс",
+                        t_pf.as_secs_f64() * 1e3,
+                        (tp.elapsed() - t_pf).as_secs_f64() * 1e3
+                    );
                 }
                 lg
             }
@@ -745,6 +754,11 @@ pub fn generate<M: CausalLm + ?Sized>(
     // попадает в вывод и историю как обычный); каждый выданный токен
     // учитывается автоматом.
     let mut budget = params.reasoning_budget.clone();
+    // LLM_SPEC_PROF=1: время фаз спек-окна (черновик / верификация /
+    // фичи драфтера / обычный декод) — куда уходит выигрыш спека.
+    let spec_prof = std::env::var("LLM_SPEC_PROF").is_ok();
+    let mut prof = [0f64; 4];
+    let mut prof_n = [0usize; 4];
 
     // Лимит — по числу ВЫДАННЫХ токенов, а не итераций: спек-шаг выдаёт
     // до 1+γ токенов за итерацию, и счёт итераций пропускал лимит в разы
@@ -795,11 +809,14 @@ pub fn generate<M: CausalLm + ?Sized>(
             &params.drafter,
             params.spec_gamma > 0 && params.pp.is_none() && room != Some(false),
         ) {
+            let tp = std::time::Instant::now();
             let (mut draft_tokens, mut draft_probs) = {
                 let mut dr = drafter.lock().unwrap();
                 dr.set_sampling(draft_sampling);
                 dr.draft(backend, &history, params.spec_gamma)
             };
+            prof[0] += tp.elapsed().as_secs_f64();
+            prof_n[0] += 1;
             if let Some(b) = budget.as_ref() {
                 let k = b.draft_room(&draft_tokens);
                 draft_tokens.truncate(k);
@@ -810,6 +827,7 @@ pub fn generate<M: CausalLm + ?Sized>(
                     let dr = drafter.lock().unwrap();
                     dr.target_layers().to_vec()
                 };
+                let tp = std::time::Instant::now();
                 let out = model.decode_spec(
                     backend,
                     next,
@@ -824,12 +842,17 @@ pub fn generate<M: CausalLm + ?Sized>(
                     &history,
                     params.repeat_penalty,
                 )?;
+                prof[1] += tp.elapsed().as_secs_f64();
+                prof_n[1] += 1;
                 // Проверенные черновики (ровно те, что лежат в кэше таргета).
                 let n_ok = out.n_draft_accepted + 1; // якорь + проверенные
                 if !tlayers.is_empty() {
+                    let tp = std::time::Instant::now();
                     let pos = model.context_len();
                     let mut dr = drafter.lock().unwrap();
                     let _ = dr.after_extract(backend, &out.extract, pos, n_ok);
+                    prof[2] += tp.elapsed().as_secs_f64();
+                    prof_n[2] += 1;
                 }
                 spec_stats.drafts += draft_tokens.len() as u64;
                 let nv = out.n_draft_verified;
@@ -892,8 +915,19 @@ pub fn generate<M: CausalLm + ?Sized>(
                 }
             }
         } else {
-            model.decode(backend, next)?
+            let tp = std::time::Instant::now();
+            let lg = model.decode(backend, next)?;
+            prof[3] += tp.elapsed().as_secs_f64();
+            prof_n[3] += 1;
+            lg
         };
+    }
+    if spec_prof {
+        eprintln!(
+            "SPEC_PROF черновик {:.0} мс/{} · верификация {:.0} мс/{} · фичи {:.0} мс/{} · декод {:.0} мс/{}",
+            prof[0] * 1e3, prof_n[0], prof[1] * 1e3, prof_n[1], prof[2] * 1e3, prof_n[2],
+            prof[3] * 1e3, prof_n[3]
+        );
     }
     if finish.is_none() {
         finish = Some(FinishReason::MaxTokens);

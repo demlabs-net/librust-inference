@@ -68,6 +68,12 @@ required-features = ["metal"]
 name = "decode_breakdown"
 required-features = ["metal"]
 [[example]]
+name = "verify_cost"
+required-features = ["metal"]
+[[example]]
+name = "gemm_small_m"
+required-features = ["metal"]
+[[example]]
 name = "layer_gpu_probe"
 required-features = ["metal"]
 [[example]]

@@ -1472,7 +1472,11 @@ impl Qwen3Model {
         let prof_attn = std::env::var("LLM_PROF_ATTN").is_ok();
         let sync = |x: &Tensor| -> Result<f64, BackendError> {
             if prof_attn {
-                backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
+                // q бывает half (f16-KV): синхронизация — через чтение f16
+                let v = x.view_restricted(vec![1]);
+                if backend.to_cpu_f32(&v).is_err() {
+                    backend.to_cpu_f16(&v)?;
+                }
             }
             Ok(0.0)
         };

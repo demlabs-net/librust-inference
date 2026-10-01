@@ -254,6 +254,9 @@ pub struct Qwen35Model {
     pos: usize,
     /// forward считает логиты только последней позиции (prefill_last).
     last_only: bool,
+    /// LLM_SPEC_PROF: (с forward окон, с реплеев, число реплеев, число окон).
+    spec_prof: (f64, f64, usize, usize),
+    spec_prof_snap: f64,
 }
 
 impl Qwen35Model {
@@ -426,6 +429,8 @@ impl Qwen35Model {
             states,
             pos: 0,
             last_only: false,
+            spec_prof: (0.0, 0.0, 0, 0),
+            spec_prof_snap: 0.0,
         })
     }
 
@@ -564,19 +569,26 @@ impl Qwen35Model {
 
     /// Снимок рекуррентных стейтов (копии на устройстве): delta rule обновляет
     /// стейт на месте, поэтому ссылка на старый тензор снимком не является.
+    /// Копии стейтов всех GDN-слоёв — ОДНИМ command buffer'ом: копирование
+    /// по слою с синхронизацией каждой (≈48 коммитов на окно спека) стоило
+    /// 10 мс — треть верификации на Qwen3.5-4B.
     fn snapshot_states(&self, backend: &dyn Backend) -> Result<Vec<Option<(Tensor, Tensor)>>, BackendError> {
         let copy = |t: &Tensor| -> Result<Tensor, BackendError> {
             let y = backend.zeros(t.shape().to_vec())?;
             backend.scale(t, &y, 1.0)?;
             Ok(y)
         };
-        self.states
+        backend.begin_batch()?;
+        let r = self
+            .states
             .iter()
             .map(|s| match s {
                 Some(st) => Ok(Some((copy(&st.conv)?, copy(&st.ssm)?))),
                 None => Ok(None),
             })
-            .collect()
+            .collect();
+        backend.end_batch()?;
+        r
     }
 
     /// Спекулятивный шаг (Ф9.4): верификация [id, draft…] ОДНИМ forward'ом.
@@ -608,14 +620,24 @@ impl Qwen35Model {
                 draft_probs.len()
             )));
         }
+        let prof = std::env::var("LLM_SPEC_PROF").is_ok();
+        let tp = std::time::Instant::now();
         let base = self.pos;
         let snap = self.snapshot_states(backend)?;
+        if prof {
+            // синхронизация: время снимка отдельно от forward
+            if let Some(Some(st)) = self.states.iter().find(|s| s.is_some()) {
+                backend.to_cpu_f32(&st.ssm.view_restricted(vec![1]))?;
+            }
+            self.spec_prof_snap += tp.elapsed().as_secs_f64();
+        }
         let mut ids = Vec::with_capacity(1 + draft.len());
         ids.push(id);
         ids.extend_from_slice(draft);
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?;
         let v = self.cfg.vocab_size;
         let ld = backend.to_cpu_f32(&logits)?;
+        let t_fwd = tp.elapsed().as_secs_f64();
         let (accepted, accepted_len, n_verified) = crate::qwen3::verify_draft(
             &ld,
             v,
@@ -642,7 +664,32 @@ impl Qwen35Model {
                 }
             }
             self.pos = base;
-            let _ = self.prefill(backend, &ids[..accepted_len])?;
+            let tr = std::time::Instant::now();
+            // Логиты реплея не нужны (они уже есть из окна верификации):
+            // lm_head только последней строки — vocab×dim на строку был
+            // заметной долей реплея.
+            self.last_only = true;
+            let r = self.prefill(backend, &ids[..accepted_len]);
+            self.last_only = false;
+            r?;
+            if prof {
+                self.spec_prof.1 += tr.elapsed().as_secs_f64();
+                self.spec_prof.2 += 1;
+            }
+        }
+        if prof {
+            self.spec_prof.0 += t_fwd;
+            self.spec_prof.3 += 1;
+            if self.spec_prof.3.is_multiple_of(50) {
+                eprintln!(
+                    "QWEN35_SPEC_PROF окон {}: снимок {:.1} · снимок+forward+логиты {:.1} мс/окно · реплей {:.1} мс × {} раз",
+                    self.spec_prof.3,
+                    self.spec_prof_snap * 1e3 / self.spec_prof.3 as f64,
+                    self.spec_prof.0 * 1e3 / self.spec_prof.3 as f64,
+                    self.spec_prof.1 * 1e3 / self.spec_prof.2.max(1) as f64,
+                    self.spec_prof.2
+                );
+            }
         }
         let row = &ld[row_idx * v..(row_idx + 1) * v];
         let out_logits = backend.from_cpu_f32(row, vec![1, 1, v])?;
@@ -1193,9 +1240,19 @@ mod tests {
             (1, 299, 4, 2, 128), // split-K: nsg > 1
             (1, 1000, 4, 2, 128),
             (1, 40, 4, 1, 64),
-            (7, 0, 4, 2, 128), // общий путь (Tq < 16)
+            (7, 0, 4, 2, 128), // малый батч (2 ≤ Tq ≤ 8): split-K по ключам
             (7, 33, 4, 1, 128),
-            (15, 17, 2, 1, 128),
+            (2, 0, 4, 2, 128),
+            (3, 255, 8, 2, 128), // nsg > 1, нечётный Tkv
+            (5, 1000, 4, 2, 128),
+            (8, 4093, 4, 1, 64),
+            (4, 77, 2, 1, 256),
+            (6, 9, 2, 2, 8),
+            // hd = 256 на длинном контексте: nsg·(2+hd)·4 байт threadgroup-
+            // памяти упирался в предел 32 КБ (Qwen3.5 после ~2k токенов)
+            (1, 4095, 2, 1, 256),
+            (3, 4093, 2, 1, 256),
+            (15, 17, 2, 1, 128), // общий путь (8 < Tq < 16)
             (16, 0, 4, 2, 128), // предфилл: half-матрицы
             (37, 11, 4, 2, 128),
             (64, 64, 4, 1, 128),
@@ -1212,7 +1269,10 @@ mod tests {
                 .iter()
                 .map(|&v| half::f16::from_f32(v))
                 .collect();
-            let mask = if tq > 1 {
+            // Tq ≤ 8 при чётном past — без маски (блок драфтера: все
+            // запросы видят все ключи); иначе каузальная маска.
+            let full = (2..=8).contains(&tq) && past % 2 == 0;
+            let mask = if tq > 1 && !full {
                 Some(crate::nn::build_causal_mask(&be, tq, tkv, past, None).unwrap())
             } else {
                 None
@@ -1236,7 +1296,7 @@ mod tests {
                 for h in 0..nh {
                     let khd = h / (nh / nkv);
                     let qr = &q[(t * nh + h) * hd..][..hd];
-                    let lim = past + t + 1;
+                    let lim = if full { tkv } else { past + t + 1 };
                     let sc: Vec<f32> = (0..lim)
                         .map(|j| {
                             let kr = &k[(j * nkv + khd) * hd..][..hd];
@@ -1257,7 +1317,7 @@ mod tests {
                 &be.to_cpu_f32(&out).unwrap(),
                 &ro,
                 3e-3,
-                &format!("f16 attn tq={tq} past={past} kv={nkv} hd={hd}"),
+                &format!("f16 attn tq={tq} past={past} kv={nkv} hd={hd} full={full}"),
             );
         }
     }

@@ -2966,6 +2966,79 @@ kernel void mv_q8_0_ks(
     }
 }
 
+// ── Q8_0 × малый батч M ≤ 8 (окно верификации спека, Ф3) ────────────────────
+// Окно спека — forward 1+γ строк. Тайловый GEMM (тайл 32 строки активаций,
+// 64 строки весов) при M ≤ 8 упирается в малое число threadgroup'ов и длинную
+// K-петлю с барьерами: ≈3.5× matvec'а при любом M. Схема ggml
+// kernel_mul_mv_ext (4 строки весов на simdgroup, 8 лейнов на строку) тоже не
+// масштабируется: каждые 4 строки весов заново читают все M строк активаций
+// (на M=8 трафик активаций в 8× больше трафика весов; у llama.cpp pp8 = 4.8×
+// pp1 на этой машине). Здесь все 32 лейна делят K (лейн — 4 значения блока,
+// 4 блока за шаг, чтение строки весов — 136 байт подряд), а каждый
+// simdgroup ведёт NR строк весов: активации шага читаются один раз на NR
+// строк, веса — один раз на M строк активаций.
+template <short M, short NR>
+kernel void mv_q8_0_mb(
+    device const float* A [[buffer(0)]],     // активации [M, K]
+    device const uchar* B [[buffer(1)]],     // веса Q8_0 [N, K]
+    device float* C [[buffer(2)]],           // [M, N]
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint nb = K / 32u;
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    const uint bl = lane / 8u;          // блок внутри шага из 4 блоков
+    const uint el = (lane % 8u) * 4u;   // смещение 4 значений в блоке
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * 34u;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = bl; ib < nb; ib += 4u) {
+        float4 y[M];
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            y[m] = *(device const float4*)(A + (ulong)m * K + ib * 32u + el);
+        }
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * 34u;
+            const float d = (float)load_half_unaligned(blk);
+            device const char* qs = (device const char*)(blk + 2u + el);
+            const float4 w = float4(qs[0], qs[1], qs[2], qs[3]) * d;
+#pragma unroll
+            for (short m = 0; m < M; ++m) acc[r][m] += dot(w, y[m]);
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+// Набор — по замерам examples/gemm_small_m (сумма матмулов forward'а 8B):
+// M=2..4 — NR=4 (26–32 мс при декоде 29); M=5,6 — NR=8 (49–60); M=7,8 —
+// два прохода по ≤4 строки (≈64; один проход — 78–165, тайловый — 107).
+typedef decltype(mv_q8_0_mb<2, 4>) mv_q8_0_mb_t;
+template [[host_name("mv_q8_0_mb2")]] kernel mv_q8_0_mb_t mv_q8_0_mb<2, 4>;
+template [[host_name("mv_q8_0_mb3")]] kernel mv_q8_0_mb_t mv_q8_0_mb<3, 4>;
+template [[host_name("mv_q8_0_mb4")]] kernel mv_q8_0_mb_t mv_q8_0_mb<4, 4>;
+template [[host_name("mv_q8_0_mb5")]] kernel mv_q8_0_mb_t mv_q8_0_mb<5, 8>;
+template [[host_name("mv_q8_0_mb6")]] kernel mv_q8_0_mb_t mv_q8_0_mb<6, 8>;
+
 // ── Q8_0 GEMM m>1 по схеме ggml kernel_mul_mm (Ф8.2b) ────────────────────────
 // Тайл 64 (строки весов, N) × 32 (строки активаций, M), K-шаг 32, 128 потоков
 // (4 simdgroup'а, каждый — 32×16 выхода = 8 фрагментов 8×8). Разделяемая
@@ -3976,6 +4049,120 @@ kernel void attn_decode_split_f16(
         if (d4 < n4) y4[d4] = out[c] * inv;
     }
 }
+
+// Внимание малого батча запросов по f16-кэшу (окно верификации спека,
+// блок драфтера; 2 ≤ Tq ≤ 8): схема attn_decode_split_f16 — ключи кэша
+// делятся между NSG simdgroup'ами, частичные (m, s, acc) сводятся в
+// threadgroup-памяти; сетка — головы × блоки по QB запросов. Общий путь
+// (attn_ar_f16_fused: simdgroup на пару (голова, запрос), весь кэш
+// последовательно) на контексте 4k стоил ≈4× декода уже при Tq = 2.
+// QB = 1 быстрее всех (examples/verify_cost, 8B, контекст 4k, Tq = 4:
+// 1.38× декода против 1.64× при QB = 2 и 2.96× при QB = 4): повторное
+// чтение K/V разными threadgroup'ами гасит кэш, а параллелизма больше; при
+// QB = 8 аккумуляторы не помещались в регистры. Маска — как у общего пути:
+// буфер [Tq, Tkv] (каузальная, SWA, M-RoPE) или её нет — каждый запрос
+// видит все ключи.
+template <uint QB>
+kernel void attn_split_f16_qb(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& Tkv [[buffer(4)]],
+    constant uint& H [[buffer(5)]],
+    constant uint& KVH [[buffer(6)]],
+    constant uint& HD [[buffer(7)]],
+    constant uint& NSG [[buffer(8)]],
+    constant uint& Tq [[buffer(9)]],
+    device const float* MASK [[buffer(10)]],
+    constant uint& HAS_MASK [[buffer(11)]],
+    threadgroup float* sh [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    const uint h = tgpig.x;
+    const uint t0 = tgpig.y * QB;
+    if (h >= H || t0 >= Tq) return;
+    const uint nq = min(QB, Tq - t0);
+    const uint kvh = h / (H / KVH);
+    const uint D = H * HD;
+    const uint KD = KVH * HD;
+    const uint n4 = HD / 4u;
+    const uint nc = (n4 + 31u) / 32u;
+    const float scale = 1.0f / sqrt((float)HD);
+    float4 qv[QB][2], acc[QB][2];
+    float m[QB], s[QB];
+    for (uint i = 0; i < QB; ++i) {
+        m[i] = -INFINITY;
+        s[i] = 0.0f;
+        device const half4* q4 = (device const half4*)(Q + (ulong)(t0 + min(i, nq - 1u)) * D + h * HD);
+        for (uint c = 0; c < 2u; ++c) {
+            const uint d4 = lane + 32u * c;
+            qv[i][c] = (c < nc && d4 < n4) ? float4(q4[d4]) * scale : float4(0.0f);
+            acc[i][c] = float4(0.0f);
+        }
+    }
+    for (uint j = sgitg; j < Tkv; j += NSG) {
+        device const half4* k4 = (device const half4*)(K + (ulong)j * KD + kvh * HD);
+        device const half4* v4 = (device const half4*)(V + (ulong)j * KD + kvh * HD);
+        float4 kk[2], vv[2];
+        for (uint c = 0; c < 2u; ++c) {
+            const uint d4 = lane + 32u * c;
+            const bool ok = c < nc && d4 < n4;
+            kk[c] = ok ? float4(k4[d4]) : float4(0.0f);
+            vv[c] = ok ? float4(v4[d4]) : float4(0.0f);
+        }
+        for (uint i = 0; i < QB; ++i) {
+            if (i >= nq) break;
+            const float bias = HAS_MASK != 0u ? MASK[(ulong)(t0 + i) * Tkv + j] : 0.0f;
+            if (bias == -INFINITY) continue;
+            const float sc = simd_sum(dot(qv[i][0], kk[0]) + dot(qv[i][1], kk[1])) + bias;
+            const float mn = max(m[i], sc);
+            const float corr = exp(m[i] - mn);
+            const float p = exp(sc - mn);
+            s[i] = s[i] * corr + p;
+            acc[i][0] = acc[i][0] * corr + p * vv[0];
+            acc[i][1] = acc[i][1] * corr + p * vv[1];
+            m[i] = mn;
+        }
+    }
+    // свёртка частичных результатов по simdgroup'ам — по одному запросу
+    threadgroup float* mine = sh + sgitg * (2u + HD);
+    for (uint i = 0; i < nq; ++i) {
+        if (lane == 0u) { mine[0] = m[i]; mine[1] = s[i]; }
+        for (uint c = 0; c < nc; ++c) {
+            const uint d4 = lane + 32u * c;
+            if (d4 < n4) *((threadgroup float4*)(mine + 2u) + d4) = acc[i][c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0u) {
+            float gm = -INFINITY;
+            for (uint g = 0; g < NSG; ++g) gm = max(gm, sh[g * (2u + HD)]);
+            float gs = 0.0f;
+            float4 out[2] = {float4(0.0f), float4(0.0f)};
+            for (uint g = 0; g < NSG; ++g) {
+                threadgroup float* part = sh + g * (2u + HD);
+                const float w = (part[0] == -INFINITY) ? 0.0f : exp(part[0] - gm);
+                gs += part[1] * w;
+                for (uint c = 0; c < nc; ++c) {
+                    const uint d4 = lane + 32u * c;
+                    if (d4 < n4) out[c] += *((threadgroup float4*)(part + 2u) + d4) * w;
+                }
+            }
+            const float inv = (gs > 0.0f) ? 1.0f / gs : 0.0f;
+            device float4* y4 = (device float4*)(Y + (ulong)(t0 + i) * D + h * HD);
+            for (uint c = 0; c < nc; ++c) {
+                const uint d4 = lane + 32u * c;
+                if (d4 < n4) y4[d4] = out[c] * inv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+typedef decltype(attn_split_f16_qb<1>) attn_split_f16_qb_t;
+template [[host_name("attn_split_f16_q1")]] kernel attn_split_f16_qb_t attn_split_f16_qb<1>;
 
 // Общий f16-путь внимания (любые Tq, маска): port attn_ar_f32_fused с
 // half4-чтением Q/K/V (голова = 32 лейна, online-softmax). Хвостовые

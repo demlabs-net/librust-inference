@@ -56,6 +56,17 @@ pub fn with_attn_path<R>(path: &'static str, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Число simdgroup'ов split-K внимания по ключам: одна группа на ~64 ключа,
+/// не больше 32 и не больше, чем помещается в threadgroup-память слияния
+/// (`nsg·(2+hd)·4` байт; предел устройства — 32 КБ). При hd = 256 32 группы
+/// требовали 33 КБ: на контексте > 1984 токенов (Qwen3.5) Metal отбрасывал
+/// команду — выход внимания оставался мусором без ошибки.
+fn split_attn_groups(tkv: usize, hd: usize) -> usize {
+    const TG_MEM: usize = 32 * 1024;
+    let by_mem = (TG_MEM / ((2 + hd) * 4)).max(1);
+    tkv.div_ceil(64).clamp(1, 32).min(by_mem)
+}
+
 /// Включён ли вариант внимания: переопределение потока или переменная
 /// окружения (`INFER_ATTN_<NAME>=1`; для legacy — сам факт наличия).
 fn attn_opt(name: &'static str) -> bool {
@@ -1460,6 +1471,49 @@ impl MetalCtx {
                 b.dtype
             )));
         }
+        // 1 < m ≤ 8, Q8_0 (окно верификации спека, черновой блок DFlash):
+        // matvec с батчем (mv_q8_0_mb) — веса читаются один раз на m строк
+        // активаций. Тайловый GEMM ниже при таком m стоил ≈3.5× matvec'а —
+        // forward 1+γ строк был дороже трёх шагов декода, и спек проигрывал
+        // при любой приёмке. m = 7, 8 — два прохода (4 + остаток). Активации
+        // читаются float4: нужен 16-байтовый сдвиг. INFER_GEMM_Q8_SMALL_MM=1
+        // — прежний тайловый путь (сверка).
+        if m > 1
+            && m <= 8
+            && b.dtype == GpuDtype::Q8_0
+            && a.offset.is_multiple_of(16)
+            && std::env::var("INFER_GEMM_Q8_SMALL_MM").is_err()
+        {
+            let (k32, n32) = (k as u32, n as u32);
+            let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
+                let (name, nr) = match rows {
+                    2 => ("mv_q8_0_mb2", 4usize),
+                    3 => ("mv_q8_0_mb3", 4),
+                    4 => ("mv_q8_0_mb4", 4),
+                    5 => ("mv_q8_0_mb5", 8),
+                    _ => ("mv_q8_0_mb6", 8),
+                };
+                // 2 simdgroup'а на threadgroup, NR строк весов на simdgroup
+                let grid = MTLSize::new((n.div_ceil(nr * 2) * 64) as u64, 1, 1);
+                let group = MTLSize::new(64, 1, 1);
+                let a_off = (a.offset + row0 * k * 4) as u64;
+                let c_off = (c.offset + row0 * n * 4) as u64;
+                self.run(name, grid, group, |enc| {
+                    enc.set_buffer(0, Some(&a.buffer), a_off);
+                    enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                    enc.set_buffer(2, Some(&c.buffer), c_off);
+                    enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                    enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+                })
+            };
+            return match m {
+                7 | 8 => {
+                    pass(4, 0)?;
+                    pass(m - 4, 4)
+                }
+                _ => pass(m, 0),
+            };
+        }
         // m>1, Q8_0: тайловый GEMM на матричных блоках simdgroup (prefill и
         // верификация спека). INFER_GEMM_Q8_LEGACY=1 — прежний m8f4 (сверка).
         if m > 1 && b.dtype == GpuDtype::Q8_0 && std::env::var("INFER_GEMM_Q8_LEGACY").is_err() {
@@ -2412,7 +2466,7 @@ impl MetalCtx {
         if b == 1 && tq == 1 && mask.is_none() && hd <= 256 {
             let (tkv32, h32, kvh32, hd32) =
                 (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
-            let nsg = tkv.div_ceil(64).clamp(1, 32);
+            let nsg = split_attn_groups(tkv, hd);
             let nsg32 = nsg as u32;
             let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
             let grid = MTLSize::new((n_heads * nsg * 32) as u64, 1, 1);
@@ -2427,6 +2481,42 @@ impl MetalCtx {
                 enc.set_bytes(6, 4, (&kvh32 as *const u32).cast());
                 enc.set_bytes(7, 4, (&hd32 as *const u32).cast());
                 enc.set_bytes(8, 4, (&nsg32 as *const u32).cast());
+                enc.set_threadgroup_memory_length(0, bytes as u64);
+            });
+        }
+        // Малый батч запросов (окно верификации спека, блок драфтера):
+        // split-K по ключам, threadgroup на пару (голова, запрос); маска —
+        // та же, что у общего пути. INFER_ATTN_MB_OFF=1 — общий путь (сверка).
+        if b == 1
+            && (2..=8).contains(&tq)
+            && hd <= 256
+            && std::env::var("INFER_ATTN_MB_OFF").is_err()
+        {
+            let (tkv32, h32, kvh32, hd32, tq32) =
+                (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32, tq as u32);
+            let has_mask = mask.is_some() as u32;
+            let nsg = split_attn_groups(tkv, hd);
+            let nsg32 = nsg as u32;
+            let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
+            let grid = MTLSize::new((n_heads * nsg * 32) as u64, tq as u64, 1);
+            let group = MTLSize::new((nsg * 32) as u64, 1, 1);
+            return self.run("attn_split_f16_q1", grid, group, |enc| {
+                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(4, 4, (&tkv32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&kvh32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&nsg32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&tq32 as *const u32).cast());
+                match mask {
+                    Some(m) => enc.set_buffer(10, Some(&m.buffer), m.offset as u64),
+                    // буфер обязан быть привязан; без маски не читается
+                    None => enc.set_buffer(10, Some(&q.buffer), q.offset as u64),
+                }
+                enc.set_bytes(11, 4, (&has_mask as *const u32).cast());
                 enc.set_threadgroup_memory_length(0, bytes as u64);
             });
         }
@@ -2645,9 +2735,8 @@ impl MetalCtx {
             // Разбиение ключей: на длинном контексте 8 групп оставляли всего
             // 32 threadgroup'а — каждый лейн тянул цепочку из сотен ключей
             // последовательно (декод на 4k контекста падал до 1.3 ток/с).
-            // Число групп растёт с длиной KV: одна группа на ~64 ключа,
-            // не больше 32 (память слияния 32×(2+hd)×4 ≤ 16.6 КБ при hd=128).
-            let nsg = tkv.div_ceil(64).clamp(1, 32);
+            // Число групп растёт с длиной KV (см. split_attn_groups).
+            let nsg = split_attn_groups(tkv, hd);
             let nsg32 = nsg as u32;
             let bytes = (nsg * (2 + hd) * 4).div_ceil(16) * 16;
             let grid = MTLSize::new((n_heads * nsg * 32) as u64, 1, 1);
@@ -4623,6 +4712,64 @@ mod quant_gemm_tests {
             let bound = tol * k as f32 * 1.5;
             let diff = max_diff(&got, &c_ref);
             assert!(diff <= bound, "{dtype:?}: |Δ| max {diff} > {bound}");
+        }
+    }
+
+    /// Память слияния split-K внимания помещается в threadgroup (32 КБ)
+    /// при любой длине контекста и hd до 512: превышение Metal без слоя
+    /// валидации молча принимал (MTL_DEBUG_LAYER=1 — assertion), это UB.
+    #[test]
+    fn split_attn_groups_fit_threadgroup_memory() {
+        for hd in [64usize, 128, 256, 512] {
+            for tkv in [1usize, 63, 64, 1984, 2048, 4096, 100_000] {
+                let n = split_attn_groups(tkv, hd);
+                assert!(n >= 1);
+                assert!(n * (2 + hd) * 4 <= 32 * 1024, "hd={hd} tkv={tkv}: {n} групп");
+            }
+        }
+        assert_eq!(split_attn_groups(4096, 128), 32, "hd=128 не урезается");
+    }
+
+    /// Малый батч Q8_0 (окно верификации спека): M = 2…8 — mv_q8_0_mb
+    /// (M = 7, 8 — двумя проходами), N не кратно числу строк на simdgroup,
+    /// K — 3 блока (не кратно шагу лейнов). Сверка с CPU и с тайловым путём.
+    #[test]
+    fn q8_0_small_batch_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        let (n, k) = (77usize, 96usize);
+        let bytes: Vec<u8> = (0..n * k / 32)
+            .flat_map(|b| {
+                let mut blk = half::f16::from_f32(0.01 + (b % 7) as f32 * 0.003)
+                    .to_bits()
+                    .to_le_bytes()
+                    .to_vec();
+                blk.extend((0..32).map(|j| (((b * 37 + j * 11) % 255) - 127) as i8 as u8));
+                blk
+            })
+            .collect();
+        let b = GpuTensor::from_quantized(dev, &bytes, vec![n, k], GpuDtype::Q8_0).unwrap();
+        let tmp = WeightsMap {
+            arch: "t".into(),
+            tensors: vec![crate::weights_map::WeightTensor {
+                name: "w".into(),
+                shape: vec![n as u64, k as u64],
+                format: crate::dtype::WeightFormat::Q8_0,
+                offset: 0,
+                data: &bytes,
+            }],
+            storage: vec![],
+        };
+        let bf = dequant_f32(&tmp.tensors[0]);
+        for m in 2..=8usize {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 104729.0).sin()).collect();
+            let c_ref = cpu_ref(&a_data, m, k, &bf, n);
+            let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![m, k]).unwrap();
+            let c = GpuTensor::zeros(dev, vec![m, n]).unwrap();
+            ctx.gemm_nt_quantized(&a, &b, &c).unwrap();
+            let got = c.to_cpu_f32(&ctx).unwrap();
+            let diff = max_diff(&got, &c_ref);
+            assert!(diff <= 1e-3, "M={m}: |Δ| max {diff}");
         }
     }
 

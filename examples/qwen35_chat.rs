@@ -78,6 +78,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             spec_gamma: std::env::var("QWEN35_GAMMA").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
             ..Default::default()
         };
+        // Прогрев тем же путём (пайплайны таргета и драфтера, подкачка
+        // весов после загрузки драфтера): замер — по тёплому движку.
+        {
+            let warm = GenerateParams {
+                max_tokens: 4,
+                temperature: 0.0,
+                drafter: params.drafter.clone(),
+                spec_gamma: params.spec_gamma,
+                ..Default::default()
+            };
+            generate(&mut model, &backend, &tok, &ids, &warm, |_| true)?;
+            model.reset_cache(&backend)?;
+            if let Some(d) = &params.drafter {
+                d.lock().unwrap().reset();
+            }
+        }
         print!("{prompt}");
         let mut stats = None;
         let mut timings = None;

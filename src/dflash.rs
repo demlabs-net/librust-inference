@@ -741,6 +741,17 @@ impl DFlashModel {
         pos: usize,
         features: Option<&Tensor>,
     ) -> Result<DiffusionResult, BackendError> {
+        // DFLASH_DIFF_PROF=1: синхронизация после этапов — где время диффузии
+        let dprof = std::env::var("DFLASH_DIFF_PROF").is_ok();
+        let sync = |label: &str, t0: &mut std::time::Instant, x: &Tensor| -> Result<(), BackendError> {
+            if dprof {
+                backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
+                eprintln!("  diffuse {label}: {:.2} мс", t0.elapsed().as_secs_f64() * 1e3);
+                *t0 = std::time::Instant::now();
+            }
+            Ok(())
+        };
+        let mut t0 = std::time::Instant::now();
         backend.begin_batch()?;
         let r = (|| {
             let t = ids.len();
@@ -776,6 +787,9 @@ impl DFlashModel {
                 }
                 _ => None,
             };
+            if let Some(e) = &enc {
+                sync("fc+enc_norm", &mut t0, e)?;
+            }
             let ctx = enc.as_ref().map(|e| e.shape()[1]).unwrap_or(0);
             // кэш-индексы — непрерывно от past_len (длина кэша ДО диффузии;
             // z-lab: cache_position = position_ids от get_seq_length()); на
@@ -796,6 +810,9 @@ impl DFlashModel {
                     );
                 }
                 // ── attn-часть (свой путь: прямая инъекция k_ctx) ──
+                if i == 0 {
+                    sync("до слоя 0", &mut t0, &x)?;
+                }
                 let mut h = layer.dense.attn_norm.forward(backend, &x)?;
                 let attn_dyn = match (&layer.attn_conv.proj, &layer.attn_conv.base) {
                     (Some(p), Some(_)) => Some(conv_dynamic(backend, p, &h)?),
@@ -915,6 +932,7 @@ impl DFlashModel {
                     cur = conv_side(backend, &cur, b, d, 1, self.block_size)?;
                 }
                 let ffn_inp = add(backend, &cur, &x)?;
+                sync(&format!("слой {i} attn"), &mut t0, &ffn_inp)?;
                 // ── ffn-часть ──
                 let mut h = layer.dense.ffn_norm.forward(backend, &ffn_inp)?;
                 let ffn_dyn = match (&layer.ffn_conv.proj, &layer.ffn_conv.base) {
@@ -929,6 +947,7 @@ impl DFlashModel {
                     f = conv_side(backend, &f, b, d, 1, self.block_size)?;
                 }
                 x = add(backend, &f, &ffn_inp)?;
+                sync(&format!("слой {i}"), &mut t0, &x)?;
             }
             let hidden = self.out_norm.forward(backend, &x)?;
             let logits = crate::nn::Linear {
@@ -936,6 +955,7 @@ impl DFlashModel {
                 b: None,
             }
             .forward(backend, &hidden)?;
+            sync("lm_head", &mut t0, &logits)?;
             Ok(DiffusionResult { logits, hidden })
         })();
         backend.end_batch()?;
@@ -1073,6 +1093,8 @@ pub struct DFlashDrafter {
     /// (см. [`crate::spec::DraftSampling`]). По умолчанию жадный: так
     /// работает и эталон z-lab (`dflash_generate`: argmax при temperature 0).
     pub sampling: crate::spec::DraftSampling,
+    /// LLM_SPEC_PROF: (секунды всего, число черновиков, секунды диффузии).
+    prof: (f64, usize, f64),
 }
 
 impl DFlashDrafter {
@@ -1083,6 +1105,7 @@ impl DFlashDrafter {
             target_embed,
             lm_head,
             features: None,
+            prof: (0.0, 0, 0.0),
             committed: std::collections::VecDeque::new(),
             rng: 0x85ebca6b,
             sampling: crate::spec::DraftSampling::Greedy,
@@ -1130,6 +1153,12 @@ impl DFlashDrafter {
 }
 
 impl crate::spec::Drafter for DFlashDrafter {
+    fn reset(&mut self) {
+        self.model.truncate_caches(0);
+        self.features = None;
+        self.committed.clear();
+    }
+
     fn set_sampling(&mut self, mode: crate::spec::DraftSampling) {
         self.sampling = mode;
     }
@@ -1262,6 +1291,8 @@ impl crate::spec::Drafter for DFlashDrafter {
                 self.features.as_ref().map(|f| f.shape().to_vec())
             );
         }
+        let prof = std::env::var("LLM_SPEC_PROF").is_ok();
+        let tp = std::time::Instant::now();
         let res =
             match self
                 .model
@@ -1273,6 +1304,7 @@ impl crate::spec::Drafter for DFlashDrafter {
                     return (vec![], vec![]);
                 }
             };
+        let t_diffuse = tp.elapsed().as_secs_f64();
         let (tokens, probs) = if self.model.selector.is_some() {
             match self.model.select(backend, &res.logits, &res.hidden) {
                 Ok(s) => (s.tokens, s.probs),
@@ -1324,6 +1356,20 @@ impl crate::spec::Drafter for DFlashDrafter {
             }
             (tokens, probs)
         };
+        if prof {
+            self.prof.0 += tp.elapsed().as_secs_f64();
+            self.prof.1 += 1;
+            self.prof.2 += t_diffuse;
+            if self.prof.1.is_multiple_of(32) {
+                eprintln!(
+                    "DFLASH_PROF {} черновиков: {:.1} мс/черновик (диффузия {:.1}, выбор {:.1}; block={block})",
+                    self.prof.1,
+                    self.prof.0 * 1e3 / self.prof.1 as f64,
+                    self.prof.2 * 1e3 / self.prof.1 as f64,
+                    (self.prof.0 - self.prof.2) * 1e3 / self.prof.1 as f64
+                );
+            }
+        }
         // кэш после диффузии содержит k/v блока — откат до pos (crop)
         self.model.truncate_caches(pos);
         self.commit(&tokens);
@@ -1417,21 +1463,15 @@ fn load_dense_layer(
             }
         }
     };
-    // q/k/v fused (как Qwen3Model::load): wqkv [q_size + 2·kv_size, dim]
-    let mut wqkv = dequant_f32(
-        w.get(&p("attn_q.weight"))
-            .ok_or_else(|| BackendError::Shape("attn_q.weight missing".into()))?,
-    );
-    wqkv.extend(dequant_f32(w.get(&p("attn_k.weight")).ok_or_else(
-        || BackendError::Shape("attn_k.weight missing".into()),
-    )?));
-    wqkv.extend(dequant_f32(w.get(&p("attn_v.weight")).ok_or_else(
-        || BackendError::Shape("attn_v.weight missing".into()),
-    )?));
+    // q/k/v и gate/up — слитые матрицы, как у Qwen3Model::load
+    // (upload_fused): квантованные файлы остаются в своём кванте. Раньше
+    // они деквантовались в f16 — вдвое больше чтения весов на каждом
+    // черновом блоке (драфтер стоил больше шага декода таргета).
     let attn = Attention {
-        wqkv: upload_f16(
+        wqkv: crate::qwen3::Qwen3Model::upload_fused(
             backend,
-            &wqkv,
+            w,
+            &[&p("attn_q.weight"), &p("attn_k.weight"), &p("attn_v.weight")],
             vec![
                 cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
                 cfg.dim,
@@ -1464,16 +1504,13 @@ fn load_dense_layer(
         n_kv_heads: cfg.n_kv_heads,
         head_dim: cfg.head_dim,
     };
-    // gate/up fused (как Qwen3Model::load): w13 [2·ffn, dim]
-    let mut w13 = dequant_f32(
-        w.get(&p("ffn_gate.weight"))
-            .ok_or_else(|| BackendError::Shape("ffn_gate.weight missing".into()))?,
-    );
-    w13.extend(dequant_f32(w.get(&p("ffn_up.weight")).ok_or_else(
-        || BackendError::Shape("ffn_up.weight missing".into()),
-    )?));
     let ffn = SwiGLU {
-        w13: upload_f16(backend, &w13, vec![2 * cfg.ffn_dim, cfg.dim])?,
+        w13: crate::qwen3::Qwen3Model::upload_fused(
+            backend,
+            w,
+            &[&p("ffn_gate.weight"), &p("ffn_up.weight")],
+            vec![2 * cfg.ffn_dim, cfg.dim],
+        )?,
         w2: up(&p("ffn_down.weight"), vec![cfg.dim, cfg.ffn_dim])?,
     };
     Ok(Qwen3Layer {

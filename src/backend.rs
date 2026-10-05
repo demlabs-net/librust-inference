@@ -1473,20 +1473,28 @@ pub trait Backend: Send + Sync {
     /// к стораджу) — см. историю мёртвого `let _ = &yt`.
     fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
-    /// Complex magnitude: X [..., 2n] (re | im row-major halves) → new
-    /// Y [..., n] with y[i] = sqrt(x[i]² + x[i+n]²) (silero STFT). The
-    /// default is the exact host math (Metal/CPU parity); CUDA fuses it
-    /// into one kernel.
+    /// Complex magnitude по ПОСЛЕДНЕЙ оси: X [..., 2n] (половина re, затем
+    /// половина im В КАЖДОЙ строке) → Y [..., n], y[r, c] = sqrt(x[r, c]² +
+    /// x[r, n+c]²). Silero STFT даёт [1, T, 258] = T строк по (re|im) на
+    /// кадр — прежняя реализация (и CUDA-кернел) брали половины ВСЕГО
+    /// тензора (x[i] ↔ x[i + numel/2]), то есть складывали кадры 0–1 с
+    /// кадрами 2–3: вероятности VAD расходились с официальной моделью
+    /// (сверка tests/silero_vad_golden.rs; |Δ| до 0.9).
     fn magnitude_sqrt(&self, x: &Tensor) -> Result<Tensor, BackendError> {
         let mut shape = x.shape().to_vec();
-        let n = x.numel() / 2;
+        let last = *shape.last().unwrap_or(&2);
+        let n = last / 2;
+        let rows = x.numel() / last.max(1);
         let xh = self.to_cpu_f32(x)?;
-        let mut yh = Vec::with_capacity(n);
-        for i in 0..n {
-            let (re, im) = (xh[i], xh[i + n]);
-            yh.push((re * re + im * im).sqrt());
+        let mut yh = Vec::with_capacity(rows * n);
+        for r in 0..rows {
+            let row = &xh[r * last..(r + 1) * last];
+            for c in 0..n {
+                let (re, im) = (row[c], row[n + c]);
+                yh.push((re * re + im * im).sqrt());
+            }
         }
-        *shape.last_mut().unwrap() /= 2;
+        *shape.last_mut().unwrap() = n;
         self.from_cpu_f32(&yh, shape)
     }
 

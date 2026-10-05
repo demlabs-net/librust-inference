@@ -202,18 +202,26 @@ extern "C" __global__ void bias_norm_zipformer_f32(
     for (int j = 0; j < d; ++j) yr[j] = xr[j] * sc;
 }
 
-// Silero VAD complex magnitude: X [..., 2n] (re | im halves) →
-// Y [..., n]: y[i] = sqrt(x[i]^2 + x[i+n]^2) (the re/im interleave is
-// row-major with the im half immediately after the re half).
+// Silero VAD complex magnitude по последней оси: X [rows, 2n] (в КАЖДОЙ
+// строке сначала re, затем im) → Y [rows, n]:
+//   y[r*n + c] = sqrt(x[r*2n + c]^2 + x[r*2n + n + c]^2).
+// Прежняя версия складывала половины ВСЕГО тензора (x[i] и x[i+n*rows]) —
+// для [1, T, 258] это кадры 0–1 против кадров 2–3 (неверно). PTX в
+// репозитории — пересобрать на машине с nvcc; до этого хостовая реализация
+// (Backend::magnitude_sqrt по умолчанию) даёт верный результат.
 extern "C" __global__ void magnitude_sqrt_f32(
     const float* __restrict__ x,
     float* __restrict__ y,
-    int n)
+    int n,
+    int rows)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float re = x[i];
-    float im = x[i + n];
+    if (i >= n * rows) return;
+    int r = i / n;
+    int c = i % n;
+    const float* row = x + (long)r * 2 * n;
+    float re = row[c];
+    float im = row[n + c];
     y[i] = sqrtf(re * re + im * im);
 }
 

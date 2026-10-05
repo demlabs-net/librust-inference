@@ -1465,21 +1465,11 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg).map_err(map_err)? };
         Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
     }
-    fn magnitude_sqrt(&self, x: &Tensor) -> Result<Tensor, BackendError> {
-        let mut shape = x.shape().to_vec();
-        let n = x.numel() / 2;
-        let mut s = self.take_pooled(n)?;
-        let f = self.function("magnitude_sqrt_f32")?;
-        let cfg = LaunchConfig::for_num_elems(n as u32);
-        let mut la = self.stream.launch_builder(&f);
-        la.arg(x.as_cuda());
-        la.arg(&mut s);
-        let ni = n as i32;
-        la.arg(&ni);
-        unsafe { la.launch(cfg).map_err(map_err)? };
-        *shape.last_mut().unwrap() /= 2;
-        Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
-    }
+    // CUDA-кернел magnitude_sqrt_f32 переписан на построчную семантику
+    // (см. kernels.cu), но PTX в репозитории собран из старой версии —
+    // оверрайд снят до пересборки PTX на машине с nvcc: хостовая
+    // реализация верна для любой раскладки, а тензор VAD мал (T×258).
+    // Вернуть оверрайд после `cargo build --features cuda` с nvcc.
 
     fn lstm_cell(
         &self,

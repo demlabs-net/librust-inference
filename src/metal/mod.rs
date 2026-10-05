@@ -683,6 +683,7 @@ impl MetalCtx {
             "add_scaled_f32",
             "scale_f32",
             "copy_rows_f32",
+            "argmax_lse_rows_f32",
             "uniform_attn_f32",
             "rope_f32",
             // DAC codec path (fp32 decode/encode)
@@ -1864,6 +1865,44 @@ impl MetalCtx {
             enc.set_bytes(2, 8, (&n as *const usize).cast());
             enc.set_bytes(3, 4, (&scale as *const f32).cast());
         })
+    }
+
+    /// Аргмакс по строкам логитов [T, V] + logsumexp строки (см.
+    /// [`Backend::argmax_rows`]). `factors` — множители штрафа [V] (1.0 вне
+    /// истории) либо None. Возврат: (ids [T], lse [T]) на хосте.
+    pub fn argmax_lse_rows_f32(
+        &self,
+        logits: &GpuTensor,
+        factors: Option<&GpuTensor>,
+        t: usize,
+        v: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>), MetalError> {
+        // id пишутся как float (V < 2^24 — точность f32 полная): отдельный
+        // целочисленный тензор не заводим
+        let ids = GpuTensor::zeros(&self.device, vec![t])?;
+        let lse = GpuTensor::zeros(&self.device, vec![t])?;
+        let (t32, v32) = (t as u32, v as u32);
+        let has = factors.is_some() as u32;
+        let group = 256u64;
+        let grid = MTLSize::new(t as u64 * group, 1, 1);
+        // Нет factors — буфер не читается, но обязан быть привязан
+        let fallback = match factors {
+            Some(_) => None,
+            None => Some(logits.clone()),
+        };
+        let factors = factors.unwrap_or_else(|| fallback.as_ref().unwrap());
+        self.run("argmax_lse_rows_f32", grid, MTLSize::new(group, 1, 1), |enc| {
+            enc.set_buffer(0, Some(&logits.buffer), logits.offset as u64);
+            enc.set_buffer(1, Some(&factors.buffer), factors.offset as u64);
+            enc.set_buffer(2, Some(&ids.buffer), ids.offset as u64);
+            enc.set_buffer(3, Some(&lse.buffer), lse.offset as u64);
+            enc.set_bytes(4, 4, (&t32 as *const u32).cast());
+            enc.set_bytes(5, 4, (&v32 as *const u32).cast());
+            enc.set_bytes(6, 4, (&has as *const u32).cast());
+        })?;
+        let idv = ids.to_cpu_f32(self)?;
+        let lsev = lse.to_cpu_f32(self)?;
+        Ok((idv.into_iter().map(|x| x as u32).collect(), lsev))
     }
 
     /// Построчная копия fp32 со сдвигом/шагом (см. [`Backend::copy_rows_into`]).
@@ -3866,6 +3905,45 @@ impl crate::backend::Backend for MetalBackend {
         Ok(())
     }
 
+    fn argmax_rows(
+        &self,
+        logits: &crate::backend::Tensor,
+        history: Option<(&[u32], f32)>,
+    ) -> Result<(Vec<u32>, Vec<f32>), crate::error::BackendError> {
+        let shape = logits.shape().to_vec();
+        let v = *shape.last().unwrap_or(&0);
+        if v == 0 {
+            return Err(crate::error::BackendError::Shape(
+                "argmax_rows: пустой словарь".into(),
+            ));
+        }
+        let t = logits.numel() / v;
+        let factors = match history {
+            Some((hist, penalty)) if penalty != 1.0 && !hist.is_empty() => {
+                // Множитель штрафа на токен: 1.0 вне уникальной истории.
+                // Само деление/умножение — в ядре (знак логита).
+                let mut f = vec![1.0f32; v];
+                let mut seen: Vec<u32> = hist.to_vec();
+                seen.sort_unstable();
+                seen.dedup();
+                for &tok in &seen {
+                    if let Some(slot) = f.get_mut(tok as usize) {
+                        *slot = penalty;
+                    }
+                }
+                Some(self.from_cpu_f32(&f, vec![v])?)
+            }
+            _ => None,
+        };
+        let r = self.ctx.argmax_lse_rows_f32(
+            logits.as_gpu(),
+            factors.as_ref().map(|t| t.as_gpu()),
+            t,
+            v,
+        )?;
+        Ok(r)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn copy_rows_into(
         &self,
@@ -4779,6 +4857,55 @@ mod quant_gemm_tests {
             }
         }
         assert_eq!(split_attn_groups(4096, 128), 32, "hd=128 не урезается");
+    }
+
+    /// GPU-аргмакс строк (окно спека) == CPU greedy_next: включая ничьи
+    /// (первый максимум), NaN/−∞ и штраф за повторы.
+    #[test]
+    fn argmax_rows_matches_cpu() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (t, v) = (5usize, 999usize);
+        let mut data: Vec<f32> = (0..t * v)
+            .map(|i| ((i as f32 * 0.017).sin() * 3.0).round() / 2.0)
+            .collect();
+        // Ничья на первом месте: равные максимумы в первой строке
+        data[10] = 5.0;
+        data[500] = 5.0;
+        // NaN и −∞ не должны побеждать
+        data[v + 3] = f32::NAN;
+        data[2 * v + 7] = f32::NEG_INFINITY;
+        let logits = be.from_cpu_f32(&data, vec![t, v]).unwrap();
+        for penalty in [1.0f32, 1.1] {
+            for hist in [vec![], vec![10u32, 10, 500, 900]] {
+                let h = (!hist.is_empty()).then_some((hist.as_slice(), penalty));
+                let (ids, lse) = be.argmax_rows(&logits, h).unwrap();
+                for r in 0..t {
+                    let row = &data[r * v..(r + 1) * v];
+                    let want = crate::inference::sampling::greedy_next(row, &hist, penalty);
+                    assert_eq!(ids[r], want, "p={penalty} r={r}");
+                    // lse — против прямого расчёта по PENALIZED ряду
+                    let mut pen = row.to_vec();
+                    if let Some((hh, pp)) = h {
+                        crate::inference::sampling::apply_repetition_penalty_vec_unique(
+                            &mut pen, hh, pp,
+                        );
+                    }
+                    let mx = pen.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = pen
+                        .iter()
+                        .filter(|x| x.is_finite())
+                        .map(|x| (x - mx).exp())
+                        .sum();
+                    let want_lse = if mx > f32::NEG_INFINITY { sum.ln() } else { f32::NEG_INFINITY };
+                    assert!(
+                        (lse[r] - want_lse).abs() < 1e-3 || (lse[r].is_infinite() && want_lse.is_infinite()),
+                        "lse p={penalty} r={r}: {} vs {want_lse}",
+                        lse[r]
+                    );
+                }
+            }
+        }
     }
 
     /// Малый батч Q8_0 (окно верификации спека): M = 2…8 — mv_q8_0_mb

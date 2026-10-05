@@ -614,6 +614,83 @@ kernel void add_scaled_f32(
 }
 
 // ── Scale: Y = X * scale ────────────────────────────────────────────────────
+// Аргмакс по строкам логитов [T, V] + logsumexp строки. ids[t] — ПЕРВЫЙ
+// максимум (порядок сравнений, как у CPU-скана greedy_next: строго больше),
+// NaN и −∞ → −∞; lse[t] = log Σ exp(x − max) по полному ряду (нужно для
+// честных q при сэмплинге). FACTORS — множитель штрафа за повторы на токен
+// (1.0 вне истории) или nullptr. Одна threadgroup на строку: выбор черновиков
+// и жадная верификация остаются на GPU — вниз идут только id (было: строка
+// логитов [1+γ, V] на хост).
+kernel void argmax_lse_rows_f32(
+    device const float* X [[buffer(0)]],
+    device const float* FACTORS [[buffer(1)]],
+    device float* IDS [[buffer(2)]],
+    device float* LSE [[buffer(3)]],
+    constant uint& T [[buffer(4)]],
+    constant uint& V [[buffer(5)]],
+    constant uint& HAS_FACTORS [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort ntg [[threads_per_threadgroup]])
+{
+    if (tgid >= T) return;
+    threadgroup float shm[1024];
+    threadgroup uint shi[1024];
+    threadgroup float shs[1024];
+    device const float* row = X + (ulong)tgid * V;
+    float m = -INFINITY;
+    uint mi = 0u;
+    for (uint i = tiitg; i < V; i += ntg) {
+        float x = row[i];
+        if (HAS_FACTORS != 0u) {
+            x = x > 0.0f ? x / FACTORS[i] : x * FACTORS[i];
+        }
+        if (!isfinite(x)) x = -INFINITY;
+        if (x > m) {
+            m = x;
+            mi = i;
+        }
+    }
+    shm[tiitg] = m;
+    shi[tiitg] = mi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = ntg / 2u; s > 0u; s >>= 1) {
+        if (tiitg < s) {
+            const float o = shm[tiitg + s];
+            const uint oi = shi[tiitg + s];
+            if (o > shm[tiitg] || (o == shm[tiitg] && oi < shi[tiitg])) {
+                shm[tiitg] = o;
+                shi[tiitg] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float gmax = shm[0];
+    float ssum = 0.0f;
+    if (gmax > -INFINITY) {
+        for (uint i = tiitg; i < V; i += ntg) {
+            float x = row[i];
+            if (HAS_FACTORS != 0u) {
+                x = x > 0.0f ? x / FACTORS[i] : x * FACTORS[i];
+            }
+            if (!isfinite(x)) continue;
+            ssum += exp(x - gmax);
+        }
+    }
+    shs[tiitg] = ssum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = ntg / 2u; st > 0u; st >>= 1) {
+        if (tiitg < st) {
+            shs[tiitg] += shs[tiitg + st];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tiitg == 0u) {
+        IDS[tgid] = (float)shi[0];
+        LSE[tgid] = gmax > -INFINITY ? log(shs[0]) : -INFINITY;
+    }
+}
+
 // Построчная копия fp32 со сдвигом/шагом: D[(dst_row0+r)*dst_stride + dst_col0 + c] =
 // S[r*cols + c]. Сборка выходов extract-слоёв по блокам префилла и конкат
 // фич драфтера (5 слоёв) — на GPU, без скачивания на хост.

@@ -693,19 +693,30 @@ impl Qwen35Model {
         ids.extend_from_slice(draft);
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?;
         let v = self.cfg.vocab_size;
-        let ld = backend.to_cpu_f32(&logits)?;
         let t_fwd = tp.elapsed().as_secs_f64();
-        let (accepted, accepted_len, n_verified) = crate::qwen3::verify_draft(
-            &ld,
-            v,
-            id,
-            draft,
-            draft_probs,
-            rng,
-            greedy,
-            hist,
-            repeat_penalty,
-        );
+        // Жадная проверка без штрафа за повторы — argmax строк на GPU
+        // (строка [1+γ, V] на хост не едет), как у Qwen3.
+        // INFER_SPEC_CPU=1 — прежний путь через хост (сверка/замеры).
+        let gpu_greedy =
+            greedy && repeat_penalty == 1.0 && std::env::var("INFER_SPEC_CPU").is_err();
+        let mut ld = Vec::new();
+        let (accepted, accepted_len, n_verified) = if gpu_greedy {
+            let (am, _lse) = backend.argmax_rows(&logits, None)?;
+            crate::qwen3::verify_greedy_by_argmax(id, draft, &am)
+        } else {
+            ld = backend.to_cpu_f32(&logits)?;
+            crate::qwen3::verify_draft(
+                &ld,
+                v,
+                id,
+                draft,
+                draft_probs,
+                rng,
+                greedy,
+                hist,
+                repeat_penalty,
+            )
+        };
         let row_idx = accepted_len - 1;
         if accepted_len < ids.len() {
             // Откат: KV — усечением до базы, стейты — из снимка; затем
@@ -748,8 +759,12 @@ impl Qwen35Model {
                 );
             }
         }
-        let row = &ld[row_idx * v..(row_idx + 1) * v];
-        let out_logits = backend.from_cpu_f32(row, vec![1, 1, v])?;
+        let out_logits = if gpu_greedy {
+            logits.view_offset(vec![1, 1, v], row_idx * v)
+        } else {
+            let row = &ld[row_idx * v..(row_idx + 1) * v];
+            backend.from_cpu_f32(row, vec![1, 1, v])?
+        };
         Ok(crate::qwen3::SpecOutcome {
             accepted,
             logits: out_logits,

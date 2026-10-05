@@ -1459,11 +1459,20 @@ impl Qwen3Model {
         let t_fwd = tp.elapsed().as_secs_f64();
         let tv = std::time::Instant::now();
         let v = logits.shape()[2];
-        let ld = backend.to_cpu_f32(&logits)?;
+        // Жадная проверка без штрафа за повторы (обычный режим сервиса):
+        // argmax строк считается на GPU, строка [1+γ, V] на хост не едет.
+        // INFER_SPEC_CPU=1 — прежний путь через хост (сверка/замеры).
+        let gpu_greedy =
+            greedy && repeat_penalty == 1.0 && std::env::var("INFER_SPEC_CPU").is_err();
+        let mut ld = Vec::new();
+        let (accepted, accepted_len, n_verified) = if gpu_greedy {
+            let (am, _lse) = backend.argmax_rows(&logits, None)?;
+            verify_greedy_by_argmax(id, draft, &am)
+        } else {
+            ld = backend.to_cpu_f32(&logits)?;
+            verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, repeat_penalty)
+        };
         let t_dl = tv.elapsed().as_secs_f64();
-        // 2. Проверка черновиков — общая для всех архитектур (verify_draft).
-        let (accepted, accepted_len, n_verified) =
-            verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, repeat_penalty);
         // 3. KV-откат непринятого хвоста: остаются prefill-база + id + принятые.
         if accepted_len < ids.len() {
             let base = self.caches[0].pos - ids.len();
@@ -1475,9 +1484,14 @@ impl Qwen3Model {
         // Логиты позиции accepted_len-1 — СООТВЕТСТВУЮТ откаченному кэшу
         // (распределение после последнего принятого токена; при полном
         // принятии — последняя строка, продолжение после всех draft).
+        // При жадном пути — срез окна на GPU (без обмена с хостом).
         let row_idx = accepted_len - 1;
-        let row = &ld[row_idx * v..(row_idx + 1) * v];
-        let logits = backend.from_cpu_f32(row, vec![1, 1, v])?;
+        let logits = if gpu_greedy {
+            logits.view_offset(vec![1, 1, v], row_idx * v)
+        } else {
+            let row = &ld[row_idx * v..(row_idx + 1) * v];
+            backend.from_cpu_f32(row, vec![1, 1, v])?
+        };
         let n_draft_accepted = accepted_len.saturating_sub(1);
         if prof {
             self.spec_prof.0 += t_fwd;
@@ -1834,6 +1848,36 @@ pub(crate) fn verify_draft(
             break;
         }
     }
+    (accepted, accepted_len, n_verified)
+}
+
+/// Жадная верификация по строкам, посчитанным на GPU
+/// ([`crate::backend::Backend::argmax_rows`]): черновик принимается, если он
+/// равен argmax своей строки; при отказе пересэмпл — тот же argmax (жадное
+/// распределение вырождено). Применимо только при `repeat_penalty == 1.0` —
+/// иначе нужен штраф за повторы, зависящий от накопленной истории
+/// (см. [`verify_draft`]).
+pub(crate) fn verify_greedy_by_argmax(
+    id: u32,
+    draft: &[u32],
+    argmax: &[u32],
+) -> (Vec<u32>, usize, usize) {
+    debug_assert!(argmax.len() >= draft.len());
+    let mut accepted: Vec<u32> = vec![id];
+    let mut n_verified = 0usize;
+    for (i, &d) in draft.iter().enumerate() {
+        if argmax[i] == d {
+            accepted.push(d);
+            n_verified += 1;
+        } else {
+            accepted.push(argmax[i]);
+            break;
+        }
+    }
+    // Контракт verify_draft: accepted_len — якорь + ПРИНЯТЫЕ черновики.
+    // Пересэмпл при отказе в кэш верификации не входит (он — первый токен
+    // следующего окна), хотя и лежит последним в `accepted`.
+    let accepted_len = 1 + n_verified;
     (accepted, accepted_len, n_verified)
 }
 
@@ -2345,6 +2389,41 @@ mod tests {
                 .map(|(x, y)| (x - y).abs())
                 .fold(0.0f32, f32::max);
             assert!(worst < 1e-4, "chunk={chunk}: против prefill_last max |Δ| {worst}");
+        }
+    }
+
+    /// Жадная верификация по аргмаксу строк: принимает совпавшие черновики,
+    /// при отказе берёт argmax строки (пересэмпл вырожденного распределения).
+    #[test]
+    fn verify_greedy_by_argmax_matches_verify_draft() {
+        let id = 7u32;
+        for (draft, argmax) in [
+            (vec![], vec![]),
+            (vec![1, 2, 3], vec![1, 2, 3]),      // все приняты
+            (vec![1, 2, 3], vec![1, 9, 3]),      // отказ на 2-м
+            (vec![1, 2, 3], vec![8, 2, 3]),      // отказ сразу
+        ] {
+            let (acc_g, len_g, nv_g) = verify_greedy_by_argmax(id, &draft, &argmax);
+            // CPU-путь (penalty 1.0): ld — строки с максимумом в argmax[r]
+            let v = 16usize;
+            let mut ld = vec![0f32; (1 + draft.len()) * v];
+            for (r, &am) in argmax.iter().enumerate() {
+                ld[r * v + am as usize] = 5.0;
+            }
+            let (acc_c, len_c, nv_c) = verify_draft(
+                &ld,
+                v,
+                id,
+                &draft,
+                &vec![1.0; draft.len()],
+                &mut None,
+                true,
+                &[1, 2],
+                1.0,
+            );
+
+            assert_eq!((len_g, nv_g), (len_c, nv_c), "draft={draft:?} argmax={argmax:?}");
+            assert_eq!(acc_g, acc_c, "draft={draft:?} argmax={argmax:?}");
         }
     }
 

@@ -1320,39 +1320,60 @@ impl crate::spec::Drafter for DFlashDrafter {
             // argmax(draft_logits)). Раньше argmax включался только
             // переменной LLM_DRAFT_ARGMX, которую сервис не ставил: при
             // жадной проверке черновики сэмплировались — приёмка 7–12%.
+            // INFER_SPEC_CPU=1 — прежний путь (argmax строк на CPU).
+            let cpu_only = std::env::var("INFER_SPEC_CPU").is_ok();
             let (argmx, temp, top_k) = match self.sampling {
                 crate::spec::DraftSampling::Greedy => (true, 1.0, 0),
                 crate::spec::DraftSampling::Sample { temperature, top_k } => {
                     (false, temperature.max(1e-6), top_k)
                 }
             };
-            let (t, vocab) = (res.logits.shape()[1], res.logits.shape()[2]);
-            let lg = match backend.to_cpu_f32(&res.logits) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("DFlashDrafter: logits недоступны: {e}");
-                    return (vec![], vec![]);
-                }
-            };
+            let t = res.logits.shape()[1];
             let mut tokens = Vec::with_capacity(t - 1);
             let mut probs = Vec::with_capacity(t - 1);
-            // LM-конвенция: row i предсказывает токен i+1, якорь на позиции 0,
-            // черновики = строки 1..t (проверено: direct-вариант хуже — 0.7%).
-            for pos in 1..t {
-                let row = &lg[pos * vocab..(pos + 1) * vocab];
-                let tok = if argmx {
-                    let mut best = (0usize, f32::NEG_INFINITY);
-                    for (i, &l) in row.iter().enumerate() {
-                        if l.is_finite() && l > best.1 {
-                            best = (i, l);
-                        }
+            if argmx && !cpu_only {
+                // Жадные черновики — аргмакс строк на GPU: строка логитов
+                // [T, V] не скачивается вовсе (q при жадной верификации не
+                // используется — достаточно единиц).
+                let (ids, _lse) = match backend.argmax_rows(&res.logits, None) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("DFlashDrafter: аргмакс строк не удался: {e}");
+                        return (vec![], vec![]);
                     }
-                    best.0 as u32
-                } else {
-                    self.sample_row(row, temp, top_k)
                 };
-                tokens.push(tok);
-                probs.push(softmax_row_prob_t(row, tok, if argmx { 1.0 } else { temp }));
+                // LM-конвенция: row i предсказывает токен i+1, якорь на
+                // позиции 0, черновики = строки 1..t.
+                for pos in 1..t {
+                    tokens.push(ids[pos]);
+                    probs.push(1.0);
+                }
+            } else {
+                let vocab = res.logits.shape()[2];
+                let lg = match backend.to_cpu_f32(&res.logits) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("DFlashDrafter: logits недоступны: {e}");
+                        return (vec![], vec![]);
+                    }
+                };
+                for pos in 1..t {
+                    let row = &lg[pos * vocab..(pos + 1) * vocab];
+                    let tok = if argmx {
+                        // прежний путь (INFER_SPEC_CPU): argmax на CPU
+                        let mut best = (0usize, f32::NEG_INFINITY);
+                        for (i, &l) in row.iter().enumerate() {
+                            if l.is_finite() && l > best.1 {
+                                best = (i, l);
+                            }
+                        }
+                        best.0 as u32
+                    } else {
+                        self.sample_row(row, temp, top_k)
+                    };
+                    tokens.push(tok);
+                    probs.push(softmax_row_prob_t(row, tok, if argmx { 1.0 } else { temp }));
+                }
             }
             (tokens, probs)
         };

@@ -1352,6 +1352,56 @@ pub trait Backend: Send + Sync {
     fn div(&self, a: &Tensor, b: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn add_scalar(&self, x: &Tensor, y: &Tensor, c: f32) -> Result<(), BackendError>;
     fn scale(&self, x: &Tensor, y: &Tensor, c: f32) -> Result<(), BackendError>;
+    /// Аргмакс по строкам логитов [T, V] и logsumexp каждой строки:
+    /// `ids[t]` — первый максимум строки (порядок сравнений как у
+    /// [`crate::inference::sampling::greedy_next`]: строго больше, не-конечные
+    /// логиты → −∞), `lse[t] = log Σ exp(x − max)` по полному ряду.
+    /// `history` + `penalty` — тот же штраф за повторы (один раз на уникальный
+    /// токен), что у `greedy_next`; `None` — без штрафа (быстрый путь:
+    /// ни одна строка логитов не скачивается на хост). Реализация по
+    /// умолчанию — хостовая, побитово равная greedy_next.
+    fn argmax_rows(
+        &self,
+        logits: &Tensor,
+        history: Option<(&[u32], f32)>,
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
+        let shape = logits.shape().to_vec();
+        let v = *shape.last().unwrap_or(&0);
+        let t = logits.numel() / v.max(1);
+        let rows = self.to_cpu_f32(logits)?;
+        let mut ids = Vec::with_capacity(t);
+        let mut lse = Vec::with_capacity(t);
+        let mut pen: Vec<f32> = Vec::new();
+        for r in 0..t {
+            let mut row = rows[r * v..(r + 1) * v].to_vec();
+            if let Some((hist, penalty)) = history {
+                crate::inference::sampling::apply_repetition_penalty_vec_unique(
+                    &mut row, hist, penalty,
+                );
+            }
+            let mut best: Option<(usize, f32)> = None;
+            for (i, l) in row.iter().enumerate() {
+                let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
+                if best.is_none_or(|(_, bl)| l > bl) {
+                    best = Some((i, l));
+                }
+            }
+            let (bi, bv) = best.unwrap_or((0, f32::NEG_INFINITY));
+            let mut sum = 0.0f32;
+            if bv > f32::NEG_INFINITY {
+                for l in &row {
+                    if l.is_finite() {
+                        sum += (l - bv).exp();
+                    }
+                }
+            }
+            pen.clear();
+            ids.push(bi as u32);
+            lse.push(if bv > f32::NEG_INFINITY { sum.ln() } else { f32::NEG_INFINITY });
+        }
+        Ok((ids, lse))
+    }
+
     /// Построчная копия fp32 со сдвигом и шагом:
     /// `dst[(dst_row0+r)·dst_stride + dst_col0 + c] = src[r·cols + c]`.
     /// Сборка выходов extract-слоёв по блокам префилла и конкат фич драфтера

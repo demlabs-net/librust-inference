@@ -489,6 +489,7 @@ impl Qwen35Model {
         Ok(self.prefill_extract(backend, ids, &[])?.0)
     }
 
+
     /// Prefill + выходы слоёв `layers` (по возрастанию; без out_norm) —
     /// фичи таргета для DFlash-драфтера (его target_layers — индексы слоёв
     /// ЭТОЙ модели). Один проход: логиты и контекст — как у prefill.
@@ -512,6 +513,62 @@ impl Qwen35Model {
         let r = self.forward(backend, ids, layers, &mut extract);
         backend.end_batch()?;
         Ok((r?, extract))
+    }
+
+    /// Prefill блоками: логиты ТОЛЬКО последней позиции и выходы
+    /// extract-слоёв по всему промпту ([T, D] на слой) — как у Qwen3
+    /// (см. [`crate::qwen3::Qwen3Model::prefill_extract_last`]): прежний
+    /// одномоментный проход копил буферы всех слоёв до конца батча.
+    pub fn prefill_extract_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>), BackendError> {
+        if ids.is_empty() {
+            return Err(BackendError::Shape(
+                "prefill_extract_last: пустой промпт".into(),
+            ));
+        }
+        if let Some(&bad) = layers.iter().find(|&&l| l >= self.cfg.n_layers) {
+            return Err(BackendError::Shape(format!(
+                "qwen35 extract: слой {bad} >= {}",
+                self.cfg.n_layers
+            )));
+        }
+        let chunk = crate::qwen3::Qwen3Model::prefill_chunk();
+        let d = self.cfg.dim;
+        let t_all = ids.len();
+        let mut extract: Vec<Tensor> = Vec::with_capacity(layers.len());
+        for _ in layers {
+            extract.push(backend.zeros(vec![t_all, d])?);
+        }
+        let mut done = 0usize;
+        let mut logits = None;
+        while done < t_all {
+            backend.begin_batch()?;
+            let end = (done + chunk).min(t_all);
+            let part = &ids[done..end];
+            let t = part.len();
+            // логиты нужны только с последнего блока (и только последней
+            // строки — last_only экономит lm_head по строкам блока)
+            self.last_only = end == t_all && t > 1;
+            let mut ex = Vec::with_capacity(layers.len());
+            let r = self.forward(backend, part, layers, &mut ex);
+            self.last_only = false;
+            let h = r?;
+            for (li, e) in ex.iter().enumerate() {
+                extract[li] = backend.copy_rows_into(e, t, d, extract[li].clone(), done, 0, d)?;
+            }
+            if end == t_all {
+                logits = Some(h);
+            }
+            backend.end_batch()?;
+            done = end;
+        }
+        let logits = logits
+            .ok_or_else(|| BackendError::Shape("prefill_extract_last: логиты не посчитаны".into()))?;
+        Ok((logits, extract))
     }
 
     /// Один токен (decode-шаг) → логиты [1, 1, V].

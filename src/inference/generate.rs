@@ -212,6 +212,17 @@ pub trait CausalLm {
         ids: &[u32],
         layers: &[usize],
     ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError>;
+    /// Prefill промпта блоками: логиты только последней позиции, выходы
+    /// extract-слоёв — по всем токенам ([T, D] на слой). По умолчанию —
+    /// общий prefill_extract (одним проходом).
+    fn prefill_extract_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
+        self.prefill_extract(backend, ids, layers)
+    }
     /// Один токен → логиты [1, 1, V].
     fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError>;
     /// Спек-шаг: верификация [id, draft…] одним forward'ом + откат хвоста.
@@ -315,6 +326,14 @@ impl CausalLm for crate::qwen3::Qwen3Model {
         layers: &[usize],
     ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
         Qwen3Model::prefill_extract(self, backend, ids, layers)
+    }
+    fn prefill_extract_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
+        Qwen3Model::prefill_extract_last(self, backend, ids, layers)
     }
     fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::decode(self, backend, id)
@@ -425,6 +444,14 @@ impl CausalLm for crate::qwen35::Qwen35Model {
         layers: &[usize],
     ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
         crate::qwen35::Qwen35Model::prefill_extract(self, backend, ids, layers)
+    }
+    fn prefill_extract_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
+        crate::qwen35::Qwen35Model::prefill_extract_last(self, backend, ids, layers)
     }
     fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError> {
         crate::qwen35::Qwen35Model::decode(self, backend, id)
@@ -667,31 +694,31 @@ pub fn generate<M: CausalLm + ?Sized>(
         // DFlash (4.2.c, z-lab): первый блок контекстуализируется НА ВСЁМ
         // промпте — extract префилла отдаём драфтеру сразу (иначе первый
         // block только «видит» past_len=0 и не принимает ничего).
-        let tlayers: Option<Vec<usize>> = params
+        // Префилл промпта — блоками и с логитами только последней строки
+        // (prefill_extract_last): одномоментный проход на 4k токенов копил
+        // буферы всех блоков до конца батча и считал lm_head по всем строкам.
+        let tlayers: Vec<usize> = params
             .drafter
             .as_ref()
-            .map(|d| d.lock().unwrap().target_layers().to_vec());
-        match tlayers {
-            Some(tl) if !tl.is_empty() => {
-                let tp = std::time::Instant::now();
-                let (lg, extract) = model.prefill_extract(backend, ids, &tl)?;
-                let t_pf = tp.elapsed();
-                let n = ids.len();
-                if let Some(dr) = params.drafter.as_ref() {
-                    let mut dr = dr.lock().unwrap();
-                    let _ = dr.after_extract(backend, &extract, n, n);
-                }
-                if std::env::var("LLM_SPEC_PROF").is_ok() {
-                    eprintln!(
-                        "SPEC_PROF префилл: prefill_extract {:.0} мс, фичи драфтера {:.0} мс",
-                        t_pf.as_secs_f64() * 1e3,
-                        (tp.elapsed() - t_pf).as_secs_f64() * 1e3
-                    );
-                }
-                lg
-            }
-            _ => model.prefill_last(backend, ids)?,
+            .map(|d| d.lock().unwrap().target_layers().to_vec())
+            .unwrap_or_default();
+        let tp = std::time::Instant::now();
+        let (lg, extract) = model.prefill_extract_last(backend, ids, &tlayers)?;
+        let t_pf = tp.elapsed();
+        if !tlayers.is_empty()
+            && let Some(dr) = params.drafter.as_ref()
+        {
+            let mut dr = dr.lock().unwrap();
+            let _ = dr.after_extract(backend, &extract, ids.len(), ids.len());
         }
+        if std::env::var("LLM_SPEC_PROF").is_ok() {
+            eprintln!(
+                "SPEC_PROF префилл: prefill_extract_last {:.0} мс, фичи драфтера {:.0} мс",
+                t_pf.as_secs_f64() * 1e3,
+                (tp.elapsed() - t_pf).as_secs_f64() * 1e3
+            );
+        }
+        lg
     } else {
         model.decode(backend, ids[0])?
     };

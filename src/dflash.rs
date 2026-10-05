@@ -1093,8 +1093,9 @@ pub struct DFlashDrafter {
     /// (см. [`crate::spec::DraftSampling`]). По умолчанию жадный: так
     /// работает и эталон z-lab (`dflash_generate`: argmax при temperature 0).
     pub sampling: crate::spec::DraftSampling,
-    /// LLM_SPEC_PROF: (секунды всего, число черновиков, секунды диффузии).
-    prof: (f64, usize, f64),
+    /// LLM_SPEC_PROF: (секунды всего, число черновиков, секунды диффузии,
+    /// секунды выбора, секунды хвоста).
+    prof: (f64, usize, f64, f64, f64),
 }
 
 impl DFlashDrafter {
@@ -1105,7 +1106,7 @@ impl DFlashDrafter {
             target_embed,
             lm_head,
             features: None,
-            prof: (0.0, 0, 0.0),
+            prof: (0.0, 0, 0.0, 0.0, 0.0),
             committed: std::collections::VecDeque::new(),
             rng: 0x85ebca6b,
             sampling: crate::spec::DraftSampling::Greedy,
@@ -1213,22 +1214,20 @@ impl crate::spec::Drafter for DFlashDrafter {
         // строки t = [l0[t]; l1[t]; …; l4[t]] (токен-мажор!). Раньше
         // клали слой-мажор ([L0-все строки, L1-все…]) — fc получал
         // перепутанный вход и драфтер выдавал мусор (приёмка 0%).
-        let d = extract[0].shape()[2];
-        let t = extract[0].shape()[1];
-        let rows = n_accepted.min(t).min(t);
+        // Форма extract: [1, T, D] (верификационное окно) или [T, D]
+        // (промпт — буферы, собранные блоками ядром copy_rows_f32).
+        let d = *extract[0].shape().last().expect("extract: пустая форма");
+        let t = extract[0].numel() / d;
+        let rows = n_accepted.min(t);
         let n_layers = extract.len();
-        let mut feat = vec![0f32; n_layers * rows * d];
+        // Конкат по последней оси ([T, 5D]) — ядром copy_rows_f32: строки
+        // слоёв ложатся в свои столбцы. Раньше каждый слой скачивался на
+        // хост и копировался в буфер вручную, потом всё заливалось обратно —
+        // на промпте 4k это 288 МБ вниз и 288 МБ вверх (секунды).
+        let mut features = _backend.zeros(vec![rows, n_layers * d])?;
         for (li, t_) in extract.iter().enumerate() {
-            let td = t_.shape()[1];
-            let rows_ = _backend.to_cpu_f32(t_)?;
-            let n = rows.min(td);
-            for r in 0..n {
-                let src = r * d;
-                let dst = r * n_layers * d + li * d;
-                feat[dst..dst + d].copy_from_slice(&rows_[src..src + d]);
-            }
+            features = _backend.copy_rows_into(t_, rows, d, features, 0, li * d, n_layers * d)?;
         }
-        let features = _backend.from_cpu_f32(&feat, vec![rows, extract.len() * d])?;
         self.features = Some(features);
         let _ = pos;
         Ok(())
@@ -1305,6 +1304,7 @@ impl crate::spec::Drafter for DFlashDrafter {
                 }
             };
         let t_diffuse = tp.elapsed().as_secs_f64();
+        let ts = std::time::Instant::now();
         let (tokens, probs) = if self.model.selector.is_some() {
             match self.model.select(backend, &res.logits, &res.hidden) {
                 Ok(s) => (s.tokens, s.probs),
@@ -1356,23 +1356,29 @@ impl crate::spec::Drafter for DFlashDrafter {
             }
             (tokens, probs)
         };
+        let t_sample = ts.elapsed().as_secs_f64();
+        let tt = std::time::Instant::now();
+        // кэш после диффузии содержит k/v блока — откат до pos (crop)
+        self.model.truncate_caches(pos);
+        self.commit(&tokens);
+        let t_tail = tt.elapsed().as_secs_f64();
         if prof {
             self.prof.0 += tp.elapsed().as_secs_f64();
             self.prof.1 += 1;
             self.prof.2 += t_diffuse;
-            if self.prof.1.is_multiple_of(32) {
+            self.prof.3 += t_sample;
+            self.prof.4 += t_tail;
+            if self.prof.1.is_multiple_of(8) {
                 eprintln!(
-                    "DFLASH_PROF {} черновиков: {:.1} мс/черновик (диффузия {:.1}, выбор {:.1}; block={block})",
+                    "DFLASH_PROF {} черновиков: всего {:.1} мс (диффузия {:.1}, выбор {:.1}, хвост {:.1}; block={block})",
                     self.prof.1,
                     self.prof.0 * 1e3 / self.prof.1 as f64,
                     self.prof.2 * 1e3 / self.prof.1 as f64,
-                    (self.prof.0 - self.prof.2) * 1e3 / self.prof.1 as f64
+                    self.prof.3 * 1e3 / self.prof.1 as f64,
+                    self.prof.4 * 1e3 / self.prof.1 as f64
                 );
             }
         }
-        // кэш после диффузии содержит k/v блока — откат до pos (crop)
-        self.model.truncate_caches(pos);
-        self.commit(&tokens);
         (
             tokens.into_iter().take(gamma).collect(),
             probs.into_iter().take(gamma).collect(),

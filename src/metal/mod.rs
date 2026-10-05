@@ -682,6 +682,7 @@ impl MetalCtx {
             "add_bias2d_f32",
             "add_scaled_f32",
             "scale_f32",
+            "copy_rows_f32",
             "uniform_attn_f32",
             "rope_f32",
             // DAC codec path (fp32 decode/encode)
@@ -1862,6 +1863,33 @@ impl MetalCtx {
             enc.set_buffer(1, Some(&y.buffer), y.offset as u64);
             enc.set_bytes(2, 8, (&n as *const usize).cast());
             enc.set_bytes(3, 4, (&scale as *const f32).cast());
+        })
+    }
+
+    /// Построчная копия fp32 со сдвигом/шагом (см. [`Backend::copy_rows_into`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rows_f32(
+        &self,
+        src: &GpuTensor,
+        rows: usize,
+        cols: usize,
+        dst: &GpuTensor,
+        dst_row0: usize,
+        dst_col0: usize,
+        dst_stride: usize,
+    ) -> Result<(), MetalError> {
+        let (rows32, cols32) = (rows as u32, cols as u32);
+        let (r0_32, c0_32, st32) = (dst_row0 as u32, dst_col0 as u32, dst_stride as u32);
+        let grid = MTLSize::new(cols as u64, rows as u64, 1);
+        let group = MTLSize::new(32, 4, 1);
+        self.run("copy_rows_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&src.buffer), src.offset as u64);
+            enc.set_buffer(1, Some(&dst.buffer), dst.offset as u64);
+            enc.set_bytes(2, 4, (&rows32 as *const u32).cast());
+            enc.set_bytes(3, 4, (&cols32 as *const u32).cast());
+            enc.set_bytes(4, 4, (&r0_32 as *const u32).cast());
+            enc.set_bytes(5, 4, (&c0_32 as *const u32).cast());
+            enc.set_bytes(6, 4, (&st32 as *const u32).cast());
         })
     }
 
@@ -3836,6 +3864,29 @@ impl crate::backend::Backend for MetalBackend {
     ) -> Result<(), crate::error::BackendError> {
         self.ctx.scale_f32(x.as_gpu(), y.as_gpu(), c)?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_rows_into(
+        &self,
+        src: &crate::backend::Tensor,
+        rows: usize,
+        cols: usize,
+        dst: crate::backend::Tensor,
+        dst_row0: usize,
+        dst_col0: usize,
+        dst_stride: usize,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        self.ctx.copy_rows_f32(
+            src.as_gpu(),
+            rows,
+            cols,
+            dst.as_gpu(),
+            dst_row0,
+            dst_col0,
+            dst_stride,
+        )?;
+        Ok(dst)
     }
 
     fn add_bias(

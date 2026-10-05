@@ -240,6 +240,9 @@ pub struct Qwen3Model {
     /// текста равна числу токенов в кэше, но после картинки (Qwen3-VL)
     /// позиция растёт на max(nx,ny)=24, а не на 2304 vision-токенов.
     pos_rope: usize,
+    /// LLM_SPEC_PROF: (секунды forward окон, секунды скачивания логитов,
+    /// число окон) — разложение верификации.
+    spec_prof: (f64, f64, usize),
 }
 
 impl Qwen3Model {
@@ -594,6 +597,7 @@ impl Qwen3Model {
             output,
             caches,
             pos_rope: 0,
+            spec_prof: (0.0, 0.0, 0),
         })
     }
 
@@ -742,6 +746,100 @@ impl Qwen3Model {
         })();
         backend.end_batch()?;
         r
+    }
+
+    /// Prefill блоками: логиты ТОЛЬКО последней позиции и выходы
+    /// extract-слоёв по всему промпту ([T, D] на слой — инжект DFlash).
+    /// Прежний prefill_extract шёл одним проходом по всему промпту: буферы
+    /// всех блоков копились в отложенном списке до конца батча (на 4k
+    /// токенов — десятки ГБ, система уходила в своп) и lm_head считался по
+    /// ВСЕМ строкам ([T, V] = 2.1 ГБ на 4k). На 4k это давало 42 с против
+    /// 16 с у prefill_last — и точно так же замедляло следующие окна спека.
+    /// Строки блоков собираются в буферы слоёв ядром copy_rows_f32 (GPU).
+    pub fn prefill_extract_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>), BackendError> {
+        self.prefill_extract_last_chunked(backend, ids, layers, Self::prefill_chunk())
+    }
+
+    /// То же с явным размером блока (тесты: сверка блочного пути с одним проходом).
+    pub fn prefill_extract_last_chunked(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        layers: &[usize],
+        chunk: usize,
+    ) -> Result<(Tensor, Vec<Tensor>), BackendError> {
+        let chunk = chunk.max(1);
+        if ids.is_empty() {
+            return Err(BackendError::Shape(
+                "prefill_extract_last: пустой промпт".into(),
+            ));
+        }
+        if layers.is_empty() {
+            return Ok((self.prefill_last(backend, ids)?, Vec::new()));
+        }
+        if let Some(&bad) = layers.iter().find(|&&l| l >= self.layers.len()) {
+            return Err(BackendError::Shape(format!(
+                "extract: слой {bad} >= {}",
+                self.layers.len()
+            )));
+        }
+        let d = self.cfg.dim;
+        let t_all = ids.len();
+        // Резерв KV под весь промпт (как prefill_last_chunked): без него
+        // ступени роста копируют кэш.
+        let want = (self.pos_rope + t_all).min(self.cfg.rope_max_seq);
+        for c in self.caches.iter_mut() {
+            c.ensure(backend, want)?;
+        }
+        let mut extract: Vec<Tensor> = Vec::with_capacity(layers.len());
+        for _ in layers {
+            extract.push(backend.zeros(vec![t_all, d])?);
+        }
+        let mut done = 0usize;
+        let mut logits = None;
+        let prof = std::env::var("LLM_SPEC_PROF").ok().as_deref() == Some("2");
+        let (mut t_fwd, mut t_copy) = (0.0f64, 0.0f64);
+        while done < t_all {
+            backend.begin_batch()?;
+            let end = (done + chunk).min(t_all);
+            let part = &ids[done..end];
+            let t = part.len();
+            let x = self.embed.forward(backend, part, t)?;
+            let tf = std::time::Instant::now();
+            let (h, ex) = self.forward_layers_extract(backend, x, t, None, 0, None, layers)?;
+            t_fwd += tf.elapsed().as_secs_f64();
+            for (li, e) in ex.iter().enumerate() {
+                let tc = std::time::Instant::now();
+                extract[li] =
+                    backend.copy_rows_into(e, t, d, extract[li].clone(), done, 0, d)?;
+                t_copy += tc.elapsed().as_secs_f64();
+            }
+            if end == t_all {
+                let last = h.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d);
+                logits = Some(self.lm_head(backend, &last)?);
+            }
+            // Позиция следующего блока — от кэша (rope/маска).
+            self.pos_rope = self.caches[0].pos;
+            backend.end_batch()?;
+            done = end;
+        }
+        self.pos_rope = self.caches[0].pos;
+        if prof {
+            eprintln!(
+                "PREFILL_EXTRACT_LAST: forward {:.0} мс, copy_rows {:.0} мс (chunk={chunk}, t={t_all})",
+                t_fwd * 1e3,
+                t_copy * 1e3
+            );
+        }
+        let logits = logits.ok_or_else(|| {
+            BackendError::Shape("prefill_extract_last: логиты не посчитаны".into())
+        })?;
+        Ok((logits, extract))
     }
 
     /// Prefill с vision-эмбеддингами (Ф1.11): токены == `vision_token`
@@ -1351,13 +1449,18 @@ impl Qwen3Model {
         repeat_penalty: f32,
     ) -> Result<SpecOutcome, BackendError> {
         assert_eq!(draft.len(), draft_probs.len());
+        let prof = std::env::var("LLM_SPEC_PROF").is_ok();
+        let tp = std::time::Instant::now();
         let mut ids = Vec::with_capacity(1 + draft.len());
         ids.push(id);
         ids.extend_from_slice(draft);
         // 1. ОДИН forward: кэш пополняется всеми (1+γ) токенами.
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?; // [1, T, V]
+        let t_fwd = tp.elapsed().as_secs_f64();
+        let tv = std::time::Instant::now();
         let v = logits.shape()[2];
         let ld = backend.to_cpu_f32(&logits)?;
+        let t_dl = tv.elapsed().as_secs_f64();
         // 2. Проверка черновиков — общая для всех архитектур (verify_draft).
         let (accepted, accepted_len, n_verified) =
             verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, repeat_penalty);
@@ -1376,6 +1479,21 @@ impl Qwen3Model {
         let row = &ld[row_idx * v..(row_idx + 1) * v];
         let logits = backend.from_cpu_f32(row, vec![1, 1, v])?;
         let n_draft_accepted = accepted_len.saturating_sub(1);
+        if prof {
+            self.spec_prof.0 += t_fwd;
+            self.spec_prof.1 += t_dl;
+            self.spec_prof.2 += 1;
+            if self.spec_prof.2.is_multiple_of(16)
+                || std::env::var("LLM_SPEC_PROF").ok().as_deref() == Some("2")
+            {
+                eprintln!(
+                    "QWEN3_SPEC_PROF окон {}: forward {:.1} мс/окно · скачивание логитов {:.1} мс/окно",
+                    self.spec_prof.2,
+                    self.spec_prof.0 * 1e3 / self.spec_prof.2 as f64,
+                    self.spec_prof.1 * 1e3 / self.spec_prof.2 as f64,
+                );
+            }
+        }
         Ok(SpecOutcome {
             accepted,
             logits,
@@ -2178,6 +2296,58 @@ mod tests {
     /// 7.5 (унификация петель): prefill_extract идёт через ОБЩУЮ послойную
     /// петлю — логиты обязаны совпасть с prefill бит-в-бит, а скрытые — с
     /// выходами тех же слоёв через forward_layers_range.
+    /// prefill_extract_last (блоками, логиты последней строки, выходы слоёв
+    /// по всем токенам) == prefill_extract (один проход) и prefill_last.
+    /// Блоки: 4+4+1 и больше промпта (один проход).
+    #[test]
+    fn prefill_extract_last_matches_single_pass() {
+        let (backend, mut model) = mini_model();
+        let ids = [1u32, 2, 3, 4, 5, 6, 7, 8, 9];
+        let layers = [0usize, 1];
+        for chunk in [4usize, 100] {
+            model.reset_cache(&backend).unwrap();
+            let (lg, ex) = model
+                .prefill_extract_last_chunked(&backend, &ids, &layers, chunk)
+                .unwrap();
+            let lv = backend.to_cpu_f32(&lg).unwrap();
+
+            model.reset_cache(&backend).unwrap();
+            let (lg_ref, ex_ref) = model.prefill_extract(&backend, &ids, &layers).unwrap();
+            let lv_ref = backend.to_cpu_f32(&lg_ref).unwrap();
+            let row = lv_ref.len() - lv.len();
+            // Блочный путь и один проход считают одним и тем же ядром, но
+            // тайлы/маски блоков дают порядковые различия fp32 — допуск как
+            // у prefill_last_chunked_equals_single_pass.
+            let worst = lv
+                .iter()
+                .zip(&lv_ref[row..])
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "chunk={chunk}: max |Δ| логитов {worst}");
+
+            for (li, (a, b)) in ex.iter().zip(&ex_ref).enumerate() {
+                let av = backend.to_cpu_f32(a).unwrap();
+                let bv = backend.to_cpu_f32(b).unwrap();
+                let worst = av
+                    .iter()
+                    .zip(&bv)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(worst < 1e-4, "chunk={chunk}: extract слоя {li}: max |Δ| {worst}");
+            }
+
+            model.reset_cache(&backend).unwrap();
+            let lg2 = model.prefill_last(&backend, &ids).unwrap();
+            let lv2 = backend.to_cpu_f32(&lg2).unwrap();
+            let worst = lv
+                .iter()
+                .zip(&lv2)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "chunk={chunk}: против prefill_last max |Δ| {worst}");
+        }
+    }
+
     #[test]
     fn prefill_extract_matches_prefill_and_range() {
         let (backend, mut model) = mini_model();

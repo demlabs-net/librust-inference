@@ -1352,6 +1352,37 @@ pub trait Backend: Send + Sync {
     fn div(&self, a: &Tensor, b: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn add_scalar(&self, x: &Tensor, y: &Tensor, c: f32) -> Result<(), BackendError>;
     fn scale(&self, x: &Tensor, y: &Tensor, c: f32) -> Result<(), BackendError>;
+    /// Построчная копия fp32 со сдвигом и шагом:
+    /// `dst[(dst_row0+r)·dst_stride + dst_col0 + c] = src[r·cols + c]`.
+    /// Сборка выходов extract-слоёв по блокам префилла и конкат фич драфтера
+    /// (5 слоёв по последней оси) — на GPU. `src` читается как [rows, cols]
+    /// от начала буфера (лишние строки не трогаются). Реализация по
+    /// умолчанию — через хост (CPU-бэкенд): корректно, но медленно.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_rows_into(
+        &self,
+        src: &Tensor,
+        rows: usize,
+        cols: usize,
+        dst: Tensor,
+        dst_row0: usize,
+        dst_col0: usize,
+        dst_stride: usize,
+    ) -> Result<Tensor, BackendError> {
+        if src.dtype() != Dtype::F32 {
+            return Err(BackendError::UnsupportedFormat(
+                "copy_rows_into: только fp32".into(),
+            ));
+        }
+        let sv = self.to_cpu_f32(src)?;
+        let mut dv = self.to_cpu_f32(&dst)?;
+        for r in 0..rows {
+            let s0 = r * cols;
+            let d0 = (dst_row0 + r) * dst_stride + dst_col0;
+            dv[d0..d0 + cols].copy_from_slice(&sv[s0..s0 + cols]);
+        }
+        self.from_cpu_f32(&dv, dst.shape().to_vec())
+    }
     fn add_bias(&self, x: &Tensor, bias: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn sqrt(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn log(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;

@@ -614,6 +614,23 @@ kernel void add_scaled_f32(
 }
 
 // ── Scale: Y = X * scale ────────────────────────────────────────────────────
+// Построчная копия fp32 со сдвигом/шагом: D[(dst_row0+r)*dst_stride + dst_col0 + c] =
+// S[r*cols + c]. Сборка выходов extract-слоёв по блокам префилла и конкат
+// фич драфтера (5 слоёв) — на GPU, без скачивания на хост.
+kernel void copy_rows_f32(
+    device const float* S [[buffer(0)]],
+    device float* D [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& dst_row0 [[buffer(4)]],
+    constant uint& dst_col0 [[buffer(5)]],
+    constant uint& dst_stride [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= cols || gid.y >= rows) return;
+    D[((ulong)(dst_row0 + gid.y) * dst_stride) + dst_col0 + gid.x] = S[(ulong)gid.y * cols + gid.x];
+}
+
 kernel void scale_f32(
     device const float* X [[buffer(0)]],
     device float* Y [[buffer(1)]],

@@ -254,6 +254,9 @@ pub struct Qwen35Model {
     pos: usize,
     /// forward считает логиты только последней позиции (prefill_last).
     last_only: bool,
+    /// Логиты вообще не нужны (промежуточные блоки префилла): head не
+    /// считается — lm_head по 512 строкам стоил ~100 мс на блок (V=248k).
+    no_logits: bool,
     /// LLM_SPEC_PROF: (с forward окон, с реплеев, число реплеев, число окон).
     spec_prof: (f64, f64, usize, usize),
     spec_prof_snap: f64,
@@ -429,6 +432,7 @@ impl Qwen35Model {
             states,
             pos: 0,
             last_only: false,
+            no_logits: false,
             spec_prof: (0.0, 0.0, 0, 0),
             spec_prof_snap: 0.0,
         })
@@ -551,11 +555,14 @@ impl Qwen35Model {
             let part = &ids[done..end];
             let t = part.len();
             // логиты нужны только с последнего блока (и только последней
-            // строки — last_only экономит lm_head по строкам блока)
+            // строки — last_only экономит lm_head по строкам блока); на
+            // промежуточных блоках head пропускается целиком (no_logits).
+            self.no_logits = end != t_all;
             self.last_only = end == t_all && t > 1;
             let mut ex = Vec::with_capacity(layers.len());
             let r = self.forward(backend, part, layers, &mut ex);
             self.last_only = false;
+            self.no_logits = false;
             let h = r?;
             for (li, e) in ex.iter().enumerate() {
                 extract[li] = backend.copy_rows_into(e, t, d, extract[li].clone(), done, 0, d)?;
@@ -602,10 +609,14 @@ impl Qwen35Model {
             while done < ids.len() {
                 let end = (done + chunk).min(ids.len());
                 let part = &ids[done..end];
-                self.last_only = end == ids.len();
+                // промежуточные блоки: head не считается вовсе (lm_head по
+                // V=248k стоил ~100 мс на блок 512)
+                self.no_logits = end != ids.len();
+                self.last_only = end == ids.len() && part.len() > 1;
                 backend.begin_batch()?;
                 let one = self.forward(backend, part, &[], &mut Vec::new());
                 self.last_only = false;
+                self.no_logits = false;
                 backend.end_batch()?;
                 out = Some(one?);
                 done = end;
@@ -863,6 +874,10 @@ impl Qwen35Model {
         } else {
             (x, t)
         };
+        if self.no_logits {
+            // Промежуточный блок префилла: логиты не нужны вовсе.
+            return backend.zeros(vec![1, 1, 1]);
+        }
         let h = self.out_norm.forward(backend, &x)?;
         let logits = self.head_rows(backend, &h, t)?;
         if prof {
@@ -1325,6 +1340,9 @@ mod tests {
             (1, 4095, 2, 1, 256),
             (3, 4093, 2, 1, 256),
             (15, 17, 2, 1, 128), // общий путь (8 < Tq < 16)
+            (32, 0, 2, 1, 256),  // матричный предфилл при HD=256
+            (37, 11, 2, 1, 256), // хвост Tq=5 при HD=256
+            (64, 64, 4, 2, 256),
             (16, 0, 4, 2, 128), // предфилл: half-матрицы
             (37, 11, 4, 2, 128),
             (64, 64, 4, 1, 128),

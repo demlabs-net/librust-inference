@@ -3523,7 +3523,7 @@ kernel void attn_prefill_mma_f32(
     // Фрагменты выхода — в регистрах: циклы по фрагментам разворачиваются с
     // константной границей (32), иначе динамическая индексация o[] уводит
     // массив в локальную память (hd=256 был медленнее прежнего кернела).
-    simdgroup_float8x8 o[32];
+    simdgroup_float8x8 o[16];
     #pragma unroll
     for (uint f = 0; f < 32u; ++f) {
         if (f >= nf) break;
@@ -4340,7 +4340,11 @@ kernel void attn_ar_f16_fused(
 }
 
 // Предфилл-внимание по f16-кэшу: Q/K/V — half-фрагменты 8×8, накопление float.
-kernel void attn_prefill_mma_f16(
+// NF — число 8-колоночных фрагментов головы (HD/8): 16 для HD ≤ 128,
+// 32 для HD = 256 (Qwen3.5). Отдельные инстанциации: при HD=128 массивы
+// остаются на 16 фрагментов (регистры — узкое место этого кернела).
+template <uint NF>
+kernel void attn_prefill_mma_f16_nf(
     device const half* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
     device const half* V [[buffer(2)]],
@@ -4368,7 +4372,7 @@ kernel void attn_prefill_mma_f16(
     // simdgroup'а (qtg + sg*8): Q-тайл общий на threadgroup.
     const uint qtg = tgpig.x * 16u;
     const uint D = H * HD, KD = KVH * HD;
-    const uint nf = HD / 8u;
+    const uint nf = HD / 8u;   // до 32 (HD до 256): фрагменты по 8 значений
     const float scale = 1.0f / sqrt((float)HD);
     threadgroup float* myS = sS + sg * 8u * 32u;
     threadgroup float* myD = sD + sg * 64u;
@@ -4382,11 +4386,11 @@ kernel void attn_prefill_mma_f16(
         sQh[e] = (qi < Tq) ? Q[(ulong)qi * D + h * HD + c] : (half)0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_half8x8 qa[16];
+    simdgroup_half8x8 qa[NF];
     for (uint f = 0; f < nf; ++f) {
         simdgroup_load(qa[f], sQh + sg * 8u * HD + f * 8u, HD);
     }
-    simdgroup_float8x8 o[16];
+    simdgroup_float8x8 o[NF];
     for (uint f = 0; f < nf; ++f) o[f] = make_filled_simdgroup_matrix<float, 8>(0.f);
     float m_run = -INFINITY, l_run = 0.0f;
     for (uint kb = 0; kb < Tkv; kb += 32u) {
@@ -4516,3 +4520,7 @@ kernel void attn_prefill_mma_f16(
         }
     }
 }
+
+typedef decltype(attn_prefill_mma_f16_nf<16>) attn_prefill_mma_f16_nf_t;
+template [[host_name("attn_prefill_mma_f16_nf16")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<16>;
+template [[host_name("attn_prefill_mma_f16_nf32")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<32>;

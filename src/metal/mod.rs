@@ -684,6 +684,8 @@ impl MetalCtx {
             "scale_f32",
             "copy_rows_f32",
             "argmax_lse_rows_f32",
+            "attn_prefill_mma_f16_nf16",
+            "attn_prefill_mma_f16_nf32",
             "uniform_attn_f32",
             "rope_f32",
             // DAC codec path (fp32 decode/encode)
@@ -2501,17 +2503,25 @@ impl MetalCtx {
             )));
         }
         // Предфилл: half×half матричные блоки (16 запросов/threadgroup).
-        // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел)
-        if b == 1 && tq >= 16 && tkv >= 8 && hd.is_multiple_of(8) && hd <= 128 {
+        // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел).
+        // HD до 256 (Qwen3.5): фрагментов головы вдвое больше (nf = HD/8).
+        if b == 1 && tq >= 16 && tkv >= 8 && hd.is_multiple_of(8) && hd <= 256 {
             let (tq32, tkv32, h32, kvh32, hd32) =
                 (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
             // S float 2×8×32 + P half 2×8×32 + диаг float 2×64 + 1/l 2×8
             // + Q half 16×HD (стейджинг с построчной защитой хвоста).
             let bytes: u64 =
                 (2 * 8 * 32 * 4 + 2 * 8 * 32 * 2 + 2 * 64 * 4 + 2 * 8 * 4 + 16 * hd * 2) as u64;
+            // Инстанциация по числу фрагментов головы (HD/8): 16 при HD ≤ 128,
+            // 32 при HD = 256 — регистры при HD=128 не растут.
+            let name = if hd <= 128 {
+                "attn_prefill_mma_f16_nf16"
+            } else {
+                "attn_prefill_mma_f16_nf32"
+            };
             let grid = MTLSize::new((tq.div_ceil(16) * 64) as u64, n_heads as u64, 1);
             let group = MTLSize::new(64, 1, 1);
-            return self.run("attn_prefill_mma_f16", grid, group, |enc| {
+            return self.run(name, grid, group, |enc| {
                 enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
                 enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
                 enc.set_buffer(2, Some(&v.buffer), v.offset as u64);

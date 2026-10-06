@@ -4670,8 +4670,8 @@ impl crate::backend::Backend for MetalBackend {
     fn moe_experts_mv(
         &self,
         a: &crate::backend::Tensor,
-        ids: &[u32],
-        weights: &[f32],
+        ids: &crate::backend::Tensor,
+        weights: &crate::backend::Tensor,
         b: &crate::backend::Tensor,
         c: &crate::backend::Tensor,
         n_rows: usize,
@@ -4684,20 +4684,15 @@ impl crate::backend::Backend for MetalBackend {
             c.inner_metal(),
         );
         let k = a.shape()[a.shape().len() - 1];
-        let kslots = ids.len();
-        if kslots == 0 || weights.len() != kslots {
+        let kslots = ids.numel();
+        if kslots == 0 || weights.numel() != kslots {
             return Err(BackendError::Shape(format!(
                 "moe_experts_mv: ids {} / weights {}",
                 kslots,
-                weights.len()
+                weights.numel()
             )));
         }
-        // set_bytes ограничен 4 КБ — при большем top-k нужны буферы.
-        if kslots * 8 > 4096 {
-            return Err(BackendError::Shape(format!(
-                "moe_experts_mv: top-k {kslots} не влезает в set_bytes"
-            )));
-        }
+        let (ig, wg) = (ids.inner_metal(), weights.inner_metal());
         let name = match (bg.dtype, per_slot) {
             (GpuDtype::Q4_K, false) => "mv_id_q4_k",
             (GpuDtype::Q4_K, true) => "mv_id_q4_k_dpsl",
@@ -4721,8 +4716,8 @@ impl crate::backend::Backend for MetalBackend {
         let group = MTLSize::new(128, 1, 1);
         self.ctx.run(name, grid, group, |enc| {
             enc.set_buffer(0, Some(&ag.buffer), ag.offset as u64);
-            enc.set_bytes(1, 4 * kslots as u64, ids.as_ptr().cast());
-            enc.set_bytes(2, 4 * kslots as u64, weights.as_ptr().cast());
+            enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
+            enc.set_buffer(2, Some(&wg.buffer), wg.offset as u64);
             enc.set_buffer(3, Some(&bg.buffer), bg.offset as u64);
             enc.set_buffer(4, Some(&cg.buffer), cg.offset as u64);
             enc.set_bytes(5, 4, (&k32 as *const u32).cast());
@@ -4730,6 +4725,105 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(7, 4, (&ks32 as *const u32).cast());
         })
         .map_err(|e| BackendError::Shape(format!("moe_experts_mv: {e}")))
+    }
+
+    fn from_cpu_u32(
+        &self,
+        data: &[u32],
+        shape: Vec<usize>,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        let n: usize = shape.iter().product();
+        if n != data.len() {
+            return Err(crate::error::BackendError::Shape(format!(
+                "from_cpu_u32: shape {shape:?} против {} элементов",
+                data.len()
+            )));
+        }
+        let mut t = GpuTensor::zeros_f32(&self.ctx.device, vec![n])?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().cast::<u8>(),
+                t.buffer.contents().cast::<u8>(),
+                n * 4,
+            );
+        }
+        t.shape = shape;
+        Ok(crate::backend::Tensor::from_gpu(t))
+    }
+
+    fn to_cpu_u32(
+        &self,
+        t: &crate::backend::Tensor,
+    ) -> Result<Vec<u32>, crate::error::BackendError> {
+        let g = t.inner_metal();
+        let n = t.numel();
+        // Как to_cpu_f32: сначала слить батч (запись кернела не видна до
+        // commit+wait), затем скопировать n×4 байта с учётом offset вью.
+        self.ctx
+            .flush_batch()
+            .map_err(|e| crate::error::BackendError::Shape(format!("to_cpu_u32: {e}")))?;
+        let barrier = self.ctx.queue.new_command_buffer();
+        barrier.commit();
+        barrier.wait_until_completed();
+        let ptr = g.buffer.contents();
+        if ptr.is_null() {
+            return Err(crate::error::BackendError::Shape(
+                "to_cpu_u32: нулевой contents".into(),
+            ));
+        }
+        let base = unsafe { (ptr as *const u8).add(g.offset) };
+        let mut out = vec![0u32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(base, out.as_mut_ptr().cast::<u8>(), n * 4);
+        }
+        Ok(out)
+    }
+
+    fn moe_route(
+        &self,
+        logits: &crate::backend::Tensor,
+        ids: &crate::backend::Tensor,
+        weights: &crate::backend::Tensor,
+        k: usize,
+        norm: bool,
+        scale: f32,
+    ) -> Result<(), crate::error::BackendError> {
+        use crate::error::BackendError;
+        let (lg, ig, wg) = (logits.inner_metal(), ids.inner_metal(), weights.inner_metal());
+        let shp = logits.shape();
+        if shp.len() != 2 {
+            return Err(BackendError::Shape(format!(
+                "moe_route: логиты {shp:?}, ждали [T, E]"
+            )));
+        }
+        let (t, e) = (shp[0], shp[1]);
+        if e > 4096 || k == 0 || k > e {
+            return Err(BackendError::Shape(format!(
+                "moe_route: E={e}, k={k} вне пределов (E ≤ 4096, 1 ≤ k ≤ E)"
+            )));
+        }
+        let (e32, k32) = (e as u32, k as u32);
+        let norm32 = norm as u32;
+        // dispatch_threads: grid — ЧИСЛО ПОТОКОВ (не threadgroup'ов!), т.е.
+        // 128 потоков на токен. С `grid = T` запускался один неполный
+        // threadgroup, и роутер считал только первый токен (тихо).
+        let bytes = (e * 4 + 2 * 128 * 4) as u64;
+        let grid = MTLSize::new((t * 128) as u64, 1, 1);
+        let group = MTLSize::new(128, 1, 1);
+        self.ctx
+            .run("moe_route_topk", grid, group, |enc| {
+                enc.set_buffer(0, Some(&lg.buffer), lg.offset as u64);
+                enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
+                enc.set_buffer(2, Some(&wg.buffer), wg.offset as u64);
+                enc.set_bytes(3, 4, (&e32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&norm32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&scale as *const f32).cast());
+                enc.set_threadgroup_memory_length(0, (e * 4) as u64);
+                enc.set_threadgroup_memory_length(1, 512);
+                enc.set_threadgroup_memory_length(2, 512);
+            })
+            .map_err(|err| BackendError::Shape(format!("moe_route: {err}")))
     }
 
     fn attn_ar(

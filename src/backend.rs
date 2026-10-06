@@ -751,6 +751,23 @@ pub trait Backend: Send + Sync {
 
     /// Upload int8 weights with a per-channel fp32 scale (GEMM storage).
     /// Default: dequantize to f32.
+    /// Прочитать буфер как u32 (индексы MoE: id экспертов, записанные
+    /// роутером на устройстве). Хранение — те же 4 байта на элемент, что у
+    /// f32; тип буфера на бэкендах без U32-варианта остаётся f32.
+    fn to_cpu_u32(&self, _t: &Tensor) -> Result<Vec<u32>, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "to_cpu_u32: бэкенд не умеет u32-буферы".into(),
+        ))
+    }
+
+    /// Загрузить u32-буфер (индексы: id экспертов MoE, тесты). Дефолт —
+    /// не поддержано: бэкенд без u32-буферов обязан сказать об этом.
+    fn from_cpu_u32(&self, _data: &[u32], _shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "from_cpu_u32: бэкенд не умеет u32-буферы".into(),
+        ))
+    }
+
     fn from_cpu_i8(
         &self,
         data: &[i8],
@@ -2030,6 +2047,27 @@ pub trait Backend: Send + Sync {
     /// Column-wise scale: X (rows, D) · w (D,) → Y (rows, D).
     fn mul_vec(&self, x: &Tensor, w: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// Роутер MoE НА УСТРОЙСТВЕ: softmax по всем экспертам, top-k (ничьи —
+    /// меньший индекс), при `norm` — нормировка top-k (clamp 6.1e-5), затем
+    /// масштаб. Пишет `ids` (u32 [T, k]) и `weights` (f32 [T, k]).
+    ///
+    /// Зачем: host-роутинг требует чтения логитов на CPU — по одной
+    /// синхронизации GPU→CPU на слой на токен, и декод MoE упирается в это.
+    /// Дефолт — не поддержано (тогда остаётся честный host-путь).
+    fn moe_route(
+        &self,
+        _logits: &Tensor,
+        _ids: &Tensor,
+        _weights: &Tensor,
+        _k: usize,
+        _norm: bool,
+        _scale: f32,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_route: бэкенд не умеет роутер на устройстве".into(),
+        ))
+    }
+
     /// MoE-проекция по идентификаторам экспертов (порт идеи llama.cpp
     /// `mul_mat_id`, декод): один вызов обслуживает все слоты top-k вместо
     /// отдельного matvec на эксперта.
@@ -2037,8 +2075,8 @@ pub trait Backend: Send + Sync {
     /// * `a` — активации: `[K]` при `per_slot = false` (проекции up/gate,
     ///   строка общая для всех слотов) или `[k, K]` при `per_slot = true`
     ///   (проекция down: у каждого слота свой вход);
-    /// * `ids` — идентификаторы выбранных экспертов (len = k), `weights` —
-    ///   их веса роутера (используются только при `per_slot = true`);
+    /// * `ids` — идентификаторы выбранных экспертов (u32, len = k),
+    ///   `weights` — их веса роутера (f32; используются при `per_slot = true`);
     /// * `b` — плоские веса экспертов `[n_expert * n_rows, K]` (нативный
     ///   квант), `c` — выход: `[k, n_rows]` при `per_slot = false` или
     ///   `[n_rows]` (сумма `Σ w_j · dot_j`) при `per_slot = true`.
@@ -2049,8 +2087,8 @@ pub trait Backend: Send + Sync {
     fn moe_experts_mv(
         &self,
         _a: &Tensor,
-        _ids: &[u32],
-        _weights: &[f32],
+        _ids: &Tensor,
+        _weights: &Tensor,
         _b: &Tensor,
         _c: &Tensor,
         _n_rows: usize,

@@ -488,14 +488,55 @@ impl MoeLayer {
         // приходилось 3·k вызовов и столько же аллокаций буферов (384 на токен
         // у OLMoE) — это и было узкое место декода (40 против 208 tok/s).
         let k = self.cfg.n_expert_used.min(e);
+        // Роутер на устройстве: без чтения логитов на CPU (host-путь стоил
+        // синхронизацию GPU→CPU на слой на токен — 16 на токен у OLMoE).
+        // Доступен только для softmax-гейтинга без групп; остальные схемы
+        // идут host-путём (routed уже посчитан выше).
+        let device_ids = backend.zeros(vec![t * k]).ok();
+        let device_wts = backend.zeros(vec![t * k]).ok();
+        let mut device_route = false;
+        if let (Some(di), Some(dw)) = (&device_ids, &device_wts)
+            && matches!(self.cfg.gating, Gating::Softmax)
+            && self.cfg.n_expert_groups <= 1
+        {
+            device_route = backend
+                .moe_route(
+                    &logits,
+                    di,
+                    dw,
+                    k,
+                    self.cfg.norm_topk_prob,
+                    self.cfg.expert_weights_scale,
+                )
+                .is_ok();
+        }
         let acc = backend.zeros(vec![t, d])?;
-        for (ti, (ids, ws)) in routed.iter().enumerate() {
+        for ti in 0..t {
             let x_t = x2.view_offset(vec![1, d], ti * d);
+            // ids/weights: с устройства (роутер посчитал) или с хоста (fallback).
+            let (ids_t, wts_t) = if device_route {
+                (
+                    device_ids
+                        .as_ref()
+                        .expect("device_ids есть")
+                        .view_offset(vec![k], ti * k),
+                    device_wts
+                        .as_ref()
+                        .expect("device_wts есть")
+                        .view_offset(vec![k], ti * k),
+                )
+            } else {
+                let (ids, ws) = &routed[ti];
+                (
+                    backend.from_cpu_u32(ids, vec![k])?,
+                    backend.from_cpu_f32(ws, vec![k])?,
+                )
+            };
             // up/gate: вход общий (строка токена), выход — по слотам [k, ffn].
             let up = backend.zeros(vec![k, ffn])?;
-            backend.moe_experts_mv(&x_t, ids, ws, &self.up.w, &up, ffn, false)?;
+            backend.moe_experts_mv(&x_t, &ids_t, &wts_t, &self.up.w, &up, ffn, false)?;
             let gate = backend.zeros(vec![k, ffn])?;
-            backend.moe_experts_mv(&x_t, ids, ws, &self.gate.w, &gate, ffn, false)?;
+            backend.moe_experts_mv(&x_t, &ids_t, &wts_t, &self.gate.w, &gate, ffn, false)?;
             // silu(gate)·up поэлементно по всем слотам сразу.
             let act = backend.zeros(vec![k, ffn])?;
             backend.silu(&gate, &act)?;
@@ -503,7 +544,7 @@ impl MoeLayer {
             backend.mul(&act, &up, &prod)?;
             // down: у каждого слота свой вход, выход — взвешенная сумма [dim].
             let out_t = acc.view_offset(vec![1, d], ti * d);
-            backend.moe_experts_mv(&prod, ids, ws, &self.down.w, &out_t, d, true)?;
+            backend.moe_experts_mv(&prod, &ids_t, &wts_t, &self.down.w, &out_t, d, true)?;
         }
         Ok(acc.view(vec![1, t, d]))
     }
@@ -631,7 +672,9 @@ mod tests {
 
         // up/gate: выход по слотам [4, ffn]
         let y_id = be.zeros(vec![4, ffn]).unwrap();
-        be.moe_experts_mv(&x, &ids, &ws, &up_w, &y_id, ffn, false).unwrap();
+        let ids_t = be.from_cpu_u32(&ids, vec![ids.len()]).unwrap();
+        let ws_t = be.from_cpu_f32(&ws, vec![ws.len()]).unwrap();
+        be.moe_experts_mv(&x, &ids_t, &ws_t, &up_w, &y_id, ffn, false).unwrap();
         let id_host = be.to_cpu_f32(&y_id).unwrap();
         for (j, &eid) in ids.iter().enumerate() {
             let slice = ExpertTensor {
@@ -664,7 +707,7 @@ mod tests {
             )
             .unwrap();
         let y_ids = be.zeros(vec![n]).unwrap();
-        be.moe_experts_mv(&prod, &ids, &ws, &down_w, &y_ids, n, true).unwrap();
+        be.moe_experts_mv(&prod, &ids_t, &ws_t, &down_w, &y_ids, n, true).unwrap();
         let sum_id = be.to_cpu_f32(&y_ids).unwrap();
         let mut want = vec![0f32; n];
         for (j, &eid) in ids.iter().enumerate() {
@@ -690,6 +733,76 @@ mod tests {
                 sum_id[i],
                 want[i]
             );
+        }
+    }
+
+    /// Роутер на устройстве (moe_route) даёт те же id и веса, что host-путь:
+    /// softmax, top-k (ничьи — меньший индекс), нормировка, масштаб.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn device_router_matches_host() {
+        use crate::backend::Backend as _;
+        let be = crate::metal::MetalBackend::new().unwrap();
+        let (t, e, k) = (3usize, 128usize, 4usize);
+        // Логиты с ровными значениями (ничьи) и без них.
+        let mut seed = 0xDEAD_BEEFu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 6.0
+        };
+        let mut logits = Vec::with_capacity(t * e);
+        for ti in 0..t {
+            for i in 0..e {
+                logits.push(if ti == 1 && i < 8 { 3.0 } else { next() });
+            }
+        }
+        let lg = be.from_cpu_f32(&logits, vec![t, e]).unwrap();
+        for norm in [false, true] {
+            let c = MoeConfig {
+                n_expert: e,
+                n_expert_used: k,
+                ffn_dim: 1,
+                gating: Gating::Softmax,
+                norm_topk_prob: norm,
+                expert_weights_scale: 1.5,
+                n_expert_groups: 0,
+                n_group_used: 0,
+            };
+            let ids_t = be.zeros(vec![t * k]).unwrap();
+            let ws_t = be.zeros(vec![t * k]).unwrap();
+            be.moe_route(&lg, &ids_t, &ws_t, k, norm, c.expert_weights_scale)
+                .unwrap();
+            let got_ids = be.to_cpu_u32(&ids_t).unwrap();
+            let got_ws = be.to_cpu_f32(&ws_t).unwrap();
+            let mut want_ids = Vec::new();
+            let mut want_ws = Vec::new();
+            for ti in 0..t {
+                let (mut i, mut w) = (Vec::new(), Vec::new());
+                c.route_row(&logits[ti * e..(ti + 1) * e], &mut i, &mut w);
+                want_ids.push(i);
+                want_ws.push(w);
+            }
+            if std::env::var("DBG_ROUTE").is_ok() {
+                eprintln!("DBG norm={norm} device ids={got_ids:?} host ids={want_ids:?}");
+                eprintln!("DBG device ws={got_ws:?}");
+                eprintln!("DBG host ws={want_ws:?}");
+            }
+            for ti in 0..t {
+                for j in 0..k {
+                    assert_eq!(
+                        got_ids[ti * k + j],
+                        want_ids[ti][j],
+                        "токен {ti} слот {j}: id (norm={norm})"
+                    );
+                    let (g, w) = (got_ws[ti * k + j], want_ws[ti][j]);
+                    assert!(
+                        (g - w).abs() <= 1e-6 * (1.0 + w.abs()),
+                        "токен {ti} слот {j}: вес {g} против {w} (norm={norm})"
+                    );
+                }
+            }
         }
     }
 

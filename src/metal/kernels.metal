@@ -4773,6 +4773,103 @@ typedef decltype(mv_ks_t<0>) mv_ks_t_t;
 template [[host_name("mv_ks_q4_k")]] kernel mv_ks_t_t mv_ks_t<0>;
 template [[host_name("mv_ks_q6_k")]] kernel mv_ks_t_t mv_ks_t<1>;
 
+// ── роутер MoE на устройстве: softmax + top-k (без синхронизации с CPU) ────
+// Host-роутинг стоил 16 синхронизаций GPU→CPU на токен (по одной на слой) —
+// каждая ждёт всю очередь GPU, и декод MoE упирался именно в это (44 против
+// 208 tok/s у llama.cpp). Здесь всё считается кернелом, id уходят прямо в
+// mv_id_* буферами — CPU видит только итоговый текст.
+// Один threadgroup на токен: E логитов в threadgroup-память, softmax с
+// вычитанием максимума, затем K проходов «взять лучший из невыбранных» с
+// ничьей в пользу МЕНЬШЕГО индекса (как сортировка на хосте).
+kernel void moe_route_topk(
+    device const float* LOGITS [[buffer(0)]],   // [T, E]
+    device uint* IDS [[buffer(1)]],             // [T, K]
+    device float* WTS [[buffer(2)]],            // [T, K]
+    constant uint& E [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& NORM [[buffer(5)]],
+    constant float& SCALE [[buffer(6)]],
+    threadgroup float* sh [[threadgroup(0)]],   // E значений (softmax in place)
+    threadgroup float* sv [[threadgroup(1)]],   // 128
+    threadgroup uint* si [[threadgroup(2)]],    // 128
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    device const float* lg = LOGITS + (ulong)tgid * E;
+    device uint* ids = IDS + (ulong)tgid * K;
+    device float* wts = WTS + (ulong)tgid * K;
+    for (uint i = lane; i < E; i += 128u) sh[i] = lg[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // максимум
+    float mx = -INFINITY;
+    for (uint i = lane; i < E; i += 128u) mx = max(mx, sh[i]);
+    sv[lane] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = 64u; st > 0u; st >>= 1u) {
+        if (lane < st) sv[lane] = max(sv[lane], sv[lane + st]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float m = sv[0];
+    // exp и сумма
+    float ssum = 0.0f;
+    for (uint i = lane; i < E; i += 128u) {
+        const float e = exp(sh[i] - m);
+        sh[i] = e;
+        ssum += e;
+    }
+    sv[lane] = ssum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = 64u; st > 0u; st >>= 1u) {
+        if (lane < st) sv[lane] += sv[lane + st];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = (sv[0] > 0.0f) ? 1.0f / sv[0] : 0.0f;
+    for (uint i = lane; i < E; i += 128u) sh[i] *= inv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // top-K: K проходов по невыбранным
+    for (uint j = 0; j < K; ++j) {
+        float bv = -INFINITY;
+        uint bi = E;
+        for (uint i = lane; i < E; i += 128u) {
+            const float v = sh[i];
+            if (v > bv || (v == bv && i < bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+        sv[lane] = bv;
+        si[lane] = bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint st = 64u; st > 0u; st >>= 1u) {
+            if (lane < st) {
+                const float ov = sv[lane + st];
+                const uint oi = si[lane + st];
+                if (ov > sv[lane] || (ov == sv[lane] && oi < si[lane])) {
+                    sv[lane] = ov;
+                    si[lane] = oi;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0u) {
+            ids[j] = si[0];
+            wts[j] = sv[0];
+            if (si[0] < E) sh[si[0]] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // нормировка top-k (clamp 6.1e-5, как build_moe_ffn) и масштаб
+    if (NORM == 1u && lane == 0u) {
+        float wsum = 0.0f;
+        for (uint j = 0; j < K; ++j) wsum += wts[j];
+        wsum = max(wsum, 6.103515625e-5f);
+        for (uint j = 0; j < K; ++j) wts[j] = wts[j] / wsum;
+    }
+    if (lane == 0u && SCALE != 0.0f && SCALE != 1.0f) {
+        for (uint j = 0; j < K; ++j) wts[j] *= SCALE;
+    }
+}
+
 // ── matvec по ИДЕНТИФИКАТОРАМ экспертов (MoE, декод) ────────────────────────
 // Порт идеи llama.cpp `kernel_mul_mv_id_*`: вместо k отдельных matvec'ов на
 // токен (8 экспертов × 3 проекции × 16 слоёв = 384 вызова и столько же

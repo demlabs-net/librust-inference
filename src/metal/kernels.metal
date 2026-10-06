@@ -2004,10 +2004,12 @@ kernel void rope_std_f32(
     Y[base + HD / 2] = x1 * c + x0 * s;
 }
 
-// Частичный rotate-half RoPE (GLM-4 и родственные): вращаются первые NROT
-// компонент каждой головы, пары (i, i+NROT/2), частоты theta^(-2i/NROT);
-// хвост [NROT, HD) копируется без изменений. NROT == HD — полный RoPE (тогда
-// быстрее старый rope_std_f32: сетка вдвое меньше).
+// Частичный RoPE: вращаются первые NROT компонент каждой головы (частоты
+// theta^(-2k/NROT), k — индекс пары), хвост [NROT, HD) копируется.
+// PAIRING: 0 — halves (k, k+NROT/2; llama.cpp NEOX, HF rotate_half),
+//          1 — adjacent (2k, 2k+1; llama.cpp ROPE_TYPE_NORM — GLM-4/chatglm).
+// NROT == HD и PAIRING == 0 — полный поворот (быстрее старый rope_std_f32:
+// сетка вдвое меньше).
 kernel void rope_std_part_f32(
     device const float* X [[buffer(0)]],
     device float* Y [[buffer(1)]],
@@ -2017,31 +2019,39 @@ kernel void rope_std_part_f32(
     constant uint& NROT [[buffer(5)]],
     constant uint& pos [[buffer(6)]],
     constant float& theta [[buffer(7)]],
+    constant uint& PAIRING [[buffer(8)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint t = gid.x, h = gid.y, j = gid.z;
     if (t >= tq || j >= HD) return;
     uint base = t * D + h * HD;
-    // `half` — имя типа в Metal, поэтому half_rot
-    uint half_rot = NROT / 2u;
     float v;
-    if (j < half_rot) {
-        // первая половина пары (j, j+half_rot) — элемент j
-        float x0 = X[base + j];
-        float x1 = X[base + j + half_rot];
-        float inv = 1.0f / pow(theta, 2.0f * (float)j / (float)NROT);
+    if (j >= NROT) {
+        v = X[base + j];                       // хвост без вращения
+    } else if (PAIRING == 1u) {
+        uint k = j >> 1u;                      // пара (2k, 2k+1): соседние
+        float inv = 1.0f / pow(theta, 2.0f * (float)k / (float)NROT);
         float p = (float)(pos + t);
-        v = x0 * cos(p * inv) - x1 * sin(p * inv);
-    } else if (j < NROT) {
-        // вторая половина пары: частота берётся по i = j - half_rot
-        uint i = j - half_rot;
-        float x0 = X[base + i];
-        float x1 = X[base + j];
-        float inv = 1.0f / pow(theta, 2.0f * (float)i / (float)NROT);
-        float p = (float)(pos + t);
-        v = x1 * cos(p * inv) + x0 * sin(p * inv);
+        float c = cos(p * inv), s = sin(p * inv);
+        float x0 = X[base + (k << 1u)];
+        float x1 = X[base + (k << 1u) + 1u];
+        v = (j & 1u) == 0u ? x0 * c - x1 * s : x0 * s + x1 * c;
     } else {
-        v = X[base + j];
+        uint half_rot = NROT / 2u;             // пара (k, k+NROT/2): половины
+        if (j < half_rot) {
+            float x0 = X[base + j];
+            float x1 = X[base + j + half_rot];
+            float inv = 1.0f / pow(theta, 2.0f * (float)j / (float)NROT);
+            float p = (float)(pos + t);
+            v = x0 * cos(p * inv) - x1 * sin(p * inv);
+        } else {
+            uint k = j - half_rot;             // частота берётся по k
+            float x0 = X[base + k];
+            float x1 = X[base + j];
+            float inv = 1.0f / pow(theta, 2.0f * (float)k / (float)NROT);
+            float p = (float)(pos + t);
+            v = x0 * sin(p * inv) + x1 * cos(p * inv);
+        }
     }
     Y[base + j] = v;
 }

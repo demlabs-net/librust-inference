@@ -677,6 +677,15 @@ pub(crate) fn download_in_dtype<B: Backend + ?Sized>(
     }
 }
 
+/// Парность компонент в RoPE (см. [`Backend::rope_partial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopePairing {
+    /// (k, k+n_rot/2) — llama.cpp NEOX/MROPE/IMROPE, HF rotate_half.
+    Halves,
+    /// (2k, 2k+1) — llama.cpp ROPE_TYPE_NORM (GLM-4/chatglm, GPT-J).
+    Adjacent,
+}
+
 pub trait Backend: Send + Sync {
     /// Allocate a zero-initialized tensor of `shape`.
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;
@@ -820,32 +829,38 @@ pub trait Backend: Send + Sync {
         }
         self.from_cpu_f32(&yd, x.shape().to_vec())
     }
-    /// Частичный rotate-half RoPE: вращаются первые `n_rot` компонент каждой
-    /// головы (пары (i, i+n_rot/2), частоты theta^(-2i/n_rot)), хвост
-    /// [n_rot, hd) копируется как есть. `n_rot == hd` — обычный полный RoPE.
-    /// Нужно GLM-4 (`rope.dimension_count` = половина головы) и родственным.
+    /// Частичный RoPE с выбором парности: вращаются первые `n_rot` компонент
+    /// каждой головы (частоты theta^(-2k/n_rot), k — индекс пары), хвост
+    /// [n_rot, hd) копируется как есть. `n_rot == hd` — полный поворот.
+    ///
+    /// * `RopePairing::Halves` — пары (k, k+n_rot/2): llama.cpp
+    ///   NEOX/MROPE/IMROPE (Qwen3/3.5, GLM-4.5), HF rotate_half;
+    /// * `RopePairing::Adjacent` — пары (2k, 2k+1): llama.cpp
+    ///   ROPE_TYPE_NORM (GLM-4/chatglm, GPT-J-стиль).
+    ///
     /// Default — CPU-референс (CUDA наследует до пересборки PTX); Metal —
     /// кернел `rope_std_part_f32`.
-    fn rope_standard_partial(
+    fn rope_partial(
         &self,
         x: &Tensor,
         pos: usize,
         hd: usize,
         n_rot: usize,
         theta: f32,
+        pairing: RopePairing,
     ) -> Result<Tensor, BackendError> {
-        if n_rot == 0 || n_rot == hd {
+        if pairing == RopePairing::Halves && (n_rot == 0 || n_rot == hd) {
             return self.rope_standard(x, pos, hd, theta);
         }
         if n_rot > hd || !n_rot.is_multiple_of(2) {
             return Err(BackendError::Shape(format!(
-                "rope_standard_partial: n_rot={n_rot} не согласован с hd={hd}"
+                "rope_partial: n_rot={n_rot} не согласован с hd={hd}"
             )));
         }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         if d % hd != 0 {
             return Err(BackendError::Shape(format!(
-                "rope_standard_partial: hd={hd} не делит d={d}"
+                "rope_partial: hd={hd} не делит d={d}"
             )));
         }
         let xd = self.to_cpu_f32(x)?;
@@ -855,13 +870,16 @@ pub trait Backend: Send + Sync {
             let p = (pos + tt) as f32;
             for h in 0..d / hd {
                 let base = tt * d + h * hd;
-                for i in 0..half {
-                    let inv = 1.0 / theta.powf(2.0 * i as f32 / n_rot as f32);
-                    let c = (p * inv).cos();
-                    let s = (p * inv).sin();
-                    let (x0, x1) = (xd[base + i], xd[base + i + half]);
-                    yd[base + i] = x0 * c - x1 * s;
-                    yd[base + i + half] = x1 * c + x0 * s;
+                for k in 0..half {
+                    let inv = 1.0 / theta.powf(2.0 * k as f32 / n_rot as f32);
+                    let (c, s) = ((p * inv).cos(), (p * inv).sin());
+                    let (i0, i1) = match pairing {
+                        RopePairing::Halves => (k, k + half),
+                        RopePairing::Adjacent => (2 * k, 2 * k + 1),
+                    };
+                    let (x0, x1) = (xd[base + i0], xd[base + i1]);
+                    yd[base + i0] = x0 * c - x1 * s;
+                    yd[base + i1] = x0 * s + x1 * c;
                 }
             }
         }

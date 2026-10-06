@@ -3514,15 +3514,16 @@ impl crate::backend::Backend for MetalBackend {
         Ok(q)
     }
 
-    fn rope_standard_partial(
+    fn rope_partial(
         &self,
         x: &crate::backend::Tensor,
         pos: usize,
         hd: usize,
         n_rot: usize,
         theta: f32,
+        pairing: crate::backend::RopePairing,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
-        if n_rot == 0 || n_rot == hd {
+        if pairing == crate::backend::RopePairing::Halves && (n_rot == 0 || n_rot == hd) {
             return self.rope_standard(x, pos, hd, theta);
         }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
@@ -3545,6 +3546,11 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(5, 8, (&n_rot as *const usize).cast());
             enc.set_bytes(6, 8, (&pos as *const usize).cast());
             enc.set_bytes(7, 4, (&theta as *const f32).cast());
+            let pairing: usize = match pairing {
+                crate::backend::RopePairing::Halves => 0,
+                crate::backend::RopePairing::Adjacent => 1,
+            };
+            enc.set_bytes(8, 8, (&pairing as *const usize).cast());
         })?;
         Ok(y)
     }
@@ -4046,6 +4052,15 @@ impl crate::backend::Backend for MetalBackend {
         bias: &crate::backend::Tensor,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
+        // Кернел читает bias как float*: f16-буфер (upload_w на Metal грузит
+        // f16!) молча давал мусор вместо биаса — ловим явно.
+        if bias.as_gpu().dtype != GpuDtype::F32 || x.as_gpu().dtype != GpuDtype::F32 {
+            return Err(crate::error::BackendError::Shape(format!(
+                "add_bias: нужны f32-тензоры, получено x={:?} bias={:?}",
+                x.as_gpu().dtype,
+                bias.as_gpu().dtype
+            )));
+        }
         self.ctx
             .add_bias_f32(x.as_gpu(), bias.as_gpu(), y.as_gpu())?;
         Ok(())
@@ -5102,35 +5117,40 @@ mod quant_gemm_tests {
     /// случай n_rot = hd (полный поворот) и хвост без поворота.
     #[test]
     fn rope_partial_matches_host() {
-        use crate::backend::Backend as _;
+        use crate::backend::{Backend as _, RopePairing};
         let be = MetalBackend::new().expect("MetalBackend");
         let (tq, d, hd) = (3usize, 8usize, 8usize); // 2 головы по 8
         let data: Vec<f32> = (0..tq * d).map(|i| 0.1 + (i as f32) * 0.017).collect();
         let x = be.from_cpu_f32(&data, vec![1, tq, d]).unwrap();
         let theta = 10_000.0f32;
-        for n_rot in [0usize, 2, 4, 8] {
-            let got = be
-                .to_cpu_f32(&be.rope_standard_partial(&x, 5, hd, n_rot, theta).unwrap())
-                .unwrap();
-            // host-референс: та же математика независимо от кернела
-            let eff = if n_rot == 0 { hd } else { n_rot };
-            let half = eff / 2;
-            let mut want = data.clone();
-            for tt in 0..tq {
-                let p = (5 + tt) as f32;
-                for h in 0..d / hd {
-                    let base = tt * d + h * hd;
-                    for i in 0..half {
-                        let inv = 1.0 / theta.powf(2.0 * i as f32 / eff as f32);
-                        let (c, s) = ((p * inv).cos(), (p * inv).sin());
-                        let (x0, x1) = (data[base + i], data[base + i + half]);
-                        want[base + i] = x0 * c - x1 * s;
-                        want[base + i + half] = x1 * c + x0 * s;
+        for pairing in [RopePairing::Halves, RopePairing::Adjacent] {
+            for n_rot in [2usize, 4, 8] {
+                let got = be
+                    .to_cpu_f32(&be.rope_partial(&x, 5, hd, n_rot, theta, pairing).unwrap())
+                    .unwrap();
+                // host-референс: та же математика независимо от кернела
+                let half = n_rot / 2;
+                let mut want = data.clone();
+                for tt in 0..tq {
+                    let p = (5 + tt) as f32;
+                    for h in 0..d / hd {
+                        let base = tt * d + h * hd;
+                        for k in 0..half {
+                            let inv = 1.0 / theta.powf(2.0 * k as f32 / n_rot as f32);
+                            let (c, sv) = ((p * inv).cos(), (p * inv).sin());
+                            let (i0, i1) = match pairing {
+                                RopePairing::Halves => (k, k + half),
+                                RopePairing::Adjacent => (2 * k, 2 * k + 1),
+                            };
+                            let (x0, x1) = (data[base + i0], data[base + i1]);
+                            want[base + i0] = x0 * c - x1 * sv;
+                            want[base + i1] = x0 * sv + x1 * c;
+                        }
                     }
                 }
+                let diff = max_diff(&got, &want);
+                assert!(diff <= 1e-5, "{pairing:?} n_rot={n_rot}: |Δ| max {diff}");
             }
-            let diff = max_diff(&got, &want);
-            assert!(diff <= 1e-5, "n_rot={n_rot}: |Δ| max {diff}");
         }
     }
 
@@ -5337,5 +5357,121 @@ mod batch_debug {
         ctx.gemm_nt_quantized(&a2, &b, &c2).unwrap();
         let cv2 = c2.to_cpu_f32(&ctx).unwrap();
         assert_eq!(cv2, vec![0.0, 0.0, 31.0, 0.0], "единица j=31: got {cv2:?}");
+    }
+}
+
+#[cfg(test)]
+mod glm_attention_tests {
+    use super::*;
+    use crate::backend::Backend as _;
+
+    /// GQA с БОЛЬШИМ отношением: nh=32 / nkv=2 (hd=128) — геометрия GLM-4.
+    /// Проверяем `attn_ar` (Metal) против CPU-референса при tq = 1, 7, 16:
+    /// существующие тесты покрывали отношения до 8, а n_rep=16 не встречалось.
+    /// KV-кэш f16 (как у модели) с kv_dim = 2·128 = 256: запись и чтение
+    /// через view — регрессия на NaN в f16-пути при этой геометрии.
+    #[test]
+    fn kv_cache_f16_small_kv_dim_roundtrip() {
+        use crate::backend::Backend as _;
+        let metal = MetalBackend::new().expect("MetalBackend");
+        let (nkv, hd) = (2usize, 128usize);
+        let kvd = nkv * hd;
+        for t in [1usize, 2, 7, 16] {
+            let mut cache = crate::nn::KvCache::new(
+                &metal,
+                nkv,
+                hd,
+                crate::dtype::KvFormat::F16,
+                crate::dtype::KvFormat::F16,
+                10_000.0,
+                None,
+            )
+            .unwrap();
+            let k_v: Vec<f32> = (0..t * kvd).map(|i| ((i as f32) * 0.011).sin()).collect();
+            let v_v: Vec<f32> = (0..t * kvd).map(|i| ((i as f32) * 0.013).cos()).collect();
+            let k = metal.from_cpu_f32(&k_v, vec![1, t, kvd]).unwrap();
+            let v = metal.from_cpu_f32(&v_v, vec![1, t, kvd]).unwrap();
+            cache.update(&metal, &k, &v).unwrap();
+            let ck = cache.view();
+            let cv = cache.view_v();
+            assert_eq!(ck.shape(), vec![1, t, kvd], "t={t}: форма K-вида");
+            let ckv = metal.to_cpu_f16(&ck).unwrap();
+            let cvv = metal.to_cpu_f16(&cv).unwrap();
+            let nf = ckv
+                .iter()
+                .chain(cvv.iter())
+                .filter(|x| !x.is_finite())
+                .count();
+            assert_eq!(nf, 0, "t={t}: NaN/Inf в f16-кэше ({nf})");
+            for i in 0..t * kvd {
+                let dk = (ckv[i].to_f32() - k_v[i]).abs();
+                let dv = (cvv[i].to_f32() - v_v[i]).abs();
+                assert!(dk <= 2e-3 && dv <= 2e-3, "t={t} i={i}: |Δk|={dk} |Δv|={dv}");
+            }
+        }
+    }
+
+    #[test]
+    fn attn_ar_large_gqa_ratio_matches_cpu() {
+        let metal = MetalBackend::new().expect("MetalBackend");
+        let cpu = crate::cpu::CpuBackend;
+        let (nh, nkv, hd) = (32usize, 2usize, 128usize);
+        let (qd, kvd) = (nh * hd, nkv * hd);
+        for tq in [1usize, 7, 16] {
+            let tkv = tq;
+            let mk = |n: usize, seed: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.5)
+                    .collect()
+            };
+            let qd_v = mk(tq * qd, 0.1);
+            let kd_v = mk(tkv * kvd, 0.7);
+            let vd_v = mk(tkv * kvd, 1.3);
+            let mask_v: Vec<f32> = (0..tq * tkv)
+                .map(|i| {
+                    let (i, j) = (i / tkv, i % tkv);
+                    if j > i { f32::NEG_INFINITY } else { 0.0 }
+                })
+                .collect();
+            let q = metal.from_cpu_f32(&qd_v, vec![1, tq, qd]).unwrap();
+            let k = metal.from_cpu_f32(&kd_v, vec![1, tkv, kvd]).unwrap();
+            let v = metal.from_cpu_f32(&vd_v, vec![1, tkv, kvd]).unwrap();
+            let m = metal.from_cpu_f32(&mask_v, vec![1, tq, tkv]).unwrap();
+            let y = metal.zeros(vec![1, tq, qd]).unwrap();
+            metal.attn_ar(&q, &k, &v, Some(&m), &y, nh, nkv, hd).unwrap();
+            let got = metal.to_cpu_f32(&y).unwrap();
+            let qc = cpu.from_cpu_f32(&qd_v, vec![1, tq, qd]).unwrap();
+            let kc = cpu.from_cpu_f32(&kd_v, vec![1, tkv, kvd]).unwrap();
+            let vc = cpu.from_cpu_f32(&vd_v, vec![1, tkv, kvd]).unwrap();
+            let mc = cpu.from_cpu_f32(&mask_v, vec![1, tq, tkv]).unwrap();
+            let yc = cpu.zeros(vec![1, tq, qd]).unwrap();
+            cpu.attn_ar(&qc, &kc, &vc, Some(&mc), &yc, nh, nkv, hd).unwrap();
+            let want = cpu.to_cpu_f32(&yc).unwrap();
+            let nf = got.iter().filter(|x| !x.is_finite()).count();
+            assert_eq!(nf, 0, "tq={tq}: NaN/Inf в выходе Metal ({nf})");
+            let diff = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(diff <= 1e-4, "tq={tq}: |Δ| max {diff}");
+            // f16-KV (как в кэше модели): K/V — f16-буферы, тот же attn_ar.
+            let k16: Vec<half::f16> = kd_v.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let v16: Vec<half::f16> = vd_v.iter().map(|&x| half::f16::from_f32(x)).collect();
+            let kf = metal.from_cpu_f16(&k16, vec![1, tkv, kvd]).unwrap();
+            let vf = metal.from_cpu_f16(&v16, vec![1, tkv, kvd]).unwrap();
+            let yf = metal.zeros(vec![1, tq, qd]).unwrap();
+            metal.attn_ar(&q, &kf, &vf, Some(&m), &yf, nh, nkv, hd).unwrap();
+            let got16 = metal.to_cpu_f32(&yf).unwrap();
+            let nf16 = got16.iter().filter(|x| !x.is_finite()).count();
+            assert_eq!(nf16, 0, "tq={tq}: NaN/Inf в f16-KV выходе ({nf16})");
+            let diff16 = got16
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(diff16 <= 2e-2, "tq={tq}: f16-KV |Δ| max {diff16}");
+
+        }
     }
 }

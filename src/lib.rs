@@ -76,6 +76,7 @@ pub mod dtype;
 pub mod error;
 pub mod export;
 pub mod gguf;
+pub mod glm4;
 #[cfg(feature = "cpu")]
 pub mod harness;
 pub mod inference;

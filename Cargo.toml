@@ -47,6 +47,12 @@ cpu = []
 # `cpu` now in default, plain `cargo test` must not try to build them
 # (they are LLM-zone demos, not part of the bridge's test surface).
 [[example]]
+name = "glm_probe"
+required-features = ["metal"]
+[[example]]
+name = "glm_chat"
+required-features = ["metal"]
+[[example]]
 name = "train_logits_check"
 required-features = ["metal"]
 [[example]]

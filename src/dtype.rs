@@ -91,6 +91,28 @@ impl WeightFormat {
         !matches!(self, WeightFormat::Plain(_))
     }
 
+    /// (элементов в блоке, байт в блоке) для блочно-квантованных форматов
+    /// (раскладки ggml); None — формат не блочный (Plain/Int4/Nf4).
+    ///
+    /// Нужно там, где тензор режется ПО СТРОКАМ без копии (эксперты MoE):
+    /// смещение среза считается в блоках, а не в элементах.
+    pub fn block(self) -> Option<(usize, usize)> {
+        match self {
+            WeightFormat::Plain(_) | WeightFormat::Int4 | WeightFormat::Nf4 => None,
+            WeightFormat::Q4_0 => Some((32, 18)),
+            WeightFormat::Q5_0 => Some((32, 22)),
+            WeightFormat::Q8_0 => Some((32, 34)),
+            WeightFormat::Q4_K => Some((256, 144)),
+            WeightFormat::Q5_K => Some((256, 176)),
+            WeightFormat::Q6_K => Some((256, 210)),
+        }
+    }
+
+    /// Байт в строке из `cols` элементов для блочного формата; None — не блочный.
+    pub fn block_row_bytes(self, cols: usize) -> Option<usize> {
+        self.block().map(|(be, bb)| cols.div_ceil(be) * bb)
+    }
+
     pub fn name(self) -> String {
         match self {
             WeightFormat::Plain(d) => d.name().to_string(),

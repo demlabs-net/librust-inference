@@ -460,6 +460,45 @@ impl Tensor {
         self.view_inner(shape)
     }
 
+    /// Zero-copy срез буфера, смещение — в БАЙТАХ. Нужен для блочно-
+    /// квантованных тензоров (packed-раскладка: «элемент» хранилища — байт,
+    /// а shape — логические строки/столбцы), в частности для среза эксперта
+    /// MoE. Смещение обязано быть кратно блоку формата (иначе строка начнётся
+    /// в середине блока и кернел прочитает мусор) — это ответственность
+    /// вызывающего ([`crate::moe::ExpertTensor`] считает смещение по строкам).
+    ///
+    /// На не-paked тензорах — паника: у f32/f16 «элемент» не байт, и такой
+    /// вызов означал бы смещение в 4/2 раза больше задуманного.
+    pub fn view_offset_bytes(&self, shape: Vec<usize>, byte_offset: usize) -> Tensor {
+        assert!(
+            self.is_block_quantized(),
+            "view_offset_bytes: тензор не блочно-квантован (dtype {:?})",
+            self.dtype
+        );
+        self.view_offset(shape, byte_offset)
+    }
+
+    /// Хранится ли тензор в блочно-квантованном (packed) виде на СВОЁМ
+    /// бэкенде. CPU-бэкенд держит веса в f32 — там срезов по байтам нет.
+    pub fn is_block_quantized(&self) -> bool {
+        #[cfg(feature = "metal")]
+        if let TensorInner::Metal(g) = &self.inner {
+            return g.dtype.block_elems().is_some();
+        }
+        #[cfg(feature = "cuda")]
+        if matches!(
+            self.inner,
+            TensorInner::CudaQ4K(_)
+                | TensorInner::CudaQ4KC(_)
+                | TensorInner::CudaQ5K(_)
+                | TensorInner::CudaQ3K(_)
+                | TensorInner::CudaQ6K(_)
+        ) {
+            return true;
+        }
+        false
+    }
+
     /// View starting `elem_offset` elements into the buffer. Metal — zero-copy
     /// view (offset через set_buffer); CPU/CUDA — contiguous КОПИЯ со сдвигом
     /// (та же семантика результата, без разделяемого хранилища). Используется

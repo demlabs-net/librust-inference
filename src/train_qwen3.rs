@@ -1552,6 +1552,7 @@ mod tests {
 
     fn tiny_cfg() -> Qwen3Config {
         Qwen3Config {
+            moe: None,
             dim: 16,
             n_layers: 2,
             n_heads: 2,
@@ -2106,6 +2107,7 @@ mod tests {
         unsafe { std::env::set_var("BACKEND", "cpu") };
         let bk = crate::backend::default_backend().unwrap();
         let cfg = Qwen3Config {
+            moe: None,
             dim: 8,
             n_layers: 1,
             n_heads: 1,

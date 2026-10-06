@@ -1417,9 +1417,9 @@ mod tests {
         }
     }
 
-    /// f16-вариант fused-разбора qkv: Q на выходе — half (сравнение с
-    /// f32-композитом в допуске округления), k/v в f16-кэше равны
-    /// полу-округлённому композиту, а хвост кэша после pos не тронут.
+    /// f16-вариант fused-разбора qkv: Q на выходе — f32 (не округляется),
+    /// k/v в f16-кэше равны полу-округлённому композиту, а хвост кэша
+    /// после pos не тронут.
     #[test]
     fn fused_qkv_f16_matches_composite() {
         let be = MetalBackend::new().unwrap();
@@ -1446,7 +1446,9 @@ mod tests {
             let q1 = be
                 .qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6)
                 .unwrap();
-            assert_eq!(q1.dtype(), crate::dtype::Dtype::F16);
+            // Q — f32 (в llama.cpp запрос не округляется; f16-окружение
+            // запроса давало расхождение текста на десятках токенов).
+            assert_eq!(q1.dtype(), crate::dtype::Dtype::F32);
             // f32-композит (как default трейта) → полу-округление на записи
             let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
             let part = |w: usize, off: usize| {
@@ -1465,8 +1467,8 @@ mod tests {
             let f16v = |x: &[f32]| -> Vec<f32> {
                 x.iter().map(|&v| f32::from(half::f16::from_f32(v))).collect()
             };
-            let q1f: Vec<f32> = be.to_cpu_f16(&q1).unwrap().iter().map(|&x| f32::from(x)).collect();
-            close(&q1f, &f16v(&be.to_cpu_f32(&q2).unwrap()), 1e-3, "fused f16 q");
+            let q1f: Vec<f32> = be.to_cpu_f32(&q1).unwrap();
+            close(&q1f, &be.to_cpu_f32(&q2).unwrap(), 1e-3, "fused f32 q");
             let k1f: Vec<f32> = be.to_cpu_f16(&k1).unwrap().iter().map(|&x| f32::from(x)).collect();
             let k2f: Vec<f32> = be.to_cpu_f16(&k2).unwrap().iter().map(|&x| f32::from(x)).collect();
             let v1f: Vec<f32> = be.to_cpu_f16(&v1).unwrap().iter().map(|&x| f32::from(x)).collect();

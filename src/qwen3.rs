@@ -46,6 +46,8 @@ pub struct Qwen3Config {
     /// [main|ds0|ds1|ds2] входного буфера для текстовых токенов нулевые).
     /// None = нет.
     pub n_deepstack: Option<usize>,
+    /// MoE-ветвь (qwen3moe/olmoe); None — плотный FFN.
+    pub moe: Option<crate::moe::MoeConfig>,
 }
 
 impl Qwen3Config {
@@ -139,7 +141,54 @@ impl Qwen3Config {
                 .get(&p("n_deepstack_layers"))
                 .and_then(GgufValue::as_u32)
                 .map(|v| v as usize),
+            moe: {
+                let mut moe = crate::moe::MoeConfig::from_gguf(file, &arch, n_layers, ffn_dim)?;
+                if let Some(m) = moe.as_mut() {
+                    // Гейтинг и нормировку llama.cpp задаёт В ГРАФЕ арх, а не
+                    // из метаданных (qwen3moe.cpp: norm_w=true; olmoe.cpp:
+                    // norm_w=false — у OLMoE HF-конфиг нормирует top-k, но
+                    // эталон для нас llama.cpp, и он нормировку не делает).
+                    match arch.as_str() {
+                        "qwen3moe" => {
+                            m.gating = crate::moe::Gating::Softmax;
+                            m.norm_topk_prob = true;
+                        }
+                        "olmoe" => {
+                            m.gating = crate::moe::Gating::Softmax;
+                            m.norm_topk_prob = false;
+                        }
+                        _ => {}
+                    }
+                }
+                moe
+            },
         })
+    }
+}
+
+/// FFN слоя: плотный (Qwen3) или экспертный (MoE-архитектуры: qwen3moe,
+/// olmoe). Смешанных «плотный + MoE в одном слое» схем (общие эксперты) в
+/// qwen3-семействе нет — они придут своей веткой (A3+).
+#[derive(Debug, Clone)]
+pub enum Ffn {
+    Dense(SwiGLU),
+    Moe(crate::moe::MoeLayer),
+}
+
+impl Ffn {
+    pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
+        match self {
+            Ffn::Dense(f) => ffn_forward(backend, x, f),
+            Ffn::Moe(m) => m.forward(backend, x),
+        }
+    }
+
+    /// Плотная часть — для диагностики (examples/prefill_breakdown).
+    pub fn dense(&self) -> Option<&SwiGLU> {
+        match self {
+            Ffn::Dense(f) => Some(f),
+            Ffn::Moe(_) => None,
+        }
     }
 }
 
@@ -148,7 +197,7 @@ pub struct Qwen3Layer {
     pub attn_norm: RmsNorm,
     pub attn: Attention,
     pub ffn_norm: RmsNorm,
-    pub ffn: SwiGLU,
+    pub ffn: Ffn,
 }
 
 /// Qwen3-модель (decode-состояние: KV-кэши в слоях).
@@ -251,9 +300,10 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    /// FFN слоя `i` (диагностика производительности: examples/prefill_breakdown).
-    pub fn debug_ffn(&self, i: usize) -> &SwiGLU {
-        &self.layers[i].ffn
+    /// Плотный FFN слоя `i` (диагностика производительности:
+    /// examples/prefill_breakdown); None у MoE-моделей.
+    pub fn debug_ffn(&self, i: usize) -> Option<&SwiGLU> {
+        self.layers[i].ffn.dense()
     }
 
     /// Таблица эмбеддингов (для DFlash-драфтера, 4.2b).
@@ -501,18 +551,32 @@ impl Qwen3Model {
                 ],
             )?;
             // QK-norm опционален (Qwen3 — есть; Qwen2.5-Omni thinker — нет).
+            // Область нормировки — по РАЗМЕРУ тензора в файле: head_dim =
+            // по голове (Qwen3), n_embd = по всей проекции q/k (OLMoE:
+            // llama.cpp olmoe.cpp нормирует q/k ДО reshape в головы).
+            let qk_whole = w
+                .get(&p("attn_q_norm.weight"))
+                .map(|t| t.shape[0] as usize)
+                .filter(|&n| n == cfg.dim && cfg.dim != cfg.head_dim);
             let q_norm = if w.get(&p("attn_q_norm.weight")).is_some() {
-                Some(backend.from_cpu_f32(&t(&p("attn_q_norm.weight"))?, vec![cfg.head_dim])?)
+                Some(backend.from_cpu_f32(
+                    &t(&p("attn_q_norm.weight"))?,
+                    vec![qk_whole.unwrap_or(cfg.head_dim)],
+                )?)
             } else {
                 None
             };
             let k_norm = if w.get(&p("attn_k_norm.weight")).is_some() {
-                Some(backend.from_cpu_f32(&t(&p("attn_k_norm.weight"))?, vec![cfg.head_dim])?)
+                Some(backend.from_cpu_f32(
+                    &t(&p("attn_k_norm.weight"))?,
+                    vec![qk_whole.unwrap_or(cfg.head_dim)],
+                )?)
             } else {
                 None
             };
-            // fused-путь (norm+RoPE+запись) требует QK-norm у обоих.
-            let has_qk_norm = q_norm.is_some() && k_norm.is_some();
+            // fused-путь (norm+RoPE+запись) требует QK-norm у обоих И работает
+            // только с пер-головной нормой (у OLMoE кернел неприменим).
+            let has_qk_norm = q_norm.is_some() && k_norm.is_some() && qk_whole.is_none();
             let qkv_bias = if w.get(&p("attn_q.bias")).is_some() {
                 let mut b = t(&p("attn_q.bias"))?;
                 b.extend(t(&p("attn_k.bias"))?);
@@ -540,6 +604,7 @@ impl Qwen3Model {
                     .transpose()?,
                 q_norm,
                 k_norm,
+                qk_norm_whole_eps: qk_whole.map(|_| cfg.norm_eps),
                 n_heads: cfg.n_heads,
                 n_kv_heads: cfg.n_kv_heads,
                 head_dim: cfg.head_dim,
@@ -547,17 +612,38 @@ impl Qwen3Model {
             let attn_norm =
                 RmsNorm::from_weights(backend, t(&p("attn_norm.weight"))?, cfg.norm_eps)?;
             let ffn_norm = RmsNorm::from_weights(backend, t(&p("ffn_norm.weight"))?, cfg.norm_eps)?;
-            // ffn: gate/up fused [2·ffn, D] (нативный квант), down [D, ffn]
-            let gn = p("ffn_gate.weight");
-            let un = p("ffn_up.weight");
-            let ffn = SwiGLU {
-                w13: Self::upload_fused(backend, w, &[&gn, &un], vec![2 * cfg.ffn_dim, cfg.dim])?,
-                w2: Self::upload_q(
-                    backend,
-                    w,
-                    &p("ffn_down.weight"),
-                    vec![cfg.dim, cfg.ffn_dim],
-                )?,
+            // FFN: плотный (gate/up fused [2·ffn, D], нативный квант) или
+            // экспертный (qwen3moe/olmoe: роутер + 3-Д тензоры экспертов).
+            let ffn = match cfg.moe {
+                Some(moe) => {
+                    let prefix = format!("blk.{i}.");
+                    Ffn::Moe(crate::moe::MoeLayer::load(
+                        backend,
+                        w,
+                        &prefix,
+                        moe,
+                        cfg.dim,
+                        cfg.ffn_dim,
+                    )?)
+                }
+                None => {
+                    let gn = p("ffn_gate.weight");
+                    let un = p("ffn_up.weight");
+                    Ffn::Dense(SwiGLU {
+                        w13: Self::upload_fused(
+                            backend,
+                            w,
+                            &[&gn, &un],
+                            vec![2 * cfg.ffn_dim, cfg.dim],
+                        )?,
+                        w2: Self::upload_q(
+                            backend,
+                            w,
+                            &p("ffn_down.weight"),
+                            vec![cfg.dim, cfg.ffn_dim],
+                        )?,
+                    })
+                }
             };
             layers.push(Qwen3Layer {
                 attn_norm,
@@ -1122,6 +1208,16 @@ impl Qwen3Model {
         } else {
             None
         };
+        // Постадийная сверка MoE/A3-пути с host-эталоном (examples/olmoe_probe):
+        // MOE_DEBUG_L=<слой> печатает те же теги (последний токен, первые 8
+        // значений), что печатает HOST у зонда.
+        let dbg_layer = std::env::var("MOE_DEBUG_L").ok().and_then(|v| v.parse::<usize>().ok());
+        let dump = |tag: &str, t: &Tensor| -> Result<(), BackendError> {
+            let v = backend.to_cpu_f32(t)?;
+            let d = self.cfg.dim;
+            eprintln!("ENG {tag}: {:?}", &v[v.len() - d..v.len() - d + 8]);
+            Ok(())
+        };
         let mut extract_li = 0usize;
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(u) = upto
@@ -1135,6 +1231,9 @@ impl Qwen3Model {
             let t0 = std::time::Instant::now();
             let capture_split = split_at == Some(i);
             let h = layer.attn_norm.forward(backend, &x)?;
+            if dbg_layer == Some(i) {
+                dump("attn_norm_last", &h)?;
+            }
             let normed_cap = if capture_split { Some(h.clone()) } else { None };
             if std::env::var("INFER_LLM_DEBUG").is_ok() && i == 0 {
                 let hv = backend.to_cpu_f32(&h)?;
@@ -1154,6 +1253,9 @@ impl Qwen3Model {
                 mask.as_ref(),
             )?;
             x = backend_add(backend, &x, &h)?;
+            if dbg_layer == Some(i) {
+                dump("after_attn_last", &x)?;
+            }
             if prof {
                 // PROF — GPU-время: синхронизация перед замером (без неё
                 // счётчик показывал только CPU-кодирование батча).
@@ -1185,8 +1287,14 @@ impl Qwen3Model {
             }
             let t1 = std::time::Instant::now();
             let h = layer.ffn_norm.forward(backend, &x)?;
-            let f = ffn_forward(backend, &h, &layer.ffn)?;
+            if dbg_layer == Some(i) {
+                dump("ffn_norm_last", &h)?;
+            }
+            let f = layer.ffn.forward(backend, &h)?;
             x = backend_add(backend, &x, &f)?;
+            if dbg_layer == Some(i) {
+                dump("after_ffn_last", &x)?;
+            }
             if prof {
                 backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
                 prof_ffn += t1.elapsed().as_secs_f64();
@@ -1373,7 +1481,7 @@ impl Qwen3Model {
                 )?;
                 x = backend_add(backend, &x, &h)?;
                 let h = layer.ffn_norm.forward(backend, &x)?;
-                let f = ffn_forward(backend, &h, &layer.ffn)?;
+                let f = layer.ffn.forward(backend, &h)?;
                 x = backend_add(backend, &x, &f)?;
             }
             Ok(out)
@@ -1631,9 +1739,12 @@ impl Qwen3Model {
         // модели без QK-norm, f16/q8-KV) — прежним путём.
         // f16-хранилище обслуживается тем же fused-путём (qkv_norm_rope_kv
         // сам выбирает кернел по типу k-буфера и пишет q в half).
+        // OLMoE: QK-норма по ВСЕЙ проекции (qk_norm_whole_eps) — fused-кернел
+        // умеет только пер-головную норму, поэтому такие модели идут общим путём.
         let fused = cache_at.is_none()
             && mrope.is_none()
             && cfg.mrope_sections.is_none()
+            && attn.qk_norm_whole_eps.is_none()
             && (cache.is_f32() || cache.is_f16())
             && std::env::var("INFER_QKV_UNFUSED").is_err();
         let (q, t_norm, t_upd_d) = if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
@@ -1705,19 +1816,34 @@ impl Qwen3Model {
                     backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?,
                 )
             } else {
-                // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4; дефолт
-                // (CPU/CUDA) — два шага
+                // OLMoE: QK-норма по ВСЕЙ проекции (вес длиной n_embd) —
+                // пер-головный fused-кернел тут неприменим: нормируем строку
+                // целиком (как llama.cpp olmoe.cpp build_norm ДО reshape в
+                // головы), затем стандартный RoPE.
+                let norm_rope =
+                    |x: &Tensor, w: &Tensor, heads: usize| -> Result<Tensor, BackendError> {
+                        match attn.qk_norm_whole_eps {
+                            Some(eps) => {
+                                let y = backend.zeros(x.shape().to_vec())?;
+                                backend.rmsnorm(x, w, &y, eps)?;
+                                rope_standard(backend, &y, pos, t, attn.head_dim, cfg.rope_theta)
+                            }
+                            // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4;
+                            // дефолт (CPU/CUDA) — два шага
+                            None => backend.rmsnorm_head_rope(
+                                x,
+                                w,
+                                pos,
+                                attn.head_dim,
+                                cfg.rope_theta,
+                                heads,
+                                1e-6,
+                            ),
+                        }
+                    };
                 let q = match &attn.q_norm {
                     Some(w) => {
-                        let q = backend.rmsnorm_head_rope(
-                            &q,
-                            w,
-                            pos,
-                            attn.head_dim,
-                            cfg.rope_theta,
-                            attn.n_heads,
-                            1e-6,
-                        )?;
+                        let q = norm_rope(&q, w, attn.n_heads)?;
                         if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
                             let qv = backend.to_cpu_f32(&q)?;
                             eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
@@ -1727,15 +1853,7 @@ impl Qwen3Model {
                     None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
                 };
                 let k = match &attn.k_norm {
-                    Some(w) => backend.rmsnorm_head_rope(
-                        &k,
-                        w,
-                        pos,
-                        attn.head_dim,
-                        cfg.rope_theta,
-                        attn.n_kv_heads,
-                        1e-6,
-                    )?,
+                    Some(w) => norm_rope(&k, w, attn.n_kv_heads)?,
                     None => rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
                 };
                 (q, k)
@@ -2034,6 +2152,7 @@ mod test_util {
 
     pub fn mini_cfg() -> Qwen3Config {
         Qwen3Config {
+            moe: None,
             dim: 16,
             n_layers: 2,
             n_heads: 4,
@@ -2337,6 +2456,7 @@ mod tests {
 
         // Несовместимый объект — громкая ошибка, а не молчаливый мусор.
         let (backend3, mut other) = mini_model_with_cfg(Qwen3Config {
+            moe: None,
             n_kv_heads: 1,
             ..mini_cfg()
         });

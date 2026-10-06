@@ -48,7 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // сверка с синтетическим prefill_probe (тот же путь ffn_forward).
     let d = m.cfg.dim;
     let x = be.from_cpu_f32(&vec![0.01f32; t * d], vec![1, t, d])?;
-    let ffn = m.debug_ffn(0);
+    let ffn = m
+        .debug_ffn(0)
+        .ok_or("prefill_breakdown: модель без плотного FFN (MoE)")?;
     be.begin_batch()?;
     let _ = rust_inference::qwen3::ffn_forward(&be, &x, ffn)?;
     be.end_batch()?;
@@ -63,7 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t2 = std::time::Instant::now();
     be.begin_batch()?;
     for i in 0..m.cfg.n_layers {
-        let _ = rust_inference::qwen3::ffn_forward(&be, &x, m.debug_ffn(i))?;
+        let _ = rust_inference::qwen3::ffn_forward(
+            &be,
+            &x,
+            m.debug_ffn(i)
+                .ok_or("prefill_breakdown: модель без плотного FFN (MoE)")?,
+        )?;
     }
     be.end_batch()?;
     eprintln!(
@@ -75,7 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t3 = std::time::Instant::now();
     for i in 0..m.cfg.n_layers {
         be.begin_batch()?;
-        let _ = rust_inference::qwen3::ffn_forward(&be, &x, m.debug_ffn(i))?;
+        let _ = rust_inference::qwen3::ffn_forward(
+            &be,
+            &x,
+            m.debug_ffn(i)
+                .ok_or("prefill_breakdown: модель без плотного FFN (MoE)")?,
+        )?;
         be.end_batch()?;
     }
     eprintln!(

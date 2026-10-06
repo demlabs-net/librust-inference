@@ -4220,7 +4220,7 @@ kernel void qkv_norm_rope_kv_f16_f32(
     device const float* QKV [[buffer(0)]],
     device const float* WQ [[buffer(1)]],
     device const float* WK [[buffer(2)]],
-    device half* Q [[buffer(3)]],
+    device float* Q [[buffer(3)]],
     device half* KBUF [[buffer(4)]],
     device half* VBUF [[buffer(5)]],
     constant uint& T [[buffer(6)]],
@@ -4245,8 +4245,10 @@ kernel void qkv_norm_rope_kv_f16_f32(
     }
     const bool is_q = hh < H;
     device const float* W = is_q ? WQ : WK;
-    device half* y = is_q ? Q + ((ulong)t * H + hh) * HD
-                          : KBUF + ((ulong)(pos_kv + t) * KVH + (hh - H)) * HD;
+    // Q — отдельный (f32) буфер, K — половина общей пары указателей: типы
+    // разные, поэтому пишем развилкой, а не одним `device half* y`.
+    device float* yq = Q + ((ulong)t * H + hh) * HD;
+    device half* yk = KBUF + ((ulong)(pos_kv + t) * KVH + (hh - H)) * HD;
     float s = 0.0f;
     for (uint i = lane; i < HD; i += 32u) s += x[i] * x[i];
     const float inv = rsqrt(simd_sum(s) / (float)HD + eps);
@@ -4257,14 +4259,19 @@ kernel void qkv_norm_rope_kv_f16_f32(
         const float c = cos(p * fr), sn = sin(p * fr);
         const float x0 = x[i] * inv * W[i];
         const float x1 = x[i + half_hd] * inv * W[i + half_hd];
-        y[i] = (half)(x0 * c - x1 * sn);
-        y[i + half_hd] = (half)(x1 * c + x0 * sn);
+        if (is_q) {
+            yq[i] = x0 * c - x1 * sn;
+            yq[i + half_hd] = x1 * c + x0 * sn;
+        } else {
+            yk[i] = (half)(x0 * c - x1 * sn);
+            yk[i + half_hd] = (half)(x1 * c + x0 * sn);
+        }
     }
 }
 
 // Декодное внимание по f16-кэшу: K/V читаются half4 (вдвое меньше трафика).
 kernel void attn_decode_split_f16(
-    device const half* Q [[buffer(0)]],
+    device const float* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
     device const half* V [[buffer(2)]],
     device float* Y [[buffer(3)]],
@@ -4284,11 +4291,13 @@ kernel void attn_decode_split_f16(
     const uint n4 = HD / 4u;
     const uint nc = (n4 + 31u) / 32u;
     const float scale = 1.0f / sqrt((float)HD);
-    device const half4* q4 = (device const half4*)(Q + h * HD);
+    // Q — f32 (как в llama.cpp): округление запроса до half теряло ~11 бит
+    // и на близких логитах меняло выбранный токен через десятки шагов.
+    device const float4* q4 = (device const float4*)(Q + h * HD);
     float4 qv[2], acc[2];
     for (uint c = 0; c < 2u; ++c) {
         const uint d4 = lane + 32u * c;
-        float4 qq = (c < nc && d4 < n4) ? float4(q4[d4]) : float4(0.0f);
+        float4 qq = (c < nc && d4 < n4) ? q4[d4] : float4(0.0f);
         qv[c] = qq * scale;
         acc[c] = float4(0.0f);
     }
@@ -4358,7 +4367,7 @@ kernel void attn_decode_split_f16(
 // видит все ключи.
 template <uint QB>
 kernel void attn_split_f16_qb(
-    device const half* Q [[buffer(0)]],
+    device const float* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
     device const half* V [[buffer(2)]],
     device float* Y [[buffer(3)]],
@@ -4390,10 +4399,10 @@ kernel void attn_split_f16_qb(
     for (uint i = 0; i < QB; ++i) {
         m[i] = -INFINITY;
         s[i] = 0.0f;
-        device const half4* q4 = (device const half4*)(Q + (ulong)(t0 + min(i, nq - 1u)) * D + h * HD);
+        device const float4* q4 = (device const float4*)(Q + (ulong)(t0 + min(i, nq - 1u)) * D + h * HD);
         for (uint c = 0; c < 2u; ++c) {
             const uint d4 = lane + 32u * c;
-            qv[i][c] = (c < nc && d4 < n4) ? float4(q4[d4]) * scale : float4(0.0f);
+            qv[i][c] = (c < nc && d4 < n4) ? q4[d4] * scale : float4(0.0f);
             acc[i][c] = float4(0.0f);
         }
     }
@@ -4462,7 +4471,7 @@ template [[host_name("attn_split_f16_q1")]] kernel attn_split_f16_qb_t attn_spli
 // half4-чтением Q/K/V (голова = 32 лейна, online-softmax). Хвостовые
 // чанки промпта (Tq < 16) и короткие промпты матричных кернелов не имеют.
 kernel void attn_ar_f16_fused(
-    device const half* Q [[buffer(0)]],
+    device const float* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
     device const half* V [[buffer(2)]],
     device const float* MASK [[buffer(3)]],
@@ -4488,12 +4497,12 @@ kernel void attn_ar_f16_fused(
     const float scale = 1.0f / sqrt((float)HD);
     uint nc = (n4 + 31u) / 32u;
     const uint MAXC = 4u;
-    const device half4* qrow4 = (const device half4*)(Q + (b * Tq + t) * D + h * HD);
+    const device float4* qrow4 = (const device float4*)(Q + (b * Tq + t) * D + h * HD);
     float4 q4[MAXC];
     float4 y4[MAXC];
     for (uint c = 0u; c < MAXC; ++c) {
         uint d4 = lane + 32u * c;
-        q4[c] = (c < nc && d4 < n4) ? float4(qrow4[d4]) : float4(0.0f);
+        q4[c] = (c < nc && d4 < n4) ? qrow4[d4] : float4(0.0f);
         y4[c] = float4(0.0f);
     }
     const device float* maskrow = (MASK != nullptr) ? MASK + (b * Tq + t) * Tkv : nullptr;

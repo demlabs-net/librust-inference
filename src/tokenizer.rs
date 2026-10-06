@@ -136,6 +136,10 @@ pub enum PreTokenizer {
     /// GLM-4/ChatGLM (`glm4`, `chatglm-bpe`): как Qwen2, но цифры берутся
     /// сериями по 1-3 (`\p{N}{1,3}`), а не по одной.
     ChatGlm4,
+    /// OLMo/GPT-2-подобные (`olmo`; тот же набор у mpt/jais/trillion):
+    /// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`.
+    /// Отличия от Qwen2 — в [`pre_split_olmo`].
+    Olmo,
 }
 
 impl PreTokenizer {
@@ -147,6 +151,7 @@ impl PreTokenizer {
             "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" => Ok(Self::Qwen2),
             "qwen35" => Ok(Self::Qwen35),
             "glm4" | "chatglm-bpe" => Ok(Self::ChatGlm4),
+            "olmo" => Ok(Self::Olmo),
             other => Err(TokenizerError::UnsupportedPreTokenizer(other.to_string())),
         }
     }
@@ -596,6 +601,9 @@ fn cpt_tolower(cpt: u32) -> u32 {
 /// (и `_qwen35`) llama.cpp. Работает по кодовым точкам; возвращает срезы
 /// исходной строки.
 fn pre_split(text: &str, pre: PreTokenizer) -> Vec<&str> {
+    if pre == PreTokenizer::Olmo {
+        return pre_split_olmo(text);
+    }
     // кодовые точки и их байтовые смещения (невалидный UTF-8 у &str невозможен)
     let mut cpts: Vec<u32> = Vec::with_capacity(text.len());
     let mut offs: Vec<usize> = Vec::with_capacity(text.len() + 1);
@@ -736,6 +744,126 @@ fn pre_split(text: &str, pre: PreTokenizer) -> Vec<&str> {
         .into_iter()
         .map(|(a, b)| &text[offs[a]..offs[b]])
         .collect()
+}
+
+/// Разбиение для OLMo/GPT-2-подобных (`LLAMA_VOCAB_PRE_TYPE_OLMO`, тот же
+/// набор регулярок у mpt/jais/trillion/granite-docling):
+///
+/// ```text
+/// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)
+/// ```
+///
+/// Отличия от qwen2-набора (отсюда и отдельная функция):
+/// * апострофная группа ЧУВСТВИТЕЛЬНА к регистру (`'S` — уже не она);
+/// * перед буквами/цифрами/прочими допускается только ПРОБЕЛ, а не любой
+///   одиночный `[^\r\n\p{L}\p{N}]`;
+/// * цифры берутся СЕРИЕЙ (`\p{N}+`), а не по одной;
+/// * у группы «прочих» нет `[\r\n]*`-хвоста, а `\s*[\r\n]+`/`\s+`
+///   заменены единственной альтернативой `\s+(?!\S)`.
+///
+/// Ключевая тонкость: `\s+(?!\S)` при прогоне из R пробельных, за которым
+/// идёт непустой остаток, съедает R−1 символов (последний пробел забирает
+/// следующая альтернатива), а при R = 1 не совпадает ВООБЩЕ — в llama.cpp
+/// такой промежуток отдаётся отдельным куском
+/// (`unicode_regex_split_stl`: gap между совпадениями → слово). Поэтому
+/// промежутки копятся и выводятся куском, а не по символу.
+fn pre_split_olmo<'a>(text: &'a str) -> Vec<&'a str> {
+    let mut cpts: Vec<u32> = Vec::with_capacity(text.len());
+    let mut offs: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    for (o, c) in text.char_indices() {
+        cpts.push(c as u32);
+        offs.push(o);
+    }
+    offs.push(text.len());
+    let n = cpts.len();
+    let flags: Vec<CptFlags> = cpts.iter().map(|&c| cpt_flags(c)).collect();
+    let is_other = |f: CptFlags| !(f.is_whitespace() || f.is_letter() || f.is_number());
+
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut gap: Option<usize> = None;
+    let mut flush = |gap: &mut Option<usize>, end: usize, out: &mut Vec<&'a str>| {
+        if let Some(g) = gap.take()
+            && g < end
+        {
+            out.push(&text[offs[g]..offs[end]]);
+        }
+    };
+
+    let mut pos = 0usize;
+    while pos < n {
+        let start = pos;
+        let c = cpts[pos];
+        let mut end: Option<usize> = None;
+
+        // 's|'t|'re|'ve|'m|'ll|'d — регистр важен (в qwen2-наборе (?i:…)).
+        if c == '\'' as u32 && pos + 1 < n {
+            let c1 = cpts[pos + 1];
+            if c1 == 's' as u32 || c1 == 't' as u32 || c1 == 'm' as u32 || c1 == 'd' as u32 {
+                end = Some(pos + 2);
+            } else if pos + 2 < n {
+                let c2 = cpts[pos + 2];
+                if (c1 == 'r' as u32 && c2 == 'e' as u32)
+                    || (c1 == 'v' as u32 && c2 == 'e' as u32)
+                    || (c1 == 'l' as u32 && c2 == 'l' as u32)
+                {
+                    end = Some(pos + 3);
+                }
+            }
+        }
+
+        // ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ — пробел только один и только ' '.
+        if end.is_none() {
+            let p = if c == ' ' as u32 { pos + 1 } else { pos };
+            if p < n {
+                let f = flags[p];
+                let take = |mut q: usize, pred: &dyn Fn(CptFlags) -> bool| -> usize {
+                    while q < n && pred(flags[q]) {
+                        q += 1;
+                    }
+                    q
+                };
+                let q = if f.is_letter() {
+                    take(p, &|g: CptFlags| g.is_letter())
+                } else if f.is_number() {
+                    take(p, &|g: CptFlags| g.is_number())
+                } else if is_other(f) {
+                    take(p, &is_other)
+                } else {
+                    p
+                };
+                if q > p {
+                    end = Some(q);
+                }
+            }
+        }
+
+        // \s+(?!\S): хвостовой прогон — целиком; иначе R−1 (R ≥ 2).
+        if end.is_none() && flags[pos].is_whitespace() {
+            let mut r = pos;
+            while r < n && flags[r].is_whitespace() {
+                r += 1;
+            }
+            if r == n {
+                end = Some(r);
+            } else if r - pos >= 2 {
+                end = Some(r - 1);
+            }
+        }
+
+        match end {
+            Some(e) => {
+                pos = e;
+                flush(&mut gap, start, &mut out);
+                out.push(&text[offs[start]..offs[pos]]);
+            }
+            None => {
+                gap.get_or_insert(start);
+                pos += 1;
+            }
+        }
+    }
+    flush(&mut gap, n, &mut out);
+    out
 }
 
 /// Инкрементальный декодер для стриминга: куски могут обрываться на границе

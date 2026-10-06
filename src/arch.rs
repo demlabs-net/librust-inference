@@ -70,6 +70,8 @@ pub const SUPPORTED: &[ArchInfo] = &[
     a("qwen3vl", Family::Multimodal, Support::Supported, "Qwen3-VL: текстовое ядро + vision-энкодер"),
     a("qwen3vlmoe", Family::Multimodal, Support::Planned, "Qwen3-VL-MoE: нужен MoE-каркас (A3)"),
     a("glm4", Family::Dense, Support::Supported, "GLM-4-0414/ChatGLM-4: частичный RoPE, biасы qkv, sandwich-нормы"),
+    a("olmoe", Family::Moe, Support::Supported, "OLMoE: MoE-FFN (64 эксперта, top-8), QK-norm по всей проекции"),
+    a("qwen3moe", Family::Moe, Support::Supported, "Qwen3-MoE: MoE-FFN (128 экспертов, top-8, нормировка top-k)"),
     a("dflash", Family::Other, Support::Supported, "DFlash-драфтер (спек-декодинг)"),
     a("bert", Family::Encoder, Support::Supported, "BERT-эмбеддинги (bge)"),
 ];
@@ -115,7 +117,6 @@ const PLANNED: &[ArchInfo] = &[
     a("glm-dsa", Family::Sparse, Support::Planned, "GLM-DSA: разреженное внимание с индексером"),
     a("chatglm", Family::Dense, Support::Planned, "легаси ChatGLM (fused qkv/up — другая раскладка, чем glm4)"),
     a("qwen3next", Family::Sparse, Support::Planned, "Qwen3-Next/3.8-Flash: GDN+индексер+MoE+PLE — A5"),
-    a("qwen3moe", Family::Moe, Support::Planned, "Qwen3-MoE — волна A3 (MoE-каркас)"),
     a("qwen35moe", Family::Moe, Support::Planned, "Qwen3.5-MoE — A3"),
     a("llama", Family::Dense, Support::Planned, "Llama 1/2/3 — A6"),
     a("mistral3", Family::Dense, Support::Planned, "Mistral/Ministral — A6"),

@@ -994,6 +994,7 @@ mod tests {
     fn mini_model() -> (MetalBackend, Qwen3Model) {
         let backend = MetalBackend::new().unwrap();
         let c = Qwen3Config {
+            moe: None,
             dim: 16,
             n_layers: 2,
             n_heads: 4,

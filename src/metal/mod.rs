@@ -368,6 +368,25 @@ impl GpuTensor {
     }
 
     /// Zero-filled f16 buffer (f16-KV/активации, Ф8.2f).
+    /// Zero-filled f32 tensor (маленькие буферы: q во внимании с f16-KV).
+    pub fn zeros_f32(device: &Device, shape: Vec<usize>) -> Result<Self, MetalError> {
+        let bytes = shape.iter().product::<usize>() * 4;
+        let buffer = with_pool(|p| p.acquire(device, bytes));
+        if buffer.contents().is_null() {
+            return Err(MetalError::BufferAlloc);
+        }
+        unsafe {
+            std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, bytes);
+        }
+        Ok(Self {
+            buffer,
+            shape,
+            dtype: GpuDtype::F32,
+            offset: 0,
+            pooled: Some(Arc::new(PooledToken)),
+        })
+    }
+
     pub fn zeros_f16(device: &Device, shape: Vec<usize>) -> Result<Self, MetalError> {
         let bytes = shape.iter().product::<usize>() * 2;
         let buffer = with_pool(|p| p.acquire(device, bytes));
@@ -2485,39 +2504,18 @@ impl MetalCtx {
                 q.dtype, k.dtype, v.dtype
             )));
         }
-        // Q бывает f32 (ветки без fused qkv — DFlash-драфтер): приводим к f16
-        // отдельным проходом; тензор запроса мал (Tq×H·HD).
-        let qh_store;
-        let q = match q.dtype {
-            GpuDtype::F16 => q,
-            GpuDtype::F32 => {
-                let n: usize = q.shape.iter().product();
-                if !n.is_multiple_of(4) {
-                    return Err(MetalError::Shape(format!(
-                        "attn_ar f16: число элементов Q ({n}) не кратно 4"
-                    )));
-                }
-                let dst = GpuTensor::zeros_f16(&self.device, q.shape.clone())?;
-                let n4 = (n / 4) as u32;
-                self.run(
-                    "cast_f32_f16",
-                    MTLSize::new((n / 4) as u64, 1, 1),
-                    MTLSize::new(64, 1, 1),
-                    |enc| {
-                        enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
-                        enc.set_buffer(1, Some(&dst.buffer), dst.offset as u64);
-                        enc.set_bytes(2, 4, (&n4 as *const u32).cast());
-                    },
-                )?;
-                qh_store = dst;
-                &qh_store
-            }
-            other => {
-                return Err(MetalError::Shape(format!(
-                    "attn_ar f16: тип Q {other:?} не поддержан"
-                )));
-            }
-        };
+        // Q — f32 во ВСЕХ кернелах f16-внимания (кроме mma-предфилла, где
+        // половина нужна формату фрагментов). Так делает и llama.cpp: KV
+        // хранится в half, а запрос не округляется — округление q теряло
+        // ~11 бит и на близких логитах меняло выбранный токен через десятки
+        // шагов генерации (OLMoE, 64-экспертный роутер — самый чувствительный).
+        if q.dtype != GpuDtype::F32 {
+            return Err(MetalError::Shape(format!(
+                "attn_ar f16: Q обязан быть f32, получен {:?}",
+                q.dtype
+            )));
+        }
+        let q = q;
         if !n_heads.is_multiple_of(kv_heads) || !hd.is_multiple_of(4) {
             return Err(MetalError::Shape(format!(
                 "attn_ar f16: H={n_heads} не делится на KVH={kv_heads} или HD={hd} не кратен 4"
@@ -2535,6 +2533,27 @@ impl MetalCtx {
                 (2 * 8 * 32 * 4 + 2 * 8 * 32 * 2 + 2 * 64 * 4 + 2 * 8 * 4 + 16 * hd * 2) as u64;
             // Инстанциация по числу фрагментов головы (HD/8): 16 при HD ≤ 128,
             // 32 при HD = 256 — регистры при HD=128 не растут.
+            // mma-предфилл работает half-фрагментами (как llama.cpp для
+            // префилла) — здесь переводим q в f16 отдельным проходом.
+            let n: usize = q.shape.iter().product();
+            if !n.is_multiple_of(4) {
+                return Err(MetalError::Shape(format!(
+                    "attn_ar f16: число элементов Q ({n}) не кратно 4"
+                )));
+            }
+            let qh = GpuTensor::zeros_f16(&self.device, q.shape.clone())?;
+            let n4 = (n / 4) as u32;
+            self.run(
+                "cast_f32_f16",
+                MTLSize::new((n / 4) as u64, 1, 1),
+                MTLSize::new(64, 1, 1),
+                |enc| {
+                    enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+                    enc.set_buffer(1, Some(&qh.buffer), qh.offset as u64);
+                    enc.set_bytes(2, 4, (&n4 as *const u32).cast());
+                },
+            )?;
+            let q = &qh;
             let name = if hd <= 128 {
                 "attn_prefill_mma_f16_nf16"
             } else {
@@ -3435,9 +3454,10 @@ impl crate::backend::Backend for MetalBackend {
         eps: f32,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         let t = qkv.numel() / ((h + 2 * kvh) * hd);
-        // f16-KV (Ф8.2f): Q тоже пишется в half — внимание тогда идёт
-        // f16-кернелами (half-фрагменты 8×8 и half4-чтения, вдвое меньше
-        // трафика). Выбор по типу k-буфера: f16-кэш ⇒ f16-путь.
+        // f16-KV (Ф8.2f): K/V пишутся в half (вдвое меньше трафика внимания),
+        // а Q остаётся f32 — как в llama.cpp: округление запроса до half
+        // теряло точность, и текст расходился с эталоном через десятки
+        // идентичных токенов (замер: OLMoE-1B-7B, промпт про Париж).
         if kbuf.dtype() == crate::dtype::Dtype::F16 {
             if vbuf.dtype() != crate::dtype::Dtype::F16 {
                 return Err(crate::error::BackendError::Shape(
@@ -3445,11 +3465,7 @@ impl crate::backend::Backend for MetalBackend {
                 ));
             }
             let (kg, vg) = (kbuf.as_gpu(), vbuf.as_gpu());
-            let qh = GpuTensor::from_cpu_f16(
-                &self.ctx.device,
-                &vec![half::f16::from_f32(0.0); t * h * hd],
-                vec![1, t, h * hd],
-            )?;
+            let qh = GpuTensor::zeros_f32(&self.ctx.device, vec![1, t, h * hd])?;
             let (xg, wq, wk) = (qkv.as_gpu(), q_norm.as_gpu(), k_norm.as_gpu());
             let (t32, h32, kvh32, hd32, rp32, pk32) = (
                 t as u32,

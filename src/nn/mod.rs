@@ -269,6 +269,11 @@ pub struct Attention {
     pub qkv_bias: Option<Tensor>,
     pub q_norm: Option<Tensor>,
     pub k_norm: Option<Tensor>,
+    /// Область применения QK-норм: None — по голове (Qwen3: q_norm имеет
+    /// длину head_dim, кернел нормирует каждую голову отдельно); Some(eps) —
+    /// по всей проекции q/k (OLMoE: вес длиной n_embd, llama.cpp нормирует
+    /// q/k ДО reshape в головы, eps — из конфига модели).
+    pub qk_norm_whole_eps: Option<f32>,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -297,6 +302,7 @@ impl Attention {
             k_norm: k_norm
                 .map(|w| backend.from_cpu_f32(&w, vec![dim]))
                 .transpose()?,
+            qk_norm_whole_eps: None,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -327,10 +333,19 @@ impl Attention {
         let k = slice_last(backend, &qkv, kv_size, q_size)?;
         let v = slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
         let (q, k) = if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
-            (
-                rmsnorm_head(backend, &q, qn, self.n_heads)?,
-                rmsnorm_head(backend, &k, kn, self.n_kv_heads)?,
-            )
+            match self.qk_norm_whole_eps {
+                // Норма по ВСЕЙ проекции q/k (OLMoE: llama.cpp olmoe.cpp зовёт
+                // build_norm ДО reshape в головы, вес — [n_embd]): масштаб
+                // зависит от суммы по всем головам, а не по одной.
+                Some(eps) => (
+                    rmsnorm_last(backend, &q, qn, eps)?,
+                    rmsnorm_last(backend, &k, kn, eps)?,
+                ),
+                None => (
+                    rmsnorm_head(backend, &q, qn, self.n_heads)?,
+                    rmsnorm_head(backend, &k, kn, self.n_kv_heads)?,
+                ),
+            }
         } else {
             (q, k)
         };
@@ -873,6 +888,18 @@ fn rmsnorm_head(
 ) -> Result<Tensor, BackendError> {
     let y = backend.zeros(x.shape().to_vec())?;
     backend.rmsnorm_head(x, w, &y, n_heads, 1e-6)?;
+    Ok(y)
+}
+
+/// RMSNorm по последней оси (вся проекция q/k разом) — OLMoE-путь.
+fn rmsnorm_last(
+    backend: &dyn Backend,
+    x: &Tensor,
+    w: &Tensor,
+    eps: f32,
+) -> Result<Tensor, BackendError> {
+    let y = backend.zeros(x.shape().to_vec())?;
+    backend.rmsnorm(x, w, &y, eps)?;
     Ok(y)
 }
 

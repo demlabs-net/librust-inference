@@ -521,6 +521,7 @@ fn load_thinker(
     };
     eprintln!("thinker weights: {} tensors", wm.tensors.len());
     let thinker_cfg = Qwen3Config {
+        moe: None,
         dim: cfg.dim,
         n_layers: cfg.n_layers,
         n_heads: cfg.n_heads,

@@ -293,6 +293,7 @@ impl DFlashModel {
             )));
         }
         let cfg = Qwen3Config {
+            moe: None,
             dim,
             n_layers,
             n_heads,
@@ -424,6 +425,7 @@ impl DFlashModel {
         }
         let head_dim = g("head_dim").unwrap_or(dim / n_heads);
         let cfg = Qwen3Config {
+            moe: None,
             dim,
             n_layers,
             n_heads,
@@ -944,7 +946,7 @@ impl DFlashModel {
                 if let (Some(d), Some(b)) = (&ffn_dyn, &layer.ffn_conv.base) {
                     h = conv_side(backend, &h, b, d, 0, self.block_size)?;
                 }
-                let mut f = crate::qwen3::ffn_forward(backend, &h, &layer.dense.ffn)?;
+                let mut f = layer.dense.ffn.forward(backend, &h)?;
                 if let (Some(d), Some(b)) = (&ffn_dyn, &layer.ffn_conv.base) {
                     f = conv_side(backend, &f, b, d, 1, self.block_size)?;
                 }
@@ -1502,6 +1504,7 @@ fn load_dense_layer(
     // они деквантовались в f16 — вдвое больше чтения весов на каждом
     // черновом блоке (драфтер стоил больше шага декода таргета).
     let attn = Attention {
+        qk_norm_whole_eps: None,
         wqkv: crate::qwen3::Qwen3Model::upload_fused(
             backend,
             w,
@@ -1565,7 +1568,7 @@ fn load_dense_layer(
             ),
             cfg.norm_eps,
         )?,
-        ffn,
+        ffn: crate::qwen3::Ffn::Dense(ffn),
     })
 }
 
@@ -1593,6 +1596,7 @@ mod tests {
 
     fn cfg() -> Qwen3Config {
         Qwen3Config {
+            moe: None,
             dim: 16,
             n_layers: 2,
             n_heads: 2,

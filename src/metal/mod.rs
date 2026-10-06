@@ -1665,6 +1665,36 @@ impl MetalCtx {
                 enc.set_bytes(4, 4, (&n32 as *const u32).cast());
             });
         }
+        // Q4_K/Q6_K: K-расщеплённый кернел (строка весов на simdgroup) —
+        // «поток на строку» читал суперблоки последовательно и упирался в
+        // латентность (MoE-эксперты: 17 ГБ/с против ~94 у llama.cpp).
+        // Порог по N — по замеру (examples/mv_bench, M-серия):
+        //   [1024x2048] эксперты MoE: 56 против 28 ГБ/с (2×);
+        //   [4096x4096]              145 против 90 ГБ/с;
+        //   [13696x4096] ffn         140 против 161 ГБ/с;
+        //   [151936x4096] lm_head     94 против 108 ГБ/с.
+        // То есть K-расщеп выигрывает на «узких» матрицах (мало строк / короткая
+        // строка) и проигрывает на широких, где поток на строку уже насыщает
+        // память последовательным чтением.
+        let ks_ok = n <= 4096 && std::env::var("INFER_MV_KS_OFF").is_err();
+        if ks_ok {
+            if let Some(kname) = match b.dtype {
+                GpuDtype::Q4_K => Some("mv_ks_q4_k"),
+                GpuDtype::Q6_K => Some("mv_ks_q6_k"),
+                _ => None,
+            } {
+                let (k32, n32) = (k as u32, n as u32);
+                let grid = MTLSize::new((n.div_ceil(4) * 128) as u64, 1, 1);
+                let group = MTLSize::new(128, 1, 1);
+                return self.run(kname, grid, group, |enc| {
+                    enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                    enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                    enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                    enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                    enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+                });
+            }
+        }
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(64, 1, 1);
         self.run(name, grid, group, |enc| {

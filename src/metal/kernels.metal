@@ -1941,6 +1941,43 @@ kernel void mv_q6_k(
     C[n] = acc;
 }
 
+// ── K-расщеплённый matvec для K-квантов (Q4_K/Q6_K): декод ─────────────────
+// Кернелы выше — «поток на строку весов»: поток читает суперблоки (144/210 Б)
+// последовательно и платит латентность памяти на каждый. На MoE (OLMoE:
+// N=1024, K=2048 на эксперта) это давало ~17 ГБ/с против ~94 у llama.cpp —
+// декод 35 против 208 tok/s; на плотной GLM-4-9B-Q4_K_M 19 против 41 tok/s.
+// Здесь строку ведёт simdgroup: лейн ℓ берёт суперблоки ℓ, ℓ+32, … (тем же
+// скалярным dot-хелпером, только частично) и складывает через simd_sum.
+// 4 строки на threadgroup (по simdgroupу), 128 потоков.
+#define MVKS_NR 4u
+template <int KIND>  // 0 = Q4_K (144 Б/суперблок), 1 = Q6_K (210 Б)
+kernel void mv_ks_t(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint bsz = (KIND == 0) ? 144u : 210u;
+    const uint sb_count = K / 256u;
+    const uint r = tgid * MVKS_NR + sgid;
+    const bool ok = r < N;
+    float acc = 0.0f;
+    if (ok) {
+        device const uchar* row = B + (ulong)r * sb_count * bsz;
+        for (uint sb = lane; sb < sb_count; sb += 32u) {
+            device const uchar* blk = row + sb * bsz;
+            acc += (KIND == 0) ? dot_q4_k(A + sb * 256u, blk)
+                               : dot_q6_k(A + sb * 256u, blk);
+        }
+    }
+    const float v = simd_sum(acc);
+    if (lane == 0u && ok) C[r] = v;
+}
+
 kernel void mv_q5_0(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],
@@ -4731,5 +4768,8 @@ kernel void attn_prefill_mma_f16_nf(
 }
 
 typedef decltype(attn_prefill_mma_f16_nf<16>) attn_prefill_mma_f16_nf_t;
+typedef decltype(mv_ks_t<0>) mv_ks_t_t;
+template [[host_name("mv_ks_q4_k")]] kernel mv_ks_t_t mv_ks_t<0>;
+template [[host_name("mv_ks_q6_k")]] kernel mv_ks_t_t mv_ks_t<1>;
 template [[host_name("attn_prefill_mma_f16_nf16")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<16>;
 template [[host_name("attn_prefill_mma_f16_nf32")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<32>;

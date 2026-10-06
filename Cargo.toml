@@ -47,6 +47,15 @@ cpu = []
 # `cpu` now in default, plain `cargo test` must not try to build them
 # (they are LLM-zone demos, not part of the bridge's test surface).
 [[example]]
+name = "train_logits_check"
+required-features = ["metal"]
+[[example]]
+name = "dflash_env_matrix"
+required-features = ["metal"]
+[[example]]
+name = "dflash_block_dump"
+required-features = ["metal"]
+[[example]]
 name = "audio_chat"
 required-features = ["metal"]
 [[example]]

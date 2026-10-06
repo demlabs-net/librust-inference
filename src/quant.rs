@@ -104,6 +104,18 @@ impl QuantFormat {
         )
     }
 
+    /// Бит на вес с учётом служебных полей блока (для оценки размера в UI).
+    pub fn bits_per_weight(self) -> f32 {
+        match self {
+            Self::F32 => 32.0,
+            Self::F16 | Self::Bf16 => 16.0,
+            Self::Q4_0 | Self::Q4_K_M => 4.5,
+            Self::Q5_0 | Self::Q5_K => 5.5,
+            Self::Q6_K => 6.5625,
+            Self::Q8_0 => 8.5,
+        }
+    }
+
     /// Формат по ggml-типу (обратный к `ggml_type`); `None` — тип, который
     /// движок писать не умеет (Q5_0/Q5_K/IQ* — чужие форматы).
     pub fn from_ggml_type(t: GgmlType) -> Option<Self> {
@@ -1776,6 +1788,64 @@ mod tests {
         let dec = crate::weights_map::dequant_q6_k(&enc);
         let scale = w.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         approx(&dec, &w, 0.06 * scale.max(1e-9));
+    }
+
+    /// Отмена: `quantize_gguf` по флагу возвращает Cancelled и НЕ оставляет
+    /// файл-обрубок (панель/сервис полагаются на это при «Стоп»).
+    #[test]
+    fn quantize_gguf_cancel_leaves_no_file() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let src = dir.join("mini-f16.gguf");
+        let dst = std::env::temp_dir().join(format!(
+            "quant-cancel-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut progress = |_d: u64, _t: u64| {};
+        let err = quantize_gguf(
+            &src,
+            &dst,
+            QuantFormat::Q4_0,
+            &mut progress,
+            Some(&cancel),
+        )
+        .expect_err("отмена должна вернуть ошибку");
+        assert!(
+            matches!(err, crate::error::BackendError::Cancelled),
+            "ожидали Cancelled, получили {err:?}"
+        );
+        assert!(!dst.exists(), "обрубок {dst:?} не удалён");
+
+        // Контроль: без отмены тот же путь даёт валидный GGUF и отчёт.
+        let rep = quantize_gguf(&src, &dst, QuantFormat::Q4_0, &mut progress, None)
+            .expect("квантование мини-фикстуры");
+        assert!(dst.exists());
+        assert!(rep.tensors > 0 && rep.bytes > 0);
+        assert_eq!(rep.format, "Q4_0");
+        // У мини-фикстуры token_embd [32, 64] — связанный эмбеддинг, который
+        // политика хочет в Q6_K, но ne[0]=32 не кратен 256 → штатный
+        // fallback Q8_0 (как у llama.cpp); норма (1-D) остаётся F16.
+        assert_eq!(rep.warnings.len(), 1, "отклонения: {:?}", rep.warnings);
+        assert!(
+            rep.warnings[0].contains("не кратен 256"),
+            "неожиданное отклонение: {:?}",
+            rep.warnings
+        );
+        let mut hist: Vec<&str> = rep.by_type.iter().map(|(t, _, _)| *t).collect();
+        hist.sort_unstable();
+        assert_eq!(hist, vec!["Q4_0", "Q8_0"], "гистограмма {hist:?}");
+        let bytes = std::fs::read(&dst).unwrap();
+        let f = crate::gguf::parse(&bytes).unwrap();
+        assert_eq!(f.tensors.len(), rep.tensors);
+        assert_eq!(
+            f.get("general.file_type").and_then(GgufValue::as_u32),
+            Some(2)
+        );
+        let _ = std::fs::remove_file(&dst);
     }
 
     #[test]

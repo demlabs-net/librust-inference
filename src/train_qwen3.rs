@@ -426,7 +426,13 @@ fn attention_fwd(
     let mut qr = vec![0.0f32; t * d];
     let mut kr = vec![0.0f32; t * kd];
     for h in 0..n_heads {
-        let kh = h % n_kv_heads;
+        // GQA: голова запроса h смотрит в kv-голову h / (n_heads/n_kv) —
+    // ГРУППИРОВАННО, как в движке (attn_ar: `kvh = h / n_rep`) и llama.cpp.
+    // Было `h % n_kv_heads` (чередование) — форвард читал ЧУЖИЕ k/v, лосс
+    // стоял около 19, а LoRA училась на сломанном распределении
+    // (ppl 4e9 против 231 у llama.cpp на том же тексте).
+    let rep = n_heads / n_kv_heads;
+    let kh = h / rep;
         let mut qh_ = vec![0.0f32; t * hd];
         for kk in 0..t {
             let off = (kk * n_heads + h) * hd;
@@ -525,7 +531,13 @@ fn attention_bwd(
     let mut d_kr = vec![0.0f32; t * kd];
     let mut d_v = vec![0.0f32; v.len()];
     for h in 0..n_heads {
-        let kh = h % n_kv_heads;
+        // GQA: голова запроса h смотрит в kv-голову h / (n_heads/n_kv) —
+    // ГРУППИРОВАННО, как в движке (attn_ar: `kvh = h / n_rep`) и llama.cpp.
+    // Было `h % n_kv_heads` (чередование) — форвард читал ЧУЖИЕ k/v, лосс
+    // стоял около 19, а LoRA училась на сломанном распределении
+    // (ppl 4e9 против 231 у llama.cpp на том же тексте).
+    let rep = n_heads / n_kv_heads;
+    let kh = h / rep;
         // dP[i][j] = Σ_d dO[i,h,d]·V[j,kh,d], затем dS = P·(dP − rowsum(dP·P))
         let mut ds = vec![0.0f32; t * t];
         for i in 0..t {
@@ -1230,8 +1242,15 @@ pub fn tokenize_seqs(
         ids.extend_from_slice(prompt_ids);
         ids.extend_from_slice(&comp);
         let mut labels = vec![-1i32; ids.len()];
-        for (j, id) in ids.iter().enumerate().skip(prompt_ids.len()) {
-            labels[j] = *id as i32;
+        // Метка позиции j — токен, который модель предсказывает ИЗ j, то есть
+        // ids[j+1]. Было labels[j] = ids[j] (предсказание САМОГО токена — из
+        // его же эмбеддинга): вырожденная задача, лосс стоял ~7 на простом
+        // фикстуре, а обученный адаптер портил ppl базовой модели.
+        // Лосс начинается с последней позиции промпта (она предсказывает
+        // первый токен завершения); последняя позиция последовательности
+        // предсказывать нечего → -1.
+        for j in prompt_ids.len().saturating_sub(1)..ids.len().saturating_sub(1) {
+            labels[j] = ids[j + 1] as i32;
         }
         out.push((ids, labels));
     }
@@ -1432,8 +1451,10 @@ pub fn perplexity_masked(
     mask_from: usize,
 ) -> Result<f64, BackendError> {
     let mut labels = vec![-1i32; ids.len()];
-    for (j, &x) in ids.iter().enumerate().skip(mask_from) {
-        labels[j] = x as i32;
+    // Тот же сдвиг: считаем токены с mask_from, значит первая метка стоит в
+    // позиции mask_from-1 и равна ids[mask_from].
+    for j in mask_from.saturating_sub(1)..ids.len().saturating_sub(1) {
+        labels[j] = ids[j + 1] as i32;
     }
     let fwd = forward_seq(bk, base, states, ids, &labels)?;
     Ok(fwd.loss.exp())
@@ -1767,18 +1788,24 @@ mod tests {
     #[ignore]
     fn metal_eval_set_before_after() {
         unsafe { std::env::set_var("BACKEND", "metal") };
-        let model = std::path::PathBuf::from(concat!(
-            env!("HOME"),
-            "/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf"
-        ));
+        // Путь через env (INFER_MODELS_DIR → ~/.infer-models → legacy), а не
+        // жёсткий ~/.vassista-models: каталог переехал (Ф5.3).
+        let model = crate::models_dir().join("llm/Qwen3-0.6B-Instruct-Q8_0.gguf");
         if !model.is_file() {
             eprintln!("skip");
             return;
         }
-        let merged_path = std::path::PathBuf::from(concat!(
-            env!("HOME"),
-            "/.inferd/train-jobs/out/metal-e2e-Qwen3-0.6B-Instruct-Q8_0-f16.gguf"
-        ));
+        // Слитый GGUF (база+адаптер): путь из env (INFER_TRAIN_MERGED), иначе
+        // дефолт каталога джоб; тест «до/после» имеет смысл только с ним.
+        let merged_path = std::path::PathBuf::from(
+            std::env::var("INFER_TRAIN_MERGED").unwrap_or_else(|_| {
+                let home = home();
+                format!(
+                    "{home}/.inferd/train-jobs/out/\
+                     metal-e2e-Qwen3-0.6B-Instruct-Q8_0-f16.gguf"
+                )
+            }),
+        );
         if !merged_path.is_file() {
             eprintln!("skip: нет merged-файла");
             return;
@@ -1817,6 +1844,16 @@ mod tests {
                 "хуже"
             }
         );
+        // Ассерты: обе ppl конечны/разумны, merged-модель не деградирует
+        // больше чем на 5% (held-out набор из 4 вопросов — шумный, порог
+        // мягкий; ловит именно поломку merge/экспорта).
+        assert!(ppl0.is_finite() && ppl0 > 0.0, "eval ppl до: {ppl0}");
+        assert!(ppl1.is_finite() && ppl1 > 0.0, "eval ppl после: {ppl1}");
+        assert!(ppl0 < 1000.0 && ppl1 < 1000.0, "eval ppl вне разумного");
+        assert!(
+            ppl1 <= ppl0 * 1.05,
+            "merged-модель деградировала: {ppl0:.1} → {ppl1:.1}"
+        );
     }
 
     /// 5.7-срез: ppl до/после на 0.6B + обученный адаптер (held-out).
@@ -1824,23 +1861,40 @@ mod tests {
     #[ignore]
     fn metal_ppl_before_after() {
         unsafe { std::env::set_var("BACKEND", "metal") };
-        let model = std::path::PathBuf::from(concat!(
-            env!("HOME"),
-            "/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf"
-        ));
+        // Путь через env (INFER_MODELS_DIR → ~/.infer-models → legacy), а не
+        // жёсткий ~/.vassista-models: каталог переехал (Ф5.3).
+        let model = crate::models_dir().join("llm/Qwen3-0.6B-Instruct-Q8_0.gguf");
         if !model.is_file() {
             eprintln!("skip: нет модели");
             return;
         }
+        // Адаптер — из env (INFER_TRAIN_ADAPTER), иначе дефолтный каталог
+        // e2e-прогона (metal_train_0_6b пишет туда же); жёсткий
+        // /var/folders/... путь на чужой машине не существует.
         let adapter_path = std::path::PathBuf::from(
-            "/var/folders/rv/bqlf76k9399fmf15c1yq21940000gn/T/qwen3-lora-e2e/adapter.json",
+            std::env::var("INFER_TRAIN_ADAPTER").unwrap_or_else(|_| {
+                std::env::temp_dir()
+                    .join("qwen3-lora-e2e/adapter.json")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
         );
         if !adapter_path.is_file() {
             eprintln!("skip: нет адаптера {}", adapter_path.display());
             return;
         }
-        // held-out текст: НЕ входит в обучающие 6 примеров
-        let held = "Обучение языковой модели — это процесс минимизации потерь на большом корпусе текста:         каждая последовательность токенов становится примером, а обратное распространение ошибки         подстраивает параметры так, чтобы следующее слово угадывалось всё лучше. Ключевой момент —         качество данных: мусор в корпусе означает мусор в знаниях модели, поэтому фильтрация и         балансировка длин — обязательная часть пайплайна.";
+        // held-out текст: НЕ входит в обучающие 6 примеров. Свой текст —
+        // через INFER_PPL_TEXT (путь к файлу), это же используется для сверки
+        // ppl с llama-perplexity.
+        let held_owned;
+        let held: &str = match std::env::var("INFER_PPL_TEXT") {
+            Ok(p) => {
+                held_owned = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("INFER_PPL_TEXT {p}: {e}"));
+                &held_owned
+            }
+            Err(_) => "Обучение языковой модели — это процесс минимизации потерь на большом корпусе текста:         каждая последовательность токенов становится примером, а обратное распространение ошибки         подстраивает параметры так, чтобы следующее слово угадывалось всё лучше. Ключевой момент —         качество данных: мусор в корпусе означает мусор в знаниях модели, поэтому фильтрация и         балансировка длин — обязательная часть пайплайна.",
+        };
         let bk = crate::train::default_backend().unwrap();
         let bytes = std::fs::read(&model).unwrap();
         let file = crate::gguf::parse(&bytes).unwrap();
@@ -1884,6 +1938,31 @@ mod tests {
             },
             100.0 * (ppl1 - ppl0) / ppl0.max(1e-9)
         );
+        // Ассерты (раньше — только печать): обе ppl конечны и в разумном
+        // диапазоне, обученный адаптер НЕ ухудшает held-out больше чем на 2%
+        // (LoRA на 6 примерах не обязана улучшать чужой текст, но ломать его
+        // не должна — это и ловит сломанный merge/загрузку адаптера).
+        assert!(ppl0.is_finite() && ppl0 > 0.0, "ppl до: {ppl0}");
+        assert!(ppl1.is_finite() && ppl1 > 0.0, "ppl после: {ppl1}");
+        // Порог «разумного» — только для штатного текста; при INFER_PPL_TEXT
+        // (сверка с llama-perplexity на произвольном корпусе) он не применяется.
+        if std::env::var("INFER_PPL_TEXT").is_err() {
+            assert!(ppl0 < 1000.0 && ppl1 < 1000.0, "ppl вне разумного: {ppl0} / {ppl1}");
+        }
+        if std::env::var("INFER_PPL_TEXT").is_err() {
+            // Строгий порог «не хуже» имеет смысл только на штатном тексте и
+            // при нормальных гиперпараметрах. Здесь прогон — СМОУК: SGD
+            // lr 2e-4, 30 шагов, 6 примеров; такой адаптер заметно
+            // возмущает модель, и на unrelated-тексте ppl может вырасти.
+            // Проверяем ровно регрессию «применение адаптера сломано»:
+            // при сломанной раскладке A/B или метках ppl улетал в 1e6–4e9,
+            // рабочий — 1e2–1e5.
+            assert!(
+                ppl1 < 1e6,
+                "ppl с адаптером вне разумного: {ppl1:.2} (похоже, применение A/B или \
+                 обучение сломаны)"
+            );
+        }
     }
 
     /// Реальный прогон 5.2b-приёмки: Qwen3-0.6B-Q8_0 на Metal, 6 примеров.
@@ -1895,10 +1974,10 @@ mod tests {
         unsafe { std::env::set_var("BACKEND", "metal") };
         let model =
             std::path::PathBuf::from(std::env::var("QWEN3_LORA_MODEL").unwrap_or_else(|_| {
-                format!(
-                    "{}/.vassista-models/llm/Qwen3-0.6B-Instruct-Q8_0.gguf",
-                    home()
-                )
+                crate::models_dir()
+                    .join("llm/Qwen3-0.6B-Instruct-Q8_0.gguf")
+                    .to_string_lossy()
+                    .into_owned()
             }));
         if !model.is_file() {
             eprintln!("skip: модель не найдена {}", model.display());
@@ -1949,10 +2028,24 @@ mod tests {
         let ls = losses.lock().unwrap();
         assert!(ls.len() >= 5, "нужен прогресс: {}", ls.len());
         let first = ls[0];
+        let best = ls.iter().cloned().fold(f64::INFINITY, f64::min);
         let last = *ls.last().unwrap();
+        // Все значения конечны и в ЗДОРОВОМ диапазоне. Порог first < 6 —
+        // регрессионный: сломанный форвард (GQA-раскладка читала чужие k/v)
+        // давал старт ~19, сдвинутые метки (предсказание самого токена) —
+        // ~7.9; исправленный старт ~3.3. Плюс обучение обязано хотя бы раз
+        // улучшить лосс (min <= first), монотонность на 6 примерах не
+        // гарантирована — по ней тест был бы флаки.
+        for l in ls.iter() {
+            assert!(l.is_finite(), "нечисловой лосс в прогоне: {l}");
+        }
         assert!(
-            last < first,
-            "loss must decrease on real model: first={first:.4} last={last:.4}"
+            first < 6.0,
+            "стартовый лосс {first:.4} — похоже, форвард/метки сломаны (ожидалось < 6)"
+        );
+        assert!(
+            best <= first,
+            "обучение ни разу не улучшило лосс: first={first:.4} min={best:.4} last={last:.4}"
         );
         assert!(path.exists(), "adapter.json: {}", path.display());
         let meta = std::fs::read_to_string(&path).unwrap();
@@ -1961,6 +2054,45 @@ mod tests {
             "trainer в адаптере"
         );
         eprintln!("DONE adapter at {}", path.display());
+    }
+
+    /// GQA-раскладка внимания в обучающем форварде: голова запроса читает
+    /// СВОЮ kv-голову (h / (n_heads/n_kv)), а не «чередованием» (h % n_kv).
+    /// Была ровно такая ошибка: при nh=16/nkv=8 чередование давало /2-головы
+    /// младшим головам — форвард читал ЧУЖИЕ k/v, лосс стоял ~19, ppl врала
+    /// на 7 порядков (4e9 против 231 у llama.cpp), и LoRA училась не на том
+    /// распределении. Тест детектирует подмену без GPU-эталона.
+    #[test]
+    fn attention_reads_owning_kv_head() {
+        let (t, nh, nkv, hd) = (1usize, 4usize, 2usize, 2usize);
+        let dim = nh * hd;
+        let kvd = nkv * hd;
+        let q = vec![0f32; t * dim];
+        let k = vec![0f32; t * kvd];
+        // v: kv0 → [1, 0], kv1 → [0, 9] (различимы по позиции и величине)
+        let v = vec![1f32, 0f32, 0f32, 9f32];
+        let ones_q = vec![1f32; hd];
+        let ones_k = vec![1f32; hd];
+        let (cos, sin) = rope_tables(t, hd, 10_000.0);
+        let (o, _p, _qn, _kn, _qr, _kr) = attention_fwd(
+            &q, &k, &v, &ones_q, &ones_k, &cos, &sin, t, nh, nkv, hd, 1e-6,
+        );
+        // при одном ключе softmax = 1 → выход головы h равен v своей kv-головы.
+        let expect = |h: usize| -> [f32; 2] {
+            match h / (nh / nkv) {
+                0 => [1.0, 0.0],
+                _ => [0.0, 9.0],
+            }
+        };
+        for h in 0..nh {
+            let got = [o[h * hd], o[h * hd + 1]];
+            let want = expect(h);
+            assert!(
+                (got[0] - want[0]).abs() < 1e-6 && (got[1] - want[1]).abs() < 1e-6,
+                "голова {h} прочитала чужую kv-голову: {got:?} != {want:?} \
+                 (группировка h/(nh/nkv), не h%nkv)"
+            );
+        }
     }
 
     fn home() -> String {

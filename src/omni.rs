@@ -930,7 +930,10 @@ mod tests {
     /// реальным mel-входом (vassista_live.wav) — метал vs CPU.
     #[test]
     fn conv1d_real_weights_matches_cpu() {
-        let dir = std::path::Path::new("/Users/dmitriygerasimov/.vassista-models/omni3b");
+        // Абсолютный путь на машину автора ломал тест у всех остальных:
+        // каталог моделей — из env (INFER_MODELS_DIR/…), подкаталог omni3b.
+        let dir = &crate::models_dir().join("omni3b");
+        let dir = dir.as_path();
         if !dir.join("config.json").exists() {
             eprintln!("skip: omni3b не скачан");
             return;

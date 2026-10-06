@@ -32,6 +32,34 @@
     clippy::needless_range_loop
 )]
 
+/// Каталог моделей: `INFER_MODELS_DIR` → `~/.infer-models` → устаревший
+/// `VASSISTA_MODELS_DIR`/`~/.vassista-models` (с предупреждением). Та же
+/// политика, что в `infer_core::models_dir()` сервиса: тесты/примеры не
+/// должны знать про старые пути (раскладка подкаталогов: llm/stt/tts/vad/vlm).
+pub fn models_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("INFER_MODELS_DIR") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let new = std::path::PathBuf::from(&home).join(".infer-models");
+    if new.exists() {
+        return new;
+    }
+    if let Ok(p) = std::env::var("VASSISTA_MODELS_DIR") {
+        eprintln!("models: VASSISTA_MODELS_DIR устарела — переименуйте в INFER_MODELS_DIR");
+        return std::path::PathBuf::from(p);
+    }
+    let legacy = std::path::PathBuf::from(&home).join(".vassista-models");
+    if legacy.exists() {
+        eprintln!(
+            "models: найден устаревший {} — используйте INFER_MODELS_DIR (раскладка та же)",
+            legacy.display()
+        );
+        return legacy;
+    }
+    new
+}
+
 pub mod audio;
 pub mod backend;
 pub mod bert;

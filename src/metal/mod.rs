@@ -1668,15 +1668,17 @@ impl MetalCtx {
         // Q4_K/Q6_K: K-расщеплённый кернел (строка весов на simdgroup) —
         // «поток на строку» читал суперблоки последовательно и упирался в
         // латентность (MoE-эксперты: 17 ГБ/с против ~94 у llama.cpp).
-        // Порог по N — по замеру (examples/mv_bench, M-серия):
-        //   [1024x2048] эксперты MoE: 56 против 28 ГБ/с (2×);
-        //   [4096x4096]              145 против 90 ГБ/с;
-        //   [13696x4096] ffn         140 против 161 ГБ/с;
-        //   [151936x4096] lm_head     94 против 108 ГБ/с.
-        // То есть K-расщеп выигрывает на «узких» матрицах (мало строк / короткая
-        // строка) и проигрывает на широких, где поток на строку уже насыщает
-        // память последовательным чтением.
-        let ks_ok = n <= 4096 && std::env::var("INFER_MV_KS_OFF").is_err();
+        // K-расщеплённый путь — ОПТ-ИН (INFER_MV_KS=1), по замеру он быстрее на
+        // «узких» матрицах: эксперты MoE [1024×2048] 56 против 28 ГБ/с,
+        // [4096×4096] 145 против 90; на широких проигрывает ([13696×4096]
+        // 140 против 161, [151936×4096] 94 против 108) и там не берётся.
+        //
+        // Почему не по умолчанию: порядок суммирования по K другой, и на
+        // чувствительных моделях это меняет исход близких логитов — у OLMoE
+        // (64-экспертный роутер) text_parity расходился на 2 промптах из 3,
+        // тогда как путь «поток на строку» даёт байт-в-байт. Паритет первичен,
+        // скорость — рычагом (решение зафиксировано в плане A3.4).
+        let ks_ok = n <= 4096 && std::env::var("INFER_MV_KS").is_ok();
         if ks_ok {
             if let Some(kname) = match b.dtype {
                 GpuDtype::Q4_K => Some("mv_ks_q4_k"),
@@ -4663,6 +4665,71 @@ impl crate::backend::Backend for MetalBackend {
         self.ctx
             .add_bias2d_f32(x.as_gpu(), b.as_gpu(), y.as_gpu())?;
         Ok(())
+    }
+
+    fn moe_experts_mv(
+        &self,
+        a: &crate::backend::Tensor,
+        ids: &[u32],
+        weights: &[f32],
+        b: &crate::backend::Tensor,
+        c: &crate::backend::Tensor,
+        n_rows: usize,
+        per_slot: bool,
+    ) -> Result<(), crate::error::BackendError> {
+        use crate::error::BackendError;
+        let (ag, bg, cg) = (
+            a.inner_metal(),
+            b.inner_metal(),
+            c.inner_metal(),
+        );
+        let k = a.shape()[a.shape().len() - 1];
+        let kslots = ids.len();
+        if kslots == 0 || weights.len() != kslots {
+            return Err(BackendError::Shape(format!(
+                "moe_experts_mv: ids {} / weights {}",
+                kslots,
+                weights.len()
+            )));
+        }
+        // set_bytes ограничен 4 КБ — при большем top-k нужны буферы.
+        if kslots * 8 > 4096 {
+            return Err(BackendError::Shape(format!(
+                "moe_experts_mv: top-k {kslots} не влезает в set_bytes"
+            )));
+        }
+        let name = match (bg.dtype, per_slot) {
+            (GpuDtype::Q4_K, false) => "mv_id_q4_k",
+            (GpuDtype::Q4_K, true) => "mv_id_q4_k_dpsl",
+            (GpuDtype::Q6_K, false) => "mv_id_q6_k",
+            (GpuDtype::Q6_K, true) => "mv_id_q6_k_dpsl",
+            (other, _) => {
+                return Err(BackendError::UnsupportedFormat(format!(
+                    "moe_experts_mv: квант {other:?} не поддержан (Q4_K/Q6_K)"
+                )));
+            }
+        };
+        let block = bg.dtype.block_elems().unwrap_or(0);
+        if block == 0 || !k.is_multiple_of(block) {
+            return Err(BackendError::Shape(format!(
+                "moe_experts_mv: K={k} не кратен блоку {block}"
+            )));
+        }
+        let (k32, n32, ks32) = (k as u32, n_rows as u32, kslots as u32);
+        // 16 строк весов на threadgroup (4 simdgroup × 4 строки), слоты — цикл.
+        let grid = MTLSize::new((n_rows.div_ceil(16) * 128) as u64, 1, 1);
+        let group = MTLSize::new(128, 1, 1);
+        self.ctx.run(name, grid, group, |enc| {
+            enc.set_buffer(0, Some(&ag.buffer), ag.offset as u64);
+            enc.set_bytes(1, 4 * kslots as u64, ids.as_ptr().cast());
+            enc.set_bytes(2, 4 * kslots as u64, weights.as_ptr().cast());
+            enc.set_buffer(3, Some(&bg.buffer), bg.offset as u64);
+            enc.set_buffer(4, Some(&cg.buffer), cg.offset as u64);
+            enc.set_bytes(5, 4, (&k32 as *const u32).cast());
+            enc.set_bytes(6, 4, (&n32 as *const u32).cast());
+            enc.set_bytes(7, 4, (&ks32 as *const u32).cast());
+        })
+        .map_err(|e| BackendError::Shape(format!("moe_experts_mv: {e}")))
     }
 
     fn attn_ar(

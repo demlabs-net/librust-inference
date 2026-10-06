@@ -2030,6 +2030,37 @@ pub trait Backend: Send + Sync {
     /// Column-wise scale: X (rows, D) · w (D,) → Y (rows, D).
     fn mul_vec(&self, x: &Tensor, w: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// MoE-проекция по идентификаторам экспертов (порт идеи llama.cpp
+    /// `mul_mat_id`, декод): один вызов обслуживает все слоты top-k вместо
+    /// отдельного matvec на эксперта.
+    ///
+    /// * `a` — активации: `[K]` при `per_slot = false` (проекции up/gate,
+    ///   строка общая для всех слотов) или `[k, K]` при `per_slot = true`
+    ///   (проекция down: у каждого слота свой вход);
+    /// * `ids` — идентификаторы выбранных экспертов (len = k), `weights` —
+    ///   их веса роутера (используются только при `per_slot = true`);
+    /// * `b` — плоские веса экспертов `[n_expert * n_rows, K]` (нативный
+    ///   квант), `c` — выход: `[k, n_rows]` при `per_slot = false` или
+    ///   `[n_rows]` (сумма `Σ w_j · dot_j`) при `per_slot = true`.
+    ///
+    /// Дефолт — не поддержано: MoE-путь обязан падать громко на бэкенде без
+    /// реализации, а не считать по одному эксперту молча.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_mv(
+        &self,
+        _a: &Tensor,
+        _ids: &[u32],
+        _weights: &[f32],
+        _b: &Tensor,
+        _c: &Tensor,
+        _n_rows: usize,
+        _per_slot: bool,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_experts_mv: бэкенд не умеет mul_mat_id".into(),
+        ))
+    }
+
     // ── GLU ──
     /// Gated linear unit: X (rows, 2d) → Y (rows, d), y = a·sigmoid(b).
     fn glu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;

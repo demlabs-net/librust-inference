@@ -4768,8 +4768,92 @@ kernel void attn_prefill_mma_f16_nf(
 }
 
 typedef decltype(attn_prefill_mma_f16_nf<16>) attn_prefill_mma_f16_nf_t;
+
 typedef decltype(mv_ks_t<0>) mv_ks_t_t;
 template [[host_name("mv_ks_q4_k")]] kernel mv_ks_t_t mv_ks_t<0>;
 template [[host_name("mv_ks_q6_k")]] kernel mv_ks_t_t mv_ks_t<1>;
+
+// ── matvec по ИДЕНТИФИКАТОРАМ экспертов (MoE, декод) ────────────────────────
+// Порт идеи llama.cpp `kernel_mul_mv_id_*`: вместо k отдельных matvec'ов на
+// токен (8 экспертов × 3 проекции × 16 слоёв = 384 вызова и столько же
+// аллокаций буферов у нас) — ОДИН вызов на проекцию, внутри которого
+// перебираются слоты top-k. Строка весов адресуется как
+// B + (ids[j] * N + row) * sb_count * bsz.
+//
+// Два режима (шаблонные флаги):
+//   PER_SLOT_IN  = 0 — вход общий: активации [K] (проекции up/gate);
+//                = 1 — вход по слотам: [KSLOTS, K] (проекция down, вход —
+//                      silu-произведение каждого слота);
+//   WSUM         = 0 — выход по слотам БЕЗ весов: C[j * N + n] = dot (up/gate);
+//                = 1 — выход суммы с весами роутера: C[n] += w[j] * dot (down).
+// Строки делят threadgroup'ы (16 строк на 128 потоков), слоты — цикл в
+// регистрах: гонок за C нет ни в одном режиме.
+#define MVID_NR 16u
+template <int KIND, int PER_SLOT_IN, int WSUM>
+static inline void mv_id_impl(device const float* A, device const uint* IDS,
+                              device const float* WID, device const uchar* B,
+                              device float* C, uint K, uint N, uint KSLOTS,
+                              uint tgid, uint sgid, uint lane)
+{
+    const uint bsz = (KIND == 0) ? 144u : 210u;
+    const uint sb_count = K / 256u;
+    const uint r0 = tgid * MVID_NR + sgid * 4u;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint j = 0; j < KSLOTS; ++j) {
+        const uint e = IDS[j];
+        // WID читается только в режиме суммы (иначе буфер не привязан)
+        const float w = (WSUM == 1) ? WID[j] : 0.0f;
+        device const float* a = PER_SLOT_IN ? (A + j * K) : A;
+        for (uint rr = 0; rr < 4u; ++rr) {
+            const uint row = r0 + rr;
+            if (row >= N) break;
+            device const uchar* rw = B + ((ulong)e * N + row) * sb_count * bsz;
+            float part = 0.0f;
+            for (uint sb = lane; sb < sb_count; sb += 32u) {
+                device const uchar* blk = rw + sb * bsz;
+                part += (KIND == 0) ? dot_q4_k(a + sb * 256u, blk)
+                                    : dot_q6_k(a + sb * 256u, blk);
+            }
+            const float v = simd_sum(part);
+            if (lane == 0u) {
+                if (WSUM == 1) {
+                    acc[rr] += w * v;
+                } else {
+                    C[(ulong)j * N + row] = v;
+                }
+            }
+        }
+    }
+    if (WSUM == 1 && lane == 0u) {
+        for (uint rr = 0; rr < 4u; ++rr) {
+            const uint row = r0 + rr;
+            if (row < N) C[row] = acc[rr];
+        }
+    }
+}
+
+// Обёртки-ядра: явные атрибуты буферов (шаблонные kernel-инстанциации Metal
+// требуют typedef decltype и путаются с несколькими параметрами шаблона).
+#define MV_ID_KERNEL(NAME, KIND, PSL, WSUM)                                       \
+kernel void NAME(                                                                 \
+    device const float* A [[buffer(0)]],                                          \
+    device const uint* IDS [[buffer(1)]],                                         \
+    device const float* WID [[buffer(2)]],                                        \
+    device const uchar* B [[buffer(3)]],                                          \
+    device float* C [[buffer(4)]],                                                \
+    constant uint& K [[buffer(5)]],                                               \
+    constant uint& N [[buffer(6)]],                                               \
+    constant uint& KS [[buffer(7)]],                                              \
+    uint tgid [[threadgroup_position_in_grid]],                                   \
+    uint sgid [[simdgroup_index_in_threadgroup]],                                 \
+    uint lane [[thread_index_in_simdgroup]])                                      \
+{ mv_id_impl<KIND, PSL, WSUM>(A, IDS, WID, B, C, K, N, KS, tgid, sgid, lane); }
+
+MV_ID_KERNEL(mv_id_q4_k, 0, 0, 0)
+MV_ID_KERNEL(mv_id_q4_k_down, 0, 0, 1)
+MV_ID_KERNEL(mv_id_q4_k_dpsl, 0, 1, 1)
+MV_ID_KERNEL(mv_id_q6_k, 1, 0, 0)
+MV_ID_KERNEL(mv_id_q6_k_down, 1, 0, 1)
+MV_ID_KERNEL(mv_id_q6_k_dpsl, 1, 1, 1)
 template [[host_name("attn_prefill_mma_f16_nf16")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<16>;
 template [[host_name("attn_prefill_mma_f16_nf32")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<32>;

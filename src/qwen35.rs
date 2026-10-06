@@ -1464,9 +1464,6 @@ mod tests {
                 .unwrap();
             be.kv_update(&k2, &kr, pos).unwrap();
             be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
-            let f16v = |x: &[f32]| -> Vec<f32> {
-                x.iter().map(|&v| f32::from(half::f16::from_f32(v))).collect()
-            };
             let q1f: Vec<f32> = be.to_cpu_f32(&q1).unwrap();
             close(&q1f, &be.to_cpu_f32(&q2).unwrap(), 1e-3, "fused f32 q");
             let k1f: Vec<f32> = be.to_cpu_f16(&k1).unwrap().iter().map(|&x| f32::from(x)).collect();

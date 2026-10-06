@@ -317,7 +317,9 @@ impl ExpertTensor {
         })
     }
 
-    /// Срез эксперта `e` — [rows, cols], без копии.
+    /// Срез эксперта `e` — [rows, cols], без копии. Горячий путь MoE идёт
+    /// через [`ExpertTensor::w`] целиком (`moe_experts_mv`), а срез нужен
+    /// сверкам/будущим путям (смена резидентности экспертов в Части B).
     pub fn expert(&self, e: usize) -> Tensor {
         match self.row_bytes {
             Some(rb) => self.w.view_offset_bytes(
@@ -447,27 +449,61 @@ impl MoeLayer {
             routed.push((ids.clone(), ws.clone()));
         }
 
-        // 3. Эксперты: по токену, по выбранному эксперту — срезы без копий.
+        // Отладочный/страховочный путь: по одному matvec на (токен, слот)
+        // без id-кернелов. Нужен для A/B при расхождениях и для бэкендов без
+        // mul_mat_id (там id-путь упал бы с «не поддержано»).
+        // id-кернелы (mul_mat_id) — ОПТ-ИН (INFER_MOE_ID=1): корректны
+        // (тест id_kernel_matches_per_expert_matvec), но порядок суммирования
+        // по слотам/суперблокам иной, и на чувствительных моделях это меняет
+        // близкие логиты (у OLMoE text_parity расходился на 2 промптах из 3).
+        // Паритет первичен: по умолчанию — по одному matvec на (токен, слот).
+        let id_path = std::env::var("INFER_MOE_ID").is_ok();
+        if !id_path {
+            let acc = backend.zeros(vec![t, d])?;
+            for (ti, (ids, ws)) in routed.iter().enumerate() {
+                let x_t = x2.view_offset(vec![1, d], ti * d);
+                let acc_t = acc.view_offset(vec![1, d], ti * d);
+                for (&eid, &w) in ids.iter().zip(ws.iter()) {
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let y_up = backend.zeros(vec![1, ffn])?;
+                    backend.gemm_nt(&x_t, &self.up.expert(eid as usize), &y_up)?;
+                    let g = backend.zeros(vec![1, ffn])?;
+                    backend.gemm_nt(&x_t, &self.gate.expert(eid as usize), &g)?;
+                    let act = backend.zeros(vec![1, ffn])?;
+                    backend.silu(&g, &act)?;
+                    let prod = backend.zeros(vec![1, ffn])?;
+                    backend.mul(&act, &y_up, &prod)?;
+                    let y_dn = backend.zeros(vec![1, d])?;
+                    backend.gemm_nt(&prod, &self.down.expert(eid as usize), &y_dn)?;
+                    backend.add_scaled(&acc_t, &y_dn, &acc_t, w)?;
+                }
+            }
+            return Ok(acc.view(vec![1, t, d]));
+        }
+
+        // 3. Проекции экспертов: ОДИН вызов на проекцию на токен (mul_mat_id) —
+        // внутри кернела перебираются слоты top-k. Раньше на токен слоя
+        // приходилось 3·k вызовов и столько же аллокаций буферов (384 на токен
+        // у OLMoE) — это и было узкое место декода (40 против 208 tok/s).
+        let k = self.cfg.n_expert_used.min(e);
         let acc = backend.zeros(vec![t, d])?;
         for (ti, (ids, ws)) in routed.iter().enumerate() {
             let x_t = x2.view_offset(vec![1, d], ti * d);
-            let acc_t = acc.view_offset(vec![1, d], ti * d);
-            for (&eid, &w) in ids.iter().zip(ws.iter()) {
-                if w == 0.0 {
-                    continue;
-                }
-                let y_up = backend.zeros(vec![1, ffn])?;
-                backend.gemm_nt(&x_t, &self.up.expert(eid as usize), &y_up)?;
-                let g = backend.zeros(vec![1, ffn])?;
-                backend.gemm_nt(&x_t, &self.gate.expert(eid as usize), &g)?;
-                let act = backend.zeros(vec![1, ffn])?;
-                backend.silu(&g, &act)?;
-                let prod = backend.zeros(vec![1, ffn])?;
-                backend.mul(&act, &y_up, &prod)?;
-                let y_dn = backend.zeros(vec![1, d])?;
-                backend.gemm_nt(&prod, &self.down.expert(eid as usize), &y_dn)?;
-                backend.add_scaled(&acc_t, &y_dn, &acc_t, w)?;
-            }
+            // up/gate: вход общий (строка токена), выход — по слотам [k, ffn].
+            let up = backend.zeros(vec![k, ffn])?;
+            backend.moe_experts_mv(&x_t, ids, ws, &self.up.w, &up, ffn, false)?;
+            let gate = backend.zeros(vec![k, ffn])?;
+            backend.moe_experts_mv(&x_t, ids, ws, &self.gate.w, &gate, ffn, false)?;
+            // silu(gate)·up поэлементно по всем слотам сразу.
+            let act = backend.zeros(vec![k, ffn])?;
+            backend.silu(&gate, &act)?;
+            let prod = backend.zeros(vec![k, ffn])?;
+            backend.mul(&act, &up, &prod)?;
+            // down: у каждого слота свой вход, выход — взвешенная сумма [dim].
+            let out_t = acc.view_offset(vec![1, d], ti * d);
+            backend.moe_experts_mv(&prod, ids, ws, &self.down.w, &out_t, d, true)?;
         }
         Ok(acc.view(vec![1, t, d]))
     }
@@ -541,6 +577,120 @@ mod tests {
         let mut w = Vec::new();
         c.route_row(&[1.0, 3.0, 0.0, -1.0], &mut ids, &mut w);
         assert!((w.iter().sum::<f32>() - 0.5).abs() < 1e-6, "{w:?}");
+    }
+
+    /// id-кернелы (mul_mat_id) дают ТЕ ЖЕ числа, что matvec по срезу эксперта:
+    /// различие — только порядок суммирования, поэтому допуск — 1e-5·‖x‖.
+    /// Проверяются оба режима: up/gate (вход общий, выход по слотам) и down
+    /// (вход по слотам, взвешенная сумма).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn id_kernel_matches_per_expert_matvec() {
+        use crate::backend::Backend as _;
+        use crate::dtype::WeightFormat;
+        let be = crate::metal::MetalBackend::new().unwrap();
+        // Размеры кратны блоку Q4_K (256) — как у реальных моделей
+        // (OLMoE: k=2048, ffn=1024; здесь уменьшено для скорости теста).
+        let (e, k, n, ffn) = (8usize, 512usize, 256usize, 256usize);
+        // Валидные Q4_K-суперблоки: d=1, dmin=0.5, масштабы 1..8, нибблы случайны.
+        let mut seed = 0x1234_5678u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut q4k = |rows: usize, cols: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(rows * cols / 256 * 144);
+            for _ in 0..rows * cols / 256 {
+                out.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+                out.extend_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+                for i in 0..12 {
+                    out.push(((next() >> (i % 8)) & 0xFF) as u8);
+                }
+                for _ in 0..128 {
+                    out.push((next() & 0xFF) as u8);
+                }
+            }
+            out
+        };
+        let up_w = be
+            .from_quantized(&q4k(e * ffn, k), vec![e * ffn, k], WeightFormat::Q4_K)
+            .unwrap();
+        let down_w = be
+            .from_quantized(&q4k(e * n, ffn), vec![e * n, ffn], WeightFormat::Q4_K)
+            .unwrap();
+        let ids: Vec<u32> = (0..4).map(|j| ((j * 3) % e) as u32).collect();
+        let ws: Vec<f32> = vec![0.4, 0.3, 0.2, 0.1];
+        let x = be
+            .from_cpu_f32(
+                &(0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect::<Vec<_>>(),
+                vec![1, k],
+            )
+            .unwrap();
+
+        // up/gate: выход по слотам [4, ffn]
+        let y_id = be.zeros(vec![4, ffn]).unwrap();
+        be.moe_experts_mv(&x, &ids, &ws, &up_w, &y_id, ffn, false).unwrap();
+        let id_host = be.to_cpu_f32(&y_id).unwrap();
+        for (j, &eid) in ids.iter().enumerate() {
+            let slice = ExpertTensor {
+                w: up_w.clone(),
+                rows: ffn,
+                cols: k,
+                row_bytes: Some(144 * k / 256),
+            }
+            .expert(eid as usize);
+            let y = be.zeros(vec![1, ffn]).unwrap();
+            be.gemm_nt(&x, &slice, &y).unwrap();
+            let host = be.to_cpu_f32(&y).unwrap();
+            for i in 0..ffn {
+                let got = id_host[j * ffn + i];
+                let want = host[i];
+                assert!(
+                    (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                    "слот {j} (эксперт {eid}) [{i}]: id {got} против среза {want}"
+                );
+            }
+        }
+
+        // down: вход по слотам [4, ffn] → взвешенная сумма [n]
+        let prod = be
+            .from_cpu_f32(
+                &(0..4 * ffn)
+                    .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+                    .collect::<Vec<_>>(),
+                vec![4, ffn],
+            )
+            .unwrap();
+        let y_ids = be.zeros(vec![n]).unwrap();
+        be.moe_experts_mv(&prod, &ids, &ws, &down_w, &y_ids, n, true).unwrap();
+        let sum_id = be.to_cpu_f32(&y_ids).unwrap();
+        let mut want = vec![0f32; n];
+        for (j, &eid) in ids.iter().enumerate() {
+            let slice = ExpertTensor {
+                w: down_w.clone(),
+                rows: n,
+                cols: ffn,
+                row_bytes: Some(144 * ffn / 256),
+            }
+            .expert(eid as usize);
+            let row = prod.view_offset(vec![1, ffn], j * ffn);
+            let y = be.zeros(vec![1, n]).unwrap();
+            be.gemm_nt(&row, &slice, &y).unwrap();
+            let host = be.to_cpu_f32(&y).unwrap();
+            for i in 0..n {
+                want[i] += ws[j] * host[i];
+            }
+        }
+        for i in 0..n {
+            assert!(
+                (sum_id[i] - want[i]).abs() <= 1e-5 * (1.0 + want[i].abs()),
+                "down [{i}]: id {} против суммы срезов {}",
+                sum_id[i],
+                want[i]
+            );
+        }
     }
 
     /// sigmoid-гейтинг (DeepSeek-V3-подобные): веса — сигмоиды, не softmax.

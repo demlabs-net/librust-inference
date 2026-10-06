@@ -390,7 +390,9 @@ impl Qwen3Model {
             crate::dtype::WeightFormat::Q4_0
             | crate::dtype::WeightFormat::Q8_0
             | crate::dtype::WeightFormat::Q4_K
-            | crate::dtype::WeightFormat::Q6_K => {
+            | crate::dtype::WeightFormat::Q6_K
+            | crate::dtype::WeightFormat::Q5_K
+            | crate::dtype::WeightFormat::Q5_0 => {
                 backend.from_quantized(tensor.raw(), shape, tensor.format)
             }
             _ => upload_w(backend, &crate::weights_map::dequant_f32(tensor), shape),
@@ -420,6 +422,8 @@ impl Qwen3Model {
                     | crate::dtype::WeightFormat::Q8_0
                     | crate::dtype::WeightFormat::Q4_K
                     | crate::dtype::WeightFormat::Q6_K
+                    | crate::dtype::WeightFormat::Q5_K
+                    | crate::dtype::WeightFormat::Q5_0
             );
         if all_q {
             let mut bytes = Vec::new();

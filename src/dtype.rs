@@ -63,6 +63,8 @@ pub enum WeightFormat {
     Q8_0,
     Q4_K,
     Q6_K,
+    Q5_K,
+    Q5_0,
     Int4,
     Nf4,
 }
@@ -78,6 +80,8 @@ impl WeightFormat {
             // neither the old 148 B nor the canonical 144 B layout).
             WeightFormat::Q4_K => 4.5, // 256-elem super-block: 144 B (canonical ggml)
             WeightFormat::Q6_K => 6.5625, // 256-elem super-block: 210 B (canonical ggml)
+            WeightFormat::Q5_K => 5.5, // 256-elem super-block: 176 B (canonical ggml)
+            WeightFormat::Q5_0 => 5.5, // 32-elem block: 22 B (canonical ggml)
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -94,6 +98,8 @@ impl WeightFormat {
             WeightFormat::Q8_0 => "q8_0".into(),
             WeightFormat::Q4_K => "q4_k".into(),
             WeightFormat::Q6_K => "q6_k".into(),
+            WeightFormat::Q5_K => "q5_k".into(),
+            WeightFormat::Q5_0 => "q5_0".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
         }

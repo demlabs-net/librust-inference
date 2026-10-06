@@ -22,6 +22,9 @@ pub fn ggml_type_of(fmt: QuantFormat) -> GgmlType {
         QuantFormat::Q4_0 => GgmlType::Q4_0,
         QuantFormat::Q8_0 => GgmlType::Q8_0,
         QuantFormat::Q4_K_M => GgmlType::Q4K,
+        QuantFormat::Q6_K => GgmlType::Q6K,
+        QuantFormat::Q5_0 => GgmlType::Q5_0,
+        QuantFormat::Q5_K => GgmlType::Q5K,
     }
 }
 
@@ -33,6 +36,9 @@ pub fn parse_quant_format(s: &str) -> Option<QuantFormat> {
         "q4_0" | "q40" => Some(QuantFormat::Q4_0),
         "q8_0" | "q80" => Some(QuantFormat::Q8_0),
         "q4_k" | "q4_k_m" | "q4km" => Some(QuantFormat::Q4_K_M),
+        "q6_k" | "q6k" => Some(QuantFormat::Q6_K),
+        "q5_0" | "q50" => Some(QuantFormat::Q5_0),
+        "q5_k" | "q5_k_m" | "q5km" => Some(QuantFormat::Q5_K),
         _ => None,
     }
 }

@@ -84,6 +84,8 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Q8_0 => WeightFormat::Q8_0,
                 GgmlType::Q4K => WeightFormat::Q4_K,
                 GgmlType::Q6K => WeightFormat::Q6_K,
+                GgmlType::Q5K => WeightFormat::Q5_K,
+                GgmlType::Q5_0 => WeightFormat::Q5_0,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -272,8 +274,65 @@ pub(crate) fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Q5_0 (канонический ggml, 22 Б/32): d(f16) @0, qh[4] (u32 LE) @2,
+/// qs[16] @6; парность j (младший ниббл) / j+16 (старший), 5-е биты из qh.
+pub fn dequant_q5_0(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 22 * 32);
+    for blk in data.chunks_exact(22) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        // Позиции элементов: j (младший ниббл) и j+16 (старший), как в
+        // dequantize_row_q5_0; порядок вывода — по индексу, не «подряд».
+        let mut row = [0f32; 32];
+        for j in 0..16usize {
+            let lo = ((blk[6 + j] & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+            let hi = ((blk[6 + j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+            row[j] = lo as f32 * d;
+            row[j + 16] = hi as f32 * d;
+        }
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
+/// Q5_K (канонический ggml, 176 Б/256): d @0, dmin @2, scales[12] @4
+/// (get_scale_min_k4), qh[32] @16 (5-е биты: маски 1<<2c / 2<<2c на чанк),
+/// qs[128] @48 (низкие 4 бита, чанк-мажор). y = d·sc·q − dmin·m, q ∈ 0..31.
+pub fn dequant_q5_k(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 176 * 256);
+    for blk in data.chunks_exact(176) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        let dmin = f16_to_f32([blk[2], blk[3]]);
+        let (mut u1, mut u2) = (1u8, 2u8);
+        for c in 0..4usize {
+            let (sc1, m1) = scale_min_k4(2 * c, &blk[4..16]);
+            let (sc2, m2) = scale_min_k4(2 * c + 1, &blk[4..16]);
+            let (dd1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+            let (dd2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+            // Порядок эталона: СНАЧАЛА 32 элемента низких нибблов, затем 32
+            // высоких (не вперемешку — иначе все чётные/нечётные значения
+            // меняются местами).
+            for l in 0..32usize {
+                let b = blk[48 + c * 32 + l];
+                let qh = blk[16 + l];
+                let lo = (b & 0x0F) as u32 + if qh & u1 != 0 { 16 } else { 0 };
+                out.push(dd1 * lo as f32 - mm1);
+            }
+            for l in 0..32usize {
+                let b = blk[48 + c * 32 + l];
+                let qh = blk[16 + l];
+                let hi = (b >> 4) as u32 + if qh & u2 != 0 { 16 } else { 0 };
+                out.push(dd2 * hi as f32 - mm2);
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    out
+}
+
 /// Деквантовать GGUF-тензор (сырой ggml-тип) в f32 — для re-quant (Ф4.12).
-pub(crate) fn dequant_gguf(
+pub fn dequant_gguf(
     ggml_type: crate::gguf::GgmlType,
     data: &[u8],
 ) -> Result<Vec<f32>, crate::error::BackendError> {
@@ -296,6 +355,8 @@ pub(crate) fn dequant_gguf(
         T::Q8_0 => dequant_q8_0(data),
         T::Q4K => dequant_q4_k(data),
         T::Q6K => dequant_q6_k(data),
+        T::Q5K => dequant_q5_k(data),
+        T::Q5_0 => dequant_q5_0(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -332,6 +393,8 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Q8_0 => dequant_q8_0(t.data),
         WeightFormat::Q4_K => dequant_q4_k(t.data),
         WeightFormat::Q6_K => dequant_q6_k(t.data),
+        WeightFormat::Q5_K => dequant_q5_k(t.data),
+        WeightFormat::Q5_0 => dequant_q5_0(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

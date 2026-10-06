@@ -97,6 +97,8 @@ pub enum GpuDtype {
     Q8_0,
     Q4_K,
     Q6_K,
+    Q5_K,
+    Q5_0,
 }
 
 impl GpuDtype {
@@ -104,7 +106,8 @@ impl GpuDtype {
     pub fn block_elems(self) -> Option<usize> {
         match self {
             GpuDtype::Q4_0 | GpuDtype::Q8_0 => Some(32),
-            GpuDtype::Q4_K | GpuDtype::Q6_K => Some(256),
+            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K => Some(256),
+            GpuDtype::Q5_0 => Some(32),
             _ => None,
         }
     }
@@ -305,7 +308,7 @@ impl GpuTensor {
             GpuDtype::F32 => 4,
             GpuDtype::F16 | GpuDtype::BF16 => 2,
             GpuDtype::Q8_0 | GpuDtype::Q4_0 => 1,
-            GpuDtype::Q4_K | GpuDtype::Q6_K => 1,
+            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Q5_0 => 1,
         }
     }
 
@@ -452,6 +455,8 @@ impl GpuTensor {
             // dialect was removed together with its in-kernel layout).
             GpuDtype::Q4_K => 144.0 / 256.0,
             GpuDtype::Q6_K => 210.0 / 256.0,
+            GpuDtype::Q5_K => 176.0 / 256.0,
+            GpuDtype::Q5_0 => 22.0 / 32.0,
             other => {
                 return Err(MetalError::Shape(format!(
                     "from_quantized: {other:?} is not a quantized dtype"
@@ -890,7 +895,12 @@ impl MetalCtx {
             GpuDtype::F16 => "gemm_f16",
             GpuDtype::BF16 => "gemm_bf16",
             // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
-            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K => {
+            GpuDtype::Q4_0
+            | GpuDtype::Q8_0
+            | GpuDtype::Q4_K
+            | GpuDtype::Q6_K
+            | GpuDtype::Q5_K
+            | GpuDtype::Q5_0 => {
                 return Err(MetalError::Shape(
                     "gemm_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
                 ));
@@ -1419,7 +1429,12 @@ impl MetalCtx {
             GpuDtype::F16 => "gemm_nt_f16",
             GpuDtype::BF16 => "gemm_nt_bf16",
             // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
-            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K => {
+            GpuDtype::Q4_0
+            | GpuDtype::Q8_0
+            | GpuDtype::Q4_K
+            | GpuDtype::Q6_K
+            | GpuDtype::Q5_K
+            | GpuDtype::Q5_0 => {
                 return Err(MetalError::Shape(
                     "gemm_nt_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
                 ));
@@ -1459,6 +1474,8 @@ impl MetalCtx {
             GpuDtype::Q8_0 => "gemm_nt_q8_0",
             GpuDtype::Q4_K => "gemm_nt_q4_k",
             GpuDtype::Q6_K => "gemm_nt_q6_k",
+            GpuDtype::Q5_K => "gemm_nt_q5_k",
+            GpuDtype::Q5_0 => "gemm_nt_q5_0",
             other => {
                 return Err(MetalError::Shape(format!(
                     "gemm_nt_quantized: B dtype {other:?} is not quantized"
@@ -1595,6 +1612,8 @@ impl MetalCtx {
             GpuDtype::Q8_0 => "mv_q8_0",
             GpuDtype::Q4_K => "mv_q4_k",
             GpuDtype::Q6_K => "mv_q6_k",
+            GpuDtype::Q5_K => "mv_q5_k",
+            GpuDtype::Q5_0 => "mv_q5_0",
             other => {
                 return Err(MetalError::Shape(format!(
                     "mv_quantized: B dtype {other:?} is not quantized"
@@ -2272,6 +2291,8 @@ impl MetalCtx {
             GpuDtype::Q4_0 => 2,
             GpuDtype::Q4_K => 3,
             GpuDtype::Q6_K => 4,
+            GpuDtype::Q5_K => 5,
+            GpuDtype::Q5_0 => 6,
             other => {
                 return Err(MetalError::Shape(format!(
                     "embedding_quant: таблица {other:?} не поддержана"
@@ -3816,7 +3837,12 @@ impl crate::backend::Backend for MetalBackend {
         // Квантованные веса — через dequant-in-kernel GEMM/MMV (Ф1.3/1.4).
         if matches!(
             bg.dtype,
-            GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Q4_K | GpuDtype::Q6_K
+            GpuDtype::Q4_0
+                | GpuDtype::Q8_0
+                | GpuDtype::Q4_K
+                | GpuDtype::Q6_K
+                | GpuDtype::Q5_K
+                | GpuDtype::Q5_0
         ) {
             if a.as_gpu().shape[0] == 1 {
                 // mv_quantized — MMV-примитив: a 1D [k], c 1D [n] (тот же буфер).
@@ -3845,6 +3871,8 @@ impl crate::backend::Backend for MetalBackend {
             crate::dtype::WeightFormat::Q8_0 => GpuDtype::Q8_0,
             crate::dtype::WeightFormat::Q4_K => GpuDtype::Q4_K,
             crate::dtype::WeightFormat::Q6_K => GpuDtype::Q6_K,
+            crate::dtype::WeightFormat::Q5_K => GpuDtype::Q5_K,
+            crate::dtype::WeightFormat::Q5_0 => GpuDtype::Q5_0,
             other => {
                 return Err(crate::error::BackendError::Shape(format!(
                     "from_quantized: {other:?} is not quantized"
@@ -4753,7 +4781,10 @@ mod quant_gemm_tests {
                     .to_bits()
                     .to_le_bytes()
                     .to_vec();
-                blk.extend((0..32).map(|j| (((b * 37 + j * 11) % 255) - 127) as i8 as u8));
+                blk.extend((0..32).map(|j| {
+                    let q = ((b * 37 + j * 11) % 255) as u8;
+                    q.wrapping_sub(127) as i8 as u8
+                }));
                 blk
             })
             .collect();
@@ -4761,6 +4792,20 @@ mod quant_gemm_tests {
             (q8_big, vec![128, 96], GpuDtype::Q8_0, 0.05),
             (enc_q4_k(&src), vec![8, 256], GpuDtype::Q4_K, 0.15),
             (enc_q6_k(&src), vec![8, 256], GpuDtype::Q6_K, 0.06),
+            // Q5_K/Q5_0 — наш энкодер (порт ref llama.cpp) + CPU-деквант;
+            // сверка GPU-ядла с dequant_f32 в quantized_mv/gemm.
+            (
+                crate::quant::quantize(&src, crate::quant::QuantFormat::Q5_K),
+                vec![8, 256],
+                GpuDtype::Q5_K,
+                0.12,
+            ),
+            (
+                crate::quant::quantize(&src, crate::quant::QuantFormat::Q5_0),
+                vec![8, 256],
+                GpuDtype::Q5_0,
+                0.12,
+            ),
             // Q4_0/Q8_0 — прямо из фикстур (K=32, те же веса, что у f16)
             (
                 {
@@ -4833,6 +4878,8 @@ mod quant_gemm_tests {
                         GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
                         GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
                         GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        GpuDtype::Q5_K => crate::dtype::WeightFormat::Q5_K,
+                        GpuDtype::Q5_0 => crate::dtype::WeightFormat::Q5_0,
                         _ => unreachable!(),
                     },
                     offset: 0,
@@ -4932,7 +4979,10 @@ mod quant_gemm_tests {
                     .to_bits()
                     .to_le_bytes()
                     .to_vec();
-                blk.extend((0..32).map(|j| (((b * 37 + j * 11) % 255) - 127) as i8 as u8));
+                blk.extend((0..32).map(|j| {
+                    let q = ((b * 37 + j * 11) % 255) as u8;
+                    q.wrapping_sub(127) as i8 as u8
+                }));
                 blk
             })
             .collect();
@@ -4961,6 +5011,57 @@ mod quant_gemm_tests {
         }
     }
 
+    /// embedding_quant по всем квант-таблицам (вкл. Q5_K/Q5_0): GPU-декод
+    /// строки == CPU dequant_f32 с точностью до f32-умножения.
+    #[test]
+    fn embedding_quant_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        for (bytes, shape, dtype, tol) in cases() {
+            let n = shape[0];
+            let k = shape[1];
+            let b = GpuTensor::from_quantized(dev, &bytes, shape.clone(), dtype).unwrap();
+            let tmp = WeightsMap {
+                arch: "t".into(),
+                tensors: vec![crate::weights_map::WeightTensor {
+                    name: "w".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format: match dtype {
+                        GpuDtype::Q4_0 => crate::dtype::WeightFormat::Q4_0,
+                        GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
+                        GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
+                        GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        GpuDtype::Q5_K => crate::dtype::WeightFormat::Q5_K,
+                        GpuDtype::Q5_0 => crate::dtype::WeightFormat::Q5_0,
+                        _ => unreachable!(),
+                    },
+                    offset: 0,
+                    data: &bytes,
+                }],
+                storage: vec![],
+            };
+            let bf = dequant_f32(&tmp.tensors[0]);
+            let idx = [0u32, (n / 2) as u32, (n - 1) as u32];
+            let y = GpuTensor::zeros(dev, vec![1, idx.len(), k]).unwrap();
+            ctx.embedding_quant_f32(&idx, &b, &y).unwrap();
+            for (t, &row) in idx.iter().enumerate() {
+                for d in 0..k {
+                    let got = {
+                        let cpu = y.to_cpu_f32(&ctx).unwrap();
+                        cpu[t * k + d]
+                    };
+                    let want = bf[row as usize * k + d];
+                    let diff = (got - want).abs();
+                    let bound = tol * 8.0;
+                    assert!(
+                        diff <= bound,
+                        "{dtype:?} row {row} d {d}: {got} vs {want} (|Δ| {diff} > {bound})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn quantized_mv_matches_cpu() {
         let ctx = MetalCtx::new().expect("MetalCtx");
@@ -4979,6 +5080,8 @@ mod quant_gemm_tests {
                         GpuDtype::Q8_0 => crate::dtype::WeightFormat::Q8_0,
                         GpuDtype::Q4_K => crate::dtype::WeightFormat::Q4_K,
                         GpuDtype::Q6_K => crate::dtype::WeightFormat::Q6_K,
+                        GpuDtype::Q5_K => crate::dtype::WeightFormat::Q5_K,
+                        GpuDtype::Q5_0 => crate::dtype::WeightFormat::Q5_0,
                         _ => unreachable!(),
                     },
                     offset: 0,

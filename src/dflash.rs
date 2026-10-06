@@ -90,7 +90,9 @@ impl DFlashModel {
                 WeightFormat::Q4_0
                 | WeightFormat::Q8_0
                 | WeightFormat::Q4_K
-                | WeightFormat::Q6_K => backend.from_quantized(tensor.raw(), shape, tensor.format),
+                | WeightFormat::Q6_K
+                | WeightFormat::Q5_K
+                | WeightFormat::Q5_0 => backend.from_quantized(tensor.raw(), shape, tensor.format),
                 _ => {
                     let f = dequant_f32(tensor);
                     upload_f16(backend, &f, shape)
@@ -1481,7 +1483,12 @@ fn load_dense_layer(
             .get(name)
             .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
         match tensor.format {
-            WeightFormat::Q4_0 | WeightFormat::Q8_0 | WeightFormat::Q4_K | WeightFormat::Q6_K => {
+            WeightFormat::Q4_0
+            | WeightFormat::Q8_0
+            | WeightFormat::Q4_K
+            | WeightFormat::Q6_K
+            | WeightFormat::Q5_K
+            | WeightFormat::Q5_0 => {
                 backend.from_quantized(tensor.raw(), shape, tensor.format)
             }
             _ => {

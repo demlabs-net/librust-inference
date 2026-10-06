@@ -1719,6 +1719,55 @@ static inline float dot_q6_k(device const float* a, device const uchar* s) {
     return acc;
 }
 
+// Q5_0 (канонический ggml, 22 Б/32): d(f16) @0, qh[4] (u32 LE, 5-е биты
+// элементов j и j+16) @2, qs[16] @6. Парность нибблов — j (младший) и j+16
+// (старший); y = ((q | 5-й бит << 4) − 16)·d.
+static inline float dot_q5_0(device const float* a, device const uchar* blk) {
+    float d = (float)load_half_unaligned(blk);
+    uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+    device const uchar* qs = blk + 6;
+    float acc = 0.0f;
+    for (uint j = 0; j < 16; ++j) {
+        uint lo = (uint)(qs[j] & 0xF) + (((qh >> j) & 1u) << 4);
+        uint hi = (uint)(qs[j] >> 4) + (((qh >> (j + 16)) & 1u) << 4);
+        acc += a[j] * (((float)lo - 16.0f) * d);
+        acc += a[j + 16] * (((float)hi - 16.0f) * d);
+    }
+    return acc;
+}
+
+// Q5_K (канонический ggml, 176 Б/256): d @0, dmin @2, scales[12] @4,
+// qh[32] @16 (5-е биты; для чанка c маски m1 = 1<<2c, m2 = 2<<2c),
+// qs[128] @48 (низкие 4 бита, чанк-мажор). y = d·sc·q − dmin·m, q ∈ 0..31.
+static inline float dot_q5_k(device const float* a, device const uchar* blk) {
+    float d = (float)load_half_unaligned(blk);
+    float dmin = (float)load_half_unaligned(blk + 2);
+    device const uchar* qh = blk + 16;
+    device const uchar* qs = blk + 48;
+    float acc = 0.0f;
+    uint u1 = 1u, u2 = 2u;
+    for (uint c = 0; c < 4; ++c) {
+        int sc, mn;
+        q4k_scale_min(blk + 4, 2 * c + 0, sc, mn);
+        float d1 = d * (float)sc;
+        float m1 = dmin * (float)mn;
+        q4k_scale_min(blk + 4, 2 * c + 1, sc, mn);
+        float d2 = d * (float)sc;
+        float m2 = dmin * (float)mn;
+        uint base = c * 64;
+        for (uint l = 0; l < 32; ++l) {
+            uchar b = qs[c * 32 + l];
+            float lo = (float)((uint)(b & 0xF) + ((qh[l] & u1) ? 16u : 0u));
+            float hi = (float)((uint)(b >> 4) + ((qh[l] & u2) ? 16u : 0u));
+            acc += a[base + l] * (d1 * lo - m1);
+            acc += a[base + 32 + l] * (d2 * hi - m2);
+        }
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+    return acc;
+}
+
 kernel void gemm_nt_q4_k(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],
@@ -1761,6 +1810,46 @@ kernel void gemm_nt_q6_k(
     for (uint sb = 0; sb < superblocks; ++sb) {
         device const uchar* s = B + (n * superblocks + sb) * 210;
         acc += dot_q6_k(A + m * K + sb * 256, s);
+    }
+    C[m * N + n] = acc;
+}
+
+kernel void gemm_nt_q5_0(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* s = B + (n * blocks + b) * 22;
+        acc += dot_q5_0(A + m * K + b * 32, s);
+    }
+    C[m * N + n] = acc;
+}
+
+kernel void gemm_nt_q5_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    const uint superblocks = K / 256;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < superblocks; ++sb) {
+        device const uchar* s = B + (n * superblocks + sb) * 176;
+        acc += dot_q5_k(A + m * K + sb * 256, s);
     }
     C[m * N + n] = acc;
 }
@@ -1848,6 +1937,42 @@ kernel void mv_q6_k(
     for (uint sb = 0; sb < superblocks; ++sb) {
         device const uchar* s = B + (n * superblocks + sb) * 210;
         acc += dot_q6_k(A + sb * 256, s);
+    }
+    C[n] = acc;
+}
+
+kernel void mv_q5_0(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 32;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* s = B + (n * blocks + b) * 22;
+        acc += dot_q5_0(A + b * 32, s);
+    }
+    C[n] = acc;
+}
+
+kernel void mv_q5_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint superblocks = K / 256;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < superblocks; ++sb) {
+        device const uchar* s = B + (n * superblocks + sb) * 176;
+        acc += dot_q5_k(A + sb * 256, s);
     }
     C[n] = acc;
 }
@@ -2705,6 +2830,29 @@ kernel void embedding_quant_f32(
         int nib = ((b & 1u) == 0u) ? (int)(q & 0xF) : (int)(q >> 4);
         v = (float)load_half_unaligned(blk) * (float)sc * (float)nib
             - (float)load_half_unaligned(blk + 2) * (float)mn;
+    } else if (FMT == 5u) {
+        // Q5_K: d @0, dmin @2, scales[12] @4, qh[32] @16, qs[128] @48
+        device const uchar* s = table + (row * (D / 256u) + d / 256u) * 176u;
+        uint e = d % 256u;
+        uint b = e / 32u;              // подблок 0..7
+        uint c = e / 64u;              // чанк 0..3
+        uint j = e % 32u;              // индекс внутри 32
+        int sc, mn;
+        q4k_scale_min(s + 4, b, sc, mn);
+        uchar qb = s[48u + c * 32u + j];
+        uint bit = ((b & 1u) == 0u) ? (1u << (2u * c)) : (2u << (2u * c));
+        uint half5 = ((uint)s[16u + j] & bit) ? 16u : 0u;
+        uint q = (uint)((b & 1u) == 0u ? (qb & 0xF) : (qb >> 4)) + half5;
+        v = (float)load_half_unaligned(s) * (float)sc * (float)q
+            - (float)load_half_unaligned(s + 2) * (float)mn;
+    } else if (FMT == 6u) {
+        // Q5_0: d @0, qh[4] @2, qs[16] @6; парность j / j+16
+        device const uchar* s = table + (row * (D / 32u) + d / 32u) * 22u;
+        uint j = d % 32u;
+        uint qh = (uint)s[2] | ((uint)s[3] << 8) | ((uint)s[4] << 16) | ((uint)s[5] << 24);
+        uchar qb = s[6u + (j % 16u)];
+        uint q = (uint)((j < 16u) ? (qb & 0xF) : (qb >> 4)) + (((qh >> j) & 1u) << 4);
+        v = ((float)q - 16.0f) * (float)load_half_unaligned(s);
     } else {
         device const uchar* s = table + (row * (D / 256u) + d / 256u) * 210u;
         uint e = d % 256u;

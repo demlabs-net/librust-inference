@@ -214,6 +214,27 @@ impl GgmlType {
         let bytes = self.block_bytes() as u64;
         numel.div_ceil(elems).saturating_mul(bytes)
     }
+
+    /// Имя типа в нотации ggml (для отчётов и логов: "Q4_K", "Q6_K", …).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2K => "Q2_K",
+            Self::Q3K => "Q3_K",
+            Self::Q4K => "Q4_K",
+            Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
+            Self::Q8K => "Q8_K",
+        }
+    }
 }
 
 /// Тензор: имя, dims (ne-порядок, fastest first), тип, слайс данных.

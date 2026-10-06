@@ -68,6 +68,11 @@ impl Qwen35Config {
                 "Qwen3.5-гибрид: архитектура {arch:?} не qwen35/qwen3next"
             )));
         }
+        // qwen3next у нас пока только «по конфигу»: MoE/индексер/PLE не
+        // реализованы — говорим об этом сразу (план: волна A5).
+        if arch == "qwen3next" {
+            return Err(crate::arch::unsupported_arch(&arch));
+        }
         let p = |s: &str| format!("{arch}.{s}");
         let u = |k: &str| -> Result<usize, BackendError> {
             file.get(k)

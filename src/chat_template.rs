@@ -101,11 +101,44 @@ impl std::fmt::Debug for Template {
 
 const NAME: &str = "chat";
 
+/// Пресет GLM-4/ChatGLM-4 (см. `preset_template`).
+const GLM4_PRESET: &str = "[gMASK]<sop>{% for message in messages %}<|{{ message['role'] }}|>\n{{ message['content'] }}{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}";
+/// Пресет ChatGLM-3.
+const GLM3_PRESET: &str = "[gMASK]sop{% for message in messages %}<|{{ message['role'] }}|>\n {{ message['content'] }}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}";
+
 impl Template {
+    /// Известные ПРЕСЕТЫ шаблонов: некоторые конвертеры (в т.ч. GLM/ChatGLM,
+    /// Llama-2 эпохи) кладут в `tokenizer.chat_template` не Jinja, а имя
+    /// формата — llama.cpp такие имена распознаёт по подстроке
+    /// (`llama-chat.cpp: llm_chat_detect_template`). Мы делаем то же: имя →
+    /// наш Jinja-шаблон, отрендеренный ТЕМ ЖЕ форматом, что строит llama.cpp.
+    fn preset_template(src: &str) -> Option<&'static str> {
+        let has_jinja = src.contains("{{") || src.contains("{%");
+        if has_jinja {
+            return None;
+        }
+        let t = src.trim();
+        if t.contains("[gMASK]<sop>") || t.eq_ignore_ascii_case("chatglm4") {
+            // llama-chat.cpp, LLM_CHAT_TEMPLATE_CHATGLM_4: "[gMASK]<sop>",
+            // затем на сообщение "<|role|>" + перевод строки + контент, и
+            // "<|assistant|>" + перевод строки при add_generation_prompt.
+            return Some(GLM4_PRESET);
+        }
+        if t.contains("[gMASK]sop") || t.eq_ignore_ascii_case("chatglm3") {
+            // llama-chat.cpp, LLM_CHAT_TEMPLATE_CHATGLM_3: после перевода
+            // строки идёт ПРОБЕЛ перед контентом.
+            return Some(GLM3_PRESET);
+        }
+        None
+    }
+
     pub fn compile(
         src: &str,
         special_tokens: HashMap<String, String>,
     ) -> Result<Self, TemplateError> {
+        // Имя-пресет вместо Jinja (GLM/ChatGLM и родственные конвертеры):
+        // подменяем на наш шаблон того же формата.
+        let resolved = Self::preset_template(src).unwrap_or(src);
         let mut env = Environment::new();
         // Python-семантика: `x.startswith(...)`, `x.split(...)[-1]`,
         // `dict.items()` и т.п. — шаблоны HF написаны под Jinja2+Python.
@@ -120,9 +153,9 @@ impl Template {
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
         env.add_filter("tojson", tojson);
-        env.add_template_owned(NAME, src.to_string())
+        env.add_template_owned(NAME, resolved.to_string())
             .map_err(|e| TemplateError::Compile(error_chain(&e)))?;
-        Ok(Self { env, source: src.to_string(), special_tokens })
+        Ok(Self { env, source: resolved.to_string(), special_tokens })
     }
 
     pub fn source(&self) -> &str {
@@ -298,6 +331,29 @@ fn write_py_json(v: &serde_json::Value, indent: Option<usize>, level: usize, out
 
 #[cfg(test)]
 mod tests {
+    /// Пресет "[gMASK]<sop>" (GLM-4-0414 и родственные конвертеры, где в GGUF
+    /// лежит ИМЯ формата, а не Jinja) рендерится ровно как llama.cpp
+    /// (llama-chat.cpp LLM_CHAT_TEMPLATE_CHATGLM_4): префикс, затем
+    /// "<|role|>\n" + контент на сообщение, и "<|assistant|>\n" на генерацию.
+    #[test]
+    fn glm4_preset_renders_like_llamacpp() {
+        let t = Template::compile("[gMASK]<sop>", HashMap::new()).unwrap();
+        let ctx = TemplateContext {
+            messages: vec![
+                serde_json::json!({"role": "system", "content": "Ты краток."}),
+                serde_json::json!({"role": "user", "content": "Столица Франции?"}),
+            ],
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let out = t.render(&ctx).unwrap();
+        assert_eq!(
+            out,
+            "[gMASK]<sop><|system|>\nТы краток.<|user|>\nСтолица Франции?<|assistant|>\n",
+            "{out:?}"
+        );
+    }
+
     use super::*;
 
     fn compile(src: &str) -> Template {

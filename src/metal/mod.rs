@@ -3514,6 +3514,41 @@ impl crate::backend::Backend for MetalBackend {
         Ok(q)
     }
 
+    fn rope_standard_partial(
+        &self,
+        x: &crate::backend::Tensor,
+        pos: usize,
+        hd: usize,
+        n_rot: usize,
+        theta: f32,
+    ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
+        if n_rot == 0 || n_rot == hd {
+            return self.rope_standard(x, pos, hd, theta);
+        }
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if n_rot > hd || !n_rot.is_multiple_of(2) || !hd.is_multiple_of(2) || d % hd != 0 {
+            return Err(crate::error::BackendError::Shape(format!(
+                "rope_standard_partial: n_rot={n_rot} / hd={hd} / d={d}"
+            )));
+        }
+        let y = self.zeros(vec![1, tq, d])?;
+        let xg = x.inner_metal();
+        let yg = y.inner_metal();
+        let grid = metal::MTLSize::new(tq as u64, (d / hd) as u64, hd as u64);
+        let group = metal::MTLSize::new(1, 4, 8);
+        self.ctx.run("rope_std_part_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+            enc.set_buffer(1, Some(&yg.buffer), yg.offset as u64);
+            enc.set_bytes(2, 8, (&tq as *const usize).cast());
+            enc.set_bytes(3, 8, (&d as *const usize).cast());
+            enc.set_bytes(4, 8, (&hd as *const usize).cast());
+            enc.set_bytes(5, 8, (&n_rot as *const usize).cast());
+            enc.set_bytes(6, 8, (&pos as *const usize).cast());
+            enc.set_bytes(7, 4, (&theta as *const f32).cast());
+        })?;
+        Ok(y)
+    }
+
     fn rope_mrope_text(
         &self,
         x: &crate::backend::Tensor,
@@ -5059,6 +5094,43 @@ mod quant_gemm_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Частичный RoPE (GLM-4): кернел `rope_std_part_f32` == host-референс
+    /// (Backend::rope_standard_partial по умолчанию) при n_rot < hd, включая
+    /// случай n_rot = hd (полный поворот) и хвост без поворота.
+    #[test]
+    fn rope_partial_matches_host() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (tq, d, hd) = (3usize, 8usize, 8usize); // 2 головы по 8
+        let data: Vec<f32> = (0..tq * d).map(|i| 0.1 + (i as f32) * 0.017).collect();
+        let x = be.from_cpu_f32(&data, vec![1, tq, d]).unwrap();
+        let theta = 10_000.0f32;
+        for n_rot in [0usize, 2, 4, 8] {
+            let got = be
+                .to_cpu_f32(&be.rope_standard_partial(&x, 5, hd, n_rot, theta).unwrap())
+                .unwrap();
+            // host-референс: та же математика независимо от кернела
+            let eff = if n_rot == 0 { hd } else { n_rot };
+            let half = eff / 2;
+            let mut want = data.clone();
+            for tt in 0..tq {
+                let p = (5 + tt) as f32;
+                for h in 0..d / hd {
+                    let base = tt * d + h * hd;
+                    for i in 0..half {
+                        let inv = 1.0 / theta.powf(2.0 * i as f32 / eff as f32);
+                        let (c, s) = ((p * inv).cos(), (p * inv).sin());
+                        let (x0, x1) = (data[base + i], data[base + i + half]);
+                        want[base + i] = x0 * c - x1 * s;
+                        want[base + i + half] = x1 * c + x0 * s;
+                    }
+                }
+            }
+            let diff = max_diff(&got, &want);
+            assert!(diff <= 1e-5, "n_rot={n_rot}: |Δ| max {diff}");
         }
     }
 

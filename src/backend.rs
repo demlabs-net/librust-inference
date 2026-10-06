@@ -820,6 +820,54 @@ pub trait Backend: Send + Sync {
         }
         self.from_cpu_f32(&yd, x.shape().to_vec())
     }
+    /// Частичный rotate-half RoPE: вращаются первые `n_rot` компонент каждой
+    /// головы (пары (i, i+n_rot/2), частоты theta^(-2i/n_rot)), хвост
+    /// [n_rot, hd) копируется как есть. `n_rot == hd` — обычный полный RoPE.
+    /// Нужно GLM-4 (`rope.dimension_count` = половина головы) и родственным.
+    /// Default — CPU-референс (CUDA наследует до пересборки PTX); Metal —
+    /// кернел `rope_std_part_f32`.
+    fn rope_standard_partial(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        n_rot: usize,
+        theta: f32,
+    ) -> Result<Tensor, BackendError> {
+        if n_rot == 0 || n_rot == hd {
+            return self.rope_standard(x, pos, hd, theta);
+        }
+        if n_rot > hd || !n_rot.is_multiple_of(2) {
+            return Err(BackendError::Shape(format!(
+                "rope_standard_partial: n_rot={n_rot} не согласован с hd={hd}"
+            )));
+        }
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if d % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_standard_partial: hd={hd} не делит d={d}"
+            )));
+        }
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = xd.clone();
+        let half = n_rot / 2;
+        for tt in 0..tq {
+            let p = (pos + tt) as f32;
+            for h in 0..d / hd {
+                let base = tt * d + h * hd;
+                for i in 0..half {
+                    let inv = 1.0 / theta.powf(2.0 * i as f32 / n_rot as f32);
+                    let c = (p * inv).cos();
+                    let s = (p * inv).sin();
+                    let (x0, x1) = (xd[base + i], xd[base + i + half]);
+                    yd[base + i] = x0 * c - x1 * s;
+                    yd[base + i + half] = x1 * c + x0 * s;
+                }
+            }
+        }
+        self.from_cpu_f32(&yd, x.shape().to_vec())
+    }
+
     /// M-RoPE text (Qwen3-VL IMROPE, ТОЛЬКО текст): пары HALVES (i, i+hd/2),
     /// но e-секция (4-я позиция = 0 для текста) не ротируется. Категория
     /// пары i по llama.cpp IMROPE: sector = i % sum(sections):

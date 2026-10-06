@@ -133,6 +133,9 @@ pub enum PreTokenizer {
     /// Qwen3.5 (`qwen35`): как Qwen2, но буквенные серии поглощают и
     /// диакритику `\p{M}`.
     Qwen35,
+    /// GLM-4/ChatGLM (`glm4`, `chatglm-bpe`): как Qwen2, но цифры берутся
+    /// сериями по 1-3 (`\p{N}{1,3}`), а не по одной.
+    ChatGlm4,
 }
 
 impl PreTokenizer {
@@ -143,6 +146,7 @@ impl PreTokenizer {
         match name {
             "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" => Ok(Self::Qwen2),
             "qwen35" => Ok(Self::Qwen35),
+            "glm4" | "chatglm-bpe" => Ok(Self::ChatGlm4),
             other => Err(TokenizerError::UnsupportedPreTokenizer(other.to_string())),
         }
     }
@@ -657,9 +661,16 @@ fn pre_split(text: &str, pre: PreTokenizer) -> Vec<&str> {
             continue;
         }
 
-        // \p{N}
+        // \p{N} (qwen2/qwen35) или \p{N}{1,3} (glm4/chatglm): серия до трёх
+        // цифр — один токен-слово, дальше регулярка начинает новый матч.
         if f.is_number() {
-            pos += 1;
+            let mut k = 1usize;
+            if pre == PreTokenizer::ChatGlm4 {
+                while k < 3 && get_flags(pos + k).is_number() {
+                    k += 1;
+                }
+            }
+            pos += k;
             add(pos, &mut bounds);
             continue;
         }
@@ -847,6 +858,31 @@ fn utf8_char_len(b: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// GLM-4/chatglm pre: цифры сериями по 1-3, у qwen2 — по одной
+    /// (референс: llama.cpp `unicode_regex_split_custom` для CHATGLM4,
+    /// `\p{N}{1,3}` против `\p{N}`).
+    #[test]
+    fn pre_split_glm4_digit_runs() {
+        let glm = PreTokenizer::ChatGlm4;
+        let qwen = PreTokenizer::Qwen2;
+        assert_eq!(pre_split("123", glm), vec!["123"]);
+        assert_eq!(pre_split("1234", glm), vec!["123", "4"]);
+        assert_eq!(pre_split("1234567", glm), vec!["123", "456", "7"]);
+        assert_eq!(pre_split("12", glm), vec!["12"]);
+        // qwen2 режет каждую цифру отдельно
+        assert_eq!(pre_split("123", qwen), vec!["1", "2", "3"]);
+        // смешанный текст: буквы и пунктуация — как у qwen2
+        let t = "Ошибка 404: файл не найден (12.5%)";
+        let gl = pre_split(t, glm);
+        let qw = pre_split(t, qwen);
+        assert!(gl.contains(&"404"), "{gl:?}");
+        assert!(qw.contains(&"4") && qw.contains(&"0"), "{qw:?}");
+        // склейка обратно даёт исходный текст (никаких потерь)
+        for parts in [&gl, &qw] {
+            assert_eq!(parts.concat(), t);
+        }
+    }
+
     use super::*;
     use std::path::PathBuf;
 

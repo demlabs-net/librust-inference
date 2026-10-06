@@ -2004,6 +2004,48 @@ kernel void rope_std_f32(
     Y[base + HD / 2] = x1 * c + x0 * s;
 }
 
+// Частичный rotate-half RoPE (GLM-4 и родственные): вращаются первые NROT
+// компонент каждой головы, пары (i, i+NROT/2), частоты theta^(-2i/NROT);
+// хвост [NROT, HD) копируется без изменений. NROT == HD — полный RoPE (тогда
+// быстрее старый rope_std_f32: сетка вдвое меньше).
+kernel void rope_std_part_f32(
+    device const float* X [[buffer(0)]],
+    device float* Y [[buffer(1)]],
+    constant uint& tq [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant uint& HD [[buffer(4)]],
+    constant uint& NROT [[buffer(5)]],
+    constant uint& pos [[buffer(6)]],
+    constant float& theta [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint t = gid.x, h = gid.y, j = gid.z;
+    if (t >= tq || j >= HD) return;
+    uint base = t * D + h * HD;
+    // `half` — имя типа в Metal, поэтому half_rot
+    uint half_rot = NROT / 2u;
+    float v;
+    if (j < half_rot) {
+        // первая половина пары (j, j+half_rot) — элемент j
+        float x0 = X[base + j];
+        float x1 = X[base + j + half_rot];
+        float inv = 1.0f / pow(theta, 2.0f * (float)j / (float)NROT);
+        float p = (float)(pos + t);
+        v = x0 * cos(p * inv) - x1 * sin(p * inv);
+    } else if (j < NROT) {
+        // вторая половина пары: частота берётся по i = j - half_rot
+        uint i = j - half_rot;
+        float x0 = X[base + i];
+        float x1 = X[base + j];
+        float inv = 1.0f / pow(theta, 2.0f * (float)i / (float)NROT);
+        float p = (float)(pos + t);
+        v = x1 * cos(p * inv) + x0 * sin(p * inv);
+    } else {
+        v = X[base + j];
+    }
+    Y[base + j] = v;
+}
+
 // ── Embedding with vision-token override (Ф1.11) ───────────────────────────
 // Токены id == override_id заменяются строками из VISION (по порядку);
 // остальные — обычный lookup. Y: (T, D); VISION: (V, D).

@@ -99,6 +99,8 @@ pub enum GpuDtype {
     Q6_K,
     Q5_K,
     Q5_0,
+    /// IQ4_XS: 256-эл. суперблок, 136 Б (кодбук kvalues_iq4nl).
+    Iq4Xs,
 }
 
 impl GpuDtype {
@@ -106,7 +108,7 @@ impl GpuDtype {
     pub fn block_elems(self) -> Option<usize> {
         match self {
             GpuDtype::Q4_0 | GpuDtype::Q8_0 => Some(32),
-            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K => Some(256),
+            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Iq4Xs => Some(256),
             GpuDtype::Q5_0 => Some(32),
             _ => None,
         }
@@ -308,7 +310,8 @@ impl GpuTensor {
             GpuDtype::F32 => 4,
             GpuDtype::F16 | GpuDtype::BF16 => 2,
             GpuDtype::Q8_0 | GpuDtype::Q4_0 => 1,
-            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Q5_0 => 1,
+            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Q5_0
+            | GpuDtype::Iq4Xs => 1,
         }
     }
 
@@ -476,6 +479,7 @@ impl GpuTensor {
             GpuDtype::Q6_K => 210.0 / 256.0,
             GpuDtype::Q5_K => 176.0 / 256.0,
             GpuDtype::Q5_0 => 22.0 / 32.0,
+            GpuDtype::Iq4Xs => 136.0 / 256.0,
             other => {
                 return Err(MetalError::Shape(format!(
                     "from_quantized: {other:?} is not a quantized dtype"
@@ -919,7 +923,8 @@ impl MetalCtx {
             | GpuDtype::Q4_K
             | GpuDtype::Q6_K
             | GpuDtype::Q5_K
-            | GpuDtype::Q5_0 => {
+            | GpuDtype::Q5_0
+            | GpuDtype::Iq4Xs => {
                 return Err(MetalError::Shape(
                     "gemm_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
                 ));
@@ -1453,7 +1458,8 @@ impl MetalCtx {
             | GpuDtype::Q4_K
             | GpuDtype::Q6_K
             | GpuDtype::Q5_K
-            | GpuDtype::Q5_0 => {
+            | GpuDtype::Q5_0
+            | GpuDtype::Iq4Xs => {
                 return Err(MetalError::Shape(
                     "gemm_nt_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
                 ));
@@ -1495,6 +1501,12 @@ impl MetalCtx {
             GpuDtype::Q6_K => "gemm_nt_q6_k",
             GpuDtype::Q5_K => "gemm_nt_q5_k",
             GpuDtype::Q5_0 => "gemm_nt_q5_0",
+            // IQ4_XS: тайлового GEMM нет — тот же mv_iq4_xs по сетке (N, M).
+            // Для префилла это медленнее тайлового, но корректно; тайловый —
+            // отдельной задачей волны A4.
+            GpuDtype::Iq4Xs => {
+                return self.mv_iq4_xs_dispatch(a, b, c, k, n);
+            }
             other => {
                 return Err(MetalError::Shape(format!(
                     "gemm_nt_quantized: B dtype {other:?} is not quantized"
@@ -1633,6 +1645,12 @@ impl MetalCtx {
             GpuDtype::Q6_K => "mv_q6_k",
             GpuDtype::Q5_K => "mv_q5_k",
             GpuDtype::Q5_0 => "mv_q5_0",
+            // IQ4_XS: один кернел и на декод, и на префилл (сетка (N, M)) —
+            // тайлового GEMM для i-квантов пока нет, но копий и лишних
+            // проходов тоже: см. mv_iq4_xs.
+            GpuDtype::Iq4Xs => {
+                return self.mv_iq4_xs_dispatch(a, b, c, k, n);
+            }
             other => {
                 return Err(MetalError::Shape(format!(
                     "mv_quantized: B dtype {other:?} is not quantized"
@@ -1705,6 +1723,29 @@ impl MetalCtx {
             enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
             enc.set_bytes(3, 8, (&k as *const usize).cast());
             enc.set_bytes(4, 8, (&n as *const usize).cast());
+        })
+    }
+
+    /// IQ4_XS-проекция: C[M,N] = A[M,K] · W[N,K]ᵀ — сетка (N, M), поток на
+    /// (токен, строку весов). Один кернел на декод и префилл.
+    fn mv_iq4_xs_dispatch(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        k: usize,
+        n: usize,
+    ) -> Result<(), MetalError> {
+        let m = a.shape[0];
+        let (k32, n32) = (k as u32, n as u32);
+        let grid = MTLSize::new(n as u64, m as u64, 1);
+        let group = MTLSize::new(64, 1, 1);
+        self.run("mv_iq4_xs", grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+            enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+            enc.set_bytes(4, 4, (&n32 as *const u32).cast());
         })
     }
 
@@ -2344,6 +2385,7 @@ impl MetalCtx {
             GpuDtype::Q6_K => 4,
             GpuDtype::Q5_K => 5,
             GpuDtype::Q5_0 => 6,
+            GpuDtype::Iq4Xs => 7,
             other => {
                 return Err(MetalError::Shape(format!(
                     "embedding_quant: таблица {other:?} не поддержана"
@@ -3962,6 +4004,7 @@ impl crate::backend::Backend for MetalBackend {
             crate::dtype::WeightFormat::Q6_K => GpuDtype::Q6_K,
             crate::dtype::WeightFormat::Q5_K => GpuDtype::Q5_K,
             crate::dtype::WeightFormat::Q5_0 => GpuDtype::Q5_0,
+            crate::dtype::WeightFormat::Iq4Xs => GpuDtype::Iq4Xs,
             other => {
                 return Err(crate::error::BackendError::Shape(format!(
                     "from_quantized: {other:?} is not quantized"
@@ -4911,6 +4954,59 @@ mod quant_gemm_tests {
     use crate::gguf;
     use crate::weights_map::{WeightsMap, dequant_f32};
     use std::path::PathBuf;
+
+    /// IQ4_XS (волна A4): эталон — порт `dequantize_row_iq4_xs` из ggml.
+    /// Синтетические ВАЛИДНЫЕ блоки (случайные байты дали бы NaN в f16-масштабе):
+    /// d = 1, scales_l/scales_h задают ls 0..63, нибблы — индексы кодбука.
+    /// Сверяем и хост-деквант, и Metal-matvec (mv_iq4_xs) с ним.
+    #[test]
+    fn iq4_xs_mv_matches_host_dequant() {
+        use crate::backend::Backend as _;
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let be = MetalBackend::new().unwrap();
+        let (n, k) = (5usize, 512usize); // 5 строк по 2 суперблока
+        let mut seed = 0x9E37_79B9u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut raw = Vec::with_capacity(n * k / 256 * 136);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes()); // d
+            raw.extend_from_slice(&((next() as u16)).to_le_bytes()); // scales_h
+            for _ in 0..4 {
+                raw.push((next() & 0xFF) as u8); // scales_l
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8); // нибблы
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq4Xs)
+            .unwrap();
+        let a: Vec<f32> = (0..k).map(|i| ((i % 29) as f32 - 14.0) * 0.03).collect();
+        let av = be.from_cpu_f32(&a, vec![1, k]).unwrap();
+        let c = be.zeros(vec![1, n]).unwrap();
+        let a1 = av.view(vec![k]);
+        let c1 = c.view(vec![n]);
+        ctx.mv_quantized(a1.inner_metal(), w.inner_metal(), c1.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        // эталон: деквант строки (тот же алгоритм, что у деquant_iq4_xs) + dot
+        for row in 0..n {
+            let bytes = &raw[row * (k / 256) * 136..(row + 1) * (k / 256) * 136];
+            let y = crate::weights_map::dequant_iq4_xs(bytes);
+            let want: f64 = y.iter().zip(&a).map(|(w, x)| (*w as f64) * (*x as f64)).sum();
+            let d = (got[row] as f64 - want).abs();
+            assert!(
+                d <= 1e-4 * (1.0 + want.abs()),
+                "строка {row}: Metal {} против хоста {want} (Δ {d})",
+                got[row]
+            );
+        }
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

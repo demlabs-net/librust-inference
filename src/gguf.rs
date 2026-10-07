@@ -132,6 +132,9 @@ pub enum GgmlType {
     Q5K,
     Q6K,
     Q8K,
+    /// i-кванты (A4): пока только IQ4_XS — код 23 в GGUF (ggml.h эталонного
+    /// коммита). 256 элементов на суперблок, 136 байт, 4.25 бита на вес.
+    Iq4Xs,
 }
 
 impl GgmlType {
@@ -151,6 +154,7 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            23 => Self::Iq4Xs,
             27 => Self::Bf16,
             _ => return None,
         })
@@ -174,6 +178,7 @@ impl GgmlType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::Iq4Xs => 23,
             Self::Bf16 => 27,
         }
     }
@@ -183,7 +188,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => 256,
         }
     }
 
@@ -205,6 +210,10 @@ impl GgmlType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 292,
+            // IQ4_XS: f16-масштаб d + 2 Б (scales_h) + 4 Б (scales_l) + 128 Б
+            // нибблов = 136 Б на 256 весов (4.25 бита); раскладка ggml
+            // block_iq4_xs, сверка с llama-quantize/dequant — в тестах.
+            Self::Iq4Xs => 136,
         }
     }
 
@@ -233,6 +242,7 @@ impl GgmlType {
             Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
             Self::Q8K => "Q8_K",
+            Self::Iq4Xs => "IQ4_XS",
         }
     }
 }

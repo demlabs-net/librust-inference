@@ -1722,6 +1722,62 @@ static inline float dot_q6_k(device const float* a, device const uchar* s) {
 // Q5_0 (канонический ggml, 22 Б/32): d(f16) @0, qh[4] (u32 LE, 5-е биты
 // элементов j и j+16) @2, qs[16] @6. Парность нибблов — j (младший) и j+16
 // (старший); y = ((q | 5-й бит << 4) − 16)·d.
+// ── IQ4_XS (i-квант, 136 Б/256): кодбук kvalues_iq4nl ───────────────────────
+// Порт ggml `kvalues_iq4nl` и `dequantize_row_iq4_xs`: масштаб подблока —
+// 6 бит (ls), реальный множитель d·(ls − 32) (знак возможен!), ниббл — индекс
+// в нелинейном кодбуке. Точность чисел важна: значения таблицы совпадают с
+// ggml бит-в-бит — иначе паритет с llama.cpp разъедется.
+constant float KV_IQ4[16] = {
+    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+    1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
+};
+
+/// Вклад одного 256-элементного суперблока IQ4_XS в скалярное произведение.
+static inline float dot_iq4_xs(device const float* a, device const uchar* sb) {
+    const float d = (float)load_half_unaligned(sb);
+    const uint scales_h = (uint)sb[2] | ((uint)sb[3] << 8);
+    device const uchar* scales_l = sb + 4;
+    device const uchar* qs = sb + 8;
+    float acc = 0.0f;
+    for (uint ib = 0; ib < 8u; ++ib) {
+        const uint ls = (uint)((scales_l[ib >> 1] >> (4u * (ib & 1u))) & 0xF)
+                      | (((scales_h >> (2u * ib)) & 3u) << 4);
+        const float dl = d * ((float)(int)ls - 32.0f);
+        device const uchar* q = qs + 16u * ib;
+        float sub = 0.0f;
+        for (uint j = 0; j < 16u; ++j) {
+            sub += a[ib * 32u + j] * KV_IQ4[q[j] & 0xF]
+                 + a[ib * 32u + 16u + j] * KV_IQ4[q[j] >> 4];
+        }
+        acc += dl * sub;
+    }
+    return acc;
+}
+
+// Matvec IQ4_XS: C[m, n] = dot(A + m·K, W[n]) — поток на строку весов.
+// Одним кернелом и декод (M = 1), и префилл (M — строки батча): для префилла
+// это не тайловый GEMM (позже, как у остальных квантов), но корректно и
+// без лишних копий; сетка (N, M).
+kernel void mv_iq4_xs(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint n = gid.x, m = gid.y;
+    if (n >= N) return;
+    const uint nb = K / 256u;
+    device const uchar* row = B + (ulong)n * nb * 136u;
+    device const float* a = A + (ulong)m * K;
+    float acc = 0.0f;
+    for (uint sb = 0; sb < nb; ++sb) {
+        acc += dot_iq4_xs(a + sb * 256u, row + sb * 136u);
+    }
+    C[(ulong)m * N + n] = acc;
+}
+
 static inline float dot_q5_0(device const float* a, device const uchar* blk) {
     float d = (float)load_half_unaligned(blk);
     uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
@@ -2942,6 +2998,17 @@ kernel void embedding_quant_f32(
         uchar qb = s[6u + (j % 16u)];
         uint q = (uint)((j < 16u) ? (qb & 0xF) : (qb >> 4)) + (((qh >> j) & 1u) << 4);
         v = ((float)q - 16.0f) * (float)load_half_unaligned(s);
+    } else if (FMT == 7u) {
+        // IQ4_XS: d @0, scales_h @2, scales_l[4] @4, qs[128] @8; ниббл —
+        // индекс кодбука, множитель подблока d·(ls − 32)
+        device const uchar* s = table + (row * (D / 256u) + d / 256u) * 136u;
+        uint e = d % 256u;
+        uint ib = e / 32u, r = e % 32u;
+        uint ls = (uint)((s[4u + (ib >> 1)] >> (4u * (ib & 1u))) & 0xF)
+                | (((((uint)s[2] | ((uint)s[3] << 8)) >> (2u * ib)) & 3u) << 4);
+        uchar qb = s[8u + ib * 16u + (r % 16u)];
+        uint nib = (r < 16u) ? (uint)(qb & 0xF) : (uint)(qb >> 4);
+        v = (float)load_half_unaligned(s) * ((float)(int)ls - 32.0f) * KV_IQ4[nib];
     } else {
         device const uchar* s = table + (row * (D / 256u) + d / 256u) * 210u;
         uint e = d % 256u;

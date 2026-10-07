@@ -65,6 +65,10 @@ pub enum WeightFormat {
     Q6_K,
     Q5_K,
     Q5_0,
+    /// IQ4_XS: i-квант (A4) — 256-эл. суперблок, 136 Б, 4.25 бита; ниббл —
+    /// индекс в нелинейном кодбуке `kvalues_iq4nl` (ggml), плюс 6-битные
+    /// масштабы подблоков (ls - 32, знак возможен).
+    Iq4Xs,
     Int4,
     Nf4,
 }
@@ -82,6 +86,7 @@ impl WeightFormat {
             WeightFormat::Q6_K => 6.5625, // 256-elem super-block: 210 B (canonical ggml)
             WeightFormat::Q5_K => 5.5, // 256-elem super-block: 176 B (canonical ggml)
             WeightFormat::Q5_0 => 5.5, // 32-elem block: 22 B (canonical ggml)
+            WeightFormat::Iq4Xs => 4.25, // 256-elem super-block: 136 B (ggml)
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -101,6 +106,7 @@ impl WeightFormat {
             WeightFormat::Plain(_) | WeightFormat::Int4 | WeightFormat::Nf4 => None,
             WeightFormat::Q4_0 => Some((32, 18)),
             WeightFormat::Q5_0 => Some((32, 22)),
+            WeightFormat::Iq4Xs => Some((256, 136)),
             WeightFormat::Q8_0 => Some((32, 34)),
             WeightFormat::Q4_K => Some((256, 144)),
             WeightFormat::Q5_K => Some((256, 176)),
@@ -122,6 +128,7 @@ impl WeightFormat {
             WeightFormat::Q6_K => "q6_k".into(),
             WeightFormat::Q5_K => "q5_k".into(),
             WeightFormat::Q5_0 => "q5_0".into(),
+            WeightFormat::Iq4Xs => "iq4_xs".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
         }

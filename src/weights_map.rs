@@ -86,6 +86,7 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Q6K => WeightFormat::Q6_K,
                 GgmlType::Q5K => WeightFormat::Q5_K,
                 GgmlType::Q5_0 => WeightFormat::Q5_0,
+                GgmlType::Iq4Xs => WeightFormat::Iq4Xs,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -274,6 +275,39 @@ pub(crate) fn dequant_q6_k(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// IQ4_XS (i-квант, ggml `dequantize_row_iq4_xs`, 136 Б/256): d(f16) @0,
+/// scales_h (u16 LE) @2, scales_l[4] @4, qs[128] @8. Масштаб подблока
+/// ib (0..8): 6 бит = (scales_l[ib/2] >> (4·(ib%2)) & 0xF) | ((scales_h >> 2·ib) & 3) << 4,
+/// реальный множитель — d·(ls − 32) (знак возможен!). Ниббл — индекс в
+/// нелинейном кодбуке kvalues_iq4nl: элементы подблока идут парами
+/// (j — младший ниббл байта j, j+16 — старший).
+pub(crate) fn dequant_iq4_xs(data: &[u8]) -> Vec<f32> {
+    const KV: [f32; 16] = [
+        -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+        69.0, 89.0, 113.0,
+    ];
+    data.chunks_exact(136)
+        .flat_map(|sb| {
+            let d = f16_to_f32([sb[0], sb[1]]);
+            let scales_h = u16::from_le_bytes([sb[2], sb[3]]);
+            let scales_l = &sb[4..8];
+            let qs = &sb[8..136];
+            let mut y = vec![0f32; 256];
+            for ib in 0..8usize {
+                let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) as u32
+                    | (((scales_h >> (2 * ib)) & 3) as u32) << 4) as i32;
+                let dl = d * (ls - 32) as f32;
+                let q = &qs[ib * 16..ib * 16 + 16];
+                for j in 0..16usize {
+                    y[ib * 32 + j] = dl * KV[(q[j] & 0xF) as usize];
+                    y[ib * 32 + 16 + j] = dl * KV[(q[j] >> 4) as usize];
+                }
+            }
+            y
+        })
+        .collect()
+}
+
 /// Q5_0 (канонический ggml, 22 Б/32): d(f16) @0, qh[4] (u32 LE) @2,
 /// qs[16] @6; парность j (младший ниббл) / j+16 (старший), 5-е биты из qh.
 pub fn dequant_q5_0(data: &[u8]) -> Vec<f32> {
@@ -357,6 +391,7 @@ pub fn dequant_gguf(
         T::Q6K => dequant_q6_k(data),
         T::Q5K => dequant_q5_k(data),
         T::Q5_0 => dequant_q5_0(data),
+        T::Iq4Xs => dequant_iq4_xs(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -395,6 +430,7 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Q6_K => dequant_q6_k(t.data),
         WeightFormat::Q5_K => dequant_q5_k(t.data),
         WeightFormat::Q5_0 => dequant_q5_0(t.data),
+        WeightFormat::Iq4Xs => dequant_iq4_xs(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

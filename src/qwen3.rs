@@ -430,8 +430,8 @@ pub struct SpecOutcome {
 
 impl Qwen3Model {
     #[allow(clippy::too_many_arguments)]
-    /// Квант-осведомлённая загрузка веса: Q4_0/Q8_0/Q4_K/Q6_K — нативно
-    /// (dequant-in-kernel GEMM/MMV), иначе dequant→f16 (как раньше).
+    /// Квант-осведомлённая загрузка веса: Q4_0/Q8_0/Q4_K/Q6_K/Q5_K/Q5_0/
+    /// IQ4_XS — нативно (dequant-in-kernel GEMM/MMV), иначе dequant→f16.
     pub(crate) fn upload_q(
         backend: &dyn Backend,
         w: &WeightsMap<'_>,
@@ -447,7 +447,8 @@ impl Qwen3Model {
             | crate::dtype::WeightFormat::Q4_K
             | crate::dtype::WeightFormat::Q6_K
             | crate::dtype::WeightFormat::Q5_K
-            | crate::dtype::WeightFormat::Q5_0 => {
+            | crate::dtype::WeightFormat::Q5_0
+            | crate::dtype::WeightFormat::Iq4Xs => {
                 backend.from_quantized(tensor.raw(), shape, tensor.format)
             }
             _ => upload_w(backend, &crate::weights_map::dequant_f32(tensor), shape),
@@ -479,6 +480,7 @@ impl Qwen3Model {
                     | crate::dtype::WeightFormat::Q6_K
                     | crate::dtype::WeightFormat::Q5_K
                     | crate::dtype::WeightFormat::Q5_0
+                    | crate::dtype::WeightFormat::Iq4Xs
             );
         if all_q {
             let mut bytes = Vec::new();

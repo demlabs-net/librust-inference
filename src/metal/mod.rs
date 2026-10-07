@@ -1736,10 +1736,23 @@ impl MetalCtx {
         k: usize,
         n: usize,
     ) -> Result<(), MetalError> {
-        let m = a.shape[0];
+        // M — из ФОРМЫ ВЫХОДА C (матvec: [N] → 1 строка; GEMM: [M,N]).
+        // Раньше m = a.shape[0]: в matvec-пути A — 1-D вектор [K], и m
+        // становилось равно K — сетка (N, K), кернел писал C[m·N+n] далеко
+        // за концом буфера выхода: молчаливое OOB-поражение соседних
+        // аллокаций (флейк q8_0_small_batch/embedding_quant в параллельном
+        // прогоне тестов; поименовано по реестру аллокаций).
+        let m = if c.shape.len() == 2 { c.shape[0] } else { 1 };
+        if a.numel() != m * k || c.numel() != m * n {
+            return Err(MetalError::Shape(format!(
+                "mv_iq4_xs: A {:?} / C {:?} не согласованы с M={m}, K={k}, N={n}",
+                a.shape, c.shape
+            )));
+        }
         let (k32, n32) = (k as u32, n as u32);
-        let grid = MTLSize::new(n as u64, m as u64, 1);
-        let group = MTLSize::new(64, 1, 1);
+        // Строку весов считает один simdgroup (32 лейна) — сетка (32, N, M).
+        let grid = MTLSize::new(32, n as u64, m as u64);
+        let group = MTLSize::new(32, 1, 1);
         self.run("mv_iq4_xs", grid, group, |enc| {
             enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
             enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
@@ -3974,6 +3987,7 @@ impl crate::backend::Backend for MetalBackend {
                 | GpuDtype::Q6_K
                 | GpuDtype::Q5_K
                 | GpuDtype::Q5_0
+                | GpuDtype::Iq4Xs
         ) {
             if a.as_gpu().shape[0] == 1 {
                 // mv_quantized — MMV-примитив: a 1D [k], c 1D [n] (тот же буфер).
@@ -4962,7 +4976,6 @@ mod quant_gemm_tests {
     #[test]
     fn iq4_xs_mv_matches_host_dequant() {
         use crate::backend::Backend as _;
-        let ctx = MetalCtx::new().expect("MetalCtx");
         let be = MetalBackend::new().unwrap();
         let (n, k) = (5usize, 512usize); // 5 строк по 2 суперблока
         let mut seed = 0x9E37_79B9u64;
@@ -4991,7 +5004,8 @@ mod quant_gemm_tests {
         let c = be.zeros(vec![1, n]).unwrap();
         let a1 = av.view(vec![k]);
         let c1 = c.view(vec![n]);
-        ctx.mv_quantized(a1.inner_metal(), w.inner_metal(), c1.inner_metal())
+        be.ctx
+            .mv_quantized(a1.inner_metal(), w.inner_metal(), c1.inner_metal())
             .unwrap();
         let got = be.to_cpu_f32(&c).unwrap();
         // эталон: деквант строки (тот же алгоритм, что у деquant_iq4_xs) + dot

@@ -1732,50 +1732,71 @@ constant float KV_IQ4[16] = {
     1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
 };
 
-/// Вклад одного 256-элементного суперблока IQ4_XS в скалярное произведение.
-static inline float dot_iq4_xs(device const float* a, device const uchar* sb) {
-    const float d = (float)load_half_unaligned(sb);
-    const uint scales_h = (uint)sb[2] | ((uint)sb[3] << 8);
-    device const uchar* scales_l = sb + 4;
-    device const uchar* qs = sb + 8;
-    float acc = 0.0f;
-    for (uint ib = 0; ib < 8u; ++ib) {
-        const uint ls = (uint)((scales_l[ib >> 1] >> (4u * (ib & 1u))) & 0xF)
-                      | (((scales_h >> (2u * ib)) & 3u) << 4);
-        const float dl = d * ((float)(int)ls - 32.0f);
-        device const uchar* q = qs + 16u * ib;
-        float sub = 0.0f;
-        for (uint j = 0; j < 16u; ++j) {
-            sub += a[ib * 32u + j] * KV_IQ4[q[j] & 0xF]
-                 + a[ib * 32u + 16u + j] * KV_IQ4[q[j] >> 4];
-        }
-        acc += dl * sub;
-    }
-    return acc;
-}
-
-// Matvec IQ4_XS: C[m, n] = dot(A + m·K, W[n]) — поток на строку весов.
-// Одним кернелом и декод (M = 1), и префилл (M — строки батча): для префилла
-// это не тайловый GEMM (позже, как у остальных квантов), но корректно и
-// без лишних копий; сетка (N, M).
+// Matvec IQ4_XS — точная редукция ggml `kernel_mul_mv_iq4_xs_f32_impl`
+// (правило «паритет первичен»: тот же порядок произведений и то же дерево
+// simd_sum, что у llama.cpp — иначе близкие логиты расходятся на жадной
+// генерации; ср. mv_q8_0_ks для Q8_0). Строку весов считает ОДИН simdgroup
+// из 32 лейнов: лейн (ix = чётность суперблока, it = 0..15 → подблок
+// ib = it/2, половина il = it%2) копит float4-частичные суммы в порядке
+// ggml, итог — simd_sum. Сетка (32, N, M): n — строка весов, m — строка
+// активаций (decode M=1, префилл M>1 — тем же кернелом, тайлового GEMM
+// для i-квантов пока нет).
 kernel void mv_iq4_xs(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],
     device float* C [[buffer(2)]],
     constant uint& K [[buffer(3)]],
     constant uint& N [[buffer(4)]],
-    uint2 gid [[thread_position_in_grid]])
+    uint3 gid [[thread_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]])
 {
-    const uint n = gid.x, m = gid.y;
+    const uint n = gid.y, m = gid.z;
     if (n >= N) return;
     const uint nb = K / 256u;
     device const uchar* row = B + (ulong)n * nb * 136u;
     device const float* a = A + (ulong)m * K;
-    float acc = 0.0f;
-    for (uint sb = 0; sb < nb; ++sb) {
-        acc += dot_iq4_xs(a + sb * 256u, row + sb * 136u);
+
+    const uint ix = lane / 16u;   // 0/1 — чётность суперблока (шаг 2 по sb)
+    const uint it = lane % 16u;
+    const uint ib = it / 2u;       // подблок 0..7
+    const uint il = it % 2u;       // половина подблока: 8 байт qs
+
+    float sumf = 0.0f;
+    for (uint sb = ix; sb < nb; sb += 2u) {
+        device const uchar* x = row + sb * 136u;
+        // yl[0..3] = y4[0], y4[4], y4[1], y4[5] из ggml: байты 8il+0..3
+        // держат элементы ib·32+8il+(0..3) (младшие нибблы) и +(16..19)
+        // (старшие); байты 8il+4..7 — элементы +(4..7) и +(20..23).
+        device const float* yb = a + (ulong)sb * 256u + ib * 32u + il * 8u;
+        const float4 yl0 = {yb[0], yb[1], yb[2], yb[3]};
+        const float4 yl1 = {yb[16], yb[17], yb[18], yb[19]};
+        const float4 yl2 = {yb[4], yb[5], yb[6], yb[7]};
+        const float4 yl3 = {yb[20], yb[21], yb[22], yb[23]};
+
+        device const uchar* qb = x + 8u + 16u * ib + 8u * il;
+        const uint q0 = (uint)qb[0] | ((uint)qb[1] << 8) | ((uint)qb[2] << 16) | ((uint)qb[3] << 24);
+        const uint q1 = (uint)qb[4] | ((uint)qb[5] << 8) | ((uint)qb[6] << 16) | ((uint)qb[7] << 24);
+
+        float4 acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float4 acc2 = {0.0f, 0.0f, 0.0f, 0.0f};
+        acc1 += yl0 * float4(KV_IQ4[q0 & 0xF], KV_IQ4[(q0 >> 8) & 0xF],
+                             KV_IQ4[(q0 >> 16) & 0xF], KV_IQ4[(q0 >> 24) & 0xF]);
+        acc2 += yl1 * float4(KV_IQ4[(q0 >> 4) & 0xF], KV_IQ4[(q0 >> 12) & 0xF],
+                             KV_IQ4[(q0 >> 20) & 0xF], KV_IQ4[(q0 >> 28) & 0xF]);
+        acc1 += yl2 * float4(KV_IQ4[q1 & 0xF], KV_IQ4[(q1 >> 8) & 0xF],
+                             KV_IQ4[(q1 >> 16) & 0xF], KV_IQ4[(q1 >> 24) & 0xF]);
+        acc2 += yl3 * float4(KV_IQ4[(q1 >> 4) & 0xF], KV_IQ4[(q1 >> 12) & 0xF],
+                             KV_IQ4[(q1 >> 20) & 0xF], KV_IQ4[(q1 >> 28) & 0xF]);
+        acc1 += acc2;
+
+        const uint scales_h = (uint)x[2] | ((uint)x[3] << 8);
+        const int ls = (int)((((x[4 + (ib >> 1)] >> (4u * (ib & 1u))) & 0xF)
+                              | (((scales_h >> (2u * ib)) & 3u) << 4))) - 32;
+        const float d = (float)load_half_unaligned(x);
+        sumf += d * (float)ls * ((acc1.x + acc1.y) + acc1.z + acc1.w);
     }
-    C[(ulong)m * N + n] = acc;
+    sumf = simd_sum(sumf);
+    if (lane == 0u) C[(ulong)m * N + n] = sumf;
 }
 
 static inline float dot_q5_0(device const float* a, device const uchar* blk) {

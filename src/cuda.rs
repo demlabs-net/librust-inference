@@ -2329,7 +2329,16 @@ impl Backend for CudaBackend {
         pos: usize,
         hd: usize,
         theta: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
+        // YaRN в CUDA-кернеле — Ф9; честная ошибка вместо молчаливого игнора
+        if let Some(y) = yarn {
+            if !y.is_identity() {
+                return Err(BackendError::Shape(
+                    "rope_standard: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)".into(),
+                ));
+            }
+        }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
@@ -2362,7 +2371,16 @@ impl Backend for CudaBackend {
         theta: f32,
         h: usize,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
+        // YaRN в CUDA-кернеле — Ф9; честная ошибка вместо молчаливого игнора
+        if let Some(y) = yarn {
+            if !y.is_identity() {
+                return Err(BackendError::Shape(
+                    "rmsnorm_head_rope: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)".into(),
+                ));
+            }
+        }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         if h == 0 || d != h * hd || !hd.is_multiple_of(2) {
             return Err(BackendError::Shape(format!(

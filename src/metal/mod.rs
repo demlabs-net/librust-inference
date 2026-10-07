@@ -3488,11 +3488,13 @@ impl crate::backend::Backend for MetalBackend {
         pos: usize,
         hd: usize,
         theta: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         let y = self.zeros(vec![1, tq, d])?;
         let xg = x.inner_metal();
         let yg = y.inner_metal();
+        let yarn = yarn.copied().unwrap_or(crate::rope::RopeYarn::IDENTITY);
         let grid = metal::MTLSize::new(tq as u64, (d / hd) as u64, (hd / 2) as u64);
         let group = metal::MTLSize::new(1, 4, 4);
         self.ctx.run("rope_std_f32", grid, group, |enc| {
@@ -3503,6 +3505,7 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(4, 8, (&hd as *const usize).cast());
             enc.set_bytes(5, 8, (&pos as *const usize).cast());
             enc.set_bytes(6, 4, (&theta as *const f32).cast());
+            enc.set_bytes(7, 24, (&yarn as *const crate::rope::RopeYarn).cast());
         })?;
         Ok(y)
     }
@@ -3516,12 +3519,14 @@ impl crate::backend::Backend for MetalBackend {
         theta: f32,
         h: usize,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         let y = self.zeros(vec![1, tq, d])?;
         let xg = x.inner_metal();
         let wg = w.inner_metal();
         let yg = y.inner_metal();
+        let yarn = yarn.copied().unwrap_or(crate::rope::RopeYarn::IDENTITY);
         // simdgroup на (токен, голову) — см. rmsnorm_head_rope_sg_f32.
         let (h32, nh32, hd32, pos32) = (h as u32, (tq * h) as u32, hd as u32, pos as u32);
         let grid = metal::MTLSize::new((tq * h * 32) as u64, 1, 1);
@@ -3536,6 +3541,7 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(6, 4, (&eps as *const f32).cast());
             enc.set_bytes(7, 4, (&pos32 as *const u32).cast());
             enc.set_bytes(8, 4, (&theta as *const f32).cast());
+            enc.set_bytes(9, 24, (&yarn as *const crate::rope::RopeYarn).cast());
         })?;
         Ok(y)
     }
@@ -3554,8 +3560,10 @@ impl crate::backend::Backend for MetalBackend {
         pos_kv: usize,
         theta: f32,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         let t = qkv.numel() / ((h + 2 * kvh) * hd);
+        let yarn = yarn.copied().unwrap_or(crate::rope::RopeYarn::IDENTITY);
         // f16-KV (Ф8.2f): K/V пишутся в half (вдвое меньше трафика внимания),
         // а Q остаётся f32 — как в llama.cpp: округление запроса до half
         // теряло точность, и текст расходился с эталоном через десятки
@@ -3593,6 +3601,7 @@ impl crate::backend::Backend for MetalBackend {
                 enc.set_bytes(11, 4, (&pk32 as *const u32).cast());
                 enc.set_bytes(12, 4, (&theta as *const f32).cast());
                 enc.set_bytes(13, 4, (&eps as *const f32).cast());
+                enc.set_bytes(14, 24, (&yarn as *const crate::rope::RopeYarn).cast());
             })?;
             return Ok(crate::backend::Tensor::from_gpu(qh));
         }
@@ -3628,6 +3637,7 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(11, 4, (&pk32 as *const u32).cast());
             enc.set_bytes(12, 4, (&theta as *const f32).cast());
             enc.set_bytes(13, 4, (&eps as *const f32).cast());
+            enc.set_bytes(14, 24, (&yarn as *const crate::rope::RopeYarn).cast());
         })?;
         Ok(q)
     }
@@ -3642,7 +3652,7 @@ impl crate::backend::Backend for MetalBackend {
         pairing: crate::backend::RopePairing,
     ) -> Result<crate::backend::Tensor, crate::error::BackendError> {
         if pairing == crate::backend::RopePairing::Halves && (n_rot == 0 || n_rot == hd) {
-            return self.rope_standard(x, pos, hd, theta);
+            return self.rope_standard(x, pos, hd, theta, None);
         }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         if n_rot > hd || !n_rot.is_multiple_of(2) || !hd.is_multiple_of(2) || d % hd != 0 {
@@ -3653,6 +3663,8 @@ impl crate::backend::Backend for MetalBackend {
         let y = self.zeros(vec![1, tq, d])?;
         let xg = x.inner_metal();
         let yg = y.inner_metal();
+        // partial rope (GLM) с YaRN пока не встречается — тождественные параметры
+        let yarn = crate::rope::RopeYarn::IDENTITY;
         let grid = metal::MTLSize::new(tq as u64, (d / hd) as u64, hd as u64);
         let group = metal::MTLSize::new(1, 4, 8);
         self.ctx.run("rope_std_part_f32", grid, group, |enc| {
@@ -3669,6 +3681,7 @@ impl crate::backend::Backend for MetalBackend {
                 crate::backend::RopePairing::Adjacent => 1,
             };
             enc.set_bytes(8, 8, (&pairing as *const usize).cast());
+            enc.set_bytes(9, 24, (&yarn as *const crate::rope::RopeYarn).cast());
         })?;
         Ok(y)
     }
@@ -5761,6 +5774,7 @@ mod batch_debug {
             for _ in 0..10 {
                 let grid = metal::MTLSize::new(9, 32, 64);
                 let group = metal::MTLSize::new(1, 4, 4);
+                let yarn = crate::rope::RopeYarn::IDENTITY;
                 ctx.run("rope_std_f32", grid, group, |enc| {
                     enc.set_buffer(0, Some(&q9.buffer), q9.offset as u64);
                     enc.set_buffer(1, Some(&yr.buffer), yr.offset as u64);
@@ -5768,6 +5782,7 @@ mod batch_debug {
                         enc.set_bytes((2 + i) as u64, 8, (v as *const usize).cast());
                     }
                     enc.set_bytes(6, 4, (&1e6f32 as *const f32).cast());
+                    enc.set_bytes(7, 24, (&yarn as *const crate::rope::RopeYarn).cast());
                 })
                 .unwrap();
             }

@@ -88,6 +88,7 @@ pub mod omni;
 pub mod quant;
 pub mod qwen3;
 pub mod qwen35;
+pub mod rope;
 pub mod tp;
 pub mod spec;
 pub mod tokenizer;

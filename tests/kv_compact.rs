@@ -34,7 +34,7 @@ fn read_kv_f32(b: &dyn Backend, t: &Tensor) -> Vec<f32> {
 
 /// Standard rope for one (1, 1, D) tensor at an absolute position.
 fn rope(b: &dyn Backend, x: &Tensor, pos: usize, hd: usize, theta: f32) -> Tensor {
-    b.rope_standard(x, pos, hd, theta).expect("rope")
+    b.rope_standard(x, pos, hd, theta, None).expect("rope")
 }
 
 fn tok(b: &dyn Backend, i: usize, d: usize, base: f32) -> Tensor {

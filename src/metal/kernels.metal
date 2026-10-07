@@ -2091,6 +2091,41 @@ kernel void mv_q5_k(
     C[n] = acc;
 }
 
+// ── YaRN/линейное скалирование RoPE ─────────────────────────────────────────
+// Зеркало ggml rope_yarn/ggml_rope_cache_init (см. src/rope.rs): угол пары k
+// на позиции p строится МУЛЬТИПЛИКАТИВНЫМ накоплением theta (p·ts^k — тот же
+// порядок перемножений, что у эталона), затем интерполяция частот по коридору
+// corr_dims и масштаб cos/sin на mscale. Тождественные параметры
+// (ext=0, freq_scale=1, attn=1) — прежний путь pow(theta, 2k/hd).
+struct RopeYarn {
+    float freq_scale, ext_factor, attn_factor, corr_lo, corr_hi, theta_scale;
+};
+inline bool rope_yarn_identity(constant RopeYarn& y) {
+    return y.ext_factor == 0.0f && y.freq_scale == 1.0f && y.attn_factor == 1.0f;
+}
+inline void rope_cs(float p, uint k, float theta, uint hd, constant RopeYarn& y,
+                    thread float& c, thread float& s) {
+    if (rope_yarn_identity(y)) {
+        const float fr = 1.0f / pow(theta, 2.0f * (float)k / (float)hd);
+        c = cos(p * fr);
+        s = sin(p * fr);
+        return;
+    }
+    float theta_acc = p;
+    for (uint j = 0u; j < k; ++j) theta_acc *= y.theta_scale;
+    const float theta_interp = y.freq_scale * theta_acc;
+    float ang = theta_interp;
+    float ms = y.attn_factor;
+    if (y.ext_factor != 0.0f) {
+        const float yy = ((float)k - y.corr_lo) / max(0.001f, y.corr_hi - y.corr_lo);
+        const float ramp_mix = (1.0f - min(1.0f, max(0.0f, yy))) * y.ext_factor;
+        ang = theta_interp * (1.0f - ramp_mix) + theta_acc * ramp_mix;
+        ms *= 1.0f + 0.1f * log(1.0f / y.freq_scale);
+    }
+    c = cos(ang) * ms;
+    s = sin(ang) * ms;
+}
+
 // ── Стандартный rotate-half RoPE (HF/Qwen3) — Ф1.7 perf ─────────────────────
 // y[t,h,i] = rotate_half(x) с cos/sin(theta^(-2i/HD)) на абсолютной позиции
 // (pos + t). Замена CPU-хелпера rope_standard в qwen3.rs.
@@ -2102,14 +2137,14 @@ kernel void rope_std_f32(
     constant uint& HD [[buffer(4)]],
     constant uint& pos [[buffer(5)]],
     constant float& theta [[buffer(6)]],
+    constant RopeYarn& yarn [[buffer(7)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint t = gid.x, h = gid.y, i = gid.z;
     if (t >= tq || h >= D / HD || i >= HD / 2) return;
     float p = (float)(pos + t);
-    float inv = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
-    float c = cos(p * inv);
-    float s = sin(p * inv);
+    float c, s;
+    rope_cs(p, i, theta, HD, yarn, c, s);
     // NEOX/halves (HF rotate-half): пары (i, i + HD/2)
     uint base = t * D + h * HD + i;
     float x0 = X[base];
@@ -2134,37 +2169,41 @@ kernel void rope_std_part_f32(
     constant uint& pos [[buffer(6)]],
     constant float& theta [[buffer(7)]],
     constant uint& PAIRING [[buffer(8)]],
+    constant RopeYarn& yarn [[buffer(9)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint t = gid.x, h = gid.y, j = gid.z;
     if (t >= tq || j >= HD) return;
     uint base = t * D + h * HD;
     float v;
+    // Частотная база — NROT (не HD): у partial rope пары нумеруются по
+    // вращаемому префиксу; yarn-коридор corr_dims тоже в этих индексах.
     if (j >= NROT) {
         v = X[base + j];                       // хвост без вращения
     } else if (PAIRING == 1u) {
         uint k = j >> 1u;                      // пара (2k, 2k+1): соседние
-        float inv = 1.0f / pow(theta, 2.0f * (float)k / (float)NROT);
         float p = (float)(pos + t);
-        float c = cos(p * inv), s = sin(p * inv);
+        float c, s;
+        rope_cs(p, k, theta, NROT, yarn, c, s);
         float x0 = X[base + (k << 1u)];
         float x1 = X[base + (k << 1u) + 1u];
         v = (j & 1u) == 0u ? x0 * c - x1 * s : x0 * s + x1 * c;
     } else {
         uint half_rot = NROT / 2u;             // пара (k, k+NROT/2): половины
+        float p = (float)(pos + t);
         if (j < half_rot) {
             float x0 = X[base + j];
             float x1 = X[base + j + half_rot];
-            float inv = 1.0f / pow(theta, 2.0f * (float)j / (float)NROT);
-            float p = (float)(pos + t);
-            v = x0 * cos(p * inv) - x1 * sin(p * inv);
+            float c, s;
+            rope_cs(p, j, theta, NROT, yarn, c, s);
+            v = x0 * c - x1 * s;
         } else {
             uint k = j - half_rot;             // частота берётся по k
             float x0 = X[base + k];
             float x1 = X[base + j];
-            float inv = 1.0f / pow(theta, 2.0f * (float)k / (float)NROT);
-            float p = (float)(pos + t);
-            v = x0 * sin(p * inv) + x1 * cos(p * inv);
+            float c, s;
+            rope_cs(p, k, theta, NROT, yarn, c, s);
+            v = x0 * s + x1 * c;
         }
     }
     Y[base + j] = v;
@@ -3156,6 +3195,7 @@ kernel void rmsnorm_head_rope_sg_f32(
     constant float& eps [[buffer(6)]],
     constant uint& pos [[buffer(7)]],
     constant float& theta [[buffer(8)]],
+    constant RopeYarn& yarn [[buffer(9)]],
     uint gid [[thread_position_in_grid]])
 {
     const uint head = gid / 32u, lane = gid % 32u;
@@ -3169,8 +3209,8 @@ kernel void rmsnorm_head_rope_sg_f32(
     const uint half_hd = HD / 2u;
     device float* y = Y + (ulong)head * HD;
     for (uint i = lane; i < half_hd; i += 32u) {
-        const float fr = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
-        const float c = cos(p * fr), sn = sin(p * fr);
+        float c, sn;
+        rope_cs(p, i, theta, HD, yarn, c, sn);
         const float x0 = x[i] * inv * W[i];
         const float x1 = x[i + half_hd] * inv * W[i + half_hd];
         y[i] = x0 * c - x1 * sn;
@@ -3793,6 +3833,7 @@ kernel void qkv_norm_rope_kv_f32(
     constant uint& pos_kv [[buffer(11)]],
     constant float& theta [[buffer(12)]],
     constant float& eps [[buffer(13)]],
+    constant RopeYarn& yarn [[buffer(14)]],
     uint gid [[thread_position_in_grid]])
 {
     const uint NHT = H + 2u * KVH;
@@ -3815,8 +3856,8 @@ kernel void qkv_norm_rope_kv_f32(
     const float p = (float)(rope_pos + t);
     const uint half_hd = HD / 2u;
     for (uint i = lane; i < half_hd; i += 32u) {
-        const float fr = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
-        const float c = cos(p * fr), sn = sin(p * fr);
+        float c, sn;
+        rope_cs(p, i, theta, HD, yarn, c, sn);
         const float x0 = x[i] * inv * W[i];
         const float x1 = x[i + half_hd] * inv * W[i + half_hd];
         y[i] = x0 * c - x1 * sn;
@@ -4477,6 +4518,7 @@ kernel void qkv_norm_rope_kv_f16_f32(
     constant uint& pos_kv [[buffer(11)]],
     constant float& theta [[buffer(12)]],
     constant float& eps [[buffer(13)]],
+    constant RopeYarn& yarn [[buffer(14)]],
     uint gid [[thread_position_in_grid]])
 {
     const uint NHT = H + 2u * KVH;
@@ -4501,8 +4543,8 @@ kernel void qkv_norm_rope_kv_f16_f32(
     const float p = (float)(rope_pos + t);
     const uint half_hd = HD / 2u;
     for (uint i = lane; i < half_hd; i += 32u) {
-        const float fr = 1.0 / pow(theta, 2.0 * (float)i / (float)HD);
-        const float c = cos(p * fr), sn = sin(p * fr);
+        float c, sn;
+        rope_cs(p, i, theta, HD, yarn, c, sn);
         const float x0 = x[i] * inv * W[i];
         const float x1 = x[i + half_hd] * inv * W[i + half_hd];
         if (is_q) {

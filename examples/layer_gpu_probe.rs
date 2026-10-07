@@ -78,10 +78,10 @@ fn main() {
         let _ = rust_inference::nn::slice_last(&be, &qkv3, qs, 0).unwrap();
     });
     total += time(&be, "norm+rope q", reps, || {
-        let _ = be.rmsnorm_head_rope(&q, &qw, ctx, hd, 1e6, nh, 1e-6).unwrap();
+        let _ = be.rmsnorm_head_rope(&q, &qw, ctx, hd, 1e6, nh, 1e-6, None).unwrap();
     });
     total += time(&be, "norm+rope k", reps, || {
-        let _ = be.rmsnorm_head_rope(&k1, &qw, ctx, hd, 1e6, nkv, 1e-6).unwrap();
+        let _ = be.rmsnorm_head_rope(&k1, &qw, ctx, hd, 1e6, nkv, 1e-6, None).unwrap();
     });
     total += 2.0 * time(&be, "kv_update ×2", reps, || be.kv_update(&buf, &k1, ctx).unwrap());
     total += time(&be, &format!("attn_ar tkv={}", ctx + t), reps, || {

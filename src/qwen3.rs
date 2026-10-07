@@ -48,6 +48,9 @@ pub struct Qwen3Config {
     pub n_deepstack: Option<usize>,
     /// MoE-ветвь (qwen3moe/olmoe); None — плотный FFN.
     pub moe: Option<crate::moe::MoeConfig>,
+    /// YaRN/линейное скалирование RoPE из `rope.scaling.*` (см. [`crate::rope`]).
+    /// None — обычный RoPE (прежний путь кернелов).
+    pub rope_yarn: Option<crate::rope::RopeYarn>,
 }
 
 impl Qwen3Config {
@@ -99,6 +102,27 @@ impl Qwen3Config {
                 _ => None,
             })
             .unwrap_or(1e-6);
+        // YaRN/линейное скалирование (rope.scaling.*) — паритет с эталоном:
+        // модели вроде Qwen3-8B-abliterated-IQ4_XS (yarn factor=4, orig 32768)
+        // без коррекции частот расходятся с llama.cpp тем сильнее, чем больше
+        // позиций в attention (на позиции 0 поворот — тождество).
+        let n_ctx_train = file
+            .get(&p("context_length"))
+            .and_then(GgufValue::as_u32)
+            .unwrap_or(0);
+        let rope_yarn = crate::rope::RopeYarn::from_meta(
+            &|k| file.get(k).and_then(|v| match v {
+                GgufValue::F32(f) => Some(*f),
+                GgufValue::F64(f) => Some(*f as f32),
+                _ => None,
+            }),
+            &|k| file.get(k).and_then(|v| v.as_str().map(|s| s.to_string())),
+            &|k| file.get(k).and_then(GgufValue::as_u32),
+            &arch,
+            theta,
+            head_dim,
+            n_ctx_train,
+        );
         Ok(Self {
             dim,
             n_layers,
@@ -162,6 +186,7 @@ impl Qwen3Config {
                 }
                 moe
             },
+            rope_yarn,
         })
     }
 }
@@ -1765,6 +1790,7 @@ impl Qwen3Model {
                 pos_kv,
                 cfg.rope_theta,
                 1e-6,
+                cfg.rope_yarn.as_ref(),
             )?;
             cache.advance(tq);
             sync(&q)?;
@@ -1828,7 +1854,15 @@ impl Qwen3Model {
                             Some(eps) => {
                                 let y = backend.zeros(x.shape().to_vec())?;
                                 backend.rmsnorm(x, w, &y, eps)?;
-                                rope_standard(backend, &y, pos, t, attn.head_dim, cfg.rope_theta)
+                                rope_standard(
+                                    backend,
+                                    &y,
+                                    pos,
+                                    t,
+                                    attn.head_dim,
+                                    cfg.rope_theta,
+                                    cfg.rope_yarn.as_ref(),
+                                )
                             }
                             // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4;
                             // дефолт (CPU/CUDA) — два шага
@@ -1840,6 +1874,7 @@ impl Qwen3Model {
                                 cfg.rope_theta,
                                 heads,
                                 1e-6,
+                                cfg.rope_yarn.as_ref(),
                             ),
                         }
                     };
@@ -1852,11 +1887,27 @@ impl Qwen3Model {
                         }
                         q
                     }
-                    None => rope_standard(backend, &q, pos, t, attn.head_dim, cfg.rope_theta)?,
+                    None => rope_standard(
+                        backend,
+                        &q,
+                        pos,
+                        t,
+                        attn.head_dim,
+                        cfg.rope_theta,
+                        cfg.rope_yarn.as_ref(),
+                    )?,
                 };
                 let k = match &attn.k_norm {
                     Some(w) => norm_rope(&k, w, attn.n_kv_heads)?,
-                    None => rope_standard(backend, &k, pos, t, attn.head_dim, cfg.rope_theta)?,
+                    None => rope_standard(
+                        backend,
+                        &k,
+                        pos,
+                        t,
+                        attn.head_dim,
+                        cfg.rope_theta,
+                        cfg.rope_yarn.as_ref(),
+                    )?,
                 };
                 (q, k)
             };
@@ -2084,6 +2135,7 @@ pub(crate) fn upload_w(
 
 /// Стандартный rotate-half RoPE (HF/Qwen3) через backend-оп
 /// (Metal — кернел rope_std_f32; CPU — референс-вычисление).
+/// `yarn` — коррекция скалирования (см. [`crate::rope`]); None — старый путь.
 pub fn rope_standard(
     backend: &dyn Backend,
     x: &Tensor,
@@ -2091,9 +2143,10 @@ pub fn rope_standard(
     t: usize,
     hd: usize,
     theta: f32,
+    yarn: Option<&crate::rope::RopeYarn>,
 ) -> Result<Tensor, BackendError> {
     let _ = t;
-    backend.rope_standard(x, pos, hd, theta)
+    backend.rope_standard(x, pos, hd, theta, yarn)
 }
 
 /// FFN (Qwen3-VL llama.cpp build_ffn, LLM_FFN_SILU + LLM_FFN_PAR):
@@ -2155,6 +2208,7 @@ mod test_util {
     pub fn mini_cfg() -> Qwen3Config {
         Qwen3Config {
             moe: None,
+            rope_yarn: None,
             dim: 16,
             n_layers: 2,
             n_heads: 4,
@@ -2459,6 +2513,7 @@ mod tests {
         // Несовместимый объект — громкая ошибка, а не молчаливый мусор.
         let (backend3, mut other) = mini_model_with_cfg(Qwen3Config {
             moe: None,
+            rope_yarn: None,
             n_kv_heads: 1,
             ..mini_cfg()
         });

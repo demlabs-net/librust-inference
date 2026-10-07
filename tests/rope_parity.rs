@@ -33,9 +33,9 @@ fn rope_std_cuda_matches_cpu() {
         .map(|i| ((i * 2654435761) as f32 * 1e-9).sin() * 0.7)
         .collect();
     let xt = cpu.from_cpu_f32(&x, vec![1, tq, d]).unwrap();
-    let yc = cpu.rope_standard(&xt, pos, hd, theta).unwrap();
+    let yc = cpu.rope_standard(&xt, pos, hd, theta, None).unwrap();
     let xg = gpu.from_cpu_f32(&x, vec![1, tq, d]).unwrap();
-    let yg = gpu.rope_standard(&xg, pos, hd, theta).unwrap();
+    let yg = gpu.rope_standard(&xg, pos, hd, theta, None).unwrap();
     approx(
         &gpu.to_cpu_f32(&yg).unwrap(),
         &cpu.to_cpu_f32(&yc).unwrap(),
@@ -61,12 +61,12 @@ fn rmsnorm_head_rope_cuda_matches_cpu() {
     let xt = cpu.from_cpu_f32(&x, vec![1, tq, d]).unwrap();
     let wt = cpu.from_cpu_f32(&w, vec![hd]).unwrap();
     let yc = cpu
-        .rmsnorm_head_rope(&xt, &wt, pos, hd, theta, h, eps)
+        .rmsnorm_head_rope(&xt, &wt, pos, hd, theta, h, eps, None)
         .unwrap();
     let xg = gpu.from_cpu_f32(&x, vec![1, tq, d]).unwrap();
     let wg = gpu.from_cpu_f32(&w, vec![hd]).unwrap();
     let yg = gpu
-        .rmsnorm_head_rope(&xg, &wg, pos, hd, theta, h, eps)
+        .rmsnorm_head_rope(&xg, &wg, pos, hd, theta, h, eps, None)
         .unwrap();
     approx(
         &gpu.to_cpu_f32(&yg).unwrap(),

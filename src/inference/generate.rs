@@ -995,6 +995,7 @@ mod tests {
         let backend = MetalBackend::new().unwrap();
         let c = Qwen3Config {
             moe: None,
+            rope_yarn: None,
             dim: 16,
             n_layers: 2,
             n_heads: 4,

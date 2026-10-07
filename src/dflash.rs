@@ -294,6 +294,7 @@ impl DFlashModel {
         }
         let cfg = Qwen3Config {
             moe: None,
+            rope_yarn: None,
             dim,
             n_layers,
             n_heads,
@@ -426,6 +427,7 @@ impl DFlashModel {
         let head_dim = g("head_dim").unwrap_or(dim / n_heads);
         let cfg = Qwen3Config {
             moe: None,
+            rope_yarn: None,
             dim,
             n_layers,
             n_heads,
@@ -706,6 +708,7 @@ impl DFlashModel {
                     t,
                     self.cfg.head_dim,
                     self.cfg.rope_theta,
+                    self.cfg.rope_yarn.as_ref(),
                 )?;
                 // кэш индексирован ПОЗИЦИЯМИ токенов (llama.cpp): инжект
                 // пишет на абсолютные позиции pos..pos+t; перезапись
@@ -853,6 +856,7 @@ impl DFlashModel {
                         self.cfg.rope_theta,
                         attn.n_heads,
                         1e-6,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                     None => crate::qwen3::rope_standard(
                         backend,
@@ -861,6 +865,7 @@ impl DFlashModel {
                         t,
                         attn.head_dim,
                         self.cfg.rope_theta,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                 };
                 let k = match &attn.k_norm {
@@ -872,6 +877,7 @@ impl DFlashModel {
                         self.cfg.rope_theta,
                         attn.n_kv_heads,
                         1e-6,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                     None => crate::qwen3::rope_standard(
                         backend,
@@ -880,6 +886,7 @@ impl DFlashModel {
                         t,
                         attn.head_dim,
                         self.cfg.rope_theta,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                 };
                 // прямая инъекция фич (z-lab: concat([k_ctx, k_noise])) —
@@ -901,6 +908,7 @@ impl DFlashModel {
                             self.cfg.rope_theta,
                             attn.n_kv_heads,
                             1e-6,
+                            self.cfg.rope_yarn.as_ref(),
                         )?,
                         None => crate::qwen3::rope_standard(
                             backend,
@@ -909,6 +917,7 @@ impl DFlashModel {
                             ctx,
                             attn.head_dim,
                             self.cfg.rope_theta,
+                            self.cfg.rope_yarn.as_ref(),
                         )?,
                     };
                     self.caches[i].update_at(backend, &kc, &vc, past_len)?;
@@ -1597,6 +1606,7 @@ mod tests {
     fn cfg() -> Qwen3Config {
         Qwen3Config {
             moe: None,
+            rope_yarn: None,
             dim: 16,
             n_layers: 2,
             n_heads: 2,

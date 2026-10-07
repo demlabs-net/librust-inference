@@ -1444,7 +1444,7 @@ mod tests {
             };
             let (k1, v1, k2, v2) = (z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd));
             let q1 = be
-                .qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6)
+                .qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6, None)
                 .unwrap();
             // Q — f32 (в llama.cpp запрос не округляется; f16-окружение
             // запроса давало расхождение текста на десятках токенов).
@@ -1457,10 +1457,10 @@ mod tests {
                 y.view(vec![1, t, w])
             };
             let q2 = be
-                .rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6)
+                .rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6, None)
                 .unwrap();
             let kr = be
-                .rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6)
+                .rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6, None)
                 .unwrap();
             be.kv_update(&k2, &kr, pos).unwrap();
             be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
@@ -1488,7 +1488,7 @@ mod tests {
             let cap = pos + t + 3;
             let mk = || be.zeros(vec![1, cap, kvh * hd]).unwrap();
             let (k1, v1, k2, v2) = (mk(), mk(), mk(), mk());
-            let q1 = be.qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6).unwrap();
+            let q1 = be.qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6, None).unwrap();
             // составной путь из тех же примитивов (как default трейта)
             let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
             let part = |w: usize, off: usize| {
@@ -1496,8 +1496,8 @@ mod tests {
                 be.slice_last(&rows, &y, off).unwrap();
                 y.view(vec![1, t, w])
             };
-            let q2 = be.rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6).unwrap();
-            let kr = be.rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6).unwrap();
+            let q2 = be.rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6, None).unwrap();
+            let kr = be.rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6, None).unwrap();
             be.kv_update(&k2, &kr, pos).unwrap();
             be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
             close(&be.to_cpu_f32(&q1).unwrap(), &be.to_cpu_f32(&q2).unwrap(), 1e-6, "fused q");

@@ -858,12 +858,15 @@ pub trait Backend: Send + Sync {
     }
     /// Стандартный rotate-half RoPE (HF/Qwen3): X (1, T, D) → Y, позиции
     /// pos..pos+T. CPU-референс — прямое вычисление; Metal — кернел.
+    /// `yarn` — коррекция YaRN/линейного скалирования (см. [`crate::rope`]);
+    /// `None`/тождество — прежний путь (частоты theta^(-2i/hd)).
     fn rope_standard(
         &self,
         x: &Tensor,
         pos: usize,
         hd: usize,
         theta: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         let xd = self.to_cpu_f32(x)?;
@@ -873,9 +876,13 @@ pub trait Backend: Send + Sync {
             let p = (pos + tt) as f32;
             for h in 0..d / hd {
                 for i in 0..half {
-                    let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let c = (p * inv).cos();
-                    let s = (p * inv).sin();
+                    let (c, s) = match yarn {
+                        Some(y) if !y.is_identity() => y.cos_sin(p, i),
+                        _ => {
+                            let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
+                            ((p * inv).cos(), (p * inv).sin())
+                        }
+                    };
                     // NEOX/halves (HF rotate-half): пары (i, i + hd/2)
                     let idx = tt * d + h * hd + i;
                     let (x0, x1) = (xd[idx], xd[idx + hd / 2]);
@@ -907,7 +914,7 @@ pub trait Backend: Send + Sync {
         pairing: RopePairing,
     ) -> Result<Tensor, BackendError> {
         if pairing == RopePairing::Halves && (n_rot == 0 || n_rot == hd) {
-            return self.rope_standard(x, pos, hd, theta);
+            return self.rope_standard(x, pos, hd, theta, None);
         }
         if n_rot > hd || !n_rot.is_multiple_of(2) {
             return Err(BackendError::Shape(format!(
@@ -1987,10 +1994,11 @@ pub trait Backend: Send + Sync {
         theta: f32,
         h: usize,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
         let tmp = self.zeros(x.shape().to_vec())?;
         self.rmsnorm_head(x, w, &tmp, h, eps)?;
-        self.rope_standard(&tmp, pos, hd, theta)
+        self.rope_standard(&tmp, pos, hd, theta, yarn)
     }
     /// Разбор fused-qkv decode-шага (Ф8.2b): qkv [T, (H+2·KVH)·HD] →
     /// q = rope(rmsnorm_head(q)) — возвращается [1, T, H·HD];
@@ -2013,6 +2021,7 @@ pub trait Backend: Send + Sync {
         pos_kv: usize,
         theta: f32,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
         let t = qkv.numel() / ((h + 2 * kvh) * hd);
         let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
@@ -2024,8 +2033,8 @@ pub trait Backend: Send + Sync {
         let q = part(h * hd, 0)?;
         let k = part(kvh * hd, h * hd)?;
         let v = part(kvh * hd, (h + kvh) * hd)?;
-        let q = self.rmsnorm_head_rope(&q, q_norm, rope_pos, hd, theta, h, eps)?;
-        let k = self.rmsnorm_head_rope(&k, k_norm, rope_pos, hd, theta, kvh, eps)?;
+        let q = self.rmsnorm_head_rope(&q, q_norm, rope_pos, hd, theta, h, eps, yarn)?;
+        let k = self.rmsnorm_head_rope(&k, k_norm, rope_pos, hd, theta, kvh, eps, yarn)?;
         self.kv_update(kbuf, &k, pos_kv)?;
         self.kv_update(vbuf, &v, pos_kv)?;
         Ok(q)

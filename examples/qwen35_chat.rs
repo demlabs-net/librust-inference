@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let ids = tok.encode(&prompt);
     eprintln!("ids={ids:?}");
-    // QWEN35_SPEC=ngram|<dflash.gguf>: та же жадная генерация через
+    // QWEN35_SPEC=ngram|mtp|<dflash.gguf>: та же жадная генерация через
     // inference::generate со спек-декодингом — текст обязан совпасть с
     // обычным жадным (откат рекуррентного стейта при отказе черновика).
     if let Ok(spec) = std::env::var("QWEN35_SPEC") {
@@ -60,6 +60,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         let drafter: std::sync::Arc<std::sync::Mutex<dyn rust_inference::spec::Drafter>> =
             if spec == "ngram" {
                 std::sync::Arc::new(std::sync::Mutex::new(rust_inference::spec::NGramDrafter::new(4)))
+            } else if spec == "mtp" {
+                // Ф2.6: нативный MTP — nextn-блок из того же файла
+                // (blk.{n_layers}.nextn.*); таблицы эмбеддингов/LM-хед общие
+                // с таргетом (как в эталоне: nextn.embed_tokens/shared_head_head
+                // в этих чекпойнтах нет).
+                let (embed, output) = model.head_tables();
+                std::sync::Arc::new(std::sync::Mutex::new(rust_inference::mtp::MtpDrafter::load(
+                    &backend,
+                    &wm,
+                    &model.cfg,
+                    embed,
+                    output,
+                )?))
             } else {
                 let (embed, lm_head) = model.shared_tables(&backend, &wm)?;
                 std::sync::Arc::new(std::sync::Mutex::new(rust_inference::dflash::load_drafter_gguf(

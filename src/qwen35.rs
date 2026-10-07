@@ -27,6 +27,12 @@ use crate::nn::{KvCache, Linear, RmsNorm, SwiGLU};
 use crate::qwen3::{Qwen3Model, ffn_forward};
 use crate::weights_map::WeightsMap;
 
+/// Псевдослой extract-слоёв: скрытое ПОСЛЕ `output_norm` (все строки батча)
+/// — ровно `t_h_nextn` эталонного трейка (qwen35.cpp:206-209), которое ест
+/// MTP-адаптер (Ф2.6, [`crate::mtp`]). Настоящие слои нумеруются с 0,
+/// поэтому `usize::MAX` с ними не столкнётся.
+pub const HIDDEN_LAYER: usize = usize::MAX;
+
 /// Конфигурация гибрида из GGUF-метадаты (`qwen35.*` / `qwen35moe.*` без MoE).
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
@@ -202,12 +208,14 @@ impl Qwen35Config {
 }
 
 /// Полное gated-внимание (Qwen3.5): q-проекция отдаёт на голову [q | gate].
-struct FullAttn {
+/// pub(crate): MTP-драфтер (Ф2.6, [`crate::mtp`]) исполняет этим же путём
+/// свой nextn-блок.
+pub(crate) struct FullAttn {
     /// [n_heads·hd·2 + 2·n_kv·hd, dim] — q(+gate), k, v одним GEMM.
-    wqkv: Tensor,
-    wo: Tensor,
-    q_norm: Tensor,
-    k_norm: Tensor,
+    pub(crate) wqkv: Tensor,
+    pub(crate) wo: Tensor,
+    pub(crate) q_norm: Tensor,
+    pub(crate) k_norm: Tensor,
 }
 
 /// Линейное внимание Gated DeltaNet.
@@ -456,6 +464,13 @@ impl Qwen35Model {
         self.pos
     }
 
+    /// Тэйблы таргета для MTP-драфтера (Ф2.6): (эмбеддинги в родном
+    /// формате, lm_head) — дешёвые клоны ручек, f32-копий не требуют
+    /// (в отличие от [`Self::shared_tables`] для DFlash).
+    pub fn head_tables(&self) -> (Tensor, Tensor) {
+        (self.embed.clone(), self.output.clone())
+    }
+
     /// Таблицы, которые драфтер делит с таргетом: (эмбеддинги f32, lm_head).
     /// Эмбеддинги модели лежат в родном формате GGUF (деквант строки на
     /// лету), а драфтер читает таблицу обычным f32-эмбеддингом — сырые
@@ -511,7 +526,10 @@ impl Qwen35Model {
         if ids.is_empty() {
             return Err(BackendError::Shape("qwen35 prefill: пустой промпт".into()));
         }
-        if let Some(&bad) = layers.iter().find(|&&l| l >= self.cfg.n_layers) {
+        if let Some(&bad) = layers
+            .iter()
+            .find(|&&l| l != HIDDEN_LAYER && l >= self.cfg.n_layers)
+        {
             return Err(BackendError::Shape(format!(
                 "qwen35 extract: слой {bad} >= {}",
                 self.cfg.n_layers
@@ -539,7 +557,10 @@ impl Qwen35Model {
                 "prefill_extract_last: пустой промпт".into(),
             ));
         }
-        if let Some(&bad) = layers.iter().find(|&&l| l >= self.cfg.n_layers) {
+        if let Some(&bad) = layers
+            .iter()
+            .find(|&&l| l != HIDDEN_LAYER && l >= self.cfg.n_layers)
+        {
             return Err(BackendError::Shape(format!(
                 "qwen35 extract: слой {bad} >= {}",
                 self.cfg.n_layers
@@ -874,6 +895,19 @@ impl Qwen35Model {
         }
         self.pos += t;
         let t_head = std::time::Instant::now();
+        let t_full = t;
+        // Скрытое после out_norm для MTP-драфтера (Ф2.6) — ВСЕ строки:
+        // эталонный process() (common-speculative.cpp) гоняет nextn-адаптер
+        // по каждой позиции батча, поэтому out_norm считается по полному x
+        // ДО last_only-среза.
+        let want_h = extract_layers.contains(&HIDDEN_LAYER);
+        let h_all = if want_h {
+            let h = self.out_norm.forward(backend, &x)?;
+            extract_out.push(h.clone());
+            Some(h)
+        } else {
+            None
+        };
         let (x, t) = if self.last_only && t > 1 {
             (x.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d), 1)
         } else {
@@ -883,7 +917,10 @@ impl Qwen35Model {
             // Промежуточный блок префилла: логиты не нужны вовсе.
             return backend.zeros(vec![1, 1, 1]);
         }
-        let h = self.out_norm.forward(backend, &x)?;
+        let h = match h_all {
+            Some(h) if t == t_full => h,
+            _ => self.out_norm.forward(backend, &x)?,
+        };
         let logits = self.head_rows(backend, &h, t)?;
         if prof {
             sync(&logits)?;
@@ -898,8 +935,9 @@ impl Qwen35Model {
         Ok(logits)
     }
 
-    /// Полное gated-внимание (qwen35.cpp build_layer_attn).
-    fn attn_forward(
+    /// Полное gated-внимание (qwen35.cpp build_layer_attn). pub(crate):
+    /// тем же путём идёт MTP-блок (Ф2.6, [`crate::mtp`]).
+    pub(crate) fn attn_forward(
         cfg: &Qwen35Config,
         backend: &dyn Backend,
         h: &Tensor,

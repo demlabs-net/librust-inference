@@ -1077,8 +1077,8 @@ fn softmax_row_prob(lg: &[f32], pos: usize, vocab: usize, tok: u32) -> f32 {
 
 /// Вероятность токена в softmax(row / temperature) — q для rejection
 /// sampling обязана считаться по ТОМУ ЖЕ распределению, из которого
-/// черновик сэмплирован.
-fn softmax_row_prob_t(row: &[f32], tok: u32, temperature: f32) -> f32 {
+/// черновик сэмплирован. pub(crate): общий с MTP-драфтером (Ф2.6).
+pub(crate) fn softmax_row_prob_t(row: &[f32], tok: u32, temperature: f32) -> f32 {
     let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for &l in row {

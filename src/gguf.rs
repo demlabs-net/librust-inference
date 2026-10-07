@@ -155,7 +155,7 @@ impl GgmlType {
             14 => Self::Q6K,
             15 => Self::Q8K,
             23 => Self::Iq4Xs,
-            27 => Self::Bf16,
+            30 => Self::Bf16,
             _ => return None,
         })
     }
@@ -179,7 +179,9 @@ impl GgmlType {
             Self::Q6K => 14,
             Self::Q8K => 15,
             Self::Iq4Xs => 23,
-            Self::Bf16 => 27,
+            // BF16 = 30 по ggml.h эталонного коммита (27 — это I64);
+            // сверено с реальным llama.cpp-файлом (huihui-ai BF16-шейды).
+            Self::Bf16 => 30,
         }
     }
 
@@ -609,6 +611,38 @@ mod tests {
         let f = parse(&buf).unwrap();
         assert_eq!(f.tensors[0].ggml_type, GgmlType::Q4K);
         assert_eq!(f.tensors[1].ggml_type, GgmlType::Q6K);
+    }
+
+    /// Коды типов ПРИБИТЫ к ggml.h эталонного коммита 5266f24da75d
+    /// (F32=0 F16=1 Q4_0=2 Q8_0=8 Q4_K=12 Q5_K=13 Q6_K=14 IQ4_XS=23 BF16=30).
+    /// BF16=27 был нашей самописной ошибкой (27 — I64): реальные llama.cpp
+    /// BF16-файлы (huihui-ai) пишут 30. Менять код можно ТОЛЬКО вместе со
+    /// сменой эталонного коммита и перегенерацией фикстур.
+    #[test]
+    fn raw_codes_pinned_to_reference() {
+        assert_eq!(GgmlType::F32.raw(), 0);
+        assert_eq!(GgmlType::F16.raw(), 1);
+        assert_eq!(GgmlType::Bf16.raw(), 30);
+        assert_eq!(GgmlType::Q4_0.raw(), 2);
+        assert_eq!(GgmlType::Q8_0.raw(), 8);
+        assert_eq!(GgmlType::Q4K.raw(), 12);
+        assert_eq!(GgmlType::Q5K.raw(), 13);
+        assert_eq!(GgmlType::Q6K.raw(), 14);
+        assert_eq!(GgmlType::Iq4Xs.raw(), 23);
+        for t in [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Bf16,
+            GgmlType::Q4_0,
+            GgmlType::Q8_0,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Iq4Xs,
+        ] {
+            assert_eq!(GgmlType::from_raw(t.raw()), Some(t));
+        }
+        assert_eq!(GgmlType::from_raw(27), None); // I64 — не поддерживаем
     }
 
     #[test]

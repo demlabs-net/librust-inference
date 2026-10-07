@@ -592,14 +592,19 @@ mod tests {
         }
     }
 
-    /// Replay в after_extract обязан восстановить ровно тот же KV, что
-    /// нативная цепочка draft-шагов (те же пары (t_q, h_{q−1})).
+    /// Replay обязан восстановить ровно тот же KV, что нативная цепочка
+    /// draft-шагов (те же пары (t_q, h_{q−1})). Путь — отложенный префилл:
+    /// after_extract с pos == rows откладывает строки, первый draft()
+    /// переигрывает их по history.
     #[test]
     fn mtp_replay_rebuilds_chain_kv() {
-        let be = CpuBackend;
+        let be = CpuBackend::default();
         let f = fixture(0xBEEF);
         let d = f.cfg.dim;
-        let h0 = vec![0.2f32; d];
+        // seed-строка последовательности: pending_h до первого префилла —
+        // нули (эталон: pending_h инициализирован нулями), replay q=0 — тоже
+        // нули.
+        let h0 = vec![0.0f32; d];
         let toks = [1u32, 4, 2];
 
         // 1) цепочка: три шага, h следующего = h_out предыдущего.
@@ -616,18 +621,31 @@ mod tests {
         let chain_kv = be.to_cpu_f32(&chain.kv.view()).unwrap();
         let chain_v = be.to_cpu_f32(&chain.kv.view_v()).unwrap();
 
-        // 2) replay: extract = строки h цепочки, окно = те же токены.
+        // 2) отложенный replay: after_extract (префилл) + draft с history.
         let mut rep = drafter(&be, &f);
         rep.pending_h = Some(be.from_cpu_f32(&h0, vec![1, 1, d]).unwrap());
-        rep.window = toks.to_vec();
         let extract = be.from_cpu_f32(&h_rows, vec![toks.len(), d]).unwrap();
-        rep.after_extract(&be, &[extract], toks.len(), toks.len())
+        rep.after_extract(&be, &[extract.clone()], toks.len(), toks.len())
             .unwrap();
+        assert!(rep.pending_rows.is_some(), "префилл отложен до draft()");
+        // history = промпт + anchor; anchor — любой (черновиков gamma=0).
+        let mut history = toks.to_vec();
+        history.push(0);
+        let (t, p) = rep.draft(&be, &history, 0);
+        assert!(t.is_empty() && p.is_empty(), "gamma=0 — пустые черновики");
         assert_eq!(rep.committed(), toks.len());
         let kv = be.to_cpu_f32(&rep.kv.view()).unwrap();
         let v = be.to_cpu_f32(&rep.kv.view_v()).unwrap();
         close(&kv, &chain_kv, 1e-6, "replay k");
         close(&v, &chain_v, 1e-6, "replay v");
+
+        // 3) повторный префилл (повторная попытка сервиса) при непустом
+        //    окне прошлой последовательности — обязан сбросить границу.
+        rep.window = vec![9, 9];
+        rep.after_extract(&be, &[extract.clone()], toks.len(), toks.len())
+            .unwrap();
+        assert_eq!(rep.committed(), 0);
+        assert!(rep.pending_rows.is_some());
     }
 
     /// Границы draft(): рассинхрон history/committed и отсутствие pending_h
@@ -759,14 +777,25 @@ impl Drafter for MtpDrafter {
             h.shape()[0]
         };
         let n = n_accepted.min(rows);
-        if self.window.is_empty() && self.committed == 0 {
-            // Префилл: токены промпта драфтер увидит только в первом
-            // draft() (history) — строки h откладываем туда.
+        // Префилл узнаётся по pos == rows: он начинается с нулевой позиции,
+        // окно верификации всегда сидит ПОВЕРХ уже накопленного контекста.
+        // (Признак по пустому window не годится: повторная попытка после
+        // вырождения в сервисе — префилл при непустом окне прошлой
+        // последовательности.)
+        if pos == rows {
+            self.kv.reset();
+            self.committed = 0;
+            self.window.clear();
+            // Токены промпта драфтер увидит только в первом draft() (history)
+            // — строки h откладываем туда.
             self.pending_rows = Some(h.view(vec![rows, d]));
             self.pending_h = Some(h.view_offset(vec![1, 1, d], (rows - 1) * d));
             return Ok(());
         }
         let n = n.min(self.window.len());
+        if n == 0 {
+            return Ok(());
+        }
         let base = pos.saturating_sub(n);
         // Черновые строки поверх принятой границы — долой; принятые строки
         // окна пересобираются с h ТРЕЙКА (не цепочки) — инвариант KV

@@ -5037,6 +5037,66 @@ mod quant_gemm_tests {
         }
     }
 
+    /// IQ4_XS matvec: строка при M>1 должна давать тот же результат, что та
+    /// же строка при M=1 (per-(row,token) редукция не зависит от M). Ловит баги
+    /// сетки (32,N,M) / указателя a=A+m·K при пакетном префилле.
+    #[test]
+    fn iq4_xs_matvec_batch_consistency() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (n, k) = (40usize, 512usize);
+        let mut seed = 0xABCD_1234u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut raw = Vec::new();
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+            raw.extend_from_slice(&((next() as u16)).to_le_bytes());
+            for _ in 0..4 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq4Xs)
+            .unwrap();
+        let rows = 5usize;
+        let a: Vec<f32> = (0..rows * k)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.03 + (i / k) as f32 * 0.01)
+            .collect();
+        // M=5 пачкой
+        let av5 = be.from_cpu_f32(&a, vec![rows, k]).unwrap();
+        let c5 = be.zeros(vec![rows, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av5.inner_metal(), w.inner_metal(), c5.inner_metal())
+            .unwrap();
+        let got5 = be.to_cpu_f32(&c5).unwrap();
+        // каждая строка по-одиночке (M=1)
+        for r in 0..rows {
+            let av1 = be.from_cpu_f32(&a[r * k..r * k + k], vec![1, k]).unwrap();
+            let c1 = be.zeros(vec![1, n]).unwrap();
+            be.ctx
+                .gemm_nt_quantized(av1.inner_metal(), w.inner_metal(), c1.inner_metal())
+                .unwrap();
+            let got1 = be.to_cpu_f32(&c1).unwrap();
+            for ni in 0..n {
+                let b = got5[r * n + ni];
+                let s = got1[ni];
+                assert_eq!(
+                    b.to_bits(),
+                    s.to_bits(),
+                    "M=5 row={r} n={ni}: {b} vs M=1 {s} (не побитово)"
+                );
+            }
+        }
+    }
+
     /// IQ4_XS mul_mm (m>8): сверка тайлового GEMM с хост-деквантом. Ловит
     /// раскладку il/x по суперблокам и попадание весов в K-позиции тайла.
     #[test]

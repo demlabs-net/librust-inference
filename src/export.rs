@@ -25,6 +25,7 @@ pub fn ggml_type_of(fmt: QuantFormat) -> GgmlType {
         QuantFormat::Q6_K => GgmlType::Q6K,
         QuantFormat::Q5_0 => GgmlType::Q5_0,
         QuantFormat::Q5_K => GgmlType::Q5K,
+        QuantFormat::Iq4Xs => GgmlType::Iq4Xs,
     }
 }
 
@@ -39,6 +40,7 @@ pub fn parse_quant_format(s: &str) -> Option<QuantFormat> {
         "q6_k" | "q6k" => Some(QuantFormat::Q6_K),
         "q5_0" | "q50" => Some(QuantFormat::Q5_0),
         "q5_k" | "q5_k_m" | "q5km" => Some(QuantFormat::Q5_K),
+        "iq4_xs" | "iq4xs" => Some(QuantFormat::Iq4Xs),
         _ => None,
     }
 }

@@ -49,6 +49,11 @@ pub enum QuantFormat {
     Q5_0,
     /// Q5_K-схема (Q5_K_M в llama.cpp-терминах).
     Q5_K,
+    /// IQ4_XS (ggml type 23): супер-блок 256 весов = 136 Б (4.25 bpw),
+    /// 6-битные под-блоки scale по 32. Пишется БЕЗ imatrix (в отличие от
+    /// IQ1/IQ2/IQ3_XXS — `tensor_requires_imatrix` в llama-quant.cpp его не
+    /// требует); с imatrix был бы точнее — это опция v0.2 (Ф4.12).
+    Iq4Xs,
 }
 
 impl QuantFormat {
@@ -63,6 +68,7 @@ impl QuantFormat {
             "Q6_K" => Some(Self::Q6_K),
             "Q5_0" => Some(Self::Q5_0),
             "Q5_K" | "Q5_K_M" => Some(Self::Q5_K),
+            "IQ4_XS" => Some(Self::Iq4Xs),
             _ => None,
         }
     }
@@ -78,6 +84,7 @@ impl QuantFormat {
             Self::Q6_K => "Q6_K",
             Self::Q5_0 => "Q5_0",
             Self::Q5_K => "Q5_K",
+            Self::Iq4Xs => "IQ4_XS",
         }
     }
 
@@ -92,6 +99,7 @@ impl QuantFormat {
             Self::Q6_K => GgmlType::Q6K,
             Self::Q5_0 => GgmlType::Q5_0,
             Self::Q5_K => GgmlType::Q5K,
+            Self::Iq4Xs => GgmlType::Iq4Xs,
         }
     }
 
@@ -100,7 +108,13 @@ impl QuantFormat {
     fn needs_block_pad(self) -> bool {
         matches!(
             self,
-            Self::Q4_0 | Self::Q8_0 | Self::Q4_K_M | Self::Q6_K | Self::Q5_0 | Self::Q5_K
+            Self::Q4_0
+                | Self::Q8_0
+                | Self::Q4_K_M
+                | Self::Q6_K
+                | Self::Q5_0
+                | Self::Q5_K
+                | Self::Iq4Xs
         )
     }
 
@@ -113,11 +127,12 @@ impl QuantFormat {
             Self::Q5_0 | Self::Q5_K => 5.5,
             Self::Q6_K => 6.5625,
             Self::Q8_0 => 8.5,
+            Self::Iq4Xs => 4.25,
         }
     }
 
     /// Формат по ggml-типу (обратный к `ggml_type`); `None` — тип, который
-    /// движок писать не умеет (Q5_0/Q5_K/IQ* — чужие форматы).
+    /// движок писать не умеет (IQ4_NL/IQ1–IQ3 — чужие форматы; IQ4_XS умеет).
     pub fn from_ggml_type(t: GgmlType) -> Option<Self> {
         Some(match t {
             GgmlType::F32 => Self::F32,
@@ -129,6 +144,7 @@ impl QuantFormat {
             GgmlType::Q6K => Self::Q6_K,
             GgmlType::Q5_0 => Self::Q5_0,
             GgmlType::Q5K => Self::Q5_K,
+            GgmlType::Iq4Xs => Self::Iq4Xs,
             _ => return None,
         })
     }
@@ -677,6 +693,164 @@ pub fn quant_q5_k(weights: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Кодбук IQ4_NL/IQ4_XS (ggml `kvalues_iq4nl`), отсортирован — бинарный
+/// поиск `best_index_int8` полагается на порядок.
+const KVALUES_IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    89.0, 113.0,
+];
+
+/// `best_index_int8` из ggml-quants.c: ближайший индекс в отсортированном
+/// кодбуке (бинарный поиск, при равенстве — больший индекс).
+fn best_index_int8(val: &[f32; 16], x: f32) -> usize {
+    if x <= val[0] {
+        return 0;
+    }
+    if x >= val[15] {
+        return 15;
+    }
+    let mut ml = 0usize;
+    let mut mu = 15usize;
+    while mu - ml > 1 {
+        let mav = (ml + mu) / 2;
+        if x < val[mav] {
+            mu = mav;
+        } else {
+            ml = mav;
+        }
+    }
+    if x - val[mu - 1] < val[mu] - x {
+        mu - 1
+    } else {
+        mu
+    }
+}
+
+/// IQ4_XS (ggml type 23): супер-блок 256 весов → 136 байт:
+/// d(f16)@0, scales_h(u16)@2, scales_l[4]@4, qs[128]@8.
+/// Деквант подблока ib: y = f16(d)·(ls−32)·kvalues[l], ls — 6 бит
+/// (4 из scales_l + 2 из scales_h).
+///
+/// Энкодер — порт `quantize_iq4_xs`/`quantize_row_iq4_nl_impl`
+/// (ggml-quants.c, коммит 5266f24da) по пути БЕЗ imatrix
+/// (`quant_weights == NULL` → вес = x²; `tensor_requires_imatrix` не
+/// требует imatrix для IQ4_XS). Порядок f32-операций и FMA-контракция
+/// (`sumqx += w*q*x` → `fma(w*q, x, sumqx)`) — как у clang-сборки эталона:
+/// байты обязаны совпадать с `llama-quantize` на том же входе.
+pub fn quant_iq4_xs(weights: &[f32]) -> Vec<u8> {
+    assert!(weights.len().is_multiple_of(256), "IQ4_XS: len % 256 == 0");
+    let mut out = Vec::with_capacity(weights.len() / 256 * 136);
+    let mut l = [0u8; 256];
+    let mut scales = [0f32; 8];
+    for blk in weights.chunks_exact(256) {
+        let mut q4 = [0u8; 128]; // memset(q4, 0, 128) — как в ggml
+        let mut dh_bytes = f16_bits(0.0f32); // dh[0] = 0
+        let mut scales_h = 0u16;
+        let mut scales_l = [0u8; 4];
+        let mut max_scale = 0f32;
+        let mut amax_scale = 0f32;
+        for ib in 0..8usize {
+            let xb = &blk[32 * ib..32 * ib + 32];
+            let lb = &mut l[32 * ib..32 * ib + 32];
+            // вес без imatrix: w[j] = x[j]²
+            let mut amax = 0f32;
+            let mut max = 0f32;
+            for &v in xb.iter() {
+                let ax = v.abs();
+                if ax > amax {
+                    amax = ax;
+                    max = v;
+                }
+            }
+            if amax < GROUP_MAX_EPS {
+                scales[ib] = 0.0;
+                continue; // Lb перезапишется во втором проходе (idl=0 → 8)
+            }
+            let w = |j: usize| {
+                let v = xb[j];
+                v * v
+            };
+            let mut d = -max / KVALUES_IQ4NL[0]; // ntry=7>0
+            let id = 1.0 / d;
+            let mut sumqx = 0f32;
+            let mut sumq2 = 0f32;
+            for j in 0..32 {
+                let al = id * xb[j];
+                let li = best_index_int8(&KVALUES_IQ4NL, al);
+                lb[j] = li as u8;
+                let q = KVALUES_IQ4NL[li];
+                let wj = w(j);
+                // clang: sumqx + (w*q)*x → fma(w*q, x, sumqx)
+                sumqx = (wj * q).mul_add(xb[j], sumqx);
+                sumq2 = (wj * q).mul_add(q, sumq2);
+            }
+            d = if sumq2 > 0.0 { sumqx / sumq2 } else { 0.0 };
+            let mut best = d * sumqx;
+            for itry in -7i32..=7 {
+                // C: (itry + values[0]) — целочисленное, затем /max
+                let id = ((itry as f32) + KVALUES_IQ4NL[0]) / max;
+                sumqx = 0.0;
+                sumq2 = 0.0;
+                for j in 0..32 {
+                    let al = id * xb[j];
+                    let li = best_index_int8(&KVALUES_IQ4NL, al);
+                    let q = KVALUES_IQ4NL[li];
+                    let wj = w(j);
+                    sumqx = (wj * q).mul_add(xb[j], sumqx);
+                    sumq2 = (wj * q).mul_add(q, sumq2);
+                }
+                if sumq2 > 0.0 && sumqx * sumqx > best * sumq2 {
+                    d = sumqx / sumq2;
+                    best = d * sumqx;
+                }
+            }
+            scales[ib] = d;
+            let abs_d = d.abs();
+            if abs_d > amax_scale {
+                amax_scale = abs_d;
+                max_scale = d;
+            }
+        }
+        // супер-блок: общий d, 6-битные ls на подблок (4 бита scales_l +
+        // 2 бита scales_h), переквантование L по dl. ВНИМАНИЕ: id/dl в ggml
+        // считаются от СЫРОГО f32 d (f16 округляется только записываемый dh).
+        let d = -max_scale / 32.0;
+        dh_bytes = f16_bits(d);
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        for ib in 0..8usize {
+            let mut li = nearest_int(id * scales[ib]);
+            li = li.max(-32).min(31);
+            let dl = d * li as f32;
+            let idl = if dl != 0.0 { 1.0 / dl } else { 0.0 };
+            let lb = &mut l[32 * ib..32 * ib + 32];
+            let xb = &blk[32 * ib..32 * ib + 32];
+            for j in 0..32 {
+                lb[j] = best_index_int8(&KVALUES_IQ4NL, idl * xb[j]) as u8;
+            }
+            let ls = li + 32; // 0..63
+            let l_l = (ls & 0xf) as u8;
+            let l_h = ((ls >> 4) & 0x3) as u16;
+            if ib % 2 == 0 {
+                scales_l[ib / 2] = l_l;
+            } else {
+                scales_l[ib / 2] |= l_l << 4;
+            }
+            scales_h |= l_h << (2 * (ib % 8));
+        }
+        // упаковка нибблов: байт j — пары (j, j+16) подблока
+        for i in 0..8usize {
+            for j in 0..16 {
+                q4[16 * i + j] = l[32 * i + j] | (l[32 * i + 16 + j] << 4);
+            }
+        }
+        out.extend_from_slice(&dh_bytes);
+        out.extend_from_slice(&scales_h.to_le_bytes());
+        out.extend_from_slice(&scales_l);
+        out.extend_from_slice(&q4);
+    }
+    out
+}
+
 /// Канонический Q6_K (ggml block_q6_K): блок 256 → 210 байт: ql[128]
 /// (низкие 4 бита), qh[64] (старшие 2), scales[16] (int8 на 16-элементные
 /// подблоки), d (f16) в КОНЦЕ (208..210). Деквант: y = d·sc·(q − 32).
@@ -759,6 +933,7 @@ pub fn quantize(weights: &[f32], fmt: QuantFormat) -> Vec<u8> {
         QuantFormat::Q6_K => quant_q6_k(weights),
         QuantFormat::Q5_0 => quant_q5_0(weights),
         QuantFormat::Q5_K => quant_q5_k(weights),
+        QuantFormat::Iq4Xs => quant_iq4_xs(weights),
     }
 }
 
@@ -1139,6 +1314,7 @@ fn file_type_of(fmt: QuantFormat) -> i32 {
         QuantFormat::Q5_0 => 8,
         QuantFormat::Q5_K => 17,
         QuantFormat::Bf16 => 29,
+        QuantFormat::Iq4Xs => 30, // LLAMA_FTYPE_MOSTLY_IQ4_XS
     }
 }
 
@@ -1298,11 +1474,14 @@ struct TypePolicy {
     n_layer: usize,
     i_ffn_down: usize,
     has_tied_embeddings: bool,
+    /// `hparams.n_gqa()` = n_head/n_head_kv (из форм тензоров attn_q/attn_k);
+    /// 0 — неизвестно. Правило IQ4_XS/IQ4_NL: attn_v при n_gqa ≥ 4 → Q5_K.
+    n_gqa: usize,
     pub fallbacks: Vec<String>,
 }
 
 impl TypePolicy {
-    fn new(fmt: QuantFormat, names: &[(String, usize)], n_layer: usize) -> Self {
+    fn new(fmt: QuantFormat, names: &[(String, usize)], n_layer: usize, n_gqa: usize) -> Self {
         let mut n_attention_wv = 0;
         let mut has_tied_embeddings = true;
         for (name, _) in names {
@@ -1320,6 +1499,7 @@ impl TypePolicy {
             n_layer,
             i_ffn_down: 0,
             has_tied_embeddings,
+            n_gqa,
             fallbacks: Vec::new(),
         }
     }
@@ -1344,6 +1524,7 @@ impl TypePolicy {
             QuantFormat::Q6_K => GgmlType::Q6K,
             QuantFormat::Q5_0 => GgmlType::Q5_0,
             QuantFormat::Q5_K => GgmlType::Q5K,
+            QuantFormat::Iq4Xs => GgmlType::Iq4Xs,
         }
     }
 
@@ -1375,6 +1556,12 @@ impl TypePolicy {
             {
                 new_type = GgmlType::Q6K;
             }
+            // llama-quant.cpp:553: IQ4_NL/IQ4_XS + n_gqa ≥ 4 → attn_v в Q5_K
+            // (у Qwen3-8B n_gqa=4 — потому в эталонном IQ4_XS-файле attn_v и
+            // есть Q5_K). Только чистый v: у fused qkv своя категория.
+            if ftype == QuantFormat::Iq4Xs && cat == TensorCategory::AttnV && self.n_gqa >= 4 {
+                new_type = GgmlType::Q5K;
+            }
             self.i_attention_wv += 1;
         } else if cat == TensorCategory::AttnK || cat == TensorCategory::AttnQ {
             // Для наших ftype без изменений.
@@ -1383,6 +1570,12 @@ impl TypePolicy {
                 && Self::use_more_bits(self.i_ffn_down, self.n_layer)
             {
                 new_type = GgmlType::Q6K;
+            }
+            // llama-quant.cpp:620: IQ4_NL/IQ4_XS БЕЗ imatrix: первые 1/8
+            // ffn_down → Q5_K (защита первых слоёв). Наш энкодер imatrix не
+            // использует — правило применяется всегда.
+            if ftype == QuantFormat::Iq4Xs && self.i_ffn_down < self.n_layer / 8 {
+                new_type = GgmlType::Q5K;
             }
             self.i_ffn_down += 1;
         } else if cat == TensorCategory::AttnOutput {
@@ -1408,6 +1601,9 @@ impl TypePolicy {
         let demoted = match target {
             // Q4_K → Q5_0 (правило llama.cpp); Q6_K → Q8_0; Q5_K → Q5_1
             // (движок его не пишет — ближайший поддерживаемый Q5_0).
+            // IQ4_XS → llama даёт IQ4_NL (блок 32); движок IQ4_NL не пишет,
+            // поэтому ниже он деградирует в F16 (для форм Qwen3 не срабатывает:
+            // ne[0] кратен 256).
             GgmlType::Q4K => GgmlType::Q5_0,
             GgmlType::Q6K => GgmlType::Q8_0,
             GgmlType::Q5K => GgmlType::Q5_0,
@@ -1509,7 +1705,23 @@ pub fn quantize_gguf(
         .iter()
         .map(|t| (t.name.clone(), t.dims.len()))
         .collect();
-    let mut policy = TypePolicy::new(fmt, &names, block_count_of(&gf, &arch));
+    // n_gqa = ne1(attn_q)/ne1(attn_k): в GGUF ne[0] — ВХОД (n_embd, у q и k
+    // одинаковый), а размер выхода (n_head·head_dim / n_kv·head_dim) — ne[1].
+    // Нужно правилу IQ4_XS для attn_v; 0, если тензоров нет.
+    let n_gqa = {
+        let out_dim = |pat: &str| {
+            gf.tensors
+                .iter()
+                .find(|t| t.name.contains(pat))
+                .and_then(|t| t.dims.get(1))
+                .copied()
+        };
+        match (out_dim("attn_q.weight"), out_dim("attn_k.weight")) {
+            (Some(q), Some(k)) if k > 0 && q % k == 0 => (q / k) as usize,
+            _ => 0,
+        }
+    };
+    let mut policy = TypePolicy::new(fmt, &names, block_count_of(&gf, &arch), n_gqa);
     let mut desc = Vec::with_capacity(gf.tensors.len());
     let mut plan: Vec<(GgmlType, bool)> = Vec::with_capacity(gf.tensors.len());
     for t in &gf.tensors {
@@ -1891,7 +2103,78 @@ mod tests {
         assert_eq!(QuantFormat::parse("q8_0"), Some(QuantFormat::Q8_0));
         assert_eq!(QuantFormat::parse("Q4_K_M"), Some(QuantFormat::Q4_K_M));
         assert_eq!(QuantFormat::parse("bf16"), Some(QuantFormat::Bf16));
+        assert_eq!(QuantFormat::parse("iq4_xs"), Some(QuantFormat::Iq4Xs));
+        assert_eq!(QuantFormat::parse("IQ4_XS"), Some(QuantFormat::Iq4Xs));
         assert_eq!(QuantFormat::parse("nope"), None);
+    }
+
+    /// IQ4_XS round-trip: энкодер → `dequant_iq4_xs` (хост-деквант из
+    /// weights_map, сверенный побитово с ggml) → сравнение с входом.
+    /// Ошибка кванта: шаг подблока ≈ max/32·(соседние кодовые точки), для
+    /// плавного входа — доли от амплитуды.
+    #[test]
+    fn iq4_xs_roundtrip() {
+        let w: Vec<f32> = (0..256)
+            .map(|i| ((i as f32) * 0.07).sin() * 3.0 + ((i as f32) * 1.3).cos())
+            .collect();
+        let enc = quant_iq4_xs(&w);
+        assert_eq!(enc.len(), 136);
+        let deq = crate::weights_map::dequant_iq4_xs(&enc);
+        assert_eq!(deq.len(), 256);
+        let max_abs = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (i, (a, b)) in deq.iter().zip(&w).enumerate() {
+            // Нелинейный кодбук + 6-битная квантизация самого масштаба
+            // подблока: у краевых точек ошибка до ~15% амплитуды (IQ4_XS
+            // оптимизирован под гауссовы веса, не под синус). Побитовая
+            // сверка с llama-quantize — ниже в скрипте приёмки.
+            let tol = max_abs * 0.15 + 1e-3;
+            assert!((a - b).abs() <= tol, "элемент {i}: {a} vs {b} (tol {tol})");
+        }
+    }
+
+    /// Нулевой супер-блок: amax < GROUP_MAX_EPS → все scales=0, d = −0/32 =
+    /// −0.0 (f16 0x8000 — ровно как у ggml, dh пишется из `-max_scale/32`),
+    /// ls=32 → множитель 0 → деквант в нули.
+    #[test]
+    fn iq4_xs_zero_block() {
+        let w = vec![0.0f32; 256];
+        let enc = quant_iq4_xs(&w);
+        assert_eq!(&enc[0..2], &[0x00, 0x80], "d = −0.0 (f16 0x8000), как у ggml");
+        let deq = crate::weights_map::dequant_iq4_xs(&enc);
+        assert!(deq.iter().all(|v| *v == 0.0), "нулевой блок должен деквантоваться в нули");
+    }
+
+    /// Layout-вектор: вручную собранный блок читается деквантером именно так
+    /// (страховка от «оба конца одинаково неверны», ср. q4_0_canonical_layout).
+    #[test]
+    fn iq4_xs_layout_vector() {
+        // d = 1.0. Подблок 0: ls = (scales_l[0]&0xF) | ((scales_h>>0)&3)<<4
+        // = 1 | 16 = 17 → множитель d·(17−32) = −15; L=8 → kvalue 1 → y=−15.
+        // Подблоки 1..7: ls = 32 (верхние 2 бита = 2) → множитель 0 → y=0.
+        let mut data = vec![0u8; 136];
+        data[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        data[4] = 0x01; // scales_l[0]: низшая четверка (ib=0) = 1
+        let scales_h: u16 = 0b01 | (0b10 << 2) | (0b10 << 4) | (0b10 << 6) | (0b10 << 8)
+            | (0b10 << 10) | (0b10 << 12) | (0b10 << 14);
+        data[2..4].copy_from_slice(&scales_h.to_le_bytes());
+        for j in 0..16 {
+            data[8 + j] = 8 | (8 << 4); // элементы 0..15 и 16..31 → L=8
+        }
+        let deq = crate::weights_map::dequant_iq4_xs(&data);
+        for i in 0..32 {
+            assert!((deq[i] - (-15.0)).abs() < 1e-4, "элемент {i}: {}", deq[i]);
+        }
+        assert!(deq[32..].iter().all(|v| *v == 0.0), "ls=32 → нули");
+    }
+
+    /// Кодбук и бинарный поиск: best_index_int8 на границах.
+    #[test]
+    fn iq4_xs_best_index() {
+        assert_eq!(best_index_int8(&KVALUES_IQ4NL, -200.0), 0);
+        assert_eq!(best_index_int8(&KVALUES_IQ4NL, 200.0), 15);
+        assert_eq!(best_index_int8(&KVALUES_IQ4NL, 0.0), 8); // 0 ближе к 1, чем к −10
+        assert_eq!(best_index_int8(&KVALUES_IQ4NL, -10.0), 7);
+        assert_eq!(best_index_int8(&KVALUES_IQ4NL, 113.0), 15);
     }
 }
 

@@ -3561,6 +3561,127 @@ kernel void gemm_nt_q8_0_mm(
     }
 }
 
+// ── IQ4_XS GEMM m>1 по схеме ggml kernel_mul_mm (волна A4: паритет префилла) ──
+// Тот же тайл 64(N)×32(M)×32(K) и то же накопление simdgroup_multiply_accumulate,
+// что у gemm_nt_q8_0_mm (он побайтово совпадает с ggml mul_mm), — отличается
+// только загрузчик весов: QK_NL=256 ⇒ nl=16, два лейна на строку весов (il0)
+// проходят 16 подблоков по 16 значений (il = il0, il0+2, …, при обороте x сдвигает-
+// ся на следующий 256-суперблок). Деквант — порт dequantize_iq4_xs: dl = d·(ls−32),
+// затем dl·kvalues с ОДНИМ округлением в half (как у ggml). Без этого префилл
+// (llama.cpp при ne11>8 идёт по mul_mm) расходился с эталоном уже на первом
+// токене; matvec (mv_iq4_xs) побайтово верен только при M ≤ 8.
+kernel void gemm_nt_iq4_xs_mm(
+    device const float* A [[buffer(0)]],     // активации [M, K]
+    device const uchar* B [[buffer(1)]],     // веса IQ4_XS [N, K]
+    device float* C [[buffer(2)]],           // [M, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half* sa = (threadgroup half*)(shmem);          // 64×32 весов
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);   // 32×32 активаций
+    const int r0 = tgpig.y * 64;   // строки весов (N)
+    const int r1 = tgpig.x * 32;   // строки активаций (M)
+    const short nr0 = ((int)N - r0 < 64) ? (short)((int)N - r0) : 64;
+    const short nr1 = ((int)M - r1 < 32) ? (short)((int)M - r1) : 32;
+    const short lr0 = ((short)tiitg / 2) < nr0 ? ((short)tiitg / 2) : nr0 - 1;
+    const short lr1 = ((short)tiitg / 4) < nr1 ? ((short)tiitg / 4) : nr1 - 1;
+    const short il0 = tiitg % 2;
+    const uint nbs = K / 256u;                 // число 256-суперблоков
+    device const uchar* x = B + (ulong)(r0 + lr0) * nbs * 136u;
+    const short iy = 8 * (tiitg % 4);
+    device const float* y = A + (ulong)(r1 + lr1) * K + iy;
+
+    short il = il0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    const uint nk = K / 32u;   // шагов по 32
+    for (uint kb = 0; kb < nk; ++kb) {
+        // деквант 16 значений строки весов (порт dequantize_iq4_xs)
+        {
+            const uint ib32 = il / 2;          // подблок 0..7
+            const uint il2 = il % 2;           // первая/вторая половина
+            const uint scales_h = (uint)x[2] | ((uint)x[3] << 8);
+            const int ls = (int)((((x[4 + ib32 / 2] >> (4u * (ib32 % 2))) & 0xF)
+                                  | (((scales_h >> (2u * ib32)) & 3u) << 4))) - 32;
+            const float d = (float)load_half_unaligned(x) * (float)ls;
+            device const uint32_t* q4 = (device const uint32_t*)(x + 8) + 4 * ib32;
+            float4x4 reg;
+            for (short i = 0; i < 4; ++i) {
+                const uint aux = (q4[i] >> (4u * il2)) & 0x0f0f0f0f;
+                reg[i][0] = d * KV_IQ4[aux & 0xF];
+                reg[i][1] = d * KV_IQ4[(aux >> 8) & 0xF];
+                reg[i][2] = d * KV_IQ4[(aux >> 16) & 0xF];
+                reg[i][3] = d * KV_IQ4[(aux >> 24) & 0xF];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (tiitg / 2) / 8;
+                const short lx = (tiitg / 2) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = (half)reg[i / 4][i % 4];
+            }
+        }
+        // активации: 8 значений строки → блочная раскладка [m][k]
+        {
+            const short sx = tiitg % 4;
+            const short sy = (tiitg / 4) / 8;
+            const short ly = (tiitg / 4) % 8;
+            const short ib = 4 * sx + sy;
+            device const float4* y4 = (device const float4*)(y + kb * 32u);
+            const float4 v0 = y4[0], v1 = y4[1];
+            threadgroup half4* dst = (threadgroup half4*)(sb + 64 * ib + 8 * ly);
+            dst[0] = half4(v0);
+            dst[1] = half4(v1);
+        }
+        // продвижение il/x (generic mul_mm): il по подблокам шагом 2, при
+        // обороте (il<2) — следующий 256-суперблок
+        il = (il + 2 < 16) ? (short)(il + 2) : (short)(il % 2);
+        x = (il < 2) ? x + 136u : x;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64 <= (int)N && r1 + 32 <= (int)M) {
+        device float* Cp = C + (r0 + 32 * (sgitg & 1)) + (ulong)(r1 + 16 * (sgitg >> 1)) * N;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], Cp + 8 * (i % 4) + 8 * (ulong)N * (i / 4), N, 0, false);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* ts = ((threadgroup float*)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * 64;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], ts + 8 * (i % 4) + 8 * 64 * (i / 4), 64, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = tiitg; j < nr1; j += 128) {
+            device float* D = C + (ulong)(r1 + j) * N + r0;
+            threadgroup float* Cs = ((threadgroup float*)shmem) + j * 64;
+            for (int i = 0; i < nr0; i++) D[i] = Cs[i];
+        }
+    }
+}
+
 // ── Decode-attention (Tq=1) с разбиением ключей между simdgroup'ами (Ф8.2b) ──
 // attn_ar_f32_fused ведёт голову ОДНИМ simdgroup'ом и проходит все Tkv ключей
 // последовательно (simd_sum на каждом ключе): при 16 головах GPU занят 16

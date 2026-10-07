@@ -1501,10 +1501,25 @@ impl MetalCtx {
             GpuDtype::Q6_K => "gemm_nt_q6_k",
             GpuDtype::Q5_K => "gemm_nt_q5_k",
             GpuDtype::Q5_0 => "gemm_nt_q5_0",
-            // IQ4_XS: тайлового GEMM нет — тот же mv_iq4_xs по сетке (N, M).
-            // Для префилла это медленнее тайлового, но корректно; тайловый —
-            // отдельной задачей волны A4.
+            // IQ4_XS: при m > 8 llama.cpp идёт по kernel_mul_mm (порог use_mm:
+            // ne11 > 8), при m ≤ 8 — по mul_mv. Паритет требует совпадать с его
+            // выбором: m > 8 → gemm_nt_iq4_xs_mm (порт mul_mm), иначе mv_iq4_xs.
+            // mul_mm требует K, кратного 256 (шаг il/x по суперблокам).
             GpuDtype::Iq4Xs => {
+                if m > 8 && k % 256 == 0 && std::env::var("INFER_IQ4XS_NO_MM").is_err() {
+                    let (m32, k32, n32) = (m as u32, k as u32, n as u32);
+                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let group = MTLSize::new(128, 1, 1);
+                    return self.run("gemm_nt_iq4_xs_mm", grid, group, |enc| {
+                        enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                        enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                        enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                        enc.set_bytes(3, 4, (&m32 as *const u32).cast());
+                        enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                        enc.set_bytes(5, 4, (&n32 as *const u32).cast());
+                        enc.set_threadgroup_memory_length(0, 8192);
+                    });
+                }
                 return self.mv_iq4_xs_dispatch(a, b, c, k, n);
             }
             other => {
@@ -5020,6 +5035,80 @@ mod quant_gemm_tests {
                 got[row]
             );
         }
+    }
+
+    /// IQ4_XS mul_mm (m>8): сверка тайлового GEMM с хост-деквантом. Ловит
+    /// раскладку il/x по суперблокам и попадание весов в K-позиции тайла.
+    #[test]
+    fn iq4_xs_mm_matches_host_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (m, n, k) = (16usize, 64usize, 512usize); // m>8 → gemm_nt_iq4_xs_mm
+        let mut seed = 0x1234_5678u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut raw = Vec::with_capacity(n * k / 256 * 136);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+            raw.extend_from_slice(&((next() as u16)).to_le_bytes());
+            for _ in 0..4 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq4Xs)
+            .unwrap();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+            .collect();
+        // активации в тайле mul_mm — тоже half
+        let ah: Vec<f32> = a
+            .iter()
+            .map(|&x| half::f16::to_f32(half::f16::from_f32(x)))
+            .collect();
+        let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+        let c = be.zeros(vec![m, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        // Эталон — как mul_mm: деквант f32 → округление веса в half (тайл
+        // sa хранит half) → f64-dot. Тогда остаётся лишь разница порядка
+        // накопления; структурный баг раскладки il/x дал бы ≫1e-4.
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|r| {
+                crate::weights_map::dequant_iq4_xs(
+                    &raw[r * (k / 256) * 136..(r + 1) * (k / 256) * 136],
+                )
+                .into_iter()
+                .map(|x| half::f16::to_f32(half::f16::from_f32(x)))
+                .collect()
+            })
+            .collect();
+        let mut worst = 0f64;
+        for mi in 0..m {
+            for ni in 0..n {
+                let want: f64 = rows[ni]
+                    .iter()
+                    .zip(&ah[mi * k..mi * k + k])
+                    .map(|(w, x)| (*w as f64) * (*x as f64))
+                    .sum();
+                let d = (got[mi * n + ni] as f64 - want).abs();
+                let rel = d / (1.0 + want.abs());
+                if rel > worst {
+                    worst = rel;
+                }
+                assert!(rel <= 2e-4, "m={mi} n={ni}: {} vs {want} (Δ {d})", got[mi * n + ni]);
+            }
+        }
+        eprintln!("iq4_xs_mm worst rel {worst:e}");
     }
 
     fn fixture(name: &str) -> Vec<u8> {

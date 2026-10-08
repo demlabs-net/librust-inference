@@ -1806,6 +1806,26 @@ impl MetalCtx {
             )));
         }
         let (k32, n32) = (k as u32, n as u32);
+        // Декод (m = 1) — порт эталонного mul_mv: один simdgroup на ПАРУ
+        // строк весов, y один раз на пару (float4), кванты u32-парами, две
+        // цепи ILP. Побитово == mv_iq4_xs (тест iq4_xs_r2_matches_rowwise);
+        // требует 16-байтового сдвига A и 4-байтового B. INFER_IQ4XS_NO_R2=1
+        // — прежний путь (сверка).
+        if m == 1
+            && a.offset % 16 == 0
+            && b.offset % 4 == 0
+            && std::env::var("INFER_IQ4XS_NO_R2").is_err()
+        {
+            let grid = MTLSize::new(32, n.div_ceil(2) as u64, 1);
+            let group = MTLSize::new(32, 1, 1);
+            return self.run("mv_iq4_xs_r2", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
+        }
         // Строку весов считает один simdgroup (32 лейна) — сетка (32, N, M).
         let grid = MTLSize::new(32, n as u64, m as u64);
         let group = MTLSize::new(32, 1, 1);

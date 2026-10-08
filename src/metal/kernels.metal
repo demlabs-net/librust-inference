@@ -1799,6 +1799,77 @@ kernel void mv_iq4_xs(
     if (lane == 0u) C[(ulong)m * N + n] = sumf;
 }
 
+// Декод (m = 1): порт kernel_mul_mv_iq4_xs_f32 эталона (llama.cpp 0.4.0,
+// N_R0_IQ4_XS = 2) — ОДИН simdgroup на ПАРУ строк весов: активации читаются
+// один раз на пару (4×float4 вместо 16 скалярных на строку), кванты — парой
+// u32 (вместо 8 ld8), и две независимые цепи аккумуляции удваивают ILP.
+// Арифметика каждого выхода — точь-в-точь mv_iq4_xs (тот же порядок
+// слагаемых) → побитово идентично (сверка r2 против mb5 — в тесте
+// iq4_xs_matvec_batch_consistency, против хост-декванта — в
+// iq4_xs_mv_matches_host_dequant).
+// Требует 16-байтового сдвига A и 4-байтового — B (проверяется в диспетчере,
+// иначе — прежний mv_iq4_xs). Прежняя попытка векторизовать ОДИН ряд
+// (флаг/шаблон ALIGNED) была нейтральна: рычаг не в ширине загрузки сама по
+// себе, а в переиспользовании y на два ряда и двух цепях ILP.
+kernel void mv_iq4_xs_r2(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    const uint n0 = 2u * tgid.y;
+    if (n0 >= N) return;
+    const bool two = n0 + 1u < N;
+    const uint nb = K / 256u;
+    device const uchar* row0 = B + (ulong)n0 * nb * 136u;
+
+    const uint ix = lane / 16u;   // 0/1 — чётность суперблока (шаг 2 по sb)
+    const uint it = lane % 16u;
+    const uint ib = it / 2u;       // подблок 0..7
+    const uint il = it % 2u;       // половина подблока: 8 байт qs
+
+    float sumf[2] = {0.0f, 0.0f};
+    for (uint sb = ix; sb < nb; sb += 2u) {
+        device const float* yb = A + (ulong)sb * 256u + ib * 32u + il * 8u;
+        const float4 yl0 = *(device const float4*)yb;
+        const float4 yl1 = *(device const float4*)(yb + 16);
+        const float4 yl2 = *(device const float4*)(yb + 4);
+        const float4 yl3 = *(device const float4*)(yb + 20);
+#pragma unroll
+        for (uint rr = 0; rr < 2; ++rr) {
+            if (rr == 1u && !two) break;
+            device const uchar* x = row0 + (ulong)rr * nb * 136u + sb * 136u;
+            device const uint* q4 = (device const uint*)(x + 8u + 16u * ib + 8u * il);
+            const uint q0 = q4[0];
+            const uint q1 = q4[1];
+            float4 acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+            float4 acc2 = {0.0f, 0.0f, 0.0f, 0.0f};
+            acc1 += yl0 * float4(KV_IQ4[q0 & 0xF], KV_IQ4[(q0 >> 8) & 0xF],
+                                 KV_IQ4[(q0 >> 16) & 0xF], KV_IQ4[(q0 >> 24) & 0xF]);
+            acc2 += yl1 * float4(KV_IQ4[(q0 >> 4) & 0xF], KV_IQ4[(q0 >> 12) & 0xF],
+                                 KV_IQ4[(q0 >> 20) & 0xF], KV_IQ4[(q0 >> 28) & 0xF]);
+            acc1 += yl2 * float4(KV_IQ4[q1 & 0xF], KV_IQ4[(q1 >> 8) & 0xF],
+                                 KV_IQ4[(q1 >> 16) & 0xF], KV_IQ4[(q1 >> 24) & 0xF]);
+            acc2 += yl3 * float4(KV_IQ4[(q1 >> 4) & 0xF], KV_IQ4[(q1 >> 12) & 0xF],
+                                 KV_IQ4[(q1 >> 20) & 0xF], KV_IQ4[(q1 >> 28) & 0xF]);
+            acc1 += acc2;
+            const uint scales_h = (uint)x[2] | ((uint)x[3] << 8);
+            const int ls = (int)((((x[4 + (ib >> 1)] >> (4u * (ib & 1u))) & 0xF)
+                                  | (((scales_h >> (2u * ib)) & 3u) << 4))) - 32;
+            const float d = (float)load_half_unaligned(x);
+            sumf[rr] += d * (float)ls * ((acc1.x + acc1.y) + acc1.z + acc1.w);
+        }
+    }
+#pragma unroll
+    for (uint rr = 0; rr < 2; ++rr) {
+        const float v = simd_sum(sumf[rr]);
+        if (lane == 0u && (rr == 0u || two)) C[n0 + rr] = v;
+    }
+}
+
 // IQ4_XS matvec с батчем строк активаций (окно верификации спека, 1 < m ≤ 8):
 // mv_iq4_xs читает строку весов на КАЖДУЮ строку A (сетка z = M) — при m = 5
 // это 5-кратный трафик весов и forward окна дороже трёх шагов декода. Здесь

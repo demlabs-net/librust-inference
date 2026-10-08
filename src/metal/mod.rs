@@ -1723,6 +1723,24 @@ impl MetalCtx {
                 b.dtype
             )));
         }
+        // Q5_K matvec: тот же порт эталонного mul_mv (8 лейнов на строку,
+        // пара строк на simdgroup, y один раз на пару). uint16-чтение scales
+        // требует чётного смещения; фоллбэк INFER_Q5K_NO_R2.
+        if b.dtype == GpuDtype::Q5_K
+            && b.offset % 2 == 0
+            && std::env::var("INFER_Q5K_NO_R2").is_err()
+        {
+            let (k32, n32) = (k as u32, n as u32);
+            let grid = MTLSize::new(32, n.div_ceil(2) as u64, 1);
+            let group = MTLSize::new(32, 1, 1);
+            return self.run("mv_q5_k_r2", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
+        }
         // Q6_K matvec: порт эталонного mul_mv (пара строк на simdgroup, y
         // один раз на пару, 16 лейнов на строку). Порядок суммирования по K
         // отличается от mv_q6_k — приёмка парными text_parity; фоллбэк

@@ -2314,6 +2314,103 @@ kernel void mv_q5_k(
     C[n] = acc;
 }
 
+// Q5_K matvec — порт эталонного kernel_mul_mv_q5_K_f32 (llama.cpp 0.4.0):
+// строку ведут 8 лейнов (tid = lane/4), 4 лейна делят суперблоки (ix = lane%4),
+// на simdgroup — ПАРА строк, y грузится один раз на пару. Порядок суммирования
+// по K отличается от mv_q5_k — приёмка парными text_parity (паритет первичен,
+// фоллбэк INFER_Q5K_NO_R2).
+kernel void mv_q5_k_r2(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint nb = K / 256u;
+    const uint first_row = 2u * tgid.y;
+    if (first_row >= N) return;
+    const bool two = first_row + 1u < N;
+    const ulong row_bytes = (ulong)nb * 176u;
+
+    const uint tid = lane / 4u;   // 0..7
+    const uint ix  = lane % 4u;   // 0..3 — какие суперблоки берёт лейн
+    const uint iq  = tid / 4u;    // 0..1 — половина суперблока
+    const uint ir  = tid % 4u;    // 0..3 — четверть внутри половины
+    const uint l0  = 8u * ir;
+    const uint q_off = 32u * iq + l0;
+    const uint y_off = 64u * iq + l0;
+
+    const uint hm1 = 1u << (2u * iq);
+    const uint hm2 = hm1 << 1;
+    const uint hm3 = hm1 << 4;
+    const uint hm4 = hm2 << 4;
+
+    device const uchar* x = B + (ulong)first_row * row_bytes;
+    float sumf[2] = {0.f, 0.f};
+
+    for (uint i = ix; i < nb; i += 4u) {
+        device const uchar* blk = x + (ulong)i * 176u;
+        device const float* y1 = A + (ulong)i * 256u + y_off;
+        device const float* y2 = y1 + 128u;
+
+        float yl[16], yh[16];
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (uint l = 0; l < 8u; ++l) {
+            yl[l + 0] = y1[l +  0]; sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l +  0]; sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32]; sumy[3] += yh[l + 8];
+        }
+
+        for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+            device const uchar* xb = blk + (ulong)rr * row_bytes;
+            device const uchar* q1 = xb + 48u + q_off;
+            device const uchar* q2 = q1 + 64u;
+            device const uchar* qh = xb + 16u + l0;
+            device const uchar* sp = xb + 4u + 2u * iq;
+            const float dh = (float)load_half_unaligned(xb);
+            const float dm = (float)load_half_unaligned(xb + 2u);
+
+            uint16_t sc16[4];
+            sc16[0] = (uint16_t)(sp[0] | (sp[1] << 8)) & 0x3f3fu;
+            sc16[1] = (uint16_t)(sp[4] | (sp[5] << 8)) & 0x3f3fu;
+            sc16[2] = ((uint16_t)(sp[8] | (sp[9] << 8)) & 0x0f0fu) |
+                      (((uint16_t)(sp[0] | (sp[1] << 8)) & 0xc0c0u) >> 2);
+            sc16[3] = (((uint16_t)(sp[8] | (sp[9] << 8)) >> 4) & 0x0f0fu) |
+                      (((uint16_t)(sp[4] | (sp[5] << 8)) & 0xc0c0u) >> 2);
+            thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (uint l = 0; l < 8u; ++l) {
+                const uint h = qh[l];
+                acc1[0] += yl[l + 0] * (float)(q1[l] & 0x0Fu);
+                acc1[1] += yl[l + 8] * (float)(q1[l] & 0xF0u);
+                acc1[2] += yh[l + 0] * (float)(q2[l] & 0x0Fu);
+                acc1[3] += yh[l + 8] * (float)(q2[l] & 0xF0u);
+                acc2[0] += (h & hm1) ? yl[l + 0] : 0.f;
+                acc2[1] += (h & hm2) ? yl[l + 8] : 0.f;
+                acc2[2] += (h & hm3) ? yh[l + 0] : 0.f;
+                acc2[3] += (h & hm4) ? yh[l + 8] : 0.f;
+            }
+            sumf[rr] += dh * (sc8[0] * (acc1[0] + 16.f * acc2[0]) +
+                              sc8[1] * (acc1[1] / 16.f + 16.f * acc2[1]) +
+                              sc8[4] * (acc1[2] + 16.f * acc2[2]) +
+                              sc8[5] * (acc1[3] / 16.f + 16.f * acc2[3])) -
+                        dm * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                              sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+    }
+    const float v0 = simd_sum(sumf[0]);
+    if (lane == 0u) C[first_row] = v0;
+    if (two) {
+        const float v1 = simd_sum(sumf[1]);
+        if (lane == 0u) C[first_row + 1u] = v1;
+    }
+}
+
 // ── YaRN/линейное скалирование RoPE ─────────────────────────────────────────
 // Зеркало ggml rope_yarn/ggml_rope_cache_init (см. src/rope.rs): угол пары k
 // на позиции p строится МУЛЬТИПЛИКАТИВНЫМ накоплением theta (p·ts^k — тот же

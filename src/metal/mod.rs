@@ -3180,6 +3180,44 @@ impl MetalCtx {
         )
     }
 
+    /// Fused GDN-хвост decode-шага (t=1): conv+silu+split+l2norm+сдвиг стейта
+    /// одним кернелом. Одна threadgroup из `hd` потоков на голову; grid —
+    /// ВСЕГО потоков (heads·hd), см. ловушку dispatch_threads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv_silu_split_norm_f32(
+        &self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        state: &GpuTensor,
+        y: &GpuTensor,
+        new_state: &GpuTensor,
+        c: usize,
+        k: usize,
+        hd: usize,
+        qk: usize,
+        eps: f32,
+    ) -> Result<(), MetalError> {
+        let (c32, k32, hd32, qk32) = (c as u32, k as u32, hd as u32, qk as u32);
+        let heads = c.div_ceil(hd);
+        self.run(
+            "gdn_conv_silu_split_norm_f32",
+            MTLSize::new((heads * hd) as u64, 1, 1),
+            MTLSize::new(hd as u64, 1, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+                enc.set_buffer(2, Some(&state.buffer), state.offset as u64);
+                enc.set_buffer(3, Some(&y.buffer), y.offset as u64);
+                enc.set_buffer(4, Some(&new_state.buffer), new_state.offset as u64);
+                enc.set_bytes(5, 4, (&c32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&qk32 as *const u32).cast());
+                enc.set_bytes(9, 4, (&eps as *const f32).cast());
+            },
+        )
+    }
+
     /// Гейты GDN: g = softplus(alpha + dt_bias)·a, beta = sigmoid(beta_raw).
     /// alpha/beta/g/b [n = T·H], dt_bias/a [H].
     #[allow(clippy::too_many_arguments)]
@@ -3892,6 +3930,36 @@ impl crate::backend::Backend for MetalBackend {
         self.ctx
             .gdn_l2norm_f32(x.as_gpu(), y.as_gpu(), x.numel() / hd, hd, eps)?;
         Ok(y)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv_silu_split_norm(
+        &self,
+        x: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        state: &crate::backend::Tensor,
+        c: usize,
+        k: usize,
+        hd: usize,
+        qk: usize,
+        eps: f32,
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
+    {
+        let y = self.zeros(vec![c])?;
+        let ns = self.zeros(vec![c, k - 1])?;
+        self.ctx.gdn_conv_silu_split_norm_f32(
+            x.as_gpu(),
+            w.as_gpu(),
+            state.as_gpu(),
+            y.as_gpu(),
+            ns.as_gpu(),
+            c,
+            k,
+            hd,
+            qk,
+            eps,
+        )?;
+        Ok((y, ns))
     }
 
     fn gdn_gates(

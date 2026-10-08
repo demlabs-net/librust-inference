@@ -1062,18 +1062,45 @@ impl Qwen35Model {
         let (gate, b) = backend.gdn_gates(&ba, &g.dt_bias, &g.a)?;
         gs(t0, &mut t_gt)?;
         t0 = std::time::Instant::now();
-        let (conv_out, new_conv) = backend.gdn_conv(&qkv, &g.conv_w, &st.conv)?;
-        st.conv = new_conv;
-        let act = backend.zeros(conv_out.shape().to_vec())?;
-        backend.silu(&conv_out, &act)?;
-        gs(t0, &mut t_cv)?;
-        t0 = std::time::Instant::now();
         let qk_size = hk * s;
-        let q = crate::nn::slice_last(backend, &act, qk_size, 0)?;
-        let k = crate::nn::slice_last(backend, &act, qk_size, qk_size)?;
-        let v = crate::nn::slice_last(backend, &act, inner, 2 * qk_size)?;
-        let qn = backend.gdn_l2norm(&q, s, cfg.norm_eps)?;
-        let kn = backend.gdn_l2norm(&k, s, cfg.norm_eps)?;
+        let cq = 2 * qk_size + inner;
+        // Fused-хвост decode-шага (t=1): conv+silu+split+l2norm+сдвиг стейта
+        // одним кернелом вместо восьми запусков (зонд gdn_probe: на шумной
+        // машине 8 мелких стадий стоили ~1.4 мс/слой при ~0.15 мс пола на
+        // каждую). Головы длины s должны делить C, нитогруппа ≤ 1024.
+        let fused = t == 1 && s <= 1024 && cq % s == 0;
+        let (qn, kn, v) = if fused {
+            let (y, new_conv) = backend.gdn_conv_silu_split_norm(
+                &qkv,
+                &g.conv_w,
+                &st.conv,
+                cq,
+                cfg.conv_kernel,
+                s,
+                qk_size,
+                cfg.norm_eps,
+            )?;
+            st.conv = new_conv;
+            let qn = y.view_offset(vec![1, 1, qk_size], 0);
+            let kn = y.view_offset(vec![1, 1, qk_size], qk_size);
+            let v = y.view_offset(vec![1, 1, inner], 2 * qk_size);
+            gs(t0, &mut t_cv)?;
+            t0 = std::time::Instant::now();
+            (qn, kn, v)
+        } else {
+            let (conv_out, new_conv) = backend.gdn_conv(&qkv, &g.conv_w, &st.conv)?;
+            st.conv = new_conv;
+            let act = backend.zeros(conv_out.shape().to_vec())?;
+            backend.silu(&conv_out, &act)?;
+            gs(t0, &mut t_cv)?;
+            t0 = std::time::Instant::now();
+            let q = crate::nn::slice_last(backend, &act, qk_size, 0)?;
+            let k = crate::nn::slice_last(backend, &act, qk_size, qk_size)?;
+            let v = crate::nn::slice_last(backend, &act, inner, 2 * qk_size)?;
+            let qn = backend.gdn_l2norm(&q, s, cfg.norm_eps)?;
+            let kn = backend.gdn_l2norm(&k, s, cfg.norm_eps)?;
+            (qn, kn, v)
+        };
         gs(t0, &mut t_nr)?;
         t0 = std::time::Instant::now();
         let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, &gate, &b, &st.ssm, hk)?;

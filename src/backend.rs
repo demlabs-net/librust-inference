@@ -1134,6 +1134,51 @@ pub trait Backend: Send + Sync {
         self.from_cpu_f32(&y, x.shape().to_vec())
     }
 
+    /// Fused GDN-хвост decode-шага (t=1): causal conv (K тапов из
+    /// [state | x]) → silu → split [q | k | v], где q и k нормированы по
+    /// головам длины `hd` (v — без нормировки), + сдвиг conv-стейта.
+    /// Возврат — (y [C] = q|k|v, new_state [C, K-1]). Арифметика каждого
+    /// выхода побитово равна цепочке gdn_conv → silu → slice → gdn_l2norm.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv_silu_split_norm(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        c: usize,
+        k: usize,
+        hd: usize,
+        qk: usize,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (xv, wv, sv) = (self.to_cpu_f32(x)?, self.to_cpu_f32(w)?, self.to_cpu_f32(state)?);
+        let mut y = vec![0.0f32; c];
+        let mut ns = vec![0.0f32; c * (k - 1)];
+        for ch in 0..c {
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                let v = if j < k - 1 { sv[ch * (k - 1) + j] } else { xv[ch] };
+                acc += wv[ch * k + j] * v;
+            }
+            y[ch] = acc / (1.0 + (-acc).exp());
+            for j in 0..k - 1 {
+                ns[ch * (k - 1) + j] =
+                    if j + 1 < k - 1 { sv[ch * (k - 1) + j + 1] } else { xv[ch] };
+            }
+        }
+        for hbase in (0..2 * qk).step_by(hd) {
+            let row = &y[hbase..hbase + hd];
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            for i in 0..hd {
+                y[hbase + i] *= inv;
+            }
+        }
+        Ok((
+            self.from_cpu_f32(&y, vec![c])?,
+            self.from_cpu_f32(&ns, vec![c, k - 1])?,
+        ))
+    }
+
     /// Гейты GDN: BA [T, 2Hv] — склеенный выход одной GEMM (alpha = BA[t·2H+h],
     /// beta = BA[t·2H+H+h]); g = softplus(alpha + dt_bias)·a (a = −exp(A_log)
     /// уже в GGUF), beta = sigmoid(beta_raw).

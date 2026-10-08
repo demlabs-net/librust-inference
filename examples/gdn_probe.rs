@@ -150,6 +150,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bench("norm_gated", ssm_inner * 4 * 2, reps, || {
         be.gdn_norm_gated(&o, &z, &norm_w, 1e-6).unwrap();
     });
+    // Корректность fused-хвоста (conv+silu+split+l2norm+стейт) против
+    // хост-цепочки с тем же порядком арифметики.
+    let cq = 2 * qk + ssm_inner;
+    let mut rng = 0x243F6A8885A308D3u64;
+    let mut rnd = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                ((rng >> 40) as f32 / 1e7) - 0.5
+            })
+            .collect()
+    };
+    let xf = rnd(cq);
+    let wf = rnd(cq * 4);
+    let sf = rnd(cq * 3);
+    let xt = be.from_cpu_f32(&xf, vec![cq])?;
+    let wt = be.from_cpu_f32(&wf, vec![cq, 4])?;
+    let stt = be.from_cpu_f32(&sf, vec![cq, 3])?;
+    let (yf, nsf) = be.gdn_conv_silu_split_norm(&xt, &wt, &stt, cq, 4, s, qk, 1e-6)?;
+    let yfv = be.to_cpu_f32(&yf)?;
+    let nsfv = be.to_cpu_f32(&nsf)?;
+    let mut ywant = vec![0.0f32; cq];
+    let mut nswant = vec![0.0f32; cq * 3];
+    for ch in 0..cq {
+        let mut acc = 0.0f32;
+        for j in 0..4 {
+            let v = if j < 3 { sf[ch * 3 + j] } else { xf[ch] };
+            acc += wf[ch * 4 + j] * v;
+        }
+        ywant[ch] = acc / (1.0 + (-acc).exp());
+        for j in 0..3 {
+            nswant[ch * 3 + j] = if j + 1 < 3 { sf[ch * 3 + j + 1] } else { xf[ch] };
+        }
+    }
+    for hbase in (0..2 * qk).step_by(s) {
+        let mut ss = 0.0f32;
+        for j in 0..s {
+            ss += ywant[hbase + j] * ywant[hbase + j];
+        }
+        let inv = 1.0 / (ss + 1e-6).sqrt();
+        for j in 0..s {
+            ywant[hbase + j] *= inv;
+        }
+    }
+    let maxd = yfv
+        .iter()
+        .zip(&ywant)
+        .map(|(a, b)| (a - b).abs())
+        .chain(nsfv.iter().zip(&nswant).map(|(a, b)| (a - b).abs()))
+        .fold(0.0f32, f32::max);
+    println!("fused-хвост контроль: |Δ| max {maxd}");
+    assert!(maxd < 1e-5, "fused-хвост неверен");
+    let xq = be.from_cpu_f32(&xf, vec![1, 1, cq])?;
+    bench("fused tail", cq * 4 * 3, reps, || {
+        be.gdn_conv_silu_split_norm(&xq, &wt, &stt, cq, 4, s, qk, 1e-6).unwrap();
+    });
     // Корректность norm_gated: x,z,w с известными значениями.
     let xv: Vec<f32> = (0..ssm_inner).map(|i| ((i % 37) as f32 - 18.0) * 0.05).collect();
     let zv: Vec<f32> = (0..ssm_inner).map(|i| ((i % 23) as f32 - 11.0) * 0.2).collect();

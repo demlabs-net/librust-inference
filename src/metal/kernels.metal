@@ -3208,6 +3208,59 @@ kernel void gdn_l2norm_f32(
     for (uint i = 0; i < HD; ++i) Y[r * HD + i] = x[i] * inv;
 }
 
+// Fused GDN-хвост decode-шага (t=1): conv → silu → split → l2norm за один
+// проход вместо четырёх кернелов и трёх копий slice_last. Арифметика каждого
+// выхода побитово равна цепочке gdn_conv1d_f32 + silu_f32 + slice_last +
+// gdn_l2norm_f32: conv копит j=0..K-1 в том же порядке, silu — x/(1+exp(-x)),
+// Σx² по голове — последовательно i=0..HD-1 (копит поток 0, барьер, затем
+// все HD потоков пишут y = x·inv). Одна threadgroup на голову: головы —
+// отрезки длины HD поперёк [q | k | v], v-головы нормируются единичным
+// множителем (инвариант прежнего вызова: l2norm применялся только к q и k).
+kernel void gdn_conv_silu_split_norm_f32(
+    device const float* X [[buffer(0)]],      // [C] — qkv текущего токена
+    device const float* W [[buffer(1)]],      // [C, K]
+    device const float* STATE [[buffer(2)]],  // [C, K-1]
+    device float* Y [[buffer(3)]],            // [C] = [q | k | v]
+    device float* NEW [[buffer(4)]],          // [C, K-1] — новый стейт
+    constant uint& C [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    constant uint& HD [[buffer(7)]],          // длина головы l2norm
+    constant uint& QK [[buffer(8)]],          // Hk·HD — граница q/k
+    constant float& eps [[buffer(9)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint i [[thread_index_in_threadgroup]])
+{
+    const uint base = head * HD;
+    if (base >= C) return;
+    const bool normed = base < 2u * QK;
+    threadgroup float sv[1024];
+    threadgroup float sinv;
+
+    if (i < HD) {
+        const uint c = base + i;
+        float acc = 0.0f;
+        for (uint j = 0; j < K; ++j) {
+            float v = (j < K - 1) ? STATE[c * (K - 1) + j] : X[c];
+            acc += W[c * K + j] * v;
+        }
+        sv[i] = acc / (1.0f + exp(-acc));
+        // Сдвиг стейта при T=1: новый = [старый[1..], x].
+        for (uint j = 0; j < K - 1; ++j) {
+            NEW[c * (K - 1) + j] = (j + 1 < K - 1) ? STATE[c * (K - 1) + j + 1] : X[c];
+        }
+    }
+    if (normed) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (i == 0u) {
+            float ss = 0.0f;
+            for (uint j = 0; j < HD; ++j) ss += sv[j] * sv[j];
+            sinv = 1.0f / sqrt(ss + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (i < HD) Y[base + i] = sv[i] * (normed ? sinv : 1.0f);
+}
+
 // Гейты GDN на токен и v-голову: g = softplus(alpha + dt_bias) · ssm_a,
 // beta = sigmoid(beta_raw). ALPHA/BETA [T, H]; G/B — выходы [T, H].
 // BA [T, 2H]: alpha = BA[t·2H + h], beta = BA[t·2H + H + h] (одна GEMM на

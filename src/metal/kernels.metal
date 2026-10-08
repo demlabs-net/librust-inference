@@ -2211,6 +2211,73 @@ kernel void mv_ks_t(
     if (lane == 0u && ok) C[r] = v;
 }
 
+// Q6_K matvec — порт эталонного kernel_mul_mv_q6_K_f32 (llama.cpp 0.4.0):
+// simdgroup на ПАРУ строк весов, по 16 лейнов на строку (ix = lane%2 делит
+// суперблоки по чётности), y грузится один раз на пару. Порядок суммирования
+// по K отличается от mv_q6_k (частичные суммы лейнов + simd_sum) — результат
+// НЕ побитовый, приёмка парными прогонами text_parity на всех моделях-приёмке
+// (паритет первичен; фоллбэк INFER_Q6K_NO_R2).
+kernel void mv_q6_k_r2(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint nb = K / 256u;
+    const uint first_row = 2u * tgid.y;
+    if (first_row >= N) return;
+    const bool two = first_row + 1u < N;
+    const ulong row_bytes = (ulong)nb * 210u;
+
+    const uint tid = lane / 2u;   // 0..15 — позиция внутри строки
+    const uint ix  = lane % 2u;   // чётность суперблоков
+    const uint ip  = tid / 8u;    // половина суперблока
+    const uint il  = tid % 8u;
+    const uint l0  = 4u * il;
+    const uint is  = 8u * ip + l0 / 16u;
+    const uint y_off   = 128u * ip + l0;
+    const uint q_off_l =  64u * ip + l0;
+    const uint q_off_h =  32u * ip + l0;
+
+    device const uchar* x = B + (ulong)first_row * row_bytes;
+    float sumf[2] = {0.f, 0.f};
+    for (uint i = ix; i < nb; i += 2u) {
+        device const float* y = A + (ulong)i * 256u + y_off;
+        float yl[16];
+        for (uint l = 0; l < 4u; ++l) {
+            yl[4u*l + 0] = y[l +  0];
+            yl[4u*l + 1] = y[l + 32];
+            yl[4u*l + 2] = y[l + 64];
+            yl[4u*l + 3] = y[l + 96];
+        }
+        for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+            device const uchar* xb = x + (ulong)rr * row_bytes + (ulong)i * 210u;
+            device const uchar* q1 = xb + q_off_l;
+            device const uchar* q2 = q1 + 32;
+            device const uchar* qh = xb + 128u + q_off_h;
+            device const char*  sc = (device const char*)(xb + 192u) + is;
+            const float dh = (float)load_half_unaligned(xb + 208u);
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (uint l = 0; l < 4u; ++l) {
+                sums[0] += yl[4u*l + 0] * (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+                sums[1] += yl[4u*l + 1] * (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+                sums[2] += yl[4u*l + 2] * (float)((int8_t)((q1[l] >> 4) | ((qh[l] & 0x30)         )) - 32);
+                sums[3] += yl[4u*l + 3] * (float)((int8_t)((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)   ) - 32);
+            }
+            sumf[rr] += dh * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+    }
+    const float v0 = simd_sum(sumf[0]);
+    if (lane == 0u) C[first_row] = v0;
+    if (two) {
+        const float v1 = simd_sum(sumf[1]);
+        if (lane == 0u) C[first_row + 1u] = v1;
+    }
+}
+
 kernel void mv_q5_0(
     device const float* A [[buffer(0)]],
     device const uchar* B [[buffer(1)]],

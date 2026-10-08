@@ -1723,6 +1723,22 @@ impl MetalCtx {
                 b.dtype
             )));
         }
+        // Q6_K matvec: порт эталонного mul_mv (пара строк на simdgroup, y
+        // один раз на пару, 16 лейнов на строку). Порядок суммирования по K
+        // отличается от mv_q6_k — приёмка парными text_parity; фоллбэк
+        // INFER_Q6K_NO_R2.
+        if b.dtype == GpuDtype::Q6_K && std::env::var("INFER_Q6K_NO_R2").is_err() {
+            let (k32, n32) = (k as u32, n as u32);
+            let grid = MTLSize::new(32, n.div_ceil(2) as u64, 1);
+            let group = MTLSize::new(32, 1, 1);
+            return self.run("mv_q6_k_r2", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
+        }
         // Q8_0 (основной квант LLM): simdgroup-кооперативный кернел — лейны
         // читают соседние байты строки (коалесцированно), 8 строк на
         // threadgroup из 64 потоков. Прочие кванты — поток на строку.

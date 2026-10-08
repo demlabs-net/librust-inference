@@ -54,6 +54,38 @@ kernel void gemm_nt_f32(
     C[m * N + n] = acc;
 }
 
+// gemm_nt_f32 с float4-загрузками: накопление строго последовательное по k
+// (x, y, z, w) — ПОБИТОВО идентично скалярному, но вчетверо меньше инструкций
+// загрузки и вчетверо больше памяти в полёте на поток. Узкое место скалярной
+// версии на маленьких N (GDN beta/alpha [48,5120]: 48 потоков на весь GPU) —
+// латентность загрузок, 1.5 ГБ/с; здесь ~4× быстрее. Берётся при K%4==0 и
+// 16-байтном выравнивании обоих операндов.
+kernel void gemm_nt_f32_v4(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint m = gid.x, n = gid.y;
+    if (m >= M || n >= N) return;
+    device const float4* a = (device const float4*)(A + m * K);
+    device const float4* b = (device const float4*)(B + n * K);
+    const uint k4 = K / 4u;
+    float acc = 0.0f;
+    for (uint k = 0; k < k4; ++k) {
+        const float4 av = a[k];
+        const float4 bv = b[k];
+        acc += av.x * bv.x;
+        acc += av.y * bv.y;
+        acc += av.z * bv.z;
+        acc += av.w * bv.w;
+    }
+    C[m * N + n] = acc;
+}
+
 // ── Quantized GEMM: fp32 activations × fp16/bf16 weights, fp32 accumulate ───
 // Same layouts as the f32 kernels; only the B (weight) storage narrows to
 // 2 bytes/element. bf16 has no native MSL type on older stacks — the bits
@@ -3178,9 +3210,10 @@ kernel void gdn_l2norm_f32(
 
 // Гейты GDN на токен и v-голову: g = softplus(alpha + dt_bias) · ssm_a,
 // beta = sigmoid(beta_raw). ALPHA/BETA [T, H]; G/B — выходы [T, H].
+// BA [T, 2H]: alpha = BA[t·2H + h], beta = BA[t·2H + H + h] (одна GEMM на
+// обе проекции — см. Gdn::w_ba).
 kernel void gdn_gates_f32(
-    device const float* ALPHA [[buffer(0)]],
-    device const float* BETA [[buffer(1)]],
+    device const float* BA [[buffer(0)]],
     device const float* DT_BIAS [[buffer(2)]],
     device const float* A [[buffer(3)]],
     device float* G [[buffer(4)]],
@@ -3190,12 +3223,13 @@ kernel void gdn_gates_f32(
     uint i [[thread_position_in_grid]])
 {
     if (i >= N) return;
-    uint h = i % H;
-    float a = ALPHA[i] + DT_BIAS[h];
+    uint t = i / H, h = i % H;
+    device const float* row = BA + (ulong)t * 2u * H;
+    float a = row[h] + DT_BIAS[h];
     // softplus с порогом (как ggml: при x > 20 — линейно)
     float sp = a > 20.0f ? a : log(1.0f + exp(a));
     G[i] = sp * A[h];
-    B[i] = 1.0f / (1.0f + exp(-BETA[i]));
+    B[i] = 1.0f / (1.0f + exp(-row[H + h]));
 }
 
 // Рекуррентный gated delta rule (ggml_gated_delta_net, K=1, GDA-скаляр g).
@@ -3246,6 +3280,11 @@ kernel void gdn_delta_rule_f32(
 
 // Гейтовая RMS-норма GDN: y = rmsnorm(x)·w · silu(z), по голове HD.
 // X/Z/Y [rows, HD], W [HD]; поток на строку-голову.
+// Одна строка на simdgroup: lane 0 последовательно копит Σx² (тот же порядок
+// сложения, что был у скалярной одно-поточной версии — паритет первичен),
+// барьер, затем все 32 лейна пишут строку. Прежняя версия «один поток на
+// строку» при декоде (rows=1) отдавала всю строку 6144 одному потоку:
+// 1.2 мс/слой на 27B-гибриде вместо ~0.03.
 kernel void gdn_norm_gated_f32(
     device const float* X [[buffer(0)]],
     device const float* Z [[buffer(1)]],
@@ -3254,18 +3293,24 @@ kernel void gdn_norm_gated_f32(
     constant uint& ROWS [[buffer(4)]],
     constant uint& HD [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint r [[thread_position_in_grid]])
+    uint r [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
 {
     if (r >= ROWS) return;
-    device const float* x = X + r * HD;
-    device const float* z = Z + r * HD;
-    float ss = 0.0f;
-    for (uint i = 0; i < HD; ++i) ss += x[i] * x[i];
-    float inv = 1.0f / sqrt(ss / (float)HD + eps);
-    for (uint i = 0; i < HD; ++i) {
+    device const float* x = X + (ulong)r * HD;
+    device const float* z = Z + (ulong)r * HD;
+    threadgroup float s_inv;
+    if (lane == 0u) {
+        float ss = 0.0f;
+        for (uint i = 0; i < HD; ++i) ss += x[i] * x[i];
+        s_inv = 1.0f / sqrt(ss / (float)HD + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = s_inv;
+    for (uint i = lane; i < HD; i += 32u) {
         float zz = z[i];
         float silu = zz / (1.0f + exp(-zz));
-        Y[r * HD + i] = x[i] * inv * W[i] * silu;
+        Y[(ulong)r * HD + i] = x[i] * inv * W[i] * silu;
     }
 }
 

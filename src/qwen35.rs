@@ -231,11 +231,13 @@ struct Gdn {
     /// форматов деквантовал всё в F32: 337 МБ F32 на слой вместо 53 МБ
     /// квантов, и вход GDN стоил 2.56 мс/слой против 0.35 мс — на 48
     /// рекуррентных слоях это половина времени декода 27B-гибрида.
-    /// Порядок четырёх GEMM = порядок строк прежнего склеенного [C+I+2Hv, dim].
+    /// Порядок GEMM = порядок строк прежнего склеенного [C+I+2Hv, dim].
+    /// `w_ba` = alpha|beta, склеенные в [2Hv, dim] при загрузке: обе F32,
+    /// одна GEMM вместо двух (каждая стоила 0.65 мс/слой — 48 потоков на
+    /// весь GPU, латентность загрузок; см. gdn_probe).
     w_qkv: Tensor,
     w_gate: Tensor,
-    w_beta: Tensor,
-    w_alpha: Tensor,
+    w_ba: Tensor,
     conv_w: Tensor,
     dt_bias: Tensor,
     a: Tensor,
@@ -372,6 +374,17 @@ impl Qwen35Model {
                         cfg.conv_kernel
                     )));
                 }
+                let mut ba = f32v(&p("ssm_alpha.weight"))?;
+                let av = f32v(&p("ssm_beta.weight"))?;
+                if ba.len() != hv * cfg.dim || av.len() != hv * cfg.dim {
+                    return Err(BackendError::Shape(format!(
+                        "blk.{i}.ssm_alpha/beta: {}|{} != Hv·dim {hv}×{}",
+                        ba.len(),
+                        av.len(),
+                        cfg.dim
+                    )));
+                }
+                ba.extend_from_slice(&av);
                 Mixer::Gdn(Gdn {
                     w_qkv: Qwen3Model::upload_q(
                         backend,
@@ -385,18 +398,7 @@ impl Qwen35Model {
                         &p("attn_gate.weight"),
                         vec![cfg.ssm_inner, cfg.dim],
                     )?,
-                    w_beta: Qwen3Model::upload_q(
-                        backend,
-                        w,
-                        &p("ssm_beta.weight"),
-                        vec![hv, cfg.dim],
-                    )?,
-                    w_alpha: Qwen3Model::upload_q(
-                        backend,
-                        w,
-                        &p("ssm_alpha.weight"),
-                        vec![hv, cfg.dim],
-                    )?,
+                    w_ba: backend.from_cpu_f32(&ba, vec![2 * hv, cfg.dim])?,
                     conv_w: backend.from_cpu_f32(&conv, vec![c, cfg.conv_kernel])?,
                     dt_bias: backend.from_cpu_f32(&f32v(&p("ssm_dt.bias"))?, vec![hv])?,
                     a: backend.from_cpu_f32(&f32v(&p("ssm_a"))?, vec![hv])?,
@@ -1050,19 +1052,14 @@ impl Qwen35Model {
             b: None,
         }
         .forward(backend, h)?;
-        let beta = Linear {
-            w: g.w_beta.clone(),
-            b: None,
-        }
-        .forward(backend, h)?;
-        let alpha = Linear {
-            w: g.w_alpha.clone(),
+        let ba = Linear {
+            w: g.w_ba.clone(),
             b: None,
         }
         .forward(backend, h)?;
         gs(t0, &mut t_sl)?;
         t0 = std::time::Instant::now();
-        let (gate, b) = backend.gdn_gates(&alpha, &beta, &g.dt_bias, &g.a)?;
+        let (gate, b) = backend.gdn_gates(&ba, &g.dt_bias, &g.a)?;
         gs(t0, &mut t_gt)?;
         t0 = std::time::Instant::now();
         let (conv_out, new_conv) = backend.gdn_conv(&qkv, &g.conv_w, &st.conv)?;

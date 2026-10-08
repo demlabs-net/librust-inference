@@ -1449,7 +1449,16 @@ impl MetalCtx {
             });
         }
         let name = match b.dtype {
-            GpuDtype::F32 => "gemm_nt_f32",
+            // F32 при 16-байтном выравнивании и K%4==0 — v4-вариант:
+            // float4-загрузки при том же порядке накопления (побитово равен
+            // скалярному), ~4× меньше латентности загрузок на поток.
+            GpuDtype::F32 => {
+                if k % 4 == 0 && a.offset % 16 == 0 && b.offset % 16 == 0 {
+                    "gemm_nt_f32_v4"
+                } else {
+                    "gemm_nt_f32"
+                }
+            }
             GpuDtype::F16 => "gemm_nt_f16",
             GpuDtype::BF16 => "gemm_nt_bf16",
             // Квантованные веса — только через gemm_nt_quantized/mv_quantized.
@@ -3176,8 +3185,7 @@ impl MetalCtx {
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_gates_f32(
         &self,
-        alpha: &GpuTensor,
-        beta: &GpuTensor,
+        ba: &GpuTensor,
         dt_bias: &GpuTensor,
         a: &GpuTensor,
         g: &GpuTensor,
@@ -3189,10 +3197,9 @@ impl MetalCtx {
         self.run(
             "gdn_gates_f32",
             MTLSize::new(n as u64, 1, 1),
-            MTLSize::new(64.min(n) as u64, 1, 1),
+            MTLSize::new(64.min(n.max(1)) as u64, 1, 1),
             |enc| {
-                enc.set_buffer(0, Some(&alpha.buffer), alpha.offset as u64);
-                enc.set_buffer(1, Some(&beta.buffer), beta.offset as u64);
+                enc.set_buffer(0, Some(&ba.buffer), ba.offset as u64);
                 enc.set_buffer(2, Some(&dt_bias.buffer), dt_bias.offset as u64);
                 enc.set_buffer(3, Some(&a.buffer), a.offset as u64);
                 enc.set_buffer(4, Some(&g.buffer), g.offset as u64);
@@ -3279,8 +3286,9 @@ impl MetalCtx {
         let (r32, h32) = (rows as u32, hd as u32);
         self.run(
             "gdn_norm_gated_f32",
-            MTLSize::new(rows as u64, 1, 1),
-            MTLSize::new(32.min(rows) as u64, 1, 1),
+            // dispatch_threads — ВСЕГО потоков: 32 лейна на строку.
+            MTLSize::new((rows * 32) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
             |enc| {
                 enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
                 enc.set_buffer(1, Some(&z.buffer), z.offset as u64);
@@ -3888,23 +3896,26 @@ impl crate::backend::Backend for MetalBackend {
 
     fn gdn_gates(
         &self,
-        alpha: &crate::backend::Tensor,
-        beta: &crate::backend::Tensor,
+        ba: &crate::backend::Tensor,
         dt_bias: &crate::backend::Tensor,
         a: &crate::backend::Tensor,
     ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
     {
-        let g = self.zeros(alpha.shape().to_vec())?;
-        let b = self.zeros(beta.shape().to_vec())?;
+        let h = dt_bias.numel();
+        let n = ba.numel() / 2;
+        let mut gs = ba.shape().to_vec();
+        let l = gs.len();
+        gs[l - 1] = h;
+        let g = self.zeros(gs.clone())?;
+        let b = self.zeros(gs)?;
         self.ctx.gdn_gates_f32(
-            alpha.as_gpu(),
-            beta.as_gpu(),
+            ba.as_gpu(),
             dt_bias.as_gpu(),
             a.as_gpu(),
             g.as_gpu(),
             b.as_gpu(),
-            alpha.numel(),
-            dt_bias.numel(),
+            n,
+            h,
         )?;
         Ok((g, b))
     }

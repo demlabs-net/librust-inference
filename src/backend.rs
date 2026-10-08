@@ -1134,29 +1134,34 @@ pub trait Backend: Send + Sync {
         self.from_cpu_f32(&y, x.shape().to_vec())
     }
 
-    /// Гейты GDN: g = softplus(alpha + dt_bias)·a (a = −exp(A_log) уже в
-    /// GGUF), beta = sigmoid(beta_raw). alpha/beta [T, H], dt_bias/a [H].
+    /// Гейты GDN: BA [T, 2Hv] — склеенный выход одной GEMM (alpha = BA[t·2H+h],
+    /// beta = BA[t·2H+H+h]); g = softplus(alpha + dt_bias)·a (a = −exp(A_log)
+    /// уже в GGUF), beta = sigmoid(beta_raw).
     fn gdn_gates(
         &self,
-        alpha: &Tensor,
-        beta: &Tensor,
+        ba: &Tensor,
         dt_bias: &Tensor,
         a: &Tensor,
     ) -> Result<(Tensor, Tensor), BackendError> {
-        let (av, bv) = (self.to_cpu_f32(alpha)?, self.to_cpu_f32(beta)?);
+        let bav = self.to_cpu_f32(ba)?;
         let (dv, aa) = (self.to_cpu_f32(dt_bias)?, self.to_cpu_f32(a)?);
         let h = dv.len();
-        let mut g = vec![0.0f32; av.len()];
-        let mut b = vec![0.0f32; bv.len()];
-        for i in 0..av.len() {
-            let x = av[i] + dv[i % h];
+        let mut g = vec![0.0f32; bav.len() / 2];
+        let mut b = vec![0.0f32; bav.len() / 2];
+        for i in 0..g.len() {
+            let (t, hh) = (i / h, i % h);
+            let row = &bav[t * 2 * h..];
+            let x = row[hh] + dv[hh];
             let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
-            g[i] = sp * aa[i % h];
-            b[i] = 1.0 / (1.0 + (-bv[i]).exp());
+            g[i] = sp * aa[hh];
+            b[i] = 1.0 / (1.0 + (-row[h + hh]).exp());
         }
+        let mut gs = ba.shape().to_vec();
+        let l = gs.len();
+        gs[l - 1] = h;
         Ok((
-            self.from_cpu_f32(&g, alpha.shape().to_vec())?,
-            self.from_cpu_f32(&b, beta.shape().to_vec())?,
+            self.from_cpu_f32(&g, gs.clone())?,
+            self.from_cpu_f32(&b, gs)?,
         ))
     }
 

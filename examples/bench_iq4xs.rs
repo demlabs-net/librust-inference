@@ -50,7 +50,7 @@ fn q5_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// Q6_K: 210 Б/256 — d, qs[128], scales[16], dm.
+/// Q6_K: 210 Б/256 — ql[128], qh[64], scales[16], d (в конце).
 fn q6_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut out = Vec::with_capacity(n * k / 256 * 210);
@@ -58,14 +58,16 @@ fn q6_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        out.extend_from_slice(&half::f16::from_f32(0.004 + (s % 100) as f32 * 1e-4).to_le_bytes());
         for j in 0..128 {
             out.push(((s >> (j % 50)) ^ (j as u64 * 7)) as u8);
         }
-        for j in 0..16 {
-            out.push(((s >> (j % 40)) ^ (j as u64)) as u8);
+        for j in 0..64 {
+            out.push(((s >> (j % 40)) ^ (j as u64 * 3)) as u8);
         }
-        out.extend_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+        for j in 0..16 {
+            out.push(((s >> (j % 30)) ^ (j as u64)) as u8);
+        }
+        out.extend_from_slice(&half::f16::from_f32(0.004 + (s % 100) as f32 * 1e-4).to_le_bytes());
     }
     out
 }

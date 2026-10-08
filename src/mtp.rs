@@ -101,19 +101,14 @@ impl MtpDrafter {
         let hd = cfg.head_dim;
         let q_out = 2 * cfg.n_heads * hd;
         let kv_out = cfg.n_kv_heads * hd;
-        // Внимательная часть — тот же fused-путь, что у полновнимательных
-        // слоёв трейка (q на голову [q | gate], затем k, v).
+        // Внимательная часть — те же разделённые проекции в родных квантах,
+        // что у полновнимательных слоёв трейка (q на голову [q | gate],
+        // затем k, v). Здесь q/k — Q4_K, v — Q5_K: склейка в один GEMM
+        // заставила бы деквантовать всё в F32 (Ф8.2g).
         let attn = FullAttn {
-            wqkv: Qwen3Model::upload_fused(
-                backend,
-                w,
-                &[
-                    &p("attn_q.weight"),
-                    &p("attn_k.weight"),
-                    &p("attn_v.weight"),
-                ],
-                vec![q_out + 2 * kv_out, cfg.dim],
-            )?,
+            wq: Qwen3Model::upload_q(backend, w, &p("attn_q.weight"), vec![q_out, cfg.dim])?,
+            wk: Qwen3Model::upload_q(backend, w, &p("attn_k.weight"), vec![kv_out, cfg.dim])?,
+            wv: Qwen3Model::upload_q(backend, w, &p("attn_v.weight"), vec![kv_out, cfg.dim])?,
             wo: Qwen3Model::upload_q(
                 backend,
                 w,
@@ -450,7 +445,9 @@ mod tests {
             embed: t(&f.embed, vec![f.cfg.vocab_size, d]),
             output: t(&f.output, vec![f.cfg.vocab_size, d]),
             attn: FullAttn {
-                wqkv: t(&f.wqkv, vec![q_out + 2 * kv_out, d]),
+                wq: t(&f.wqkv[..q_out * d], vec![q_out, d]),
+                wk: t(&f.wqkv[q_out * d..(q_out + kv_out) * d], vec![kv_out, d]),
+                wv: t(&f.wqkv[(q_out + kv_out) * d..], vec![kv_out, d]),
                 wo: t(&f.wo, vec![d, f.cfg.n_heads * f.cfg.head_dim]),
                 q_norm: t(&f.q_norm, vec![f.cfg.head_dim]),
                 k_norm: t(&f.k_norm, vec![f.cfg.head_dim]),

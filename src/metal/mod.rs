@@ -1520,6 +1520,47 @@ impl MetalCtx {
                         enc.set_threadgroup_memory_length(0, 8192);
                     });
                 }
+                // 1 ≤ m ≤ 8: matvec с батчем (mv_iq4_xs_mb) — квант-блок
+                // строки весов читается ОДИН раз на m строк активаций, плюс
+                // векторные загрузки (u32-пары квантов, float4 активаций) при
+                // выравнивании. Прежний mv_iq4_xs перечитывал веса на каждую
+                // строку и грузил всё поэлементно — ~190 ГБ/с при потолке
+                // ~400. Порядок операций на выход — как у mv_iq4_xs,
+                // побитово тот же результат (тест
+                // iq4_xs_matvec_batch_consistency). m = 7, 8 — два прохода
+                // (4 + остаток), как у Q8_0. INFER_IQ4XS_NO_MB=1 — прежний
+                // путь (сверка).
+                if m <= 8 && std::env::var("INFER_IQ4XS_NO_MB").is_err() {
+                    let (k32, n32) = (k as u32, n as u32);
+                    let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
+                        let name = match rows {
+                            1 => "mv_iq4_xs_mb1",
+                            2 => "mv_iq4_xs_mb2",
+                            3 => "mv_iq4_xs_mb3",
+                            4 => "mv_iq4_xs_mb4",
+                            5 => "mv_iq4_xs_mb5",
+                            _ => "mv_iq4_xs_mb6",
+                        };
+                        let grid = MTLSize::new(32, n as u64, 1);
+                        let group = MTLSize::new(32, 1, 1);
+                        let a_off = (a.offset + row0 * k * 4) as u64;
+                        let c_off = (c.offset + row0 * n * 4) as u64;
+                        self.run(name, grid, group, |enc| {
+                            enc.set_buffer(0, Some(&a.buffer), a_off);
+                            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                            enc.set_buffer(2, Some(&c.buffer), c_off);
+                            enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                            enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+                        })
+                    };
+                    return match m {
+                        7 | 8 => {
+                            pass(4, 0)?;
+                            pass(m - 4, 4)
+                        }
+                        _ => pass(m, 0),
+                    };
+                }
                 return self.mv_iq4_xs_dispatch(a, b, c, k, n);
             }
             other => {

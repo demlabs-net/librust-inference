@@ -1799,6 +1799,91 @@ kernel void mv_iq4_xs(
     if (lane == 0u) C[(ulong)m * N + n] = sumf;
 }
 
+// IQ4_XS matvec с батчем строк активаций (окно верификации спека, 1 < m ≤ 8):
+// mv_iq4_xs читает строку весов на КАЖДУЮ строку A (сетка z = M) — при m = 5
+// это 5-кратный трафик весов и forward окна дороже трёх шагов декода. Здесь
+// один simdgroup на строку весов: квант-блок раскодируется ОДИН раз,
+// накопители отдельные на строку, порядок операций для каждого выхода —
+// точь-в-точь mv_iq4_xs → побитово тот же результат (паритет первичен).
+// ВЕКТОРНЫЕ ЗАГРУЗКИ ПРОВЕРЕНЫ И ОТКАТАНЫ: u32-пары квант-байтов и float4
+// активаций (с uniform-флагом выравнивания) ОКАЗАЛИСЬ МЕДЛЕННЕЕ поэлементных
+// (m=1: 177 против 190 ГБ/с, m=5: 2.61 против 1.87 мс) — ветка внутри
+// раскрученного цикла ломает планирование, а скалярные загрузки и так
+// коалесцируются. Кернел bound не загрузками.
+template<uint M>
+kernel void mv_iq4_xs_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgid.y;
+    if (n >= N) return;
+    const uint nb = K / 256u;
+    device const uchar* row = B + (ulong)n * nb * 136u;
+
+    const uint ix = lane / 16u;   // 0/1 — чётность суперблока (шаг 2 по sb)
+    const uint it = lane % 16u;
+    const uint ib = it / 2u;       // подблок 0..7
+    const uint il = it % 2u;       // половина подблока: 8 байт qs
+
+    float sumf[M];
+#pragma unroll
+    for (uint m = 0; m < M; ++m) sumf[m] = 0.0f;
+    for (uint sb = ix; sb < nb; sb += 2u) {
+        device const uchar* x = row + sb * 136u;
+        device const uchar* qb = x + 8u + 16u * ib + 8u * il;
+        const uint q0 = (uint)qb[0] | ((uint)qb[1] << 8) | ((uint)qb[2] << 16) | ((uint)qb[3] << 24);
+        const uint q1 = (uint)qb[4] | ((uint)qb[5] << 8) | ((uint)qb[6] << 16) | ((uint)qb[7] << 24);
+        // деквант — общий для всех строк A (в mv_iq4_xs он перемножен с yl)
+        const float4 k0 = float4(KV_IQ4[q0 & 0xF], KV_IQ4[(q0 >> 8) & 0xF],
+                                 KV_IQ4[(q0 >> 16) & 0xF], KV_IQ4[(q0 >> 24) & 0xF]);
+        const float4 k1 = float4(KV_IQ4[(q0 >> 4) & 0xF], KV_IQ4[(q0 >> 12) & 0xF],
+                                 KV_IQ4[(q0 >> 20) & 0xF], KV_IQ4[(q0 >> 28) & 0xF]);
+        const float4 k2 = float4(KV_IQ4[q1 & 0xF], KV_IQ4[(q1 >> 8) & 0xF],
+                                 KV_IQ4[(q1 >> 16) & 0xF], KV_IQ4[(q1 >> 24) & 0xF]);
+        const float4 k3 = float4(KV_IQ4[(q1 >> 4) & 0xF], KV_IQ4[(q1 >> 12) & 0xF],
+                                 KV_IQ4[(q1 >> 20) & 0xF], KV_IQ4[(q1 >> 28) & 0xF]);
+        const uint scales_h = (uint)x[2] | ((uint)x[3] << 8);
+        const int ls = (int)((((x[4 + (ib >> 1)] >> (4u * (ib & 1u))) & 0xF)
+                              | (((scales_h >> (2u * ib)) & 3u) << 4))) - 32;
+        const float d = (float)load_half_unaligned(x);
+        const float dl = d * (float)ls;
+#pragma unroll
+        for (uint m = 0; m < M; ++m) {
+            device const float* yb = A + (ulong)m * K + (ulong)sb * 256u + ib * 32u + il * 8u;
+            const float4 yl0 = {yb[0], yb[1], yb[2], yb[3]};
+            const float4 yl1 = {yb[16], yb[17], yb[18], yb[19]};
+            const float4 yl2 = {yb[4], yb[5], yb[6], yb[7]};
+            const float4 yl3 = {yb[20], yb[21], yb[22], yb[23]};
+            float4 acc1 = {0.0f, 0.0f, 0.0f, 0.0f};
+            float4 acc2 = {0.0f, 0.0f, 0.0f, 0.0f};
+            acc1 += yl0 * k0;
+            acc2 += yl1 * k1;
+            acc1 += yl2 * k2;
+            acc2 += yl3 * k3;
+            acc1 += acc2;
+            sumf[m] += dl * ((acc1.x + acc1.y) + acc1.z + acc1.w);
+        }
+    }
+#pragma unroll
+    for (uint m = 0; m < M; ++m) {
+        const float v = simd_sum(sumf[m]);
+        if (lane == 0u) C[(ulong)m * N + n] = v;
+    }
+}
+
+typedef decltype(mv_iq4_xs_mb<1>) mv_iq4_xs_mb_t;
+template [[host_name("mv_iq4_xs_mb1")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<1>;
+template [[host_name("mv_iq4_xs_mb2")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<2>;
+template [[host_name("mv_iq4_xs_mb3")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<3>;
+template [[host_name("mv_iq4_xs_mb4")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<4>;
+template [[host_name("mv_iq4_xs_mb5")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<5>;
+template [[host_name("mv_iq4_xs_mb6")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<6>;
+
 static inline float dot_q5_0(device const float* a, device const uchar* blk) {
     float d = (float)load_half_unaligned(blk);
     uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);

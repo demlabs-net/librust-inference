@@ -211,8 +211,12 @@ impl Qwen35Config {
 /// pub(crate): MTP-драфтер (Ф2.6, [`crate::mtp`]) исполняет этим же путём
 /// свой nextn-блок.
 pub(crate) struct FullAttn {
-    /// [n_heads·hd·2 + 2·n_kv·hd, dim] — q(+gate), k, v одним GEMM.
-    pub(crate) wqkv: Tensor,
+    /// q(+gate), k, v — РАЗДЕЛЬНЫМИ тензорами в родных квантах (Ф8.2g, см.
+    /// [`Gdn`]): q и k здесь IQ4_XS/Q4_K, v — Q5_K, общего формата нет.
+    /// wq — [2·n_heads·hd, dim] (на голову q|gate), wk/wv — [n_kv·hd, dim].
+    pub(crate) wq: Tensor,
+    pub(crate) wk: Tensor,
+    pub(crate) wv: Tensor,
     pub(crate) wo: Tensor,
     pub(crate) q_norm: Tensor,
     pub(crate) k_norm: Tensor,
@@ -220,9 +224,18 @@ pub(crate) struct FullAttn {
 
 /// Линейное внимание Gated DeltaNet.
 struct Gdn {
-    /// [conv_channels + inner (z) + 2·Hv (beta, alpha), dim] — все входные
-    /// проекции слоя одним GEMM.
-    w_in: Tensor,
+    /// Входные проекции — РАЗДЕЛЬНЫМИ тензорами ровно в тех квантах, в каких
+    /// они лежат в GGUF (Ф8.2g). Склейка их в один GEMM требовала общего
+    /// формата, а общего нет: `attn_qkv` — Q5_K, `attn_gate` — IQ4_XS,
+    /// `ssm_beta`/`ssm_alpha` — F32. Прежний `upload_fused` при несовпадении
+    /// форматов деквантовал всё в F32: 337 МБ F32 на слой вместо 53 МБ
+    /// квантов, и вход GDN стоил 2.56 мс/слой против 0.35 мс — на 48
+    /// рекуррентных слоях это половина времени декода 27B-гибрида.
+    /// Порядок четырёх GEMM = порядок строк прежнего склеенного [C+I+2Hv, dim].
+    w_qkv: Tensor,
+    w_gate: Tensor,
+    w_beta: Tensor,
+    w_alpha: Tensor,
     conv_w: Tensor,
     dt_bias: Tensor,
     a: Tensor,
@@ -360,16 +373,29 @@ impl Qwen35Model {
                     )));
                 }
                 Mixer::Gdn(Gdn {
-                    w_in: Qwen3Model::upload_fused(
+                    w_qkv: Qwen3Model::upload_q(
                         backend,
                         w,
-                        &[
-                            &p("attn_qkv.weight"),
-                            &p("attn_gate.weight"),
-                            &p("ssm_beta.weight"),
-                            &p("ssm_alpha.weight"),
-                        ],
-                        vec![c + cfg.ssm_inner + 2 * hv, cfg.dim],
+                        &p("attn_qkv.weight"),
+                        vec![c, cfg.dim],
+                    )?,
+                    w_gate: Qwen3Model::upload_q(
+                        backend,
+                        w,
+                        &p("attn_gate.weight"),
+                        vec![cfg.ssm_inner, cfg.dim],
+                    )?,
+                    w_beta: Qwen3Model::upload_q(
+                        backend,
+                        w,
+                        &p("ssm_beta.weight"),
+                        vec![hv, cfg.dim],
+                    )?,
+                    w_alpha: Qwen3Model::upload_q(
+                        backend,
+                        w,
+                        &p("ssm_alpha.weight"),
+                        vec![hv, cfg.dim],
                     )?,
                     conv_w: backend.from_cpu_f32(&conv, vec![c, cfg.conv_kernel])?,
                     dt_bias: backend.from_cpu_f32(&f32v(&p("ssm_dt.bias"))?, vec![hv])?,
@@ -386,12 +412,9 @@ impl Qwen35Model {
                 let q_out = 2 * cfg.n_heads * hd;
                 let kv_out = cfg.n_kv_heads * hd;
                 Mixer::Attn(FullAttn {
-                    wqkv: Qwen3Model::upload_fused(
-                        backend,
-                        w,
-                        &[&p("attn_q.weight"), &p("attn_k.weight"), &p("attn_v.weight")],
-                        vec![q_out + 2 * kv_out, cfg.dim],
-                    )?,
+                    wq: Qwen3Model::upload_q(backend, w, &p("attn_q.weight"), vec![q_out, cfg.dim])?,
+                    wk: Qwen3Model::upload_q(backend, w, &p("attn_k.weight"), vec![kv_out, cfg.dim])?,
+                    wv: Qwen3Model::upload_q(backend, w, &p("attn_v.weight"), vec![kv_out, cfg.dim])?,
                     wo: Qwen3Model::upload_q(
                         backend,
                         w,
@@ -948,18 +971,24 @@ impl Qwen35Model {
     ) -> Result<Tensor, BackendError> {
         let t = h.shape()[1];
         let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
-        let qg_size = 2 * nh * hd;
         let kv_size = nkv * hd;
-        let qkv = Linear {
-            w: a.wqkv.clone(),
+        // Три проекции каждая в своём кванте (см. [`FullAttn`]); qg — сразу
+        // [q|gate], k/v без слайсов.
+        let qg = Linear {
+            w: a.wq.clone(),
             b: None,
         }
         .forward(backend, h)?;
-        // q-проекция на голову: [q (hd) | gate (hd)] — разбор через
-        // [T·nh, 2·hd]-вид (строка = голова токена).
-        let qg = crate::nn::slice_last(backend, &qkv, qg_size, 0)?;
-        let k = crate::nn::slice_last(backend, &qkv, kv_size, qg_size)?;
-        let v = crate::nn::slice_last(backend, &qkv, kv_size, qg_size + kv_size)?;
+        let k = Linear {
+            w: a.wk.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let v = Linear {
+            w: a.wv.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
         let qg_rows = qg.view(vec![1, t * nh, 2 * hd]);
         let q = crate::nn::slice_last(backend, &qg_rows, hd, 0)?.view(vec![1, t, nh * hd]);
         let gate = crate::nn::slice_last(backend, &qg_rows, hd, hd)?.view(vec![1, t, nh * hd]);
@@ -992,37 +1021,107 @@ impl Qwen35Model {
         st: &mut GdnState,
     ) -> Result<Tensor, BackendError> {
         let t = h.shape()[1];
-        let (s, hk, hv) = (cfg.ssm_state, cfg.ssm_k_heads, cfg.ssm_v_heads);
-        let c = cfg.conv_channels();
+        let (s, hk) = (cfg.ssm_state, cfg.ssm_k_heads);
         let inner = cfg.ssm_inner;
-        let proj = Linear {
-            w: g.w_in.clone(),
+        // QWEN35_GDN_PROF=1: время по стадиям GDN-слоя (только диагностика —
+        // синхронизирует после каждой стадии).
+        let gp = std::env::var("QWEN35_GDN_PROF").is_ok() && t == 1;
+        let gs = |t0: std::time::Instant, acc: &mut f64| -> Result<(), BackendError> {
+            if gp {
+                backend.to_cpu_f32(&backend.zeros(vec![1])?)?;
+                *acc += t0.elapsed().as_secs_f64();
+            }
+            Ok(())
+        };
+        let (mut t_in, mut t_sl, mut t_gt, mut t_cv, mut t_nr, mut t_dr, mut t_og, mut t_out) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut t0 = std::time::Instant::now();
+        // Четыре проекции каждая в своём кванте (см. [`Gdn`]); строки выхода
+        // в том же порядке, что был у склеенного proj.
+        let qkv = Linear {
+            w: g.w_qkv.clone(),
             b: None,
         }
         .forward(backend, h)?;
-        let qkv = crate::nn::slice_last(backend, &proj, c, 0)?;
-        let z = crate::nn::slice_last(backend, &proj, inner, c)?;
-        let beta = crate::nn::slice_last(backend, &proj, hv, c + inner)?;
-        let alpha = crate::nn::slice_last(backend, &proj, hv, c + inner + hv)?;
+        gs(t0, &mut t_in)?;
+        t0 = std::time::Instant::now();
+        let z = Linear {
+            w: g.w_gate.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let beta = Linear {
+            w: g.w_beta.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let alpha = Linear {
+            w: g.w_alpha.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        gs(t0, &mut t_sl)?;
+        t0 = std::time::Instant::now();
         let (gate, b) = backend.gdn_gates(&alpha, &beta, &g.dt_bias, &g.a)?;
+        gs(t0, &mut t_gt)?;
+        t0 = std::time::Instant::now();
         let (conv_out, new_conv) = backend.gdn_conv(&qkv, &g.conv_w, &st.conv)?;
         st.conv = new_conv;
         let act = backend.zeros(conv_out.shape().to_vec())?;
         backend.silu(&conv_out, &act)?;
+        gs(t0, &mut t_cv)?;
+        t0 = std::time::Instant::now();
         let qk_size = hk * s;
         let q = crate::nn::slice_last(backend, &act, qk_size, 0)?;
         let k = crate::nn::slice_last(backend, &act, qk_size, qk_size)?;
         let v = crate::nn::slice_last(backend, &act, inner, 2 * qk_size)?;
         let qn = backend.gdn_l2norm(&q, s, cfg.norm_eps)?;
         let kn = backend.gdn_l2norm(&k, s, cfg.norm_eps)?;
+        gs(t0, &mut t_nr)?;
+        t0 = std::time::Instant::now();
         let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, &gate, &b, &st.ssm, hk)?;
         st.ssm = new_ssm;
+        gs(t0, &mut t_dr)?;
+        t0 = std::time::Instant::now();
         let normed = backend.gdn_norm_gated(&o.view(vec![1, t, inner]), &z, &g.norm, cfg.norm_eps)?;
-        Linear {
+        gs(t0, &mut t_og)?;
+        t0 = std::time::Instant::now();
+        let y = Linear {
             w: g.w_out.clone(),
             b: None,
         }
-        .forward(backend, &normed)
+        .forward(backend, &normed)?;
+        gs(t0, &mut t_out)?;
+        if gp {
+            static GDN_ACC: std::sync::Mutex<(u32, [f64; 8])> = std::sync::Mutex::new((0, [0.0; 8]));
+            let every: u32 = std::env::var("QWEN35_GDN_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(48);
+            let mut g = GDN_ACC.lock().unwrap();
+            for (i, x) in [t_in, t_sl, t_gt, t_cv, t_nr, t_dr, t_og, t_out].iter().enumerate() {
+                g.1[i] += x;
+            }
+            g.0 += 1;
+            // Раз в «токен» (48 GDN-слоёв) — сводка по стадиям, мс/слой.
+            if g.0 >= every {
+                let n = g.0 as f64;
+                let s = g.1;
+                eprintln!(
+                    "GDN_PROF ×{every}: w_in {:.2} slice4 {:.2} gates {:.2} conv {:.2} l2n {:.2} delta {:.2} og {:.2} w_out {:.2} мс/слой",
+                    s[0] * 1e3 / n,
+                    s[1] * 1e3 / n,
+                    s[2] * 1e3 / n,
+                    s[3] * 1e3 / n,
+                    s[4] * 1e3 / n,
+                    s[5] * 1e3 / n,
+                    s[6] * 1e3 / n,
+                    s[7] * 1e3 / n
+                );
+                *g = (0, [0.0; 8]);
+            }
+        }
+        Ok(y)
     }
 }
 

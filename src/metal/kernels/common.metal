@@ -219,3 +219,111 @@ inline void rope_cs(float p, uint k, float theta, uint hd, constant RopeYarn& y,
 // блоки Apple GPU). Прежний m8f4-кернел считал скалярно по 8 строк на поток
 // и упирался в ALU (prefill Qwen3-8B ~35 tok/s против 328 у эталона).
 #include <metal_simdgroup_matrix>
+
+// ── Матвеки K-квантов: раскладка r2 и per-block combine (порт mul_mv) ───────
+// Общие части kernel_mul_mv_q4_K_f32_impl / kernel_mul_mv_q6_K_f32_impl
+// (0.4.0): активационный регистр лейна на суперблок + вклад суперблока в
+// частичную сумму строки. Используются и plain-матвеками (mv_q4_k_r2,
+// mv_q6_k_r2), и id-кернелами MoE (mv_id_*) — так mul_mat_id считает ровно
+// тот же порядок по K, что эталонный mul_mat (его mv_id оборачивает ту же
+// impl), и побитово совпадает с по-слотовым matvec.
+
+// Q4_K: 32 лейна на строку — ix = lane/8 (фазы суперблоков, шаг 4),
+// it = lane%8 → iq (половина qs/scales), ir (четверть uint16-чанка).
+struct MvQ4KDecomp { uint ix, iq, ir; };
+static inline MvQ4KDecomp mv_q4k_decomp(uint lane) {
+    const uint ix = lane / 8u, it = lane % 8u;
+    return MvQ4KDecomp{ix, it / 4u, it % 4u};
+}
+struct MvQ4KY { float yl[16], yh[16]; float4 sumy; };
+static inline void mv_q4k_y(device const float* a, uint ib, thread const MvQ4KDecomp& d,
+                            thread MvQ4KY& o) {
+    device const float* y4 = a + (ulong)ib * 256u + 64u * d.iq + 8u * d.ir;
+    o.sumy = {0.f, 0.f, 0.f, 0.f};
+    for (uint l = 0; l < 8u; ++l) {
+        o.yl[l + 0] = y4[l +   0]; o.sumy[0] += o.yl[l + 0];
+        o.yl[l + 8] = y4[l +  32]; o.sumy[1] += o.yl[l + 8];
+        o.yh[l + 0] = y4[l + 128]; o.sumy[2] += o.yh[l + 0];
+        o.yh[l + 8] = y4[l + 160]; o.sumy[3] += o.yh[l + 8];
+    }
+}
+// Вклад суперблока (144 Б) в частичную сумму строки данным лейном.
+static inline float mv_q4k_blk(device const uchar* xb, thread const MvQ4KDecomp& d,
+                               thread const MvQ4KY& y) {
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+    device const uchar* sp = xb + 4u + 2u * d.iq;
+    uint16_t sc16[4];
+    const uint16_t s0 = (uint16_t)(sp[0] | (sp[1] << 8));
+    const uint16_t s2 = (uint16_t)(sp[4] | (sp[5] << 8));
+    const uint16_t s4 = (uint16_t)(sp[8] | (sp[9] << 8));
+    sc16[0] = s0 & kmask1;
+    sc16[1] = s2 & kmask1;
+    sc16[2] = (s4 & kmask2) | ((s0 & kmask3) >> 2);
+    sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+    thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+    device const uchar* q1 = xb + 16u + 32u * d.iq + 8u * d.ir;
+    device const uchar* q2 = q1 + 64u;
+    const float dm = (float)load_half_unaligned(xb + 2u);
+    const float dh = (float)load_half_unaligned(xb);
+
+    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+    for (uint l = 0; l < 4u; ++l) {
+        const uint16_t a = (uint16_t)(q1[2 * l] | (q1[2 * l + 1] << 8));
+        const uint16_t b = (uint16_t)(q2[2 * l] | (q2[2 * l + 1] << 8));
+        acc1[0] += y.yl[2 * l + 0] * (float)(a & 0x000Fu);
+        acc1[1] += y.yl[2 * l + 1] * (float)(a & 0x0F00u);
+        acc1[2] += y.yl[2 * l + 8] * (float)(a & 0x00F0u);
+        acc1[3] += y.yl[2 * l + 9] * (float)(a & 0xF000u);
+        acc2[0] += y.yh[2 * l + 0] * (float)(b & 0x000Fu);
+        acc2[1] += y.yh[2 * l + 1] * (float)(b & 0x0F00u);
+        acc2[2] += y.yh[2 * l + 8] * (float)(b & 0x00F0u);
+        acc2[3] += y.yh[2 * l + 9] * (float)(b & 0xF000u);
+    }
+    return dh * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                 (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                 (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                 (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+           dm * (y.sumy[0] * sc8[2] + y.sumy[1] * sc8[3] +
+                 y.sumy[2] * sc8[6] + y.sumy[3] * sc8[7]);
+}
+
+// Q6_K: 16 лейнов на строку (tid = lane/2 — позиция, ix = lane%2 — чётность
+// суперблоков), ip/il делят суперблок.
+struct MvQ6KDecomp { uint ix, y_off, q_off_l, q_off_h, is; };
+static inline MvQ6KDecomp mv_q6k_decomp(uint lane) {
+    const uint tid = lane / 2u, ix = lane % 2u;
+    const uint ip = tid / 8u, il = tid % 8u;
+    const uint l0 = 4u * il;
+    return MvQ6KDecomp{ix, 128u * ip + l0, 64u * ip + l0, 32u * ip + l0,
+                       8u * ip + l0 / 16u};
+}
+static inline void mv_q6k_y(device const float* a, uint i, thread const MvQ6KDecomp& d,
+                            thread float* yl) {
+    device const float* y = a + (ulong)i * 256u + d.y_off;
+    for (uint l = 0; l < 4u; ++l) {
+        yl[4u * l + 0] = y[l +  0];
+        yl[4u * l + 1] = y[l + 32];
+        yl[4u * l + 2] = y[l + 64];
+        yl[4u * l + 3] = y[l + 96];
+    }
+}
+static inline float mv_q6k_blk(device const uchar* xb, thread const MvQ6KDecomp& d,
+                               thread const float* yl) {
+    device const uchar* q1 = xb + d.q_off_l;
+    device const uchar* q2 = q1 + 32;
+    device const uchar* qh = xb + 128u + d.q_off_h;
+    device const char*  sc = (device const char*)(xb + 192u) + d.is;
+    const float dh = (float)load_half_unaligned(xb + 208u);
+    float4 sums = {0.f, 0.f, 0.f, 0.f};
+    for (uint l = 0; l < 4u; ++l) {
+        sums[0] += yl[4u * l + 0] * (float)((int8_t)((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+        sums[1] += yl[4u * l + 1] * (float)((int8_t)((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+        sums[2] += yl[4u * l + 2] * (float)((int8_t)((q1[l] >> 4) | ((qh[l] & 0x30)         )) - 32);
+        sums[3] += yl[4u * l + 3] * (float)((int8_t)((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)   ) - 32);
+    }
+    return dh * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+}

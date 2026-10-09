@@ -109,9 +109,13 @@ kernel void moe_route_topk(
 //                      silu-произведение каждого слота);
 //   WSUM         = 0 — выход по слотам БЕЗ весов: C[j * N + n] = dot (up/gate);
 //                = 1 — выход суммы с весами роутера: C[n] += w[j] * dot (down).
-// Строки делят threadgroup'ы (16 строк на 128 потоков), слоты — цикл в
-// регистрах: гонок за C нет ни в одном режиме.
-#define MVID_NR 16u
+//
+// Порядок суммирования по K — r2-раскладка эталонного mul_mv (хелперы
+// mv_q4k_*/mv_q6k_* в common.metal): эталонный kernel_mul_mv_id оборачивает
+// ту же impl, что и mul_mat, поэтому mv_id побитово равен по-слотовому
+// matvec'у (тест mv_id_matches_per_slot_matvec_bitwise). Пара строк на
+// simdgroup (32 лейна на строку), 8 строк на threadgroup, слоты — цикл.
+#define MVID_NR 8u
 template <int KIND, int PER_SLOT_IN, int WSUM>
 static inline void mv_id_impl(device const float* A, device const uint* IDS,
                               device const float* WID, device const uchar* B,
@@ -119,38 +123,54 @@ static inline void mv_id_impl(device const float* A, device const uint* IDS,
                               uint tgid, uint sgid, uint lane)
 {
     const uint bsz = (KIND == 0) ? 144u : 210u;
-    const uint sb_count = K / 256u;
-    const uint r0 = tgid * MVID_NR + sgid * 4u;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint nb = K / 256u;
+    const uint first_row = tgid * MVID_NR + sgid * 2u;
+    if (first_row >= N) return;
+    const bool two = first_row + 1u < N;
+    const uint row_bytes = nb * bsz;
+
+    float acc[2] = {0.0f, 0.0f};
     for (uint j = 0; j < KSLOTS; ++j) {
         const uint e = IDS[j];
         // WID читается только в режиме суммы (иначе буфер не привязан)
         const float w = (WSUM == 1) ? WID[j] : 0.0f;
-        device const float* a = PER_SLOT_IN ? (A + j * K) : A;
-        for (uint rr = 0; rr < 4u; ++rr) {
-            const uint row = r0 + rr;
-            if (row >= N) break;
-            device const uchar* rw = B + ((ulong)e * N + row) * sb_count * bsz;
-            float part = 0.0f;
-            for (uint sb = lane; sb < sb_count; sb += 32u) {
-                device const uchar* blk = rw + sb * bsz;
-                part += (KIND == 0) ? dot_q4_k(a + sb * 256u, blk)
-                                    : dot_q6_k(a + sb * 256u, blk);
+        device const float* a = PER_SLOT_IN ? (A + (ulong)j * K) : A;
+        device const uchar* x = B + ((ulong)e * N + first_row) * row_bytes;
+
+        float sumf[2] = {0.f, 0.f};
+        if (KIND == 0) {
+            const MvQ4KDecomp d = mv_q4k_decomp(lane);
+            for (uint ib = d.ix; ib < nb; ib += 4u) {
+                MvQ4KY y;
+                mv_q4k_y(a, ib, d, y);
+                for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+                    sumf[rr] += mv_q4k_blk(x + (ulong)rr * row_bytes + (ulong)ib * 144u, d, y);
+                }
             }
-            const float v = simd_sum(part);
+        } else {
+            const MvQ6KDecomp d = mv_q6k_decomp(lane);
+            for (uint ib = d.ix; ib < nb; ib += 2u) {
+                float yl[16];
+                mv_q6k_y(a, ib, d, yl);
+                for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+                    sumf[rr] += mv_q6k_blk(x + (ulong)rr * row_bytes + (ulong)ib * 210u, d, yl);
+                }
+            }
+        }
+        for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+            const float v = simd_sum(sumf[rr]);
             if (lane == 0u) {
                 if (WSUM == 1) {
                     acc[rr] += w * v;
                 } else {
-                    C[(ulong)j * N + row] = v;
+                    C[(ulong)j * N + first_row + rr] = v;
                 }
             }
         }
     }
     if (WSUM == 1 && lane == 0u) {
-        for (uint rr = 0; rr < 4u; ++rr) {
-            const uint row = r0 + rr;
-            if (row < N) C[row] = acc[rr];
+        for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+            C[first_row + rr] = acc[rr];
         }
     }
 }

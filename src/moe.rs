@@ -449,44 +449,76 @@ impl MoeLayer {
             routed.push((ids.clone(), ws.clone()));
         }
 
-        // Отладочный/страховочный путь: по одному matvec на (токен, слот)
-        // без id-кернелов. Нужен для A/B при расхождениях и для бэкендов без
-        // mul_mat_id (там id-путь упал бы с «не поддержано»).
-        // id-кернелы (mul_mat_id) — ОПТ-ИН (INFER_MOE_ID=1): корректны
-        // (тест id_kernel_matches_per_expert_matvec), но порядок суммирования
-        // по слотам/суперблокам иной, и на чувствительных моделях это меняет
-        // близкие логиты (у OLMoE text_parity расходился на 2 промптах из 3).
-        // Паритет первичен: по умолчанию — по одному matvec на (токен, слот).
-        let id_path = std::env::var("INFER_MOE_ID").is_ok();
+        // 3. Проекции экспертов. Id-кернелы (mul_mat_id) — ПУТЬ ПО УМОЛЧАНИЮ:
+        // с портированием mv_id на r2-раскладку эталонного mul_mv они считают
+        // ровно тот же порядок по K, что по-слотовый matvec (тест
+        // id_kernel_matches_per_expert_matvec — up/gate побитово; e2e OLMoE
+        // INFER_MOE_NO_ID=1 против id-пути — байт-в-байт), и на порядок
+        // дешевле по вызовам/аллокациям (3·k вызовов на токен свёрнуты в 3).
+        // Прежний скалярный порядок mv_id (ломал паритет на OLMoE) устранён.
+        // INFER_MOE_NO_ID=1 — по-слотовый путь (A/B и бэкенды без mul_mat_id;
+        // на UnsupportedFormat откат происходит сам).
+        let id_path = std::env::var("INFER_MOE_NO_ID").is_err();
         if !id_path {
-            let acc = backend.zeros(vec![t, d])?;
-            for (ti, (ids, ws)) in routed.iter().enumerate() {
-                let x_t = x2.view_offset(vec![1, d], ti * d);
-                let acc_t = acc.view_offset(vec![1, d], ti * d);
-                for (&eid, &w) in ids.iter().zip(ws.iter()) {
-                    if w == 0.0 {
-                        continue;
-                    }
-                    let y_up = backend.zeros(vec![1, ffn])?;
-                    backend.gemm_nt(&x_t, &self.up.expert(eid as usize), &y_up)?;
-                    let g = backend.zeros(vec![1, ffn])?;
-                    backend.gemm_nt(&x_t, &self.gate.expert(eid as usize), &g)?;
-                    let act = backend.zeros(vec![1, ffn])?;
-                    backend.silu(&g, &act)?;
-                    let prod = backend.zeros(vec![1, ffn])?;
-                    backend.mul(&act, &y_up, &prod)?;
-                    let y_dn = backend.zeros(vec![1, d])?;
-                    backend.gemm_nt(&prod, &self.down.expert(eid as usize), &y_dn)?;
-                    backend.add_scaled(&acc_t, &y_dn, &acc_t, w)?;
-                }
-            }
-            return Ok(acc.view(vec![1, t, d]));
+            return self.ffn_per_slot(backend, &x2, &routed, t, d, ffn);
         }
+        match self.ffn_id(backend, &x2, &logits, &routed, t, d, ffn, e) {
+            Err(BackendError::UnsupportedFormat(_)) => {
+                self.ffn_per_slot(backend, &x2, &routed, t, d, ffn)
+            }
+            r => r,
+        }
+    }
 
-        // 3. Проекции экспертов: ОДИН вызов на проекцию на токен (mul_mat_id) —
-        // внутри кернела перебираются слоты top-k. Раньше на токен слоя
-        // приходилось 3·k вызовов и столько же аллокаций буферов (384 на токен
-        // у OLMoE) — это и было узкое место декода (40 против 208 tok/s).
+    /// Страховочный путь: по одному matvec на (токен, слот) без id-кернелов.
+    fn ffn_per_slot(
+        &self,
+        backend: &dyn Backend,
+        x2: &Tensor,
+        routed: &[(Vec<u32>, Vec<f32>)],
+        t: usize,
+        d: usize,
+        ffn: usize,
+    ) -> Result<Tensor, BackendError> {
+        let acc = backend.zeros(vec![t, d])?;
+        for (ti, (ids, ws)) in routed.iter().enumerate() {
+            let x_t = x2.view_offset(vec![1, d], ti * d);
+            let acc_t = acc.view_offset(vec![1, d], ti * d);
+            for (&eid, &w) in ids.iter().zip(ws.iter()) {
+                if w == 0.0 {
+                    continue;
+                }
+                let y_up = backend.zeros(vec![1, ffn])?;
+                backend.gemm_nt(&x_t, &self.up.expert(eid as usize), &y_up)?;
+                let g = backend.zeros(vec![1, ffn])?;
+                backend.gemm_nt(&x_t, &self.gate.expert(eid as usize), &g)?;
+                let act = backend.zeros(vec![1, ffn])?;
+                backend.silu(&g, &act)?;
+                let prod = backend.zeros(vec![1, ffn])?;
+                backend.mul(&act, &y_up, &prod)?;
+                let y_dn = backend.zeros(vec![1, d])?;
+                backend.gemm_nt(&prod, &self.down.expert(eid as usize), &y_dn)?;
+                backend.add_scaled(&acc_t, &y_dn, &acc_t, w)?;
+            }
+        }
+        Ok(acc.view(vec![1, t, d]))
+    }
+
+    /// Путь по умолчанию: ОДИН вызов mul_mat_id на проекцию на токен —
+    /// внутри кернела перебираются слоты top-k. Раньше на токен слоя
+    /// приходилось 3·k вызовов и столько же аллокаций буферов (384 на токен
+    /// у OLMoE) — это и было узкое место декода (40 против 208 tok/s).
+    fn ffn_id(
+        &self,
+        backend: &dyn Backend,
+        x2: &Tensor,
+        logits: &Tensor,
+        routed: &[(Vec<u32>, Vec<f32>)],
+        t: usize,
+        d: usize,
+        ffn: usize,
+        e: usize,
+    ) -> Result<Tensor, BackendError> {
         let k = self.cfg.n_expert_used.min(e);
         // Роутер на устройстве: без чтения логитов на CPU (host-путь стоил
         // синхронизацию GPU→CPU на слой на токен — 16 на токен у OLMoE).
@@ -501,7 +533,7 @@ impl MoeLayer {
         {
             device_route = backend
                 .moe_route(
-                    &logits,
+                    logits,
                     di,
                     dw,
                     k,
@@ -690,12 +722,12 @@ mod tests {
             for i in 0..ffn {
                 let got = id_host[j * ffn + i];
                 let want = host[i];
-                // Допуск — на переупорядочивание f32-накопления: mv_id_q4_k
-                // считает скалярным dot_q4_k, а срез (m=1) идёт через
-                // mv_q4_k_r2 (порт эталонного mul_mv, другой порядок по K).
-                // Структурный баг (чужая строка/эксперт/вес) дал бы O(1).
-                assert!(
-                    (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                // mv_id и по-слотовый matvec считают одну и ту же r2-раскладку
+                // (хелперы mv_q4k_* в common.metal) — ПОБИТОВОЕ равенство и
+                // есть контракт (эталонный mv_id оборачивает ту же impl).
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
                     "слот {j} (эксперт {eid}) [{i}]: id {got} против среза {want}"
                 );
             }
@@ -731,10 +763,13 @@ mod tests {
             }
         }
         for i in 0..n {
-            // Допуск — как выше: mv_id (скалярный dot_q4_k) против срезов на
-            // mv_q4_k_r2 (другой порядок по K); структурный баг дал бы O(1).
+            // up/gate выше — побитово; down — с допуском: кернел сворачивает
+            // acc += w*v в FMA (то же делает add_scaled в default-пути), а
+            // host-эталон — отдельное умножение/сложение; при вычитании это
+            // даёт до единиц e-6. Побитовое равенство mv_id и default-пути
+            // доказывается e2e (OLMoE с INFER_MOE_ID=1 против default).
             assert!(
-                (sum_id[i] - want[i]).abs() <= 1e-3 * (1.0 + want[i].abs()),
+                (sum_id[i] - want[i]).abs() <= 1e-5 * (1.0 + want[i].abs()),
                 "down [{i}]: id {} против суммы срезов {}",
                 sum_id[i],
                 want[i]

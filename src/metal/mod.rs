@@ -5082,8 +5082,9 @@ impl crate::backend::Backend for MetalBackend {
             )));
         }
         let (k32, n32, ks32) = (k as u32, n_rows as u32, kslots as u32);
-        // 16 строк весов на threadgroup (4 simdgroup × 4 строки), слоты — цикл.
-        let grid = MTLSize::new((n_rows.div_ceil(16) * 128) as u64, 1, 1);
+        // 8 строк весов на threadgroup (4 simdgroup × пара строк, 32 лейна на
+        // строку — r2-раскладка), слоты — цикл.
+        let grid = MTLSize::new((n_rows.div_ceil(8) * 128) as u64, 1, 1);
         let group = MTLSize::new(128, 1, 1);
         self.ctx.run(name, grid, group, |enc| {
             enc.set_buffer(0, Some(&ag.buffer), ag.offset as u64);

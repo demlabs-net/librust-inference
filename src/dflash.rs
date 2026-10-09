@@ -687,7 +687,7 @@ impl DFlashModel {
                 let kv_size = self.cfg.n_kv_heads * self.cfg.head_dim;
                 let q_size = self.cfg.n_heads * self.cfg.head_dim;
                 let qkv = crate::nn::Linear {
-                    w: layer.dense.attn.wqkv.clone(),
+                    w: layer.dense.attn.wqkv.clone().expect("wqkv"),
                     b: None,
                 }
                 .forward(backend, &enc)?;
@@ -833,13 +833,13 @@ impl DFlashModel {
                     eprintln!(
                         "diffuse: layer0 h={:?} wqkv={:?}",
                         h.shape(),
-                        attn.wqkv.shape()
+                        attn.wqkv.as_ref().expect("wqkv").shape()
                     );
                 }
                 let q_size = attn.n_heads * attn.head_dim;
                 let kv_size = attn.n_kv_heads * attn.head_dim;
                 let qkv = crate::nn::Linear {
-                    w: attn.wqkv.clone(),
+                    w: attn.wqkv.clone().expect("wqkv"),
                     b: None,
                 }
                 .forward(backend, &h)?;
@@ -893,7 +893,7 @@ impl DFlashModel {
                 // k_ctx на [pos..pos+ctx), noise следом — кэш непрерывен
                 if let Some(e) = &enc {
                     let qkv2 = crate::nn::Linear {
-                        w: attn.wqkv.clone(),
+                        w: attn.wqkv.clone().expect("wqkv"),
                         b: None,
                     }
                     .forward(backend, e)?;
@@ -1514,7 +1514,7 @@ fn load_dense_layer(
     // черновом блоке (драфтер стоил больше шага декода таргета).
     let attn = Attention {
         qk_norm_whole_eps: None,
-        wqkv: crate::qwen3::Qwen3Model::upload_fused(
+        wqkv: Some(crate::qwen3::Qwen3Model::upload_fused(
             backend,
             w,
             &[&p("attn_q.weight"), &p("attn_k.weight"), &p("attn_v.weight")],
@@ -1522,7 +1522,8 @@ fn load_dense_layer(
                 cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
                 cfg.dim,
             ],
-        )?,
+        )?),
+        wqkv_split: None,
         // wo [dim, n_heads·head_dim]: у драфтера Qwen3.5-4B 32·128 = 4096 ≠
         // dim 2560 — форма [dim, dim] отвергала корректный тензор (как у
         // Qwen3Model::load, где wo всегда [dim, n_heads·head_dim]).

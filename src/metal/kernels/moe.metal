@@ -144,7 +144,7 @@ static inline void mv_id_impl(device const float* A, device const uint* IDS,
                 MvQ4KY y;
                 mv_q4k_y(a, ib, d, y);
                 for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
-                    sumf[rr] += mv_q4k_blk(x + (ulong)rr * row_bytes + (ulong)ib * 144u, d, y);
+                    mv_q4k_acc(x + (ulong)rr * row_bytes + (ulong)ib * 144u, d, y, sumf[rr]);
                 }
             }
         } else {
@@ -153,7 +153,7 @@ static inline void mv_id_impl(device const float* A, device const uint* IDS,
                 float yl[16];
                 mv_q6k_y(a, ib, d, yl);
                 for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
-                    sumf[rr] += mv_q6k_blk(x + (ulong)rr * row_bytes + (ulong)ib * 210u, d, yl);
+                    mv_q6k_acc(x + (ulong)rr * row_bytes + (ulong)ib * 210u, d, yl, sumf[rr]);
                 }
             }
         }
@@ -161,7 +161,14 @@ static inline void mv_id_impl(device const float* A, device const uint* IDS,
             const float v = simd_sum(sumf[rr]);
             if (lane == 0u) {
                 if (WSUM == 1) {
-                    acc[rr] += w * v;
+                    // Эталон суммирует слоты ДВУМЯ отдельными кернелами
+                    // (ggml_mul: p = w·v с округлением в f32, затем ggml_add):
+                    // произведение округляется ДО сложения. Контракция в FMA
+                    // здесь расходится с эталоном на 1–26 ULP на слой на токен
+                    // — на чувствительных моделях это и есть разрыв паритета.
+                    #pragma clang fp contract(off)
+                    const float p = w * v;
+                    acc[rr] = acc[rr] + p;
                 } else {
                     C[(ulong)j * N + first_row + rr] = v;
                 }

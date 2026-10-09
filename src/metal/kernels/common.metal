@@ -248,8 +248,14 @@ static inline void mv_q4k_y(device const float* a, uint ib, thread const MvQ4KDe
     }
 }
 // Вклад суперблока (144 Б) в частичную сумму строки данным лейном.
-static inline float mv_q4k_blk(device const uchar* xb, thread const MvQ4KDecomp& d,
-                               thread const MvQ4KY& y) {
+// ВАЖНО: накопление — ОДНИМ выражением `s += dh*(...) - dm*(...)`, как в
+// эталонном kernel_mul_mv_q4_K_f32_impl. Прежняя форма (return + `sumf +=`
+// в вызывающем коде) давала ДРУГУЮ FMA-контракцию clang: промежуточные acc
+// в быстром кернеле на ~2 порядка крупнее финальной суммы (массовая
+// компенсация), и разница контракции — до ~3e-5 на скаляр при финальных
+// значениях ~2e-4. Это и был разрыв паритета на OLMoE.
+static inline void mv_q4k_acc(device const uchar* xb, thread const MvQ4KDecomp& d,
+                              thread const MvQ4KY& y, thread float& s) {
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
@@ -283,12 +289,12 @@ static inline float mv_q4k_blk(device const uchar* xb, thread const MvQ4KDecomp&
         acc2[2] += y.yh[2 * l + 8] * (float)(b & 0x00F0u);
         acc2[3] += y.yh[2 * l + 9] * (float)(b & 0xF000u);
     }
-    return dh * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-                 (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-                 (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-                 (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
-           dm * (y.sumy[0] * sc8[2] + y.sumy[1] * sc8[3] +
-                 y.sumy[2] * sc8[6] + y.sumy[3] * sc8[7]);
+    s += dh * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+               (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+               (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+               (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+         dm * (y.sumy[0] * sc8[2] + y.sumy[1] * sc8[3] +
+               y.sumy[2] * sc8[6] + y.sumy[3] * sc8[7]);
 }
 
 // Q6_K: 16 лейнов на строку (tid = lane/2 — позиция, ix = lane%2 — чётность
@@ -311,8 +317,10 @@ static inline void mv_q6k_y(device const float* a, uint i, thread const MvQ6KDec
         yl[4u * l + 3] = y[l + 96];
     }
 }
-static inline float mv_q6k_blk(device const uchar* xb, thread const MvQ6KDecomp& d,
-                               thread const float* yl) {
+// Накопление — одним выражением, как эталонный kernel_mul_mv_q6_K_f32_impl
+// (`sumf[row] += dh[0] * (...)`): см. комментарий у mv_q4k_acc про контракцию.
+static inline void mv_q6k_acc(device const uchar* xb, thread const MvQ6KDecomp& d,
+                              thread const float* yl, thread float& s) {
     device const uchar* q1 = xb + d.q_off_l;
     device const uchar* q2 = q1 + 32;
     device const uchar* qh = xb + 128u + d.q_off_h;
@@ -325,5 +333,5 @@ static inline float mv_q6k_blk(device const uchar* xb, thread const MvQ6KDecomp&
         sums[2] += yl[4u * l + 2] * (float)((int8_t)((q1[l] >> 4) | ((qh[l] & 0x30)         )) - 32);
         sums[3] += yl[4u * l + 3] * (float)((int8_t)((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)   ) - 32);
     }
-    return dh * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+    s += dh * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
 }

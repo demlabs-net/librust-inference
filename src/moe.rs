@@ -449,6 +449,43 @@ impl MoeLayer {
             routed.push((ids.clone(), ws.clone()));
         }
 
+        // INFER_DUMP_MOE=<файл> — побитовый дамп роутер-логитов и весов для
+        // сверки с scripts/oracle_dump.cpp (тот же формат: заголовок TENSOR +
+        // hex-биты по 8 на строку). Вызовы нумеруются глобально: 16 MoE-слоёв
+        // на forward, порядок вызовов = порядок слоёв.
+        if let Ok(path) = std::env::var("INFER_DUMP_MOE") {
+            use std::io::Write as _;
+            static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let mut dump = |name: &str, ne: &str, vals: &[f32]| {
+                    let _ = writeln!(f, "STEP {call} TENSOR {name} ne=[{ne}]");
+                    for (i, v) in vals.iter().enumerate() {
+                        let _ = write!(f, "{:08x}{}", v.to_bits(), if i % 8 == 7 { "\n" } else { " " });
+                    }
+                    let _ = writeln!(f);
+                };
+                // Логиты в эталонном порядке [E, t] (токами по столбцам).
+                let mut lg = Vec::with_capacity(t * e);
+                for ti in 0..t {
+                    lg.extend_from_slice(&host[ti * e..(ti + 1) * e]);
+                }
+                dump("eng_logits", &format!("{e},{t},1,1"), &lg);
+                let mut wt: Vec<f32> = Vec::with_capacity(t * self.cfg.n_expert_used);
+                let mut idv: Vec<f32> = Vec::with_capacity(wt.capacity());
+                for (eid, w) in routed.iter().flat_map(|(i, w)| i.iter().zip(w.iter())) {
+                    idv.push(*eid as f32);
+                    wt.push(*w);
+                }
+                dump("eng_topk_ids", &format!("{},1,1,1", t * self.cfg.n_expert_used), &idv);
+                dump("eng_weights", &format!("1,{},1,1", self.cfg.n_expert_used), &wt);
+            }
+        }
+
         // 3. Проекции экспертов. Id-кернелы (mul_mat_id) — ПУТЬ ПО УМОЛЧАНИЮ:
         // с портированием mv_id на r2-раскладку эталонного mul_mv они считают
         // ровно тот же порядок по K, что по-слотовый matvec (тест
@@ -763,13 +800,13 @@ mod tests {
             }
         }
         for i in 0..n {
-            // up/gate выше — побитово; down — с допуском: кернел сворачивает
-            // acc += w*v в FMA (то же делает add_scaled в default-пути), а
-            // host-эталон — отдельное умножение/сложение; при вычитании это
-            // даёт до единиц e-6. Побитовое равенство mv_id и default-пути
-            // доказывается e2e (OLMoE с INFER_MOE_ID=1 против default).
-            assert!(
-                (sum_id[i] - want[i]).abs() <= 1e-5 * (1.0 + want[i].abs()),
+            // Побитово и для down: кернел суммирует слоты БЕЗ контракции
+            // (#pragma clang fp contract(off): p = w·v округляется, затем
+            // acc + p) — ровно как host-эталон и как эталонный граф llama.cpp
+            // (ggml_mul затем ggml_add — два отдельных кернела).
+            assert_eq!(
+                sum_id[i].to_bits(),
+                want[i].to_bits(),
                 "down [{i}]: id {} против суммы срезов {}",
                 sum_id[i],
                 want[i]

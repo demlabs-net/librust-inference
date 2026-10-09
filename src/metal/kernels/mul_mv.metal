@@ -407,7 +407,7 @@ kernel void mv_q6_k_r2(
         float yl[16];
         mv_q6k_y(A, i, d, yl);
         for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
-            sumf[rr] += mv_q6k_blk(x + (ulong)rr * row_bytes + (ulong)i * 210u, d, yl);
+            mv_q6k_acc(x + (ulong)rr * row_bytes + (ulong)i * 210u, d, yl, sumf[rr]);
         }
     }
     const float v0 = simd_sum(sumf[0]);
@@ -583,7 +583,7 @@ kernel void mv_q4_k_r2(
         MvQ4KY y;
         mv_q4k_y(A, ib, d, y);
         for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
-            sumf[rr] += mv_q4k_blk(x + (ulong)rr * row_bytes + (ulong)ib * 144u, d, y);
+            mv_q4k_acc(x + (ulong)rr * row_bytes + (ulong)ib * 144u, d, y, sumf[rr]);
         }
     }
     const float v0 = simd_sum(sumf[0]);

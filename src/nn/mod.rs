@@ -262,7 +262,15 @@ impl ConvTranspose1d {
 /// wqkv (3D, D), wo (D, D), optional QK-norms (D).
 #[derive(Debug, Clone)]
 pub struct Attention {
-    pub wqkv: Tensor,
+    /// Склеенная q/k/v-проекция [q+2kv, d] — когда форматы совпали и fuse
+    /// возможен без декванта. `None` — только вместе с `Some` у `wqkv_split`.
+    pub wqkv: Option<Tensor>,
+    /// Раздельные q/k/v в РОДНЫХ квантах (OLMoE: q/k Q4_K + v Q6_K). Склейка
+    /// при смешанных форматах деквантит всё в F32 — а F32-GEMM округляет не
+    /// так, как эталонный mul_mv по каждому кванту (расхождение ~5e-5 на
+    /// скаляр → разрыв паритета текста). Тогда — три gemm_nt в отдельные
+    /// выходы, ровно как три ggml_mul_mat у llama.cpp.
+    pub wqkv_split: Option<[Tensor; 3]>,
     pub wo: Tensor,
     /// Опциональный bias q/k/v (Qwen2.5-Omni thinker: q/k/v_proj.bias,
     /// [3·D] после fuse). None = классический Qwen3 без bias.
@@ -293,7 +301,8 @@ impl Attention {
         head_dim: usize,
     ) -> Result<Self, BackendError> {
         Ok(Self {
-            wqkv: backend.from_cpu_f32(&wqkv, vec![3 * dim, dim])?,
+            wqkv: Some(backend.from_cpu_f32(&wqkv, vec![3 * dim, dim])?),
+            wqkv_split: None,
             wo: backend.from_cpu_f32(&wo, vec![dim, dim])?,
             qkv_bias: None,
             q_norm: q_norm
@@ -324,14 +333,27 @@ impl Attention {
         let (b, tq, _) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let q_size = self.n_heads * self.head_dim;
         let kv_size = self.n_kv_heads * self.head_dim;
-        let qkv = Linear {
-            w: self.wqkv.clone(),
-            b: None,
-        }
-        .forward(backend, x)?;
-        let q = slice_last(backend, &qkv, q_size, 0)?;
-        let k = slice_last(backend, &qkv, kv_size, q_size)?;
-        let v = slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
+        let (q, k, v) = if let Some([wq, wk, wv]) = &self.wqkv_split {
+            let x2 = view2(x);
+            let yq = backend.zeros(vec![b * tq, q_size])?;
+            let yk = backend.zeros(vec![b * tq, kv_size])?;
+            let yv = backend.zeros(vec![b * tq, kv_size])?;
+            backend.gemm_nt(&x2, wq, &yq)?;
+            backend.gemm_nt(&x2, wk, &yk)?;
+            backend.gemm_nt(&x2, wv, &yv)?;
+            (yq, yk, yv)
+        } else {
+            let qkv = Linear {
+                w: self.wqkv.clone().expect("wqkv или wqkv_split"),
+                b: None,
+            }
+            .forward(backend, x)?;
+            (
+                slice_last(backend, &qkv, q_size, 0)?,
+                slice_last(backend, &qkv, kv_size, q_size)?,
+                slice_last(backend, &qkv, kv_size, q_size + kv_size)?,
+            )
+        };
         let (q, k) = if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
             match self.qk_norm_whole_eps {
                 // Норма по ВСЕЙ проекции q/k (OLMoE: llama.cpp olmoe.cpp зовёт

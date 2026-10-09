@@ -201,8 +201,14 @@ kernel void add_scaled_f32(
     constant float& scale [[buffer(4)]],
     uint gid [[thread_position_in_grid]])
 {
+    // Как в эталоне: scale и add — РАЗНЫЕ кернелы ggml (ggml_mul/ggml_scale,
+    // затем ggml_add), произведение округляется в f32 ДО сложения. Без
+    // отключения контракции clang сливает выражение в FMA — расхождение
+    // с эталоном на единицы ULP (на OLMoE это и разрыв паритета текста).
+    #pragma clang fp contract(off)
     if (gid >= n) return;
-    Y[gid] = A[gid] + B[gid] * scale;
+    const float p = B[gid] * scale;
+    Y[gid] = A[gid] + p;
 }
 
 // ── Scale: Y = X * scale ────────────────────────────────────────────────────

@@ -1547,7 +1547,37 @@ impl MetalCtx {
         let name = match b.dtype {
             GpuDtype::Q4_0 => "gemm_nt_q4_0",
             GpuDtype::Q8_0 => "gemm_nt_q8_0",
-            GpuDtype::Q4_K => "gemm_nt_q4_k",
+            // Q4_K при m > 8 — тайловой sgemm (порт kernel_mul_mm_q4_K_f32,
+            // каркас как у Q6_K mm). Паритет: при m > 8 эталон считает q/k/v
+            // и FFN ЭТИМ кернелом (use_mm), и его порядок суммирования
+            // отличается и от matvec'а, и от поэлементного GEMM (OLMoE p2).
+            // ПОКА ОПТ-ИН (INFER_Q4K_MM=1): порт численно верен (совпал с
+            // гипотезой A-half+B-half на ф32-точности), но НЕ побитово с
+            // эталонным mm — в эталонном dequantize_q4_K映射 il→подблок/масштаб
+            // (get_scale_min_k4_just2(is, il/2)) отличается от спекового
+            // get_scale_min_k4; разбирается следующим заходом (сверка
+            // декванта построчно с оркаловым дампом). Порог m>8 и K%256==0.
+            GpuDtype::Q4_K => {
+                if m > 8
+                    && k % 256 == 0
+                    && std::env::var("INFER_Q4K_MM").is_ok()
+                    && std::env::var("INFER_Q4K_NO_MM").is_err()
+                {
+                    let (m32, k32, n32) = (m as u32, k as u32, n as u32);
+                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let group = MTLSize::new(128, 1, 1);
+                    return self.run("gemm_nt_q4_k_mm", grid, group, |enc| {
+                        enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                        enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                        enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                        enc.set_bytes(3, 4, (&m32 as *const u32).cast());
+                        enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                        enc.set_bytes(5, 4, (&n32 as *const u32).cast());
+                        enc.set_threadgroup_memory_length(0, 8192);
+                    });
+                }
+                "gemm_nt_q4_k"
+            }
             // Q6_K при m > 8 — тайловой sgemm (порт kernel_mul_mm_q6_K_f32,
             // каркас как у Q5_K mm): скалярный gemm_nt_q6_k перечитывает веса
             // на каждую строку активаций (lm_head 27B m=128 — 423 мс в
@@ -4303,13 +4333,25 @@ impl crate::backend::Backend for MetalBackend {
                 | GpuDtype::Q5_0
                 | GpuDtype::Iq4Xs
         ) {
-            if a.as_gpu().shape[0] == 1 {
-                // mv_quantized — MMV-примитив: a 1D [k], c 1D [n] (тот же буфер).
+            let m = a.as_gpu().shape[0];
+            if m <= 8 {
+                // Эталонный ggml-metal берёт mul_mm ТОЛЬКО при m > 8
+                // (ggml_metal_op_mul_mat_use_mm), иначе — mul_mv для любого
+                // m. Быстрый mul_mv копит неизмасштабированные нибблы
+                // (промежуточные acc в ~256× крупнее точного декванта), и его
+                // округление отличается от точного dequant-GEMM на ~5e-5 на
+                // скалярное произведение — через RMS-norm это разыгрывается в
+                // расхождение текстов (OLMoE p2, символ 106). Значит при
+                // m ≤ 8 идём matvec'ом, как эталон; по столбцам — каждый
+                // выход независим и побитово равен эталонному запуску с
+                // grid.z = m. mv_quantized — MMV-примитив: a 1D [k], c 1D [n].
                 let k = a.as_gpu().shape[1];
                 let n = bg.shape[0];
-                let av = a.view(vec![k]);
-                let cv = c.view(vec![n]);
-                self.ctx.mv_quantized(av.as_gpu(), bg, cv.as_gpu())?;
+                for j in 0..m {
+                    let av = a.view_offset(vec![k], j * k);
+                    let cv = c.view_offset(vec![n], j * n);
+                    self.ctx.mv_quantized(av.as_gpu(), bg, cv.as_gpu())?;
+                }
             } else {
                 self.ctx.gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
             }

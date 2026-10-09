@@ -564,19 +564,40 @@ impl Qwen3Model {
         let mut caches = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}");
-            // fuse q/k/v → [3D, D] (нативный квант, если все Q8_0/Q4_0/...)
+            // fuse q/k/v → [3D, D] (нативный квант, если все Q8_0/Q4_0/...).
+            // При РАЗНЫХ квантах (OLMoE: q/k Q4_K + v Q6_K) fuse деквантит
+            // всё в F32 — а F32-GEMM округляет не так, как эталонный mul_mv
+            // по каждому кванту (на OLMoE — разрыв паритета текста). Тогда
+            // держим три проекции раздельно в родных квантах.
             let qn = p("attn_q.weight");
             let kn = p("attn_k.weight");
             let vn = p("attn_v.weight");
-            let wqkv = Self::upload_fused(
-                backend,
-                w,
-                &[&qn, &kn, &vn],
-                vec![
-                    cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
-                    cfg.dim,
-                ],
-            )?;
+            let fmt_same = w.get(&qn).is_some_and(|a| {
+                w.get(&kn).is_some_and(|b| {
+                    a.format == b.format && w.get(&vn).is_some_and(|c| a.format == c.format)
+                })
+            });
+            let (wqkv, wqkv_split) = if fmt_same {
+                (
+                    Some(Self::upload_fused(
+                        backend,
+                        w,
+                        &[&qn, &kn, &vn],
+                        vec![
+                            cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
+                            cfg.dim,
+                        ],
+                    )?),
+                    None,
+                )
+            } else {
+                let qs = cfg.n_heads * cfg.head_dim;
+                let kvs = cfg.n_kv_heads * cfg.head_dim;
+                let wq = Self::upload_q(backend, w, &qn, vec![qs, cfg.dim])?;
+                let wk = Self::upload_q(backend, w, &kn, vec![kvs, cfg.dim])?;
+                let wv = Self::upload_q(backend, w, &vn, vec![kvs, cfg.dim])?;
+                (None, Some([wq, wk, wv]))
+            };
             // QK-norm опционален (Qwen3 — есть; Qwen2.5-Omni thinker — нет).
             // Область нормировки — по РАЗМЕРУ тензора в файле: head_dim =
             // по голове (Qwen3), n_embd = по всей проекции q/k (OLMoE:
@@ -620,6 +641,7 @@ impl Qwen3Model {
             )?;
             let attn = Attention {
                 wqkv,
+                wqkv_split,
                 wo,
                 qkv_bias: qkv_bias
                     .map(|b| {
@@ -1718,32 +1740,56 @@ impl Qwen3Model {
         let (b, tq, _d) = (h.shape()[0], h.shape()[1], h.shape()[2]);
         let q_size = attn.n_heads * attn.head_dim;
         let kv_size = attn.n_kv_heads * attn.head_dim;
-        let qkv = Linear {
-            w: attn.wqkv.clone(),
-            b: None,
-        }
-        .forward(backend, h)?;
-        let qkv = if let Some(bias) = &attn.qkv_bias {
-            // Qwen2.5-Omni thinker: q/k/v проекции с bias (fused [3D']).
-            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
-                let bv = backend.to_cpu_f32(bias)?;
-                eprintln!("OMNI_REF our_q_bias[:8]={:?}", &bv[..8.min(bv.len())]);
-                let qv = backend.to_cpu_f32(&qkv)?;
-                eprintln!("OMNI_REF qkv_before_bias[:8]={:?}", &qv[..8.min(qv.len())]);
-            }
-            backend.add_bias(&qkv, bias, &qkv)?;
-            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
-                let qv = backend.to_cpu_f32(&qkv)?;
-                let qs = q_size + 2 * kv_size;
-                let last = qv.len() - qs;
-                eprintln!("OMNI_REF qkv_after[-1,:8]={:?}", &qv[last..last + 8]);
-            }
-            qkv
+        // Раздельные проекции в родных квантах (OLMoE q/k Q4_K + v Q6_K):
+        // три gemm_nt в отдельные выходы — побитово как три ggml_mul_mat
+        // эталона; склеенный F32-tensor округлял бы иначе.
+        let qkv_parts = if let Some([wq, wk, wv]) = &attn.wqkv_split {
+            let x2 = h.view(vec![b * tq, _d]);
+            let yq = backend.zeros(vec![b * tq, q_size])?;
+            let yk = backend.zeros(vec![b * tq, kv_size])?;
+            let yv = backend.zeros(vec![b * tq, kv_size])?;
+            backend.gemm_nt(&x2, wq, &yq)?;
+            backend.gemm_nt(&x2, wk, &yk)?;
+            backend.gemm_nt(&x2, wv, &yv)?;
+            Some((
+                yq.view(vec![b, tq, q_size]),
+                yk.view(vec![b, tq, kv_size]),
+                yv.view(vec![b, tq, kv_size]),
+            ))
         } else {
-            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
-                eprintln!("OMNI_REF qkv_bias=None!!!");
+            None
+        };
+        let qkv = if qkv_parts.is_some() {
+            None
+        } else {
+            let qkv = Linear {
+                w: attn.wqkv.clone().expect("wqkv или wqkv_split"),
+                b: None,
             }
-            qkv
+            .forward(backend, h)?;
+            let qkv = if let Some(bias) = &attn.qkv_bias {
+                // Qwen2.5-Omni thinker: q/k/v проекции с bias (fused [3D']).
+                if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
+                    let bv = backend.to_cpu_f32(bias)?;
+                    eprintln!("OMNI_REF our_q_bias[:8]={:?}", &bv[..8.min(bv.len())]);
+                    let qv = backend.to_cpu_f32(&qkv)?;
+                    eprintln!("OMNI_REF qkv_before_bias[:8]={:?}", &qv[..8.min(qv.len())]);
+                }
+                backend.add_bias(&qkv, bias, &qkv)?;
+                if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
+                    let qv = backend.to_cpu_f32(&qkv)?;
+                    let qs = q_size + 2 * kv_size;
+                    let last = qv.len() - qs;
+                    eprintln!("OMNI_REF qkv_after[-1,:8]={:?}", &qv[last..last + 8]);
+                }
+                qkv
+            } else {
+                if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
+                    eprintln!("OMNI_REF qkv_bias=None!!!");
+                }
+                qkv
+            };
+            Some(qkv)
         };
         let prof_attn = std::env::var("LLM_PROF_ATTN").is_ok();
         let sync = |x: &Tensor| -> Result<f64, BackendError> {
@@ -1757,7 +1803,9 @@ impl Qwen3Model {
             Ok(0.0)
         };
         let tp0 = std::time::Instant::now();
-        sync(&qkv)?;
+        if let Some(qkv) = &qkv {
+            sync(qkv)?;
+        }
         let t_qkv = tp0.elapsed().as_secs_f64();
         // Decode/prefill без картинок, с QK-norm и f32-KV: разбор qkv, norm+RoPE
         // q/k и запись k/v в кэш — ОДНИМ кернелом (было 7 на слой: slice ×3,
@@ -1772,13 +1820,14 @@ impl Qwen3Model {
             && mrope.is_none()
             && cfg.mrope_sections.is_none()
             && attn.qk_norm_whole_eps.is_none()
+            && qkv_parts.is_none()
             && (cache.is_f32() || cache.is_f16())
             && std::env::var("INFER_QKV_UNFUSED").is_err();
         let (q, t_norm, t_upd_d) = if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
             let t_upd = std::time::Instant::now();
             let (pos_kv, kb, vb) = cache.begin_append(backend, tq)?;
             let q = backend.qkv_norm_rope_kv(
-                &qkv,
+                qkv.as_ref().expect("fused ⇒ qkv есть"),
                 qn,
                 kn,
                 &kb,
@@ -1796,9 +1845,14 @@ impl Qwen3Model {
             sync(&q)?;
             (q, tp0.elapsed().as_secs_f64(), t_upd.elapsed().as_secs_f64())
         } else {
-            let q = crate::nn::slice_last(backend, &qkv, q_size, 0)?;
-            let k = crate::nn::slice_last(backend, &qkv, kv_size, q_size)?;
-            let v = crate::nn::slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
+            let (q, k, v) = match qkv_parts {
+                Some(parts) => parts,
+                None => (
+                    crate::nn::slice_last(backend, qkv.as_ref().expect("qkv или parts"), q_size, 0)?,
+                    crate::nn::slice_last(backend, qkv.as_ref().expect("qkv или parts"), kv_size, q_size)?,
+                    crate::nn::slice_last(backend, qkv.as_ref().expect("qkv или parts"), kv_size, q_size + kv_size)?,
+                ),
+            };
             if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
                 for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
                     let tv = backend.to_cpu_f32(t)?;

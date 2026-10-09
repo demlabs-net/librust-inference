@@ -1184,6 +1184,40 @@ kernel void gemm_nt_q6_k_mm(
 // q/k/v-проекции ИМЕННО этим кернелом (use_mm), и его порядок суммирования
 // отличается и от matvec'а, и от нашего поэлементного GEMM (на OLMoE —
 // разрыв паритета текста p2).
+// Точный (дословный) порт ggml dequantize.h: block_q4_K + get_scale_min_k4_just2
+// + dequantize_q4_K — чтобы FMA-контракция и порядок операций совпали с
+// эталонным кернелом побитово (рукописный порт расходился).
+typedef struct {
+    half   d;
+    half   dmin;
+    uchar  scales[12];
+    uchar  qs[128];
+} q4k_block;
+
+static inline uchar2 q4k_scale_min_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
+                 : uchar2{uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xc0) >> 2)),
+                          uchar((q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))};
+}
+
+static inline void q4k_dequantize_mm(device const q4k_block * xb, short il, thread float4x4 & reg) {
+    device const uchar * q = xb->qs;
+
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    const uchar2 sc = q4k_scale_min_just2(is, il / 2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
+    }
+}
+
 kernel void gemm_nt_q4_k_mm(
     device const float* A [[buffer(0)]],     // активации [M, K]
     device const uchar* B [[buffer(1)]],     // веса Q4_K [N, K] (144 Б/256)
@@ -1219,34 +1253,10 @@ kernel void gemm_nt_q4_k_mm(
 
     const uint nk = K / 32u;   // шагов по 32
     for (uint kb = 0; kb < nk; ++kb) {
-        // деквант 16 значений строки весов (порт dequantize_q4_K)
+        // деквант 16 значений строки весов — дословный порт dequantize_q4_K
         {
-            const short i3 = il & 3;
-            const uint is = (il / 4u) * 2u;
-            device const uchar* q = x + 16u + (il / 4u) * 32u + 16u * (il & 1u);
-            // get_scale_min_k4_just2(j=is, k=i3/2, scales) — ВНИМАНИЕ: в
-            // вызове первым аргументом идёт j=is, вторым k=i3/2 (первый
-            // вариант порта перепутал их местами). При j>=4 (il>=8) — вторая
-            // ветка:scale'ы догружаются старшими битами соседних байтов.
-            const uint j = is, k = (uint)(i3 / 2);
-            device const uchar* sc = x + 4u;
-            float sc0, sc1;
-            if (j < 4u) {
-                sc0 = (float)(sc[j + k] & 63u);
-                sc1 = (float)(sc[j + 4u + k] & 63u);
-            } else {
-                sc0 = (float)((sc[j + 4u + k] & 0x0Fu) | ((sc[j - 4u + k] & 0xC0u) >> 2));
-                sc1 = (float)((sc[j + 4u + k] >> 4) | ((sc[j + k] & 0xC0u) >> 2));
-            }
-            const float d = (float)load_half_unaligned(x) / (i3 < 2 ? 1.f : 16.f);
-            const float mn = (float)load_half_unaligned(x + 2u);
-            const float dl = d * sc0;
-            const float ml = mn * sc1;
-            const uint mask = i3 < 2 ? 0x0Fu : 0xF0u;
             float4x4 reg;
-            for (short i = 0; i < 16; ++i) {
-                reg[i / 4][i % 4] = dl * (float)(q[i] & mask) - ml;
-            }
+            q4k_dequantize_mm((device const q4k_block*)x, il, reg);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (short i = 0; i < 16; i++) {
                 const short sx = 2 * il0 + i / 8;

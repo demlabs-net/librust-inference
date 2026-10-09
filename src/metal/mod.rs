@@ -1558,11 +1558,7 @@ impl MetalCtx {
             // get_scale_min_k4; разбирается следующим заходом (сверка
             // декванта построчно с оркаловым дампом). Порог m>8 и K%256==0.
             GpuDtype::Q4_K => {
-                if m > 8
-                    && k % 256 == 0
-                    && std::env::var("INFER_Q4K_MM").is_ok()
-                    && std::env::var("INFER_Q4K_NO_MM").is_err()
-                {
+                if m > 8 && k % 256 == 0 && std::env::var("INFER_Q4K_NO_MM").is_err() {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);

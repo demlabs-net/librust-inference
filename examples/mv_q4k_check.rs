@@ -38,7 +38,13 @@ fn parse(path: &str, step: u32, name: &str, ne: &str) -> Vec<f32> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (xall, oq) = if let Ok(p) = std::env::var("LLM_BIN") {
+    let (xall, oq) = if std::env::var("LLM_ISO").is_ok() {
+        let rd = |p: &str| -> Vec<f32> {
+            let b = std::fs::read(p).unwrap();
+            b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        ({ let p: String = std::env::var("LLM_X").unwrap_or_else(|_| "/tmp/x14.bin".into()); rd(&p) }, rd("/tmp/iso_out.bin"))
+    } else if let Ok(p) = std::env::var("LLM_BIN") {
         let rd = |p: &str| -> Vec<f32> {
             let b = std::fs::read(p).unwrap();
             b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
@@ -56,6 +62,7 @@ fn main() {
     };
     let mm = std::env::var("LLM_MM").ok();
     let m = mm.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+    let m = std::env::var("LLM_M").ok().and_then(|s| s.parse().ok()).unwrap_or(m);
     let from_bin = mm.is_some_and(|s| s.parse::<usize>().is_ok());
 
     let bytes = std::fs::read(&a[1]).unwrap();
@@ -69,7 +76,7 @@ fn main() {
     // x — строки токенов 5..5+m (для m>1 берём токен 5 m раз — сравнение
     // только строки 0 корректна при m>1, но нас интересует побитовая
     // совпааемость matvec-пути: при m=9 движок пойдёт в mm, и это контроль).
-    let xs: Vec<f32> = if std::env::var("LLM_BIN").is_ok() || std::env::var("LLM_MM_BIN").is_ok() {
+    let xs: Vec<f32> = if std::env::var("LLM_ISO").is_ok() || std::env::var("LLM_BIN").is_ok() || std::env::var("LLM_MM_BIN").is_ok() {
         xall[..m * 2048].to_vec()
     } else {
         let mut v = Vec::new();
@@ -82,7 +89,7 @@ fn main() {
     let c = be.zeros(vec![m, 2048]).unwrap();
     be.gemm_nt(&xt, &wt, &c).unwrap();
     let got = be.to_cpu_f32(&c).unwrap();
-    let row = std::env::var("LLM_ROW").ok().and_then(|s| s.parse().ok()).unwrap_or(if std::env::var("LLM_MM_BIN").is_ok() || std::env::var("LLM_BIN").is_ok() { 0 } else { 5 });
+    let row = std::env::var("LLM_ROW").ok().and_then(|s| s.parse().ok()).unwrap_or(if std::env::var("LLM_MM_BIN").is_ok() || std::env::var("LLM_BIN").is_ok() || std::env::var("LLM_ISO").is_ok() { 0 } else { 5 });
     let oq5 = &oq[row * 2048..(row + 1) * 2048];
     let nd = (0..2048).filter(|i| oq5[*i].to_bits() != got[*i].to_bits()).count();
     println!("m={m}: bitwise-различий с oracle: {nd}/2048");

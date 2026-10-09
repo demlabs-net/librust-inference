@@ -225,6 +225,73 @@ kernel void gdn_norm_gated_f32(
     }
 }
 
+// Параллельная версия гейтовой RMS-нормы (Ф8.1): Σx² — по всем 32 лейнам
+// (stride-32, тот же шаг, что у фазы записи), частичные суммы — simd_sum.
+// Прежняя версия копила HD=6144 элементов ОДНИМ лейном последовательно: на
+// декоде 27B (rows=1) это 0.16 мс/слой — латентность глобальных загрузок
+// одного потока. Порядок суммирования изменён относительно прежней цепочки
+// (класс MV_KS) — паритет подтверждён text_parity на моделях с GDN
+// (27B-гибрид, Qwen3.5-4B); фоллбэк INFER_NG_SERIAL=1.
+kernel void gdn_norm_gated_par_f32(
+    device const float* X [[buffer(0)]],
+    device const float* Z [[buffer(1)]],
+    device const float* W [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& ROWS [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint r [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    if (r >= ROWS) return;
+    device const float* x = X + (ulong)r * HD;
+    device const float* z = Z + (ulong)r * HD;
+    float ss = 0.0f;
+    for (uint i = lane; i < HD; i += 32u) ss += x[i] * x[i];
+    ss = simd_sum(ss);
+    const float inv = 1.0f / sqrt(ss / (float)HD + eps);
+    for (uint i = lane; i < HD; i += 32u) {
+        float zz = z[i];
+        float silu = zz / (1.0f + exp(-zz));
+        Y[(ulong)r * HD + i] = x[i] * inv * W[i] * silu;
+    }
+}
+
+// То же, что gdn_norm_gated_par_f32, но строку обрабатывает threadgroup из
+// 4 simdgroup (128 потоков): при декоде 27B rows=1, и одной simdgroup мало —
+// 0.04 мс/слой против ~0.01. Σx²: частичная сумма simdgroup'а (simd_sum),
+// затем четыре частичных складываются в фиксированном порядке s0+s1+s2+s3 —
+// детерминировано. Фоллбэк INFER_NG_SERIAL=1 (прежний последовательный).
+kernel void gdn_norm_gated_par4_f32(
+    device const float* X [[buffer(0)]],
+    device const float* Z [[buffer(1)]],
+    device const float* W [[buffer(2)]],
+    device float* Y [[buffer(3)]],
+    constant uint& ROWS [[buffer(4)]],
+    constant uint& HD [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint r [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    if (r >= ROWS) return;
+    device const float* x = X + (ulong)r * HD;
+    device const float* z = Z + (ulong)r * HD;
+    threadgroup float sgs[4];
+    float ss = 0.0f;
+    for (uint i = tid; i < HD; i += 128u) ss += x[i] * x[i];
+    ss = simd_sum(ss);
+    if (lane == 0u) sgs[sgid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / sqrt(((sgs[0] + sgs[1]) + (sgs[2] + sgs[3])) / (float)HD + eps);
+    for (uint i = tid; i < HD; i += 128u) {
+        float zz = z[i];
+        float silu = zz / (1.0f + exp(-zz));
+        Y[(ulong)r * HD + i] = x[i] * inv * W[i] * silu;
+    }
+}
+
 // ── Gated delta rule, simdgroup-параллельный по i (Ф8.2) ─────────────────────
 // Прежний gdn_delta_rule_f32: поток на столбец j, и КАЖДЫЙ поток проходил
 // всю строку стейта (S=128) дважды на токен последовательно — на prefill

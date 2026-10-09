@@ -9,12 +9,16 @@ use rust_inference::dtype::WeightFormat;
 use rust_inference::metal::MetalBackend;
 use std::time::Instant;
 
-fn bench(name: &str, bytes: usize, reps: usize, mut f: impl FnMut()) {
+fn bench(be: &MetalBackend, name: &str, bytes: usize, reps: usize, mut f: impl FnMut()) {
     f(); // прогрев
+    // Повторы — в ОДНОМ command buffer (begin_batch/end_batch): без этого
+    // каждый вызов мерит commit+wait-пол (~0.2 мс), а не кернел.
     let t0 = Instant::now();
+    be.begin_batch().unwrap();
     for _ in 0..reps {
         f();
     }
+    be.end_batch().unwrap();
     let s = t0.elapsed().as_secs_f64() / reps as f64;
     println!(
         "{name:14} {:6.1} МБ | {:7.3} мс | {:6.1} ГБ/с",
@@ -73,19 +77,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let y_z = be.zeros(vec![1, ssm_inner])?;
     let y_ba = be.zeros(vec![1, hv])?;
     let y_ba2 = be.zeros(vec![1, 2 * hv])?;
-    bench("qkv Q5_K", b5.len(), reps, || {
+    bench(&be, "qkv Q5_K", b5.len(), reps, || {
         be.gemm_nt(&h2, &w_qkv, &y_qkv).unwrap();
     });
-    bench("gate IQ4XS", b4.len(), reps, || {
+    bench(&be, "gate IQ4XS", b4.len(), reps, || {
         be.gemm_nt(&h2, &w_gate, &y_z).unwrap();
     });
-    bench("beta F32", hv * dim * 4, reps, || {
+    bench(&be, "beta F32", hv * dim * 4, reps, || {
         be.gemm_nt(&h2, &w_beta, &y_ba).unwrap();
     });
-    bench("alpha F32", hv * dim * 4, reps, || {
+    bench(&be, "alpha F32", hv * dim * 4, reps, || {
         be.gemm_nt(&h2, &w_alpha, &y_ba).unwrap();
     });
-    bench("ba F32 ×2", 2 * hv * dim * 4, reps, || {
+    bench(&be, "ba F32 ×2", 2 * hv * dim * 4, reps, || {
         be.gemm_nt(&h2, &w_ba, &y_ba2).unwrap();
     });
 
@@ -99,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conv_st = be.zeros(vec![qkv_out, 3])?;
     let norm_w = be.zeros(vec![ssm_inner])?;
 
-    bench("gates", 0, reps, || {
+    bench(&be, "gates", 0, reps, || {
         be.gdn_gates(&ba, &dt_bias, &a).unwrap();
     });
     // Корректность gates: ba = alpha|beta с известными значениями.
@@ -123,31 +127,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("gates контроль: |Δ| max {maxd}");
     assert!(maxd < 1e-5, "gates неверны");
-    bench("conv", qkv_out * 4 * 2, reps, || {
+    bench(&be, "conv", qkv_out * 4 * 2, reps, || {
         be.gdn_conv(&qkv, &conv_w, &conv_st).unwrap();
     });
     let (conv_out, _cst) = be.gdn_conv(&qkv, &conv_w, &conv_st)?;
     let act = be.zeros(conv_out.shape().to_vec())?;
-    bench("silu", qkv_out * 4 * 2, reps, || {
+    bench(&be, "silu", qkv_out * 4 * 2, reps, || {
         be.silu(&conv_out, &act).unwrap();
     });
-    bench("slice q", qk * 4, reps, || {
+    bench(&be, "slice q", qk * 4, reps, || {
         rust_inference::nn::slice_last(&be, &act, qk, 0).unwrap();
     });
     let q = rust_inference::nn::slice_last(&be, &act, qk, 0)?;
     let k = rust_inference::nn::slice_last(&be, &act, qk, qk)?;
     let v = rust_inference::nn::slice_last(&be, &act, ssm_inner, 2 * qk)?;
-    bench("l2norm", qk * 4 * 2, reps, || {
+    bench(&be, "l2norm", qk * 4 * 2, reps, || {
         be.gdn_l2norm(&q, s, 1e-6).unwrap();
     });
     let gate = be.zeros(vec![1, 1, hv])?;
     let b2 = be.zeros(vec![1, 1, hv])?;
     let ssm = be.zeros(vec![hv, s, s])?;
-    bench("delta_rule", hv * s * s * 4 * 2, reps, || {
+    bench(&be, "delta_rule", hv * s * s * 4 * 2, reps, || {
         be.gdn_delta_rule(&q, &k, &v, &gate, &b2, &ssm, hk).unwrap();
     });
     let o = be.zeros(vec![1, 1, ssm_inner])?;
-    bench("norm_gated", ssm_inner * 4 * 2, reps, || {
+    bench(&be, "norm_gated", ssm_inner * 4 * 2, reps, || {
         be.gdn_norm_gated(&o, &z, &norm_w, 1e-6).unwrap();
     });
     // Корректность fused-хвоста (conv+silu+split+l2norm+стейт) против
@@ -205,7 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("fused-хвост контроль: |Δ| max {maxd}");
     assert!(maxd < 1e-5, "fused-хвост неверен");
     let xq = be.from_cpu_f32(&xf, vec![1, 1, cq])?;
-    bench("fused tail", cq * 4 * 3, reps, || {
+    bench(&be, "fused tail", cq * 4 * 3, reps, || {
         be.gdn_conv_silu_split_norm(&xq, &wt, &stt, cq, 4, s, qk, 1e-6).unwrap();
     });
     // Корректность norm_gated: x,z,w с известными значениями.

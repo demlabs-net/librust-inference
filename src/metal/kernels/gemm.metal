@@ -70,6 +70,41 @@ kernel void gemm_nt_f32_v4(
     C[m * N + n] = acc;
 }
 
+// m==1: F32 matvec — simdgroup на строку весов B (Ф8.1). Прежний v4 при m=1
+// давал ОДИН поток на выход: n=96 (beta/alpha GDN) — 96 потоков на всю GPU,
+// 16 ГБ/с против ~200 доступных (латентность цепочки загрузок на поток).
+// Здесь 32 лейна делят K stride-ом по float4, частичные суммы — simd_sum.
+// Порядок суммирования изменён относительно v4 (класс MV_KS) — паритет
+// подтверждён text_parity на моделях с F32-проекциями; фоллбэк
+// INFER_F32_NO_MV=1. Требует K%4==0 и 16-байтного выравнивания A/B.
+kernel void gemm_nt_f32_mv(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgpig.x;
+    if (n >= N) return;
+    device const float4* a = (device const float4*)A;
+    device const float4* b = (device const float4*)(B + (ulong)n * K);
+    const uint k4 = K / 4u;
+    float acc = 0.0f;
+    for (uint k = lane; k < k4; k += 32u) {
+        const float4 av = a[k];
+        const float4 bv = b[k];
+        acc += av.x * bv.x;
+        acc += av.y * bv.y;
+        acc += av.z * bv.z;
+        acc += av.w * bv.w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) C[n] = acc;
+}
+
 // ── Quantized GEMM: fp32 activations × fp16/bf16 weights, fp32 accumulate ───
 // Same layouts as the f32 kernels; only the B (weight) storage narrows to
 // 2 bytes/element. bf16 has no native MSL type on older stacks — the bits

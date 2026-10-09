@@ -1465,6 +1465,30 @@ impl MetalCtx {
                 enc.set_bytes(5, 8, (&n as *const usize).cast());
             });
         }
+        // m==1 F32 — simdgroup-матвек: v4 даёт по одному потоку на выход,
+        // при n=96 (GDN beta/alpha) это 96 потоков на всю GPU — 16 ГБ/с.
+        // Фоллбэк INFER_F32_NO_MV=1.
+        if b.dtype == GpuDtype::F32
+            && m == 1
+            && k % 4 == 0
+            && a.offset % 16 == 0
+            && b.offset % 16 == 0
+            && std::env::var("INFER_F32_NO_MV").is_err()
+        {
+            return self.run(
+                "gemm_nt_f32_mv",
+                MTLSize::new((n * 32) as u64, 1, 1),
+                MTLSize::new(32, 1, 1),
+                |enc| {
+                    enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                    enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                    enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                    enc.set_bytes(3, 8, (&m as *const usize).cast());
+                    enc.set_bytes(4, 8, (&k as *const usize).cast());
+                    enc.set_bytes(5, 8, (&n as *const usize).cast());
+                },
+            );
+        }
         let name = match b.dtype {
             // F32 при 16-байтном выравнивании и K%4==0 — v4-вариант:
             // float4-загрузки при том же порядке накопления (побитово равен
@@ -3360,11 +3384,22 @@ impl MetalCtx {
         eps: f32,
     ) -> Result<(), MetalError> {
         let (r32, h32) = (rows as u32, hd as u32);
+        // Σx² по всем лейнам (simd_sum) вместо последовательного накопления
+        // одним: на декоде 27B (rows=1, HD=6144) 0.16 мс/слой → ~0.01.
+        // HD%128==0 — 4 simdgroup на строку (одной мало при rows=1).
+        // Фоллбэк на прежний порядок — INFER_NG_SERIAL=1.
+        let (kernel, nth) = if hd % 128 == 0 && std::env::var("INFER_NG_SERIAL").is_err() {
+            ("gdn_norm_gated_par4_f32", 128u64)
+        } else if hd % 32 == 0 && std::env::var("INFER_NG_SERIAL").is_err() {
+            ("gdn_norm_gated_par_f32", 32u64)
+        } else {
+            ("gdn_norm_gated_f32", 32u64)
+        };
         self.run(
-            "gdn_norm_gated_f32",
-            // dispatch_threads — ВСЕГО потоков: 32 лейна на строку.
-            MTLSize::new((rows * 32) as u64, 1, 1),
-            MTLSize::new(32, 1, 1),
+            kernel,
+            // dispatch_threads — ВСЕГО потоков: nth лейнов на строку.
+            MTLSize::new((rows as u64) * nth, 1, 1),
+            MTLSize::new(nth, 1, 1),
             |enc| {
                 enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
                 enc.set_buffer(1, Some(&z.buffer), z.offset as u64);

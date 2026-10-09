@@ -1044,3 +1044,134 @@ kernel void gemm_nt_q5_k_mm(
         }
     }
 }
+
+// Q6_K-вариант тайлового GEMM (порт kernel_mul_mm_q6_K_f32, тот же sgemm-
+// каркас, что у gemm_nt_q5_k_mm): скалярный gemm_nt_q6_k при m>8 читает веса
+// по разу на строку активаций (lm_head 27B [248320,5120]: m=128 — 423 мс в
+// бенче). Деквант — дословный dequantize_q6_K из dequantize.h эталона (блок
+// 210 Б: ql[128]@0, qh[64]@128, scales[16 int8]@192, d@208; il — тот же
+// generic-ход mul_mm по 16-значным группам, x += 210 на обороте).
+kernel void gemm_nt_q6_k_mm(
+    device const float* A [[buffer(0)]],     // активации [M, K]
+    device const uchar* B [[buffer(1)]],     // веса Q6_K [N, K] (210 Б/256)
+    device float* C [[buffer(2)]],           // [M, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half* sa = (threadgroup half*)(shmem);          // 64×32 весов
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);   // 32×32 активаций
+    const int r0 = tgpig.y * 64;   // строки весов (N)
+    const int r1 = tgpig.x * 32;   // строки активаций (M)
+    const short nr0 = ((int)N - r0 < 64) ? (short)((int)N - r0) : 64;
+    const short nr1 = ((int)M - r1 < 32) ? (short)((int)M - r1) : 32;
+    const short lr0 = ((short)tiitg / 2) < nr0 ? ((short)tiitg / 2) : nr0 - 1;
+    const short lr1 = ((short)tiitg / 4) < nr1 ? ((short)tiitg / 4) : nr1 - 1;
+    const short il0 = tiitg % 2;
+    const uint nbs = K / 256u;
+    device const uchar* x = B + (ulong)(r0 + lr0) * nbs * 210u;
+    const short iy = 8 * (tiitg % 4);
+    device const float* y = A + (ulong)(r1 + lr1) * K + iy;
+
+    short il = il0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    const uint nk = K / 32u;   // шагов по 32
+    for (uint kb = 0; kb < nk; ++kb) {
+        // деквант 16 значений строки весов (порт dequantize_q6_K)
+        {
+            const uint qlo = 64u * (il / 8u) + 32u * ((il / 2u) & 1u) + 16u * (il & 1u);
+            const uint qho = 128u + 32u * (il / 8u) + 16u * (il & 1u);
+            device const ushort* ql = (device const ushort*)(x + qlo);
+            device const ushort* qh = (device const ushort*)(x + qho);
+            const float sc = (float)(char)x[192u + (il % 2u) + 2u * (il / 2u)];
+            const uint i2 = (il / 2u) & 3u;
+            const float d_all = (float)load_half_unaligned(x + 208u);
+            const uint32_t kmask1 = i2 > 1u ? (i2 > 2u ? 0xC0C0C0C0u : 0x30303030u)
+                                            : (i2 > 0u ? 0x0C0C0C0Cu : 0x03030303u);
+            const uint32_t kmask2 = i2 > 1u ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+            const float ml = d_all * sc * 32.f;
+            const float dl0 = d_all * sc;
+            const float dl1 = dl0 / 256.f;
+            const float dl2 = dl0 / (256.f * 256.f);
+            const float dl3 = dl0 / (256.f * 256.f * 256.f);
+            const uint shr_h = i2 > 2u ? 2u : 0u;
+            const uint shl_h = i2 > 1u ? 0u : (i2 > 0u ? 2u : 4u);
+            const uint shr_l = i2 > 1u ? 4u : 0u;
+            float4x4 reg;
+            for (short i = 0; i < 4; ++i) {
+                const uint32_t lo32 = (uint32_t)ql[2 * i] | ((uint32_t)ql[2 * i + 1] << 16);
+                const uint32_t hi32 = (uint32_t)qh[2 * i] | ((uint32_t)qh[2 * i + 1] << 16);
+                const uint32_t low = lo32 & kmask2;
+                const uint32_t high = hi32 & kmask1;
+                const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                reg[i][0] = dl0 * ((float)(half)(q & 0xFFu)) - ml;
+                reg[i][1] = dl1 * ((float)(q & 0xFF00u)) - ml;
+                reg[i][2] = dl2 * ((float)(q & 0xFF0000u)) - ml;
+                reg[i][3] = dl3 * ((float)(q & 0xFF000000u)) - ml;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (tiitg / 2) / 8;
+                const short lx = (tiitg / 2) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = (half)reg[i / 4][i % 4];
+            }
+        }
+        // активации: 8 значений строки → блочная раскладка [m][k]
+        {
+            const short sx = tiitg % 4;
+            const short sy = (tiitg / 4) / 8;
+            const short ly = (tiitg / 4) % 8;
+            const short ib = 4 * sx + sy;
+            device const float4* y4 = (device const float4*)(y + kb * 32u);
+            const float4 v0 = y4[0], v1 = y4[1];
+            threadgroup half4* dst = (threadgroup half4*)(sb + 64 * ib + 8 * ly);
+            dst[0] = half4(v0);
+            dst[1] = half4(v1);
+        }
+        il = (il + 2 < 16) ? (short)(il + 2) : (short)(il % 2);
+        x = (il < 2) ? x + 210u : x;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64 <= (int)N && r1 + 32 <= (int)M) {
+        device float* Cp = C + (r0 + 32 * (sgitg & 1)) + (ulong)(r1 + 16 * (sgitg >> 1)) * N;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], Cp + 8 * (i % 4) + 8 * (ulong)N * (i / 4), N, 0, false);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* ts = ((threadgroup float*)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * 64;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], ts + 8 * (i % 4) + 8 * 64 * (i / 4), 64, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = tiitg; j < nr1; j += 128) {
+            device float* D = C + (ulong)(r1 + j) * N + r0;
+            threadgroup float* Cs = ((threadgroup float*)shmem) + j * 64;
+            for (int i = 0; i < nr0; i++) D[i] = Cs[i];
+        }
+    }
+}

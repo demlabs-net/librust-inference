@@ -578,7 +578,106 @@ kernel void mv_q5_k_r2(
     }
 }
 
-// ── Q8_0 matvec (decode m=1), simdgroup-кооперативный (Ф8.2) ────────────────
+// ── Q4_K matvec: порт kernel_mul_mv_q4_K_f32_impl (N_R0=2) ──────────────────
+// 32 лейна на строку: ix = lane/8 делит суперблоки с шагом 4, it = lane%8
+// (iq = it/4 — половина 128-байтного qs, ir = it%4 — четверть uint16-чанка).
+// Пара строк на simdgroup: yl/yh/sumy (активации) грузятся ОДИН раз на пару
+// — тот же рычаг, что у mv_q6_k_r2/mv_q5_k_r2 (прежний mv_q4_k: поток на
+// строку, 82–164 ГБ/с на формах Q4_K_M). Порядок суммирования по K отличается
+// от скалярного dot_q4_k — класс MV_KS, приёмка парными text_parity на
+// Q4_K-моделях (GLM-4-9B, OLMoE); фоллбэк INFER_Q4K_NO_R2.
+kernel void mv_q4_k_r2(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const uint nb = K / 256u;
+    const uint first_row = 2u * tgid.y;
+    if (first_row >= N) return;
+    const bool two = first_row + 1u < N;
+    const ulong row_bytes = (ulong)nb * 144u;
+
+    const uint ix = lane / 8u;    // 0..3 — фаза суперблоков
+    const uint it = lane % 8u;
+    const uint iq = it / 4u;      // 0..1 — половина qs/scales
+    const uint ir = it % 4u;      // 0..3 — четверть uint16-чанка
+
+    const uint y_base = 64u * iq + 8u * ir;   // + ib·256 в цикле (ib стартует с ix)
+    const uint q_off  = 16u + 32u * iq + 8u * ir;   // байт в блоке (uint16-чанк)
+    const uint s_off  = 4u + 2u * iq;               // scales (uint16) + iq
+
+    device const uchar* x = B + (ulong)first_row * row_bytes;
+    float sumf[2] = {0.f, 0.f};
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        device const uchar* blk = x + (ulong)ib * 144u;
+        device const float* y4 = A + (ulong)ib * 256u + y_base;
+
+        float yl[16], yh[16];
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (uint l = 0; l < 8u; ++l) {
+            yl[l + 0] = y4[l +   0]; sumy[0] += yl[l + 0];
+            yl[l + 8] = y4[l +  32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y4[l + 128]; sumy[2] += yh[l + 0];
+            yh[l + 8] = y4[l + 160]; sumy[3] += yh[l + 8];
+        }
+
+        for (uint rr = 0u; rr < (two ? 2u : 1u); ++rr) {
+            device const uchar* xb = blk + (ulong)rr * row_bytes;
+            // scales: uint16 sc[0..4] с байта s_off
+            device const uchar* sp = xb + s_off;
+            uint16_t sc16[4];
+            const uint16_t s0 = (uint16_t)(sp[0] | (sp[1] << 8));
+            const uint16_t s2 = (uint16_t)(sp[4] | (sp[5] << 8));
+            const uint16_t s4 = (uint16_t)(sp[8] | (sp[9] << 8));
+            sc16[0] = s0 & kmask1;
+            sc16[1] = s2 & kmask1;
+            sc16[2] = (s4 & kmask2) | ((s0 & kmask3) >> 2);
+            sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+            thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+            device const uchar* q1 = xb + q_off;   // 4 uint16
+            device const uchar* q2 = q1 + 64u;
+            const float d  = (float)load_half_unaligned(xb);
+            const float dm = (float)load_half_unaligned(xb + 2u);
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (uint l = 0; l < 4u; ++l) {
+                const uint16_t a = (uint16_t)(q1[2 * l] | (q1[2 * l + 1] << 8));
+                const uint16_t b = (uint16_t)(q2[2 * l] | (q2[2 * l + 1] << 8));
+                acc1[0] += yl[2 * l + 0] * (float)(a & 0x000Fu);
+                acc1[1] += yl[2 * l + 1] * (float)(a & 0x0F00u);
+                acc1[2] += yl[2 * l + 8] * (float)(a & 0x00F0u);
+                acc1[3] += yl[2 * l + 9] * (float)(a & 0xF000u);
+                acc2[0] += yh[2 * l + 0] * (float)(b & 0x000Fu);
+                acc2[1] += yh[2 * l + 1] * (float)(b & 0x0F00u);
+                acc2[2] += yh[2 * l + 8] * (float)(b & 0x00F0u);
+                acc2[3] += yh[2 * l + 9] * (float)(b & 0xF000u);
+            }
+            sumf[rr] += d * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                             (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                             (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                             (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                        dm * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                              sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+    }
+    const float v0 = simd_sum(sumf[0]);
+    if (lane == 0u) C[first_row] = v0;
+    if (two) {
+        const float v1 = simd_sum(sumf[1]);
+        if (lane == 0u) C[first_row + 1u] = v1;
+    }
+}
 // Прежний mv_q8_0 — поток на строку: соседние потоки читали строки с шагом
 // K·34/32 байт (некоалесцированно), и decode упирался не в полосу памяти.
 // Здесь simdgroup ведёт R строк: 4 лейна на Q8_0-блок (по 8 значений),

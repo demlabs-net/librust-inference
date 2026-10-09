@@ -690,8 +690,12 @@ mod tests {
             for i in 0..ffn {
                 let got = id_host[j * ffn + i];
                 let want = host[i];
+                // Допуск — на переупорядочивание f32-накопления: mv_id_q4_k
+                // считает скалярным dot_q4_k, а срез (m=1) идёт через
+                // mv_q4_k_r2 (порт эталонного mul_mv, другой порядок по K).
+                // Структурный баг (чужая строка/эксперт/вес) дал бы O(1).
                 assert!(
-                    (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                    (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
                     "слот {j} (эксперт {eid}) [{i}]: id {got} против среза {want}"
                 );
             }
@@ -727,8 +731,10 @@ mod tests {
             }
         }
         for i in 0..n {
+            // Допуск — как выше: mv_id (скалярный dot_q4_k) против срезов на
+            // mv_q4_k_r2 (другой порядок по K); структурный баг дал бы O(1).
             assert!(
-                (sum_id[i] - want[i]).abs() <= 1e-5 * (1.0 + want[i].abs()),
+                (sum_id[i] - want[i]).abs() <= 1e-3 * (1.0 + want[i].abs()),
                 "down [{i}]: id {} против суммы срезов {}",
                 sum_id[i],
                 want[i]

@@ -1816,6 +1816,23 @@ impl MetalCtx {
                 b.dtype
             )));
         }
+        // Q4_K matvec: порт эталонного mul_mv (32 лейна на строку, пара строк
+        // на simdgroup, y один раз на пару). Чтения побайтовые — выравнивание
+        // не требуется. Порядок суммирования отличается от скалярного
+        // dot_q4_k — класс MV_KS, приёмка парными text_parity на Q4_K-моделях
+        // (GLM-4-9B, OLMoE); фоллбэк INFER_Q4K_NO_R2.
+        if b.dtype == GpuDtype::Q4_K && std::env::var("INFER_Q4K_NO_R2").is_err() {
+            let (k32, n32) = (k as u32, n as u32);
+            let grid = MTLSize::new(32, n.div_ceil(2) as u64, 1);
+            let group = MTLSize::new(32, 1, 1);
+            return self.run("mv_q4_k_r2", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
+        }
         // Q5_K matvec: тот же порт эталонного mul_mv (8 лейнов на строку,
         // пара строк на simdgroup, y один раз на пару). uint16-чтение scales
         // требует чётного смещения; фоллбэк INFER_Q5K_NO_R2.

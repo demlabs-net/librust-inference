@@ -51,6 +51,26 @@ fn q5_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
 }
 
 /// Q6_K: 210 Б/256 — ql[128], qh[64], scales[16], d (в конце).
+/// Q4_K: 144 Б/256 — d, dmin, scales[12], qs[128].
+fn q4_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 144);
+    for _ in 0..n * k / 256 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        out.extend_from_slice(&half::f16::from_f32(0.004 + (s % 100) as f32 * 1e-4).to_le_bytes());
+        out.extend_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+        for j in 0..12 {
+            out.push(((s >> (j % 40)) ^ (j as u64)) as u8);
+        }
+        for j in 0..128 {
+            out.push(((s >> (j % 48)) ^ (j as u64 * 7)) as u8);
+        }
+    }
+    out
+}
+
 fn q6_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut out = Vec::with_capacity(n * k / 256 * 210);
@@ -85,10 +105,15 @@ fn main() {
         ("gdn.w_out", 5120, 6144, WeightFormat::Q5_K),
         ("attn.q", 12288, 5120, WeightFormat::Iq4Xs),
         ("lm_head", 248320, 5120, WeightFormat::Q6_K),
+        // Формы класса Q4_K_M 8–9B (GLM-4-9B: dim 4096, ffn 13696).
+        ("k.ffn.w13", 27392usize, 4096usize, WeightFormat::Q4_K),
+        ("k.ffn.w2", 13696, 4096, WeightFormat::Q4_K),
+        ("k.attn.qkv", 6144, 4096, WeightFormat::Q4_K),
     ] {
         let raw = match fmt {
             WeightFormat::Q5_K => q5_k_bytes(n, k, 7),
             WeightFormat::Q6_K => q6_k_bytes(n, k, 7),
+            WeightFormat::Q4_K => q4_k_bytes(n, k, 7),
             _ => iq4_xs_bytes(n, k, 7),
         };
         let w = be.from_quantized(&raw, vec![n, k], fmt).unwrap();

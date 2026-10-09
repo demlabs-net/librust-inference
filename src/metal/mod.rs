@@ -1508,7 +1508,28 @@ impl MetalCtx {
             GpuDtype::Q8_0 => "gemm_nt_q8_0",
             GpuDtype::Q4_K => "gemm_nt_q4_k",
             GpuDtype::Q6_K => "gemm_nt_q6_k",
-            GpuDtype::Q5_K => "gemm_nt_q5_k",
+            // Q5_K при m > 8 — тайловый sgemm (порт kernel_mul_mm_q5_K_f32):
+            // скалярный gemm_nt_q5_k на префилле 27B-гибрида давал 0.97
+            // TFLOPS против 7 у mm-пути IQ4_XS (gdn.qkv/w_out — 22 из 23.6
+            // мс GDN-слоя). Порог m>8 и требование K%256==0 — как у IQ4_XS
+            // (порог use_mm llama.cpp). Фоллбэк INFER_Q5K_NO_MM.
+            GpuDtype::Q5_K => {
+                if m > 8 && k % 256 == 0 && std::env::var("INFER_Q5K_NO_MM").is_err() {
+                    let (m32, k32, n32) = (m as u32, k as u32, n as u32);
+                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let group = MTLSize::new(128, 1, 1);
+                    return self.run("gemm_nt_q5_k_mm", grid, group, |enc| {
+                        enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                        enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                        enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                        enc.set_bytes(3, 4, (&m32 as *const u32).cast());
+                        enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                        enc.set_bytes(5, 4, (&n32 as *const u32).cast());
+                        enc.set_threadgroup_memory_length(0, 8192);
+                    });
+                }
+                "gemm_nt_q5_k"
+            }
             GpuDtype::Q5_0 => "gemm_nt_q5_0",
             // IQ4_XS: при m > 8 llama.cpp идёт по kernel_mul_mm (порог use_mm:
             // ne11 > 8), при m ≤ 8 — по mul_mv. Паритет требует совпадать с его

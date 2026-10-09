@@ -94,7 +94,7 @@ fn main() {
         let w = be.from_quantized(&raw, vec![n, k], fmt).unwrap();
         let wbytes = raw.len();
         let mut line = format!("{name:9} [{n}x{k}] {:5.1} МБ", wbytes as f64 / 1e6);
-        for m in [1usize, 5] {
+        for m in [1usize, 5, 128] {
             let a = be
                 .from_cpu_f32(
                     &(0..m * k)
@@ -116,7 +116,16 @@ fn main() {
             }
             be.end_batch().unwrap();
             let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-            let gbs = wbytes as f64 * m as f64 / ms / 1e6;
+            // m ≤ 8 — mv/batch-mv путь: веса читаются на каждую строку
+            // (k-расщеплённые кернелы переиспользуют их в L2, но считаем
+            // пессимистично m раз). m > 8 — тайловый mul_mm: веса ОДИН раз,
+            // плюс активации и выход.
+            let traffic = if m > 8 {
+                wbytes + m * k * 4 + m * n * 4
+            } else {
+                wbytes * m
+            };
+            let gbs = traffic as f64 / ms / 1e6;
             line.push_str(&format!(" | m={m}: {:6.2} мс {:5.0} ГБ/с", ms, gbs));
         }
         println!("{line}");

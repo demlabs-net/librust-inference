@@ -744,10 +744,27 @@ impl MetalCtx {
         }
         // Библиотека — ОДИН раз на процесс (раньше: компиляция всего
         // kernels.metal на каждый новый кернел → минуты холодного старта).
+        // Исходник лежит в kernels/ тематическими файлами (5700+ строк в
+        // одном файле стали god object); конкатенация эквивалентна одному
+        // исходнику: общий заголовок (include/using/хелперы) идёт первым,
+        // кернелы между собой не перекрёстно-зависимы.
         let library = self.library.get_or_init(|| {
+            const SOURCE: &str = concat!(
+                include_str!("kernels/common.metal"),
+                include_str!("kernels/gemm.metal"),
+                include_str!("kernels/mul_mv.metal"),
+                include_str!("kernels/attention.metal"),
+                include_str!("kernels/gdn.metal"),
+                include_str!("kernels/rope.metal"),
+                include_str!("kernels/norm.metal"),
+                include_str!("kernels/conv.metal"),
+                include_str!("kernels/embed.metal"),
+                include_str!("kernels/moe.metal"),
+                include_str!("kernels/elementwise.metal"),
+            );
             let options = CompileOptions::new();
             self.device
-                .new_library_with_source(include_str!("kernels.metal"), &options)
+                .new_library_with_source(SOURCE, &options)
                 .unwrap_or_else(|e| panic!("metal kernel library compile failed: {e}"))
         });
         let func = library

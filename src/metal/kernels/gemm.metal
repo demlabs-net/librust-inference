@@ -1200,7 +1200,7 @@ static inline uchar2 q4k_scale_min_just2(int j, int k, device const uchar * q) {
                           uchar((q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))};
 }
 
-static inline void q4k_dequantize_mm(device const q4k_block * xb, short il, thread float4x4 & reg) {
+void q4k_dequantize_mm(device const q4k_block * xb, short il, thread float4x4 & reg) {
     device const uchar * q = xb->qs;
 
     short is = (il / 4) * 2;

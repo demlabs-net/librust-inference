@@ -113,6 +113,23 @@ impl GpuDtype {
             _ => None,
         }
     }
+
+    /// Байт в квант-блоке (раскладки ggml-common.h: Q4_0 18, Q5_0 22,
+    /// Q8_0 34, Q4_K 144, Q5_K 176, Q6_K 210, IQ4_XS 136). Q4_K — именно 144
+    /// (2·half + scales[12] + qs[128]); 148 был кастомным диалектом до
+    /// волны ревью 8.
+    pub fn block_bytes(self) -> Option<usize> {
+        match self {
+            GpuDtype::Q4_0 => Some(18),
+            GpuDtype::Q5_0 => Some(22),
+            GpuDtype::Q8_0 => Some(34),
+            GpuDtype::Q4_K => Some(144),
+            GpuDtype::Q5_K => Some(176),
+            GpuDtype::Q6_K => Some(210),
+            GpuDtype::Iq4Xs => Some(136),
+            _ => None,
+        }
+    }
 }
 
 /// A contiguous tensor living in Metal memory (fp32 activations, or
@@ -1449,6 +1466,15 @@ impl MetalCtx {
         }
         // B (the weight) may be stored fp16/bf16 — narrowed reads, fp32
         // accumulate; A/C stay fp32.
+        // Эталон: F32/F16-веса при m∈[2,8] идут mul_mv_ext (не поэлементным
+        // GEMM и не classic mv) — воспроизводим выбор; фоллбэк INFER_NO_MV_EXT=1.
+        if matches!(b.dtype, GpuDtype::F32 | GpuDtype::F16)
+            && (2..=8).contains(&m)
+            && std::env::var("INFER_NO_MV_EXT").is_err()
+            && self.mv_ext(a, b, c)?
+        {
+            return Ok(());
+        }
         // f16-веса при m > 1 (префилл, LoRA-merged f16-модели): m8-кернел —
         // столбец весов читается один раз на 8 строк активаций (half4), в
         // 1.7× быстрее поэлементного gemm_nt_f16 при m ≥ 128 (замер
@@ -1799,6 +1825,144 @@ impl MetalCtx {
 
     /// MV (decode, batch=1, Ф1.4): C[n] = Σ_k A[k]·B[n][k], B квантованный
     /// [N, K]; A — вектор [K]. thread на выходной n.
+    /// Выбор ext-кернела зеркалом эталонного диспатча
+    /// (ggml_metal_op_mul_mat, 5266f24da): src1 F32, K%128==0;
+    /// F32/F16/Q4_0/Q5_0/Q8_0 — m∈[2,8]; Q4_K/Q5_K/Q6_K — m∈[4,8];
+    /// IQ4_XS — в ext-списке эталона нет (всегда classic mul_mv при m≤8).
+    /// nxpsg = (K%256==0 && m<3) ? 16 : 8; r1ptg: 2→2, 3/6→3, 4/7/8→4, 5→5.
+    fn mv_ext_kernel(dtype: GpuDtype, m: usize, k: usize) -> Option<(&'static str, usize, usize)> {
+        if m < 2 || m > 8 || k % 128 != 0 {
+            return None;
+        }
+        let (x8r2, x8r3, x8r4, x8r5, x16r2): (&str, &str, &str, &str, &str) = match dtype {
+            GpuDtype::F32 => (
+                "mv_ext_f32_x8_r2",
+                "mv_ext_f32_x8_r3",
+                "mv_ext_f32_x8_r4",
+                "mv_ext_f32_x8_r5",
+                "mv_ext_f32_x16_r2",
+            ),
+            GpuDtype::F16 => (
+                "mv_ext_f16_x8_r2",
+                "mv_ext_f16_x8_r3",
+                "mv_ext_f16_x8_r4",
+                "mv_ext_f16_x8_r5",
+                "mv_ext_f16_x16_r2",
+            ),
+            GpuDtype::Q4_0 => (
+                "mv_ext_q4_0_x8_r2",
+                "mv_ext_q4_0_x8_r3",
+                "mv_ext_q4_0_x8_r4",
+                "mv_ext_q4_0_x8_r5",
+                "mv_ext_q4_0_x16_r2",
+            ),
+            GpuDtype::Q5_0 => (
+                "mv_ext_q5_0_x8_r2",
+                "mv_ext_q5_0_x8_r3",
+                "mv_ext_q5_0_x8_r4",
+                "mv_ext_q5_0_x8_r5",
+                "mv_ext_q5_0_x16_r2",
+            ),
+            GpuDtype::Q8_0 => (
+                "mv_ext_q8_0_x8_r2",
+                "mv_ext_q8_0_x8_r3",
+                "mv_ext_q8_0_x8_r4",
+                "mv_ext_q8_0_x8_r5",
+                "mv_ext_q8_0_x16_r2",
+            ),
+            GpuDtype::Q4_K => ("", "mv_ext_q4_k_x8_r3", "mv_ext_q4_k_x8_r4", "mv_ext_q4_k_x8_r5", ""),
+            GpuDtype::Q5_K => ("", "mv_ext_q5_k_x8_r3", "mv_ext_q5_k_x8_r4", "mv_ext_q5_k_x8_r5", ""),
+            GpuDtype::Q6_K => ("", "mv_ext_q6_k_x8_r3", "mv_ext_q6_k_x8_r4", "mv_ext_q6_k_x8_r5", ""),
+            GpuDtype::BF16 | GpuDtype::Iq4Xs => return None,
+        };
+        let lo = if matches!(dtype, GpuDtype::Q4_K | GpuDtype::Q5_K | GpuDtype::Q6_K) {
+            4
+        } else {
+            2
+        };
+        if m < lo {
+            return None;
+        }
+        let nxpsg = if k % 256 == 0 && m < 3 { 16 } else { 8 };
+        let r1ptg = match m {
+            2 => 2,
+            3 | 6 => 3,
+            4 | 7 | 8 => 4,
+            5 => 5,
+            _ => return None,
+        };
+        let name = match (nxpsg, r1ptg) {
+            (16, 2) => x16r2,
+            (8, 2) => x8r2,
+            (8, 3) => x8r3,
+            (8, 4) => x8r4,
+            (8, 5) => x8r5,
+            _ => return None,
+        };
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, nxpsg, r1ptg))
+    }
+
+    /// mul_mv_ext — малобатчевый matvec (порт эталонного kernel_mul_mv_ext,
+    /// см. ext-секцию mul_mv.metal). Ok(true) — кернел запущен; Ok(false) —
+    /// случай вне ext-окна/раскладки, вызывающий идёт своим путём (как
+    /// эталон вне ext).
+    pub fn mv_ext(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<bool, MetalError> {
+        let m = a.shape[0];
+        let k = a.shape[1];
+        let n = b.shape[0];
+        let Some((name, nxpsg, r1ptg)) = Self::mv_ext_kernel(b.dtype, m, k) else {
+            return Ok(false);
+        };
+        // float4-чтения активаций — 16-байтное выравнивание; широкие чтения
+        // весов: F32 — float4 (16), F16 — half4 (8), квант-блоки — char4/
+        // uint16/uint32 внутри строки (4; строки кратны 4 при K%128==0).
+        let b_align = match b.dtype {
+            GpuDtype::F32 => 16,
+            GpuDtype::F16 => 8,
+            _ => 4,
+        };
+        if a.offset % 16 != 0 || b.offset % b_align != 0 {
+            return Ok(false);
+        }
+        let nb01: u64 = match b.dtype {
+            GpuDtype::F32 => (k * 4) as u64,
+            GpuDtype::F16 => (k * 2) as u64,
+            q => ((k / q.block_elems().unwrap()) * q.block_bytes().unwrap()) as u64,
+        };
+        let nb11: u64 = (k * 4) as u64;
+        if std::env::var("INFER_EXT_DBG").is_ok() {
+            eprintln!("mv_ext {name}: m={m} n={n} k={k} nb01={nb01} nb11={nb11} a.off={} b.off={} ntg=({},{})", a.offset, b.offset, n.div_ceil(32 / nxpsg * 2), m.div_ceil(r1ptg));
+        }
+        let (ne00, ne01, ne11, ne0) = (k as i32, n as i32, m as i32, n as i32);
+        // Диспатч эталона: threadgroups (ceil(ne01/r0ptg), ceil(ne11/r1ptg), 1),
+        // r0ptg = (32/nxpsg)*nsg, nsg=2, 64 потока в threadgroup'е.
+        let r0ptg = (32 / nxpsg) * 2;
+        let ntg_x = n.div_ceil(r0ptg);
+        let ntg_y = m.div_ceil(r1ptg);
+        let grid = MTLSize::new((ntg_x * 64) as u64, ntg_y as u64, 1);
+        let group = MTLSize::new(64, 1, 1);
+        self.run(name, grid, group, |enc| {
+            enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+            enc.set_bytes(3, 4, (&ne00 as *const i32).cast());
+            enc.set_bytes(4, 4, (&ne01 as *const i32).cast());
+            enc.set_bytes(5, 4, (&ne11 as *const i32).cast());
+            enc.set_bytes(6, 8, (&nb01 as *const u64).cast());
+            enc.set_bytes(7, 8, (&nb11 as *const u64).cast());
+            enc.set_bytes(8, 4, (&ne0 as *const i32).cast());
+        })?;
+        Ok(true)
+    }
+
     pub fn mv_quantized(
         &self,
         a: &GpuTensor,
@@ -4343,6 +4507,15 @@ impl crate::backend::Backend for MetalBackend {
                 // grid.z = m. mv_quantized — MMV-примитив: a 1D [k], c 1D [n].
                 let k = a.as_gpu().shape[1];
                 let n = bg.shape[0];
+                // Внутри ext-окна эталон берёт НЕ classic mul_mv, а
+                // mul_mv_ext (свой порядок суммирования) — воспроизводим
+                // выбор точно; вне окна mv_ext возвращает false.
+                // Фоллбэк INFER_NO_MV_EXT=1.
+                if std::env::var("INFER_NO_MV_EXT").is_err()
+                    && self.ctx.mv_ext(a.as_gpu(), bg, c.as_gpu())?
+                {
+                    return Ok(());
+                }
                 for j in 0..m {
                     let av = a.view_offset(vec![k], j * k);
                     let cv = c.view_offset(vec![n], j * n);

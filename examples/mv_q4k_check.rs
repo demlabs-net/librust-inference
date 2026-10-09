@@ -65,35 +65,57 @@ fn main() {
     let m = std::env::var("LLM_M").ok().and_then(|s| s.parse().ok()).unwrap_or(m);
     let from_bin = mm.is_some_and(|s| s.parse::<usize>().is_ok());
 
-    let bytes = std::fs::read(&a[1]).unwrap();
-    let gf = rust_inference::gguf::parse(&bytes).unwrap();
-    let wm = rust_inference::weights_map::WeightsMap::from_gguf(&gf).unwrap();
+    let bytes = if std::env::var("LLM_WF32").is_ok() {
+        Vec::new()
+    } else {
+        std::fs::read(&a[1]).unwrap()
+    };
+    let gf = if bytes.is_empty() {
+        None
+    } else {
+        Some(rust_inference::gguf::parse(&bytes).unwrap())
+    };
+    let wm = gf.as_ref().map(|g| rust_inference::weights_map::WeightsMap::from_gguf(g).unwrap());
     let be = rust_inference::metal::MetalBackend::new().unwrap();
-    let w = wm.get("blk.0.attn_q.weight").unwrap();
-    let wt = be
-        .from_quantized(w.raw(), vec![2048, 2048], w.format)
-        .unwrap();
+    let k = std::env::var("LLM_K").ok().and_then(|s| s.parse().ok()).unwrap_or(2048usize);
+    let n = std::env::var("LLM_N").ok().and_then(|s| s.parse().ok()).unwrap_or(k);
+    let wt = if let Ok(p) = std::env::var("LLM_WF32") {
+        let b = std::fs::read(&p).unwrap();
+        let v: Vec<f32> = b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        be.from_cpu_f32(&v, vec![n, k]).unwrap()
+    } else {
+        let wname = std::env::var("LLM_W").unwrap_or_else(|_| "blk.0.attn_q.weight".into());
+        let w = wm.as_ref().unwrap().get(&wname).unwrap();
+        be.from_quantized(w.raw(), vec![n, k], w.format).unwrap()
+    };
     // x — строки токенов 5..5+m (для m>1 берём токен 5 m раз — сравнение
     // только строки 0 корректна при m>1, но нас интересует побитовая
     // совпааемость matvec-пути: при m=9 движок пойдёт в mm, и это контроль).
     let xs: Vec<f32> = if std::env::var("LLM_ISO").is_ok() || std::env::var("LLM_BIN").is_ok() || std::env::var("LLM_MM_BIN").is_ok() {
-        xall[..m * 2048].to_vec()
+        xall[..m * k].to_vec()
     } else {
         let mut v = Vec::new();
         for _ in 0..m {
-            v.extend_from_slice(&xall[5 * 2048..6 * 2048]);
+            v.extend_from_slice(&xall[5 * k..6 * k]);
         }
         v
     };
-    let xt = be.from_cpu_f32(&xs, vec![m, 2048]).unwrap();
-    let c = be.zeros(vec![m, 2048]).unwrap();
+    let xt = be.from_cpu_f32(&xs, vec![m, k]).unwrap();
+    let c = be.zeros(vec![m, n]).unwrap();
     be.gemm_nt(&xt, &wt, &c).unwrap();
     let got = be.to_cpu_f32(&c).unwrap();
     let row = std::env::var("LLM_ROW").ok().and_then(|s| s.parse().ok()).unwrap_or(if std::env::var("LLM_MM_BIN").is_ok() || std::env::var("LLM_BIN").is_ok() || std::env::var("LLM_ISO").is_ok() { 0 } else { 5 });
-    let oq5 = &oq[row * 2048..(row + 1) * 2048];
-    let nd = (0..2048).filter(|i| oq5[*i].to_bits() != got[*i].to_bits()).count();
-    println!("m={m}: bitwise-различий с oracle: {nd}/2048");
-    for i in 0..6 {
+    // LLM_ALL=1 — сверить ВСЕ m строк (для ext/mv_id контроль полнее).
+    let rows = if std::env::var("LLM_ALL").is_ok() { m } else { 1 };
+    let mut nd = 0usize;
+    for r in 0..rows {
+        let ri = if std::env::var("LLM_ALL").is_ok() { r } else { row };
+        let oq5 = &oq[ri * n..(ri + 1) * n];
+        nd += (0..n).filter(|i| oq5[*i].to_bits() != got[ri * n + *i].to_bits()).count();
+    }
+    println!("m={m}: bitwise-различий с oracle: {nd}/{}", rows * n);
+    let oq5 = &oq[row * n..(row + 1) * n];
+    for i in 0..16 {
         println!(
             "[{i}] oracle={:10.8} eng={:10.8} {}",
             oq5[i],

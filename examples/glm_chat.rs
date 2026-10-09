@@ -7,6 +7,7 @@
 #![cfg(feature = "metal")]
 use rust_inference::chat_template::{Template, TemplateContext};
 use rust_inference::glm4::{Glm4Config, Glm4Model};
+use rust_inference::inference::generate::CausalLm;
 use rust_inference::metal::MetalBackend;
 use rust_inference::tokenizer::Tokenizer;
 use rust_inference::weights_map::WeightsMap;
@@ -78,6 +79,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.vocab_size
     );
     eprintln!("prompt tokens: {} ({} chars)", ids.len(), prompt_text.len());
+
+    // Диагностика паритета: логиты послед позиции префилла в формате дампа
+    // оркала (oracle_dump.cpp) — %08x-биты, сравнение побитовое.
+    if std::env::var("LLM_DUMP_LOGITS").is_ok() {
+        model.reset_cache(backend.as_ref())?;
+        let lg = model.prefill(backend.as_ref(), &ids)?;
+        let v = backend.to_cpu_f32(&lg)?;
+        let out = std::env::var("LLM_DUMP_LOGITS").unwrap();
+        let mut s = String::new();
+        s.push_str("STEP 0 TENSOR result_output ne=[");
+        s.push_str(&format!("{},1,1,1]\n", cfg.vocab_size));
+        let last = &v[v.len() - cfg.vocab_size..];
+        for (i, x) in last.iter().enumerate() {
+            s.push_str(&format!("{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " }));
+        }
+        s.push('\n');
+        std::fs::write(out, s)?;
+        eprintln!("logits dumped");
+    }
 
     let params = rust_inference::inference::generate::GenerateParams {
         max_tokens,

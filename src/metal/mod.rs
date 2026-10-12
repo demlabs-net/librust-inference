@@ -2073,6 +2073,24 @@ impl MetalCtx {
                 enc.set_bytes(4, 4, (&n32 as *const u32).cast());
             });
         }
+        // Q5_0 (ffn_down в GLM-4-9B Q4_K_M — каждый третий слой): побитовый
+        // порт оркального kernel_mul_mv_q5_0_f32 (mul_vec_q_n_f32_impl):
+        // 4 строки на simdgroup, K между 32 лейнами (блок на 16, половина
+        // блока на лейн), финал simd_sum. Скалярный mv_q5_0 суммирует по K
+        // иначе и логи GLM расходятся на 1 ulp. Фоллбэк INFER_Q50_LEGACY.
+        if b.dtype == GpuDtype::Q5_0 && std::env::var("INFER_Q50_LEGACY").is_err() {
+            let (k32, n32) = (k as u32, n as u32);
+            // 16 строк на threadgroup (4 sgitg × NR0=4).
+            let grid = MTLSize::new((n.div_ceil(16) * 128) as u64, 1, 1);
+            let group = MTLSize::new(128, 1, 1);
+            return self.run("mv_q5_0_sg", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
+        }
         // Q4_K/Q6_K: K-расщеплённый кернел (строка весов на simdgroup) —
         // «поток на строку» читал суперблоки последовательно и упирался в
         // латентность (MoE-эксперты: 17 ГБ/с против ~94 у llama.cpp).
@@ -2297,13 +2315,31 @@ impl MetalCtx {
     ) -> Result<(), MetalError> {
         let d = x.shape[x.shape.len() - 1];
         let rows = x.numel() / d;
-        // threadgroup на строку (см. rmsnorm_row_f32): 256 потоков, для
-        // коротких строк — до ближайшего кратного 32.
-        let tpg = d.clamp(32, 256).div_ceil(32) * 32;
-        let grid = MTLSize::new((rows * tpg) as u64, 1, 1);
-        let group = MTLSize::new(tpg as u64, 1, 1);
+        // Побитовый порт оркального launch (ggml_metal_op_norm): ne00_t = d/4
+        // (float4) либо d; nth = 32, удваивать пока nth < ne00_t и < 1024,
+        // затем min(1024), min(ceil(ne00_t/32)*32).
+        let vec = d % 4 == 0
+            && x.offset % 16 == 0
+            && w.offset % 16 == 0
+            && y.offset % 16 == 0;
+        let nt = if vec { d / 4 } else { d };
+        let mut nth = 32usize;
+        while nth < nt && nth < 1024 {
+            nth *= 2;
+        }
+        let nth = nth.min(1024).min(nt.div_ceil(32) * 32);
+        let grid = MTLSize::new((rows * nth) as u64, 1, 1);
+        let group = MTLSize::new(nth as u64, 1, 1);
         let d32 = d as u32;
-        self.run("rmsnorm_row_f32", grid, group, |enc| {
+        self.run(
+            if vec {
+                "rmsnorm_row_f32"
+            } else {
+                "rmsnorm_row_scalar_f32"
+            },
+            grid,
+            group,
+            |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
             enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
@@ -3101,6 +3137,9 @@ impl MetalCtx {
         // Малый батч запросов (окно верификации спека, блок драфтера):
         // split-K по ключам, threadgroup на пару (голова, запрос); маска —
         // та же, что у общего пути. INFER_ATTN_MB_OFF=1 — общий путь (сверка).
+        // ВНИМАНИЕ: ни этот, ни общий f16-кернел НЕ побитово равны оркальному
+        // kernel_flash_attn_ext_vec (его окно — ne01 < 20) — префилл-логи
+        // расходятся на 1e-3; порт vec-кернела — отдельная задача.
         if b == 1
             && (2..=8).contains(&tq)
             && hd <= 256
@@ -3788,7 +3827,16 @@ impl MetalCtx {
         let hd32 = hd as u32;
         let grid = MTLSize::new(rows as u64 * h as u64 * 32, 1, 1);
         let group = MTLSize::new(64, 1, 1);
-        self.run("rmsnorm_head_sg_f32", grid, group, |enc| {
+        let vec = hd % 4 == 0 && x.offset % 16 == 0 && w.offset % 16 == 0 && y.offset % 16 == 0;
+        self.run(
+            if vec {
+                "rmsnorm_head_sg_f32"
+            } else {
+                "rmsnorm_head_scalar_f32"
+            },
+            grid,
+            group,
+            |enc| {
             enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
             enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
             enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
@@ -3974,7 +4022,16 @@ impl crate::backend::Backend for MetalBackend {
         let (h32, nh32, hd32, pos32) = (h as u32, (tq * h) as u32, hd as u32, pos as u32);
         let grid = metal::MTLSize::new((tq * h * 32) as u64, 1, 1);
         let group = metal::MTLSize::new(64, 1, 1);
-        self.ctx.run("rmsnorm_head_rope_sg_f32", grid, group, |enc| {
+        let vec = hd % 4 == 0 && xg.offset % 16 == 0;
+        self.ctx.run(
+            if vec {
+                "rmsnorm_head_rope_sg_f32"
+            } else {
+                "rmsnorm_head_rope_scalar_f32"
+            },
+            grid,
+            group,
+            |enc| {
             enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
             enc.set_buffer(1, Some(&wg.buffer), wg.offset as u64);
             enc.set_buffer(2, Some(&yg.buffer), yg.offset as u64);

@@ -328,6 +328,32 @@ impl Glm4Model {
         std::env::var("GLM4_DEBUG").is_ok()
     }
 
+    /// Побитовой дамп чекпоинтов слоя 0 в формате oracle_dump.cpp
+    /// (`GLM4_DUMP=<file>`, только m=1): имена — как в графе эталона
+    /// (attn_norm-0, post_attn_norm-0, ffn_inp-0, ffn_norm-0, ffn_up-0,
+    /// ffn_swiglu-0, ffn_out-0, post_mlp_norm-0).
+    fn dump_path() -> Option<String> {
+        std::env::var("GLM4_DUMP").ok()
+    }
+
+    fn dump(backend: &dyn Backend, path: &str, name: &str, x: &Tensor) -> Result<(), BackendError> {
+        let v = backend.to_cpu_f32(&x.view_restricted(vec![x.numel()]))?;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
+        writeln!(f, "STEP 0 TENSOR {name} ne=[{},1,1,1]", v.len())
+            .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
+        for (i, val) in v.iter().enumerate() {
+            write!(f, "{:08x}{}", val.to_bits(), if i % 8 == 7 { "\n" } else { " " })
+                .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
+        }
+        writeln!(f).map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
+        Ok(())
+    }
+
     /// Печать первых значений тензора (отладка постадийная, GLM4_DEBUG=1).
     fn dbg(backend: &dyn Backend, tag: &str, x: &Tensor) -> Result<(), BackendError> {
         if !Self::dbg_on() {
@@ -342,6 +368,8 @@ impl Glm4Model {
     fn forward(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         let t = ids.len();
         let pos = self.caches[0].pos;
+        // Дамп чекпоинтов — только первого forward (шаг 0 эталона).
+        let dump = Self::dump_path().filter(|_| pos == 0);
         let t_state = pos;
         let (nh, nkv, hd, dim) = (
             self.cfg.n_heads,
@@ -372,6 +400,9 @@ impl Glm4Model {
             if i == 0 {
                 Self::dbg(backend, "attn_norm", &h)?;
             }
+            if let Some(p) = &dump {
+                Self::dump(backend, p, &format!("attn_norm-{i}"), &h)?;
+            }
             let q = Linear {
                 w: layer.wq.clone(),
                 b: None,
@@ -389,6 +420,9 @@ impl Glm4Model {
             .forward(backend, &h)?;
             if i == 0 {
                 Self::dbg(backend, "q_pre", &q)?;
+            }
+            if let Some(p) = &dump {
+                Self::dump(backend, p, "Qcur-0", &q)?;
             }
             let q = Self::add_bias_opt(backend, &q, layer.q_bias.as_ref())?;
             let k = Self::add_bias_opt(backend, &k, layer.k_bias.as_ref())?;
@@ -450,6 +484,9 @@ impl Glm4Model {
             if i == 0 {
                 Self::dbg(backend, "attn_out", &attn)?;
             }
+            if let Some(p) = &dump {
+                Self::dump(backend, p, "kqv_out-0", &attn)?;
+            }
             let o = Linear {
                 w: layer.wo.clone(),
                 b: None,
@@ -458,15 +495,46 @@ impl Glm4Model {
             if i == 0 {
                 Self::dbg(backend, "after_wo", &o)?;
             }
+            if let Some(p) = &dump {
+                Self::dump(backend, p, "l_out-0", &o)?;
+            }
             // Sandwich: post-attention norm ДО residual.
             let o = layer.post_attn_norm.forward(backend, &o)?;
+            if let Some(p) = &dump {
+                Self::dump(backend, p, &format!("post_attn_norm-{i}"), &o)?;
+            }
             let y = backend.zeros(vec![1, t, dim])?;
             backend.add(&o, &inp, &y)?;
             let f = layer.ffn_norm.forward(backend, &y)?;
-            let f = crate::qwen3::ffn_forward(backend, &f, &layer.ffn)?;
+            if let Some(p) = &dump {
+                Self::dump(backend, p, &format!("ffn_inp-{i}"), &y)?;
+                Self::dump(backend, p, &format!("ffn_norm-{i}"), &f)?;
+            }
+            let f = if let Some(p) = &dump {
+                // Дамп-вариант ffn: те же три шага, что ffn_forward, с
+                // промежуточными чекпоинтами эталона (up/swiglu/down).
+                let (b, t2, d) = (f.shape()[0], f.shape()[1], f.shape()[2]);
+                let x2 = f.view(vec![b * t2, d]);
+                let ffn_dim = layer.ffn.w2.shape()[1];
+                let fu = backend.zeros(vec![b * t2, 2 * ffn_dim])?;
+                backend.gemm_nt(&x2, &layer.ffn.w13, &fu)?;
+                Self::dump(backend, p, &format!("ffn_up-{i}"), &fu)?;
+                let gm = backend.zeros(vec![b * t2, ffn_dim])?;
+                backend.silu_mul_fused(&fu, &gm, ffn_dim)?;
+                Self::dump(backend, p, &format!("ffn_swiglu-{i}"), &gm)?;
+                let yo = backend.zeros(vec![b * t2, d])?;
+                backend.gemm_nt(&gm, &layer.ffn.w2, &yo)?;
+                Self::dump(backend, p, &format!("ffn_out-{i}"), &yo)?;
+                yo.view(vec![b, t2, d])
+            } else {
+                crate::qwen3::ffn_forward(backend, &f, &layer.ffn)?
+            };
             let f = layer.post_ffw_norm.forward(backend, &f)?;
             if i == 0 {
                 Self::dbg(backend, "ffn_out", &f)?;
+            }
+            if let Some(p) = &dump {
+                Self::dump(backend, p, &format!("post_mlp_norm-{i}"), &f)?;
             }
             let z = backend.zeros(vec![1, t, dim])?;
             backend.add(&f, &y, &z)?;
@@ -481,6 +549,9 @@ impl Glm4Model {
             }
         }
         let h = self.out_norm.forward(backend, &x)?;
+        if let Some(p) = &dump {
+            Self::dump(backend, p, "result_norm", &h)?;
+        }
         let h2 = h.view(vec![t, dim]);
         let logits = backend.zeros(vec![t, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;

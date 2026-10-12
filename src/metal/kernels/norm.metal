@@ -38,6 +38,35 @@ kernel void rmsnorm_f32(
     for (uint d = 0; d < D; ++d) out[d] = row[d] * inv * W[d];
 }
 
+// Фолбэк для D % 4 != 0 или невыровненных буферов — прежняя схема
+// (НЕ побитово равна оркалу; на реальных моделях не используется).
+kernel void rmsnorm_row_scalar_f32(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& D [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float partial[32];
+    device const float* x = X + (ulong)row * D;
+    float s = 0.0f;
+    for (uint i = tid; i < D; i += tpg) s += x[i] * x[i];
+    s = simd_sum(s);
+    if (lane == 0u) partial[sgid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint nsg = (tpg + 31u) / 32u;
+    float total = 0.0f;
+    for (uint g = 0u; g < nsg; ++g) total += partial[g];
+    const float inv = rsqrt(total / (float)D + eps);
+    device float* y = Y + (ulong)row * D;
+    for (uint i = tid; i < D; i += tpg) y[i] = x[i] * inv * W[i];
+}
+
 // ── LayerNorm over the last dim: y = (x-mean)/sqrt(var+eps)*w + b ────────────
 kernel void layernorm_f32(
     device const float* X [[buffer(0)]],
@@ -148,6 +177,12 @@ kernel void rmsnorm_head_rope_f32(
 // больше, чем все матвеки шага. Здесь threadgroup (256 потоков) на строку:
 // частичные суммы квадратов → simd_sum → сумма по simdgroup'ам через
 // threadgroup-память; нормирование — тем же threadgroup'ом.
+// Побитовая копия оркального kernel_rms_norm_f32_4 (ggml-metal 5266f24da):
+// float4-элементы, dot на 4 компоненты, stride ntg, simd_sum, частичные
+// суммы simdgroup'ов в shmem[32] (занулён sgitg 0) и финальный simd_sum по
+// 32 лейнам (бабочка), scale = 1.0f/sqrt(mean+eps) — НЕ rsqrt. Умножение на
+// вес слито (наш прогон один кернел вместо norm+MUL оркала): (x*scale)*w —
+// те же два f32-округления, что и отдельный MUL-узел эталона.
 kernel void rmsnorm_row_f32(
     device const float* X [[buffer(0)]],
     device const float* W [[buffer(1)]],
@@ -160,19 +195,25 @@ kernel void rmsnorm_row_f32(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    threadgroup float partial[32];
-    device const float* x = X + (ulong)row * D;
-    float s = 0.0f;
-    for (uint i = tid; i < D; i += tpg) s += x[i] * x[i];
-    s = simd_sum(s);
-    if (lane == 0u) partial[sgid] = s;
+    threadgroup float sh[32];
+    if (sgid == 0u) sh[lane] = 0.0f;
+    device const float4* x4 = (device const float4*)(X + (ulong)row * D);
+    device const float4* w4 = (device const float4*)W;
+    device float4* y4 = (device float4*)(Y + (ulong)row * D);
+    const uint nt = D / 4u;
+    float sumf = 0.0f;
+    for (uint i = tid; i < nt; i += tpg) {
+        sumf += dot(x4[i], x4[i]);
+    }
+    sumf = simd_sum(sumf);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint nsg = (tpg + 31u) / 32u;
-    float total = 0.0f;
-    for (uint g = 0u; g < nsg; ++g) total += partial[g];
-    const float inv = rsqrt(total / (float)D + eps);
-    device float* y = Y + (ulong)row * D;
-    for (uint i = tid; i < D; i += tpg) y[i] = x[i] * inv * W[i];
+    if (lane == 0u) sh[sgid] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = simd_sum(sh[lane]);
+    const float scale = 1.0f / sqrt(sumf / (float)D + eps);
+    for (uint i = tid; i < nt; i += tpg) {
+        y4[i] = (x4[i] * scale) * w4[i];
+    }
 }
 
 // ── Per-head RMSNorm (+ RoPE), simdgroup на голову (Ф8.2) ───────────────────
@@ -180,11 +221,36 @@ kernel void rmsnorm_row_f32(
 // головы ЗАНОВО в каждом потоке (HD потоков × HD чтений): O(HD²) на голову.
 // Здесь один simdgroup (32 лейна) на (строку, голову): сумма — simd_sum,
 // нормирование/ротация — лейны по измерениям.
+// Побитовая копия оркального kernel_rms_norm_f32_4 для HD/4 ≤ 32 (одна
+// голова на simdgroup): float4 dot, simd_sum; shmem-бабочка орка при одном
+// simdgroup'е тождественна (сумма + нули). scale = 1/sqrt, НЕ rsqrt.
 kernel void rmsnorm_head_sg_f32(
     device const float* X [[buffer(0)]],
     device const float* W [[buffer(1)]],
     device float* Y [[buffer(2)]],
     constant uint& NH [[buffer(3)]],     // всего голов (строки × H)
+    constant uint& HD [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint head = gid / 32u, lane = gid % 32u;
+    if (head >= NH) return;
+    device const float* x = X + (ulong)head * HD;
+    device const float4* x4 = (device const float4*)x;
+    float sumf = 0.0f;
+    for (uint i = lane; i < HD / 4u; i += 32u) sumf += dot(x4[i], x4[i]);
+    const float scale = 1.0f / sqrt(simd_sum(sumf) / (float)HD + eps);
+    device float* y = Y + (ulong)head * HD;
+    for (uint i = lane; i < HD; i += 32u) y[i] = (x[i] * scale) * W[i];
+}
+
+// Фолбэк для HD % 4 != 0 или невыровненных буферов — прежняя схема
+// (НЕ побитово равна оркалу, на реальных моделях не используется).
+kernel void rmsnorm_head_scalar_f32(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& NH [[buffer(3)]],
     constant uint& HD [[buffer(4)]],
     constant float& eps [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
@@ -199,12 +265,13 @@ kernel void rmsnorm_head_sg_f32(
     for (uint i = lane; i < HD; i += 32u) y[i] = x[i] * inv * W[i];
 }
 
-kernel void rmsnorm_head_rope_sg_f32(
+// Фолбэк для HD % 4 != 0 / невыровненных буферов (прежняя схема).
+kernel void rmsnorm_head_rope_scalar_f32(
     device const float* X [[buffer(0)]],
     device const float* W [[buffer(1)]],
     device float* Y [[buffer(2)]],
     constant uint& H [[buffer(3)]],
-    constant uint& NH [[buffer(4)]],     // T × H
+    constant uint& NH [[buffer(4)]],
     constant uint& HD [[buffer(5)]],
     constant float& eps [[buffer(6)]],
     constant uint& pos [[buffer(7)]],
@@ -227,6 +294,42 @@ kernel void rmsnorm_head_rope_sg_f32(
         rope_cs(p, i, theta, HD, yarn, c, sn);
         const float x0 = x[i] * inv * W[i];
         const float x1 = x[i + half_hd] * inv * W[i + half_hd];
+        y[i] = x0 * c - x1 * sn;
+        y[i + half_hd] = x1 * c + x0 * sn;
+    }
+}
+
+kernel void rmsnorm_head_rope_sg_f32(
+    device const float* X [[buffer(0)]],
+    device const float* W [[buffer(1)]],
+    device float* Y [[buffer(2)]],
+    constant uint& H [[buffer(3)]],
+    constant uint& NH [[buffer(4)]],     // T × H
+    constant uint& HD [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    constant uint& pos [[buffer(7)]],
+    constant float& theta [[buffer(8)]],
+    constant RopeYarn& yarn [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint head = gid / 32u, lane = gid % 32u;
+    if (head >= NH) return;
+    const uint t = head / H;
+    device const float* x = X + (ulong)head * HD;
+    device const float4* x4 = (device const float4*)x;
+    float sumf = 0.0f;
+    for (uint i = lane; i < HD / 4u; i += 32u) sumf += dot(x4[i], x4[i]);
+    const float scale = 1.0f / sqrt(simd_sum(sumf) / (float)HD + eps);
+    const float p = (float)(pos + t);
+    const uint half_hd = HD / 2u;
+    device float* y = Y + (ulong)head * HD;
+    for (uint i = lane; i < half_hd; i += 32u) {
+        float c, sn;
+        rope_cs(p, i, theta, HD, yarn, c, sn);
+        // Нормованное значение — те же два округления, что norm-узел + MUL
+        // эталона ((x*scale)*w), дальше RoPE по уже нормованным.
+        const float x0 = (x[i] * scale) * W[i];
+        const float x1 = (x[i + half_hd] * scale) * W[i + half_hd];
         y[i] = x0 * c - x1 * sn;
         y[i + half_hd] = x1 * c + x0 * sn;
     }

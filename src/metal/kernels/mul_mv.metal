@@ -655,7 +655,12 @@ kernel void mv_q8_0_ks(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    threadgroup float sh[MV8_NR0 * MV8_NSG];
+    // Редукция — ПОБИТОВО как helper_mv_reduce_and_write оркала: 32 слота на
+    // строку (зануляет sgitg 0), частичные суммы simd_sum пишут лейн 0 своего
+    // simdgroup'а в слот sgitg, финал — simd_sum по 32 лейнам (бабочка:
+    // (v0+v2)+(v1+v3), а не последовательная сумма — порядок слагаемых в f32
+    // важен для паритета логов, GLM-4-9B ffn_down).
+    threadgroup float sh[MV8_NR0 * 32u];
     const uint r0 = tgid * MV8_NR0;
     const uint nb = K / 32u;
     const uint ix = lane / 4u, il = lane % 4u;
@@ -675,14 +680,18 @@ kernel void mv_q8_0_ks(
         }
     }
     for (uint row = 0; row < MV8_NR0; ++row) {
-        const float v = simd_sum(sumf[row]);
-        if (lane == 0u) sh[row * MV8_NSG + sgid] = v;
+        if (sgid == 0u) sh[row * 32u + lane] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgid == 0u && lane < MV8_NR0 && r0 + lane < N) {
-        float t = 0.0f;
-        for (uint g = 0; g < MV8_NSG; ++g) t += sh[lane * MV8_NSG + g];
-        C[r0 + lane] = t;
+    for (uint row = 0; row < MV8_NR0; ++row) {
+        if (lane == 0u) sh[row * 32u + sgid] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < MV8_NR0; ++row) {
+        if (r0 + row >= N) break;
+        const float tot = simd_sum(sh[row * 32u + lane]);
+        if (lane == 0u && sgid == 0u) C[r0 + row] = tot;
     }
 }
 
@@ -1168,3 +1177,100 @@ typedef decltype(mv_ext_q4x4_disp<3, 8, ext_q6k_block, 16, ext_deq_q6_K>) mv_ext
 template [[host_name("mv_ext_q6_k_x8_r3")]] kernel mv_ext_q6_k_t mv_ext_q4x4_disp<3, 8, ext_q6k_block, 16, ext_deq_q6_K>;
 template [[host_name("mv_ext_q6_k_x8_r4")]] kernel mv_ext_q6_k_t mv_ext_q4x4_disp<4, 8, ext_q6k_block, 16, ext_deq_q6_K>;
 template [[host_name("mv_ext_q6_k_x8_r5")]] kernel mv_ext_q6_k_t mv_ext_q4x4_disp<5, 8, ext_q6k_block, 16, ext_deq_q6_K>;
+
+// ── Q5_0 matvec — побитовый порт оркального kernel_mul_mv_q5_0_f32 ──────────
+// (mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0=4>, ggml-metal 5266f24da).
+// КРИТИЧНО для паритета: кернел воспроизведён ДОСЛОВНО по форме — отдельная
+// non-inline `inline` функция dot_y (linkonce_odr, как у оркала), struct-
+// чтение qh (align-2 load), тот же вид циклов. Ручной инлайн dot_y в тело
+// меняет форму IR и бэкенд Metal принимает ДРУГИЕ решения о контракции
+// fmul+fadd в fma — расхождение логов на 1–3 ulp (проверено побитово на
+// ffn_down GLM-4-9B: 0/4096 различий только с дословной формой).
+// Схема: threadgroup 4 simdgroup'а × 4 строки (r0 = (tgid*4+sgid)*4); K между
+// 32 лейнами: ix = lane/2 — номер блока (шаг NQ=16), il = (lane%2)*8 —
+// половина блока; yl домножен на недостающие битовые веса (1, 1/256, 1/16,
+// 1/4096); итог строки — simd_sum.
+struct block_q5_0 { half d; uchar qh[4]; uchar qs[16]; };
+
+inline float dot_y_q5_0(device const block_q5_0 * qb_curr, float sumy, thread float * yl, int il) {
+    float d = qb_curr->d;
+
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    device const uint16_t * qs =  ((device const uint16_t *)qb_curr + 3 + il/2);
+           const uint32_t   qh = *((device const uint32_t *)qb_curr->qh);
+
+    for (int i = 0; i < 8; i+=2) {
+        acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i+0+il        ) << 4 ) & 0x00010));
+        acc[1] += yl[i + 1] * ((qs[i / 2] & 0x0F00) | ((qh >> (i+1+il        ) << 12) & 0x01000));
+        acc[2] += yl[i + 8] * ((qs[i / 2] & 0x00F0) | ((qh >> (i+0+il+16) << 8 ) & 0x00100));
+        acc[3] += yl[i + 9] * ((qs[i / 2] & 0xF000) | ((qh >> (i+1+il+16) << 16) & 0x10000));
+    }
+
+    return d * (sumy * -16.f + acc[0] + acc[1] + acc[2] + acc[3]);
+}
+
+kernel void mv_q5_0_sg(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const short NSG = 4;
+    constexpr short NW = 32;
+    constexpr short NQ = 16;
+
+    const int nb = K/32;
+
+    const int r0 = (tgpig.x*NSG + sgitg)*4;
+
+    device const float        * y = A;
+
+    device const block_q5_0 * ax[4];
+    for (int row = 0; row < 4; ++row) {
+        ax[row] = ((device const block_q5_0 *) B) + (ulong)(r0 + row)*nb;
+    }
+
+    float sumf[4] = {0.f};
+
+    const short ix = (tiisg/(NW/NQ));
+    const short il = (tiisg%(NW/NQ))*8;
+
+    const int ib0 = ix;
+
+    float yl[16];
+
+    device const float * yb = y + ib0*32 + il;
+
+    for (int ib = ib0; ib < nb; ib += NQ) {
+        float sumy[2] = { 0.f, 0.f };
+
+        for (short i = 0; i < 8; i += 2) {
+            sumy[0]  += yb[i +  0] + yb[i +  1];
+            yl[i + 0] = yb[i +  0];
+            yl[i + 1] = yb[i +  1]/256.f;
+
+            sumy[1]  += yb[i + 16] + yb[i + 17];
+            yl[i + 8] = yb[i + 16]/16.f;
+            yl[i + 9] = yb[i + 17]/4096.f;
+        }
+
+        for (short row = 0; row < 4; row++) {
+            sumf[row] += dot_y_q5_0(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+        }
+
+        yb += 32 * 16;
+    }
+
+    for (int row = 0; row < 4; ++row) {
+        const float tot = simd_sum(sumf[row]);
+
+        if (tiisg == 0 && r0 + row < (int)N) {
+            C[r0 + row] = tot;
+        }
+    }
+}

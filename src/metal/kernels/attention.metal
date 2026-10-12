@@ -1588,3 +1588,582 @@ kernel void attn_prefill_mma_f16_nf(
 typedef decltype(attn_prefill_mma_f16_nf<16>) attn_prefill_mma_f16_nf_t;
 template [[host_name("attn_prefill_mma_f16_nf16")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<16>;
 template [[host_name("attn_prefill_mma_f16_nf32")]] kernel attn_prefill_mma_f16_nf_t attn_prefill_mma_f16_nf<32>;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Ф8.1c: побитовый порт эталонного flash-attn VEC-пути (ggml-metal 5266f24da,
+// fa.metal kernel_flash_attn_ext_pad / kernel_flash_attn_ext_vec /
+// kernel_flash_attn_ext_vec_reduce) для f16 KV, DK=DV, маска f16.
+//
+// Оркал берёт этот путь при ne01 < 20 && ne00 % 32 == 0
+// (ggml_metal_op_flash_attn_ext_use_vec) — то есть и для декода, и для
+// короткого префилла. При ne11 < 1024 тюнинг fa_vec_pick даёт BASELINE:
+// Q=1, NE=1; C=NCPSG=32; nsg=1; nwg=32 (ggml_metal_op_mul_mat… ops.cpp).
+// Машинный код воспроизведён ДОСЛОВНО по живой ветке (уроки Q5_0/контракции):
+// dead-ветки (sparse/sinks/bias/scap/квантовый деквант) опущены — их вырезает
+// и оркальский компилятор при специализации function-constant'ов; живые
+// арифметические выражения, порядок dot/simd_sum/fma/exp и раскладка shmem —
+// байт-в-байт как у эталона.
+//
+// Пайплайн: [pad при ne11%32!=0] → vec (grid (tq, nh, nwg), пишет tmp с
+// интерливингом по nwg + S/M в хвосте) → reduce (grid (nrows), сводит 33…
+// т.е. nwg частичных онлайн-softmax'ов).
+// ════════════════════════════════════════════════════════════════════════════
+
+#define FA_MAXHALF ((half)65504.0f)
+
+struct fa_vec_args {
+    int   ne01;   // число запросов (tq)
+    int   ne02;   // число голов Q (nh)
+    int   ne03;   // 1
+    ulong nb01;   // байт: stride запроса = qd*4
+    ulong nb02;   // байт: stride головы = tq*qd*4
+    ulong nb03;
+    int   ne11;   // длина KV
+    int   ne_12_2; // nkv
+    int   ne_12_3; // 1
+    int   ns10;   // элементы на ключ = nb11/nb10 (у оракула — function constant;
+                  // в его раскладке K [D,T,H] это DK, в нашей [T, NKV*D] — NKV*DK)
+    ulong nb11;   // байт: stride ключа = dk*2
+    ulong nb12;
+    ulong nb13;
+    int   ns20;   // элементы на ключ у V = nb21/nb20
+    ulong nb21;
+    ulong nb22;
+    ulong nb23;
+    int   ne31;   // число строк маски (tq)
+    int   ne32;   // 1
+    int   ne33;   // 1
+    ulong nb31;   // байт: stride строки маски = tkv*2
+    ulong nb32;
+    ulong nb33;
+    int   ne1;    // nh
+    int   ne2;    // tq
+    int   ne3;    // 1
+    float scale;
+};
+
+// ── pad: хвостовой чанк C ключей в отдельный буфер (K, V, маска) ─────────────
+struct fa_pad_args {
+    int   ne11;
+    int   ne_12_2;
+    int   ne_12_3;
+    ulong nb11; ulong nb12; ulong nb13;
+    ulong nb21; ulong nb22; ulong nb23;
+    int   ne31; int   ne32; int   ne33;
+    ulong nb31; ulong nb32; ulong nb33;
+};
+
+kernel void fa_vec_pad(
+    constant fa_pad_args & args [[buffer(0)]],
+    device const char * k [[buffer(1)]],
+    device const char * v [[buffer(2)]],
+    device const char * mask [[buffer(3)]],
+    device       char * dst [[buffer(4)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    ushort  tiitg [[thread_index_in_threadgroup]],
+    ushort3 ntg   [[threads_per_threadgroup]])
+{
+    const int32_t C = 32; // FC_flash_attn_ext_pad_ncpsg
+
+    device char * k_pad    = dst;
+    device char * v_pad    = k_pad + args.nb11*C*args.ne_12_2*args.ne_12_3;
+    device char * mask_pad = v_pad + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+    const int32_t icp = args.ne11 % C;
+    const int32_t ic0 = args.ne11 - icp;
+
+    const int32_t i1 = tgpig[0];
+    const int32_t i2 = tgpig[1];
+    const int32_t i3 = tgpig[2];
+
+    if (i2 < args.ne_12_2 && i3 < args.ne_12_3) {
+        device const char * k_src = k + args.nb11*(ic0 + i1) + args.nb12*i2 + args.nb13*i3;
+        device const char * v_src = v + args.nb21*(ic0 + i1) + args.nb22*i2 + args.nb23*i3;
+
+        device char * k_dst = k_pad + args.nb11*i1 + args.nb11*C*i2 + args.nb11*C*args.ne_12_2*i3;
+        device char * v_dst = v_pad + args.nb21*i1 + args.nb21*C*i2 + args.nb21*C*args.ne_12_2*i3;
+
+        if (i1 >= icp) {
+            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
+                k_dst[i] = 0;
+            }
+            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
+                v_dst[i] = 0;
+            }
+        } else {
+            // данные одного ключа одной головы = nb12 байт (наша раскладка
+            // interleaved: [T, NKV*D]); stride в pad-буфере остаётся nb11,
+            // чтобы vec-кернел читал его тем же NS10 = nb11/2
+            for (uint64_t i = tiitg; i < args.nb12; i += ntg.x) {
+                k_dst[i] = k_src[i];
+            }
+            for (uint64_t i = tiitg; i < args.nb22; i += ntg.x) {
+                v_dst[i] = v_src[i];
+            }
+        }
+    }
+
+    // FC_flash_attn_ext_pad_has_mask == true
+    if (i2 < args.ne32 && i3 < args.ne33) {
+        for (int ib = i1; ib < args.ne31; ib += C) {
+            device const half * mask_src = (device const half *)(mask + args.nb31*ib + args.nb32*i2 + args.nb33*i3) + ic0;
+            device       half * mask_dst = (device       half *)(mask_pad) + C*ib + C*args.ne31*i2 + C*args.ne31*args.ne32*i3;
+
+            for (int i = tiitg; i < C; i += ntg.x) {
+                if (i >= icp) {
+                    mask_dst[i] = -FA_MAXHALF;
+                } else {
+                    mask_dst[i] = mask_src[i];
+                }
+            }
+        }
+    }
+}
+
+// ── vec: онлайн-softmax по чанкам C=32 ключей, NWG=32 workgroup'ов делят KV ──
+template <short DK, short DV, short NE, bool HAS_MASK, bool HAS_KVPAD>
+kernel void fa_vec(
+    constant fa_vec_args & args [[buffer(0)]],
+    device const char * q [[buffer(1)]],
+    device const char * k [[buffer(2)]],
+    device const char * v [[buffer(3)]],
+    device const char * mask [[buffer(4)]],
+    device const char * sinks [[buffer(5)]],
+    device const char * pad [[buffer(6)]],
+    device       char * dst [[buffer(7)]],
+    threadgroup  half * shmem_f16 [[threadgroup(0)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    ushort  tiisg [[thread_index_in_simdgroup]],
+    ushort  sgitg [[simdgroup_index_in_threadgroup]])
+{
+#define NWG  32
+#define NSG  1
+#define NS10 (args.ns10)
+#define NS20 (args.ns20)
+
+    const short iwg = tgpig[2]%NWG;
+
+    const ushort iq3 = tgpig[2]/NWG;
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0];
+
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+
+    constexpr short PK  = ((DK + 127)/128)*128; // PAD2(DK, 128)
+    constexpr short PK4 = PK/4;
+
+    constexpr short PV  = ((DV + 127)/128)*128;
+    constexpr short PV4 = PV/4;
+
+    constexpr short NW  = 32;
+    // NE = fa_vec_baseline_ne(DK, DV): 128→1, 64→2
+    constexpr short NL  = NW/NE;
+    constexpr short Q   = 1;   // baseline
+    constexpr short C   = 32;  // OP_FLASH_ATTN_EXT_VEC_NCPSG
+    constexpr short SH  = 4*Q*C;
+
+    threadgroup half4  * sq4 = (threadgroup half4  *) (shmem_f16 + 0*PK);
+    threadgroup float  * ss  = (threadgroup float  *) (shmem_f16 +   sgitg*SH         + Q*NSG*PK);
+    threadgroup float4 * ss4 = (threadgroup float4 *) (shmem_f16 +   sgitg*SH         + Q*NSG*PK);
+    threadgroup half   * sm  = (threadgroup half   *) (shmem_f16 +   sgitg*SH + 2*Q*C + Q*NSG*PK);
+    threadgroup float4 * so4 = (threadgroup float4 *) (shmem_f16 + 2*sgitg*Q*PV4 + Q*NSG*PK + NSG*SH);
+
+    so4 += tiisg;
+
+    {
+        q += iq1*Q*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    // загрузка Q в shared (f32 → half4 — оркал ОКРУГЛЯЕТ Q до f16 здесь)
+    {
+        for (short qq = 0; qq < Q; ++qq) {
+            const int iq1_q = iq1*Q + qq;
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
+            if (iq1_q < args.ne01) {
+                for (short i = tiisg; i < PK4; i += NW) {
+                    if (i < DK4) {
+                        sq4[qq*PK4 + i] = (half4) q4[i];
+                    } else {
+                        sq4[qq*PK4 + i] = (half4) 0.0f;
+                    }
+                }
+            } else {
+                for (short i = tiisg; i < PK4; i += NW) {
+                    sq4[qq*PK4 + i] = (half4) 0.0f;
+                }
+            }
+        }
+    }
+
+    for (short qq = 0; qq < Q; ++qq) {
+        for (short i = 0; i < DV4/NL; ++i) {
+            so4[qq*DV4 + i*NL] = (float4) 0.0f;
+        }
+    }
+
+    for (short i = tiisg; i < SH/4; i += NW) {
+        ss4[i] = (float4) 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        float S[Q];
+        float M[Q];
+        for (short qq = 0; qq < Q; ++qq) {
+            S[qq] = 0.0f;
+            M[qq] = -FLT_MAX/2;
+        }
+
+        const short tx = tiisg%NL;
+        const short ty = tiisg/NL;
+
+        device const half * pm_base = (device const half *) (mask + iq1*Q*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+
+        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
+            int ic = ic0*C;
+            if (ic >= args.ne11) {
+                break;
+            }
+
+            device const half * pm[Q];
+            for (short qq = 0; qq < Q; ++qq) {
+                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
+            }
+
+            if (HAS_KVPAD && ic + C > args.ne11) {
+                k    = pad;
+                v    = (device const char *) k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                mask = (device const char *) v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+                const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+                const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+                k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+                v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+                if (!HAS_MASK) {
+                    for (short qq = 0; qq < Q; ++qq) {
+                        if (ic + tiisg >= args.ne11) {
+                            sm[qq*C + tiisg] = -FA_MAXHALF;
+                        }
+                    }
+                } else {
+                    for (short qq = 0; qq < Q; ++qq) {
+                        pm[qq] = (device const half *) (mask) +
+                            (iq1*Q + qq)*C +
+                            (iq2%args.ne32)*(C*args.ne31) +
+                            (iq3%args.ne33)*(C*args.ne31*args.ne32);
+                    }
+                }
+
+                ic = 0;
+            }
+
+            if (HAS_MASK) {
+                for (short qq = 0; qq < Q; ++qq) {
+                    if ((iq1*Q + qq) < args.ne01) {
+                        sm[qq*C + tiisg] = pm[qq][ic + tiisg];
+                    } else {
+                        sm[qq*C + tiisg] = -FA_MAXHALF;
+                    }
+                }
+            } else {
+                for (short qq = 0; qq < Q; ++qq) {
+                    if ((iq1*Q + qq) >= args.ne01) {
+                        sm[qq*C + tiisg] = -FA_MAXHALF;
+                    }
+                }
+            }
+
+            // skip -INF mask
+            {
+                bool any_finite = false;
+                for (short qq = 0; qq < Q; ++qq) {
+                    if (simd_max(sm[qq*C + tiisg]) > -FA_MAXHALF) {
+                        any_finite = true;
+                    }
+                }
+                if (!any_finite) {
+                    continue;
+                }
+            }
+
+            // Q*K^T
+            {
+                device const half4 * pk4 = (device const half4 *) (k + ic*args.nb11);
+                pk4 += ty*NS10/4 + tx;
+
+                float mqk[Q][C/NE];
+                for (short qq = 0; qq < Q; ++qq) {
+                    for (short cc = 0; cc < C/NE; ++cc) {
+                        mqk[qq][cc] = 0.0f;
+                    }
+                }
+
+                for (short cc = 0; cc < C/NE; ++cc) {
+                    for (short ii = 0; ii < DK4/NL; ++ii) {
+                        const half4 k_elem = pk4[cc*NE*NS10/4 + ii*NL];
+                        for (short qq = 0; qq < Q; ++qq) {
+                            mqk[qq][cc] += dot((float4) k_elem, (float4) sq4[qq*PK4 + ii*NL + tx]);
+                        }
+                    }
+
+                    for (short qq = 0; qq < Q; ++qq) {
+                        if (NE == 1) {
+                            mqk[qq][cc] = simd_sum(mqk[qq][cc]);
+                        } else {
+                            // simdgroup reduce (NE = 4): свёртка по NL-группам
+                            if (NE <= 1) {
+                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc], 16);
+                            }
+                            if (NE <= 2) {
+                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  8);
+                            }
+                            if (NE <= 4) {
+                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  4);
+                            }
+                            if (NE <= 8) {
+                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  2);
+                            }
+                            if (NE <= 16) {
+                                mqk[qq][cc] += simd_shuffle_down(mqk[qq][cc],  1);
+                            }
+
+                            // broadcast
+                            mqk[qq][cc] = simd_shuffle(mqk[qq][cc], NL*ty);
+                        }
+                    }
+                }
+
+                for (short qq = 0; qq < Q; ++qq) {
+                    if (HAS_MASK) {
+                        ss[qq*C + NE*tx + ty] = fma(mqk[qq][tx], args.scale, (float) sm[qq*C + NE*tx + ty]);
+                    } else {
+                        mqk[qq][tx] *= args.scale;
+                        mqk[qq][tx] += (float) sm[qq*C + NE*tx + ty];
+                        ss[qq*C + NE*tx + ty] = mqk[qq][tx];
+                    }
+                }
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // online softmax
+            {
+                for (short qq = 0; qq < Q; ++qq) {
+                    const float m = M[qq];
+                    const float s = ss[qq*C + tiisg];
+
+                    M[qq] = simd_max(max(M[qq], s));
+
+                    const float ms = exp(m - M[qq]);
+                    const float vs = exp(s - M[qq]);
+
+                    S[qq] = S[qq]*ms + simd_sum(vs);
+
+                    ss[qq*C + tiisg] = vs;
+
+                    // O = diag(ms)*O
+                    if ((DV4/NL % NW == 0) || ty == 0) {
+                        for (short ii = 0; ii < DV4/NL; ++ii) {
+                            so4[qq*DV4 + ii*NL] *= ms;
+                        }
+                    }
+                }
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // O = O + (Q*K^T)*V
+            {
+                float4 lo[Q][DV4/NL];
+                for (short qq = 0; qq < Q; ++qq) {
+                    for (short ii = 0; ii < DV4/NL; ++ii) {
+                        lo[qq][ii] = 0.0f;
+                    }
+                }
+
+                device const half4 * pv4 = (device const half4 *) (v + ic*args.nb21);
+                pv4 += ty*NS20/4 + tx;
+
+                for (short cc = 0; cc < C/NE; ++cc) {
+                    for (short ii = 0; ii < DV4/NL; ++ii) {
+                        const half4 v_elem = pv4[cc*NE*NS20/4 + ii*NL];
+                        for (short qq = 0; qq < Q; ++qq) {
+                            lo[qq][ii] += float4(float4(v_elem)*float4(ss[qq*C + cc*NE + ty]));
+                        }
+                    }
+                }
+
+                for (short qq = 0; qq < Q; ++qq) {
+                    for (short ii = 0; ii < DV4/NL; ++ii) {
+                        if (NE > 1) {
+                            lo[qq][ii][0] += simd_shuffle_down(lo[qq][ii][0], 16);
+                            lo[qq][ii][1] += simd_shuffle_down(lo[qq][ii][1], 16);
+                            lo[qq][ii][2] += simd_shuffle_down(lo[qq][ii][2], 16);
+                            lo[qq][ii][3] += simd_shuffle_down(lo[qq][ii][3], 16);
+                        }
+
+                        if (NE > 2) {
+                            lo[qq][ii][0] += simd_shuffle_down(lo[qq][ii][0],  8);
+                            lo[qq][ii][1] += simd_shuffle_down(lo[qq][ii][1],  8);
+                            lo[qq][ii][2] += simd_shuffle_down(lo[qq][ii][2],  8);
+                            lo[qq][ii][3] += simd_shuffle_down(lo[qq][ii][3],  8);
+                        }
+
+                        if (NE > 4) {
+                            lo[qq][ii][0] += simd_shuffle_down(lo[qq][ii][0],  4);
+                            lo[qq][ii][1] += simd_shuffle_down(lo[qq][ii][1],  4);
+                            lo[qq][ii][2] += simd_shuffle_down(lo[qq][ii][2],  4);
+                            lo[qq][ii][3] += simd_shuffle_down(lo[qq][ii][3],  4);
+                        }
+
+                        if (NE > 8) {
+                            lo[qq][ii][0] += simd_shuffle_down(lo[qq][ii][0],  2);
+                            lo[qq][ii][1] += simd_shuffle_down(lo[qq][ii][1],  2);
+                            lo[qq][ii][2] += simd_shuffle_down(lo[qq][ii][2],  2);
+                            lo[qq][ii][3] += simd_shuffle_down(lo[qq][ii][3],  2);
+                        }
+
+                        if (NE > 16) {
+                            lo[qq][ii][0] += simd_shuffle_down(lo[qq][ii][0],  1);
+                            lo[qq][ii][1] += simd_shuffle_down(lo[qq][ii][1],  1);
+                            lo[qq][ii][2] += simd_shuffle_down(lo[qq][ii][2],  1);
+                            lo[qq][ii][3] += simd_shuffle_down(lo[qq][ii][3],  1);
+                        }
+                    }
+                }
+
+                if ((DV4/NL % NW == 0) || ty == 0) {
+                    for (short qq = 0; qq < Q; ++qq) {
+                        for (short ii = 0; ii < DV4/NL; ++ii) {
+                            so4[qq*DV4 + ii*NL] += lo[qq][ii];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (tiisg == 0) {
+            for (short qq = 0; qq < Q; ++qq) {
+                ss[2*qq + 0] = S[qq];
+                ss[2*qq + 1] = M[qq];
+            }
+        }
+    }
+
+    so4 -= tiisg;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // parallel reduce по simdgroup'ам: NSG == 1 → цикл не выполняется
+
+    if (sgitg == 0) {
+        const int64_t nrows = args.ne3*args.ne2*args.ne1;
+
+        device float4 * dst4 = (device float4 *) dst;
+        device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
+
+        for (short qq = 0; qq < Q; ++qq) {
+            const int iq1_q = iq1*Q + qq;
+            if (iq1_q >= args.ne01) {
+                continue;
+            }
+
+            const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1_q*args.ne1;
+
+            const float Sval = NWG == 1 ? (ss[2*qq + 0] == 0.0f ? 0.0f : 1.0f/ss[2*qq + 0]) : 1.0f;
+
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[qq*DV4 + i]*Sval;
+            }
+
+            if (NWG > 1) {
+                if (tiisg == 0) {
+                    dst1[rid*(2*NWG) + 2*iwg + 0] = ss[2*qq + 0];
+                    dst1[rid*(2*NWG) + 2*iwg + 1] = ss[2*qq + 1];
+                }
+            }
+        }
+    }
+
+#undef NWG
+#undef NSG
+#undef NS10
+#undef NS20
+}
+
+// ── reduce: сведение NWG частичных результатов (онлайн-softmax merge) ────────
+template <short DV>
+kernel void fa_vec_reduce(
+    constant int & nrows_arg [[buffer(0)]],
+    device  const char * htmp [[buffer(1)]],
+    device        char * dst [[buffer(2)]],
+    uint   tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+#define NWG 32
+#define DV4 (DV/4)
+
+    const uint64_t rid = tgpig;
+
+    const short iwg = tiisg;
+
+    device const float  * ss    = (device const float  *) htmp + (uint64_t)nrows_arg*DV*NWG;
+
+    float S = ss[rid*(2*NWG) + 2*iwg + 0];
+    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+
+    const float m  = simd_max(M);
+    const float ms = exp(M - m);
+
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
+    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+
+    for (short i = sgitg; i < DV4; i += NWG) {
+        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+
+        if (iwg == 0) {
+            dst4[i] = v*S;
+        }
+    }
+
+#undef NWG
+#undef DV4
+}
+
+typedef decltype(fa_vec<128, 128, 1, true,  true>)  fa_vec_t;
+template [[host_name("fa_vec_dk128_mask_pad")]]   kernel fa_vec_t fa_vec<128, 128, 1, true,  true>;
+template [[host_name("fa_vec_dk128_mask")]]       kernel fa_vec_t fa_vec<128, 128, 1, true,  false>;
+template [[host_name("fa_vec_dk128_pad")]]        kernel fa_vec_t fa_vec<128, 128, 1, false, true>;
+template [[host_name("fa_vec_dk128")]]            kernel fa_vec_t fa_vec<128, 128, 1, false, false>;
+template [[host_name("fa_vec_dk64_mask_pad")]]    kernel decltype(fa_vec<64, 64, 2, true,  true>)  fa_vec<64, 64, 2, true,  true>;
+template [[host_name("fa_vec_dk64_mask")]]        kernel decltype(fa_vec<64, 64, 2, true,  false>) fa_vec<64, 64, 2, true,  false>;
+template [[host_name("fa_vec_dk64_pad")]]         kernel decltype(fa_vec<64, 64, 2, false, true>)  fa_vec<64, 64, 2, false, true>;
+template [[host_name("fa_vec_dk64")]]             kernel decltype(fa_vec<64, 64, 2, false, false>) fa_vec<64, 64, 2, false, false>;
+
+template [[host_name("fa_vec_reduce_dv128")]] kernel decltype(fa_vec_reduce<128>) fa_vec_reduce<128>;
+template [[host_name("fa_vec_reduce_dv64")]]  kernel decltype(fa_vec_reduce<64>)  fa_vec_reduce<64>;
+
+// маска f32 → f16 (0/-inf переходят точно; оркал получает маску уже в f16)
+kernel void cvt_f32_f16(
+    device const float* X [[buffer(0)]],
+    device half* Y [[buffer(1)]],
+    constant uint& N [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+    Y[gid] = (half) X[gid];
+}

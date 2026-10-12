@@ -177,10 +177,10 @@ static inline float dot_q5_k(device const float* a, device const uchar* blk) {
 
 // ── YaRN/линейное скалирование RoPE ─────────────────────────────────────────
 // Зеркало ggml rope_yarn/ggml_rope_cache_init (см. src/rope.rs): угол пары k
-// на позиции p строится МУЛЬТИПЛИКАТИВНЫМ накоплением theta (p·ts^k — тот же
-// порядок перемножений, что у эталона), затем интерполяция частот по коридору
-// corr_dims и масштаб cos/sin на mscale. Тождественные параметры
-// (ext=0, freq_scale=1, attn=1) — прежний путь pow(theta, 2k/hd).
+// на позиции p: theta = p·powf(base, (-1/n_dims)·2k) — одним powf, как в
+// оркальном Metal-кернеле, затем интерполяция частот по коридору corr_dims и
+// масштаб cos/sin на mscale. Тождественные параметры (ext=0, freq_scale=1,
+// attn=1) — прямой cos/sin от theta.
 struct RopeYarn {
     float freq_scale, ext_factor, attn_factor, corr_lo, corr_hi, theta_scale;
 };
@@ -189,14 +189,18 @@ inline bool rope_yarn_identity(constant RopeYarn& y) {
 }
 inline void rope_cs(float p, uint k, float theta, uint hd, constant RopeYarn& y,
                     thread float& c, thread float& s) {
+    // Оркальный kernel_rope_norm/neox (ggml-metal 0.23.0) считает theta
+    // ОДНИМ powf: theta = pos · powf(base, (-1/n_dims)·iw), iw = 2k. Ни
+    // 1/powf, ни итеративное накопление (то было зеркалом CPU-кэша
+    // ggml_rope_cache_init — на Metal он не выполняется): округление
+    // отличается на ulp и ломает побитовый паритет Q/K при pos>0 (GLM m=12).
+    const float inv_ndims = -1.0f / (float)hd;
+    const float theta_acc = p * pow(theta, inv_ndims * (2.0f * (float)k));
     if (rope_yarn_identity(y)) {
-        const float fr = 1.0f / pow(theta, 2.0f * (float)k / (float)hd);
-        c = cos(p * fr);
-        s = sin(p * fr);
+        c = cos(theta_acc);
+        s = sin(theta_acc);
         return;
     }
-    float theta_acc = p;
-    for (uint j = 0u; j < k; ++j) theta_acc *= y.theta_scale;
     const float theta_interp = y.freq_scale * theta_acc;
     float ang = theta_interp;
     float ms = y.attn_factor;

@@ -3018,6 +3018,279 @@ impl MetalCtx {
     /// Внимание по f16-кэшу (Ф8.2f). Требует f16 у всех трёх входов: fused
     /// `qkv_norm_rope_kv` пишет Q сразу в half, поэтому смешанных форматов
     /// на этом пути нет (не-fused ветки модель для f16-кэша не выбирает).
+    /// Ф8.1c: побитов путь эталонного FA VEC (pad → vec → reduce) для f16 KV,
+    /// hd ∈ {64,128}, ne01 < 20, ne11 < 1024 (baseline Q=1/NE оркала).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_fa_vec_f16(
+        &self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        mask: Option<&GpuTensor>,
+        y: &GpuTensor,
+        n_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        tq: usize,
+        tkv: usize,
+    ) -> Result<(), MetalError> {
+        #[repr(C)]
+        struct FaVecArgs {
+            ne01: i32,
+            ne02: i32,
+            ne03: i32,
+            nb01: u64,
+            nb02: u64,
+            nb03: u64,
+            ne11: i32,
+            ne_12_2: i32,
+            ne_12_3: i32,
+            ns10: i32,
+            nb11: u64,
+            nb12: u64,
+            nb13: u64,
+            ns20: i32,
+            nb21: u64,
+            nb22: u64,
+            nb23: u64,
+            ne31: i32,
+            ne32: i32,
+            ne33: i32,
+            nb31: u64,
+            nb32: u64,
+            nb33: u64,
+            ne1: i32,
+            ne2: i32,
+            ne3: i32,
+            scale: f32,
+        }
+        #[repr(C)]
+        struct FaPadArgs {
+            ne11: i32,
+            ne_12_2: i32,
+            ne_12_3: i32,
+            nb11: u64,
+            nb12: u64,
+            nb13: u64,
+            nb21: u64,
+            nb22: u64,
+            nb23: u64,
+            ne31: i32,
+            ne32: i32,
+            ne33: i32,
+            nb31: u64,
+            nb32: u64,
+            nb33: u64,
+        }
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let qd = n_heads * hd;
+        let kd = kv_heads * hd;
+        let nb11 = (kd * 2) as u64; // байт на ключ (наш layout: key-major)
+        let nb12 = (hd * 2) as u64; // байт на kv-голову
+        let nb31 = (tkv * 2) as u64; // байт на строку маски
+
+        // маска f32 → f16 (0/-inf точны; оркал получает маску уже в half)
+        let mask16 = match mask {
+            Some(m) => {
+                let n = tq * tkv;
+                let mt = GpuTensor::zeros_f16(&self.device, vec![n])?;
+                let n32 = n as u32;
+                self.run(
+                    "cvt_f32_f16",
+                    MTLSize::new(n as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                    |enc| {
+                        enc.set_buffer(0, Some(&m.buffer), m.offset as u64);
+                        enc.set_buffer(1, Some(&mt.buffer), mt.offset as u64);
+                        enc.set_bytes(2, 4, (&n32 as *const u32).cast());
+                    },
+                )?;
+                Some(mt)
+            }
+            None => None,
+        };
+        let dummy = q;
+
+        if std::env::var("INFER_FA_VEC_DEBUG").is_ok() {
+            eprintln!(
+                "fa_vec dbg tq={tq} tkv={tkv} nh={n_heads} nkv={kv_heads} hd={hd} \
+                 nb01={} nb02={} nb11={nb11} nb12={nb12} nb31={nb31} kvpad={}",
+                qd * 4,
+                hd * 4,
+                tkv % 32 != 0
+            );
+            if let Some(m16) = &mask16 {
+                let mv = m16.to_cpu_f16(self)?;
+                for i in 0..tq.min(3) {
+                    let row: Vec<f32> = mv[i * tkv..(i + 1) * tkv]
+                        .iter()
+                        .map(|x| x.to_f32())
+                        .collect();
+                    eprintln!("  mask16 r{i}: {row:?}");
+                }
+            }
+            let qv = q.to_cpu_f32(self)?;
+            let kv = k.to_cpu_f16(self)?;
+            if tq > 1 && tkv > 1 {
+                eprintln!("  q r0: {:?} r1: {:?}", &qv[0..4], &qv[qd..qd + 4]);
+                eprintln!(
+                    "  k r0: {:?} r1: {:?}",
+                    &kv[0..4],
+                    &kv[kd..kd + 4]
+                );
+            }
+            if let Ok(path) = std::env::var("INFER_FA_VEC_DUMP") {
+                // только слой 0 (первый вызов)
+                if !std::path::Path::new(&path).exists() {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(&path).unwrap();
+                    let n = tq * n_heads * hd;
+                    f.write_all(qd.to_be_bytes().as_slice()).unwrap();
+                    f.write_all(tq.to_be_bytes().as_slice()).unwrap();
+                    for x in &qv[..n] {
+                        f.write_all(&x.to_be_bytes()).unwrap();
+                    }
+                    let kn = tkv * kv_heads * hd;
+                    for x in &kv[..kn] {
+                        f.write_all(&x.to_f32().to_be_bytes()).unwrap();
+                    }
+                    let vv = v.to_cpu_f16(self)?;
+                    for x in &vv[..kn] {
+                        f.write_all(&x.to_f32().to_be_bytes()).unwrap();
+                    }
+                    eprintln!("  fa_vec dumped to {path}");
+                }
+            }
+        }
+
+        // pad-буфер хвостового чанка (K, V, маска) — при ne11 % 32 != 0
+        let has_kvpad = tkv % 32 != 0;
+        let pad = if has_kvpad {
+            let bytes = nb11 * 32 * kv_heads as u64
+                + nb11 * 32 * kv_heads as u64
+                + 32 * tq as u64 * 2;
+            Some(GpuTensor::zeros(
+                &self.device,
+                vec![bytes.div_ceil(4) as usize],
+            )?)
+        } else {
+            None
+        };
+
+        if has_kvpad {
+            let p = pad.as_ref().unwrap();
+            let a = FaPadArgs {
+                ne11: tkv as i32,
+                ne_12_2: kv_heads as i32,
+                ne_12_3: 1,
+                nb11,
+                nb12,
+                nb13: nb12,
+                nb21: nb11,
+                nb22: nb12,
+                nb23: nb12,
+                ne31: tq as i32,
+                ne32: 1,
+                ne33: 1,
+                nb31,
+                nb32: (tq * tkv * 2) as u64,
+                nb33: (tq * tkv * 2) as u64,
+            };
+            // threadgroups (32, nkv, 1) × (32,1,1)
+            self.run(
+                "fa_vec_pad",
+                MTLSize::new(32 * 32, kv_heads as u64, 1),
+                MTLSize::new(32, 1, 1),
+                |enc| {
+                    enc.set_bytes(0, std::mem::size_of::<FaPadArgs>() as u64, (&a as *const FaPadArgs).cast());
+                    enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                    enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                    enc.set_buffer(3, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                    enc.set_buffer(4, Some(&p.buffer), p.offset as u64);
+                },
+            )?;
+        }
+
+        // tmp: nwg частичных результатов + S/M в хвосте
+        let nrows = tq * n_heads;
+        let tmp = GpuTensor::zeros(&self.device, vec![nrows * (hd * 32 + 64)])?;
+
+        let a = FaVecArgs {
+            ne01: tq as i32,
+            ne02: n_heads as i32,
+            ne03: 1,
+            nb01: (qd * 4) as u64,
+            nb02: (hd * 4) as u64,
+            nb03: (tq * qd * 4) as u64,
+            ne11: tkv as i32,
+            ne_12_2: kv_heads as i32,
+            ne_12_3: 1,
+            // ns10 = nb11/nb10: элементы на ключ (у оракула function constant;
+            // в его раскладке K [D,T,H] совпадает с DK, в нашей interleaved —
+            // kv_heads*hd). Кернел шагает ключи этим stride'ом.
+            ns10: (nb11 / 2) as i32,
+            nb11,
+            nb12,
+            nb13: nb12,
+            ns20: (nb11 / 2) as i32,
+            nb21: nb11,
+            nb22: nb12,
+            nb23: nb12,
+            ne31: tq as i32,
+            ne32: 1,
+            ne33: 1,
+            nb31,
+            nb32: (tq * tkv * 2) as u64,
+            nb33: (tq * tkv * 2) as u64,
+            ne1: n_heads as i32,
+            ne2: tq as i32,
+            ne3: 1,
+            scale,
+        };
+        let name = match (hd, mask.is_some(), has_kvpad) {
+            (128, true, true) => "fa_vec_dk128_mask_pad",
+            (128, true, false) => "fa_vec_dk128_mask",
+            (128, false, true) => "fa_vec_dk128_pad",
+            (128, false, false) => "fa_vec_dk128",
+            (64, true, true) => "fa_vec_dk64_mask_pad",
+            (64, true, false) => "fa_vec_dk64_mask",
+            (64, false, true) => "fa_vec_dk64_pad",
+            _ => "fa_vec_dk64",
+        };
+        let smem = (((hd.max(128) + 4 * 32 + 2 * hd.max(128)) * 2) + 15) / 16 * 16;
+        self.run(
+            name,
+            MTLSize::new((tq * 32) as u64, n_heads as u64, 32),
+            MTLSize::new(32, 1, 1),
+            |enc| {
+                enc.set_bytes(0, std::mem::size_of::<FaVecArgs>() as u64, (&a as *const FaVecArgs).cast());
+                enc.set_buffer(1, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(2, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(3, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(4, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(5, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(6, Some(&pad.as_ref().unwrap_or(dummy).buffer), pad.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(7, Some(&tmp.buffer), tmp.offset as u64);
+                enc.set_threadgroup_memory_length(0, smem as u64);
+            },
+        )?;
+
+        let nrows_i = nrows as i32;
+        let rname = if hd == 128 { "fa_vec_reduce_dv128" } else { "fa_vec_reduce_dv64" };
+        self.run(
+            rname,
+            MTLSize::new((nrows * 1024) as u64, 1, 1),
+            MTLSize::new(1024, 1, 1),
+            |enc| {
+                enc.set_bytes(0, 4, (&nrows_i as *const i32).cast());
+                enc.set_buffer(1, Some(&tmp.buffer), tmp.offset as u64);
+                enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+            },
+        )?;
+        Ok(())
+    }
+
     fn attn_ar_f16(
         &self,
         q: &GpuTensor,
@@ -3053,6 +3326,21 @@ impl MetalCtx {
             return Err(MetalError::Shape(format!(
                 "attn_ar f16: H={n_heads} не делится на KVH={kv_heads} или HD={hd} не кратен 4"
             )));
+        }
+        // Ф8.1c: побитово воспроизведённый эталонный FA VEC (fa.metal
+        // kernel_flash_attn_ext_{pad,vec,vec_reduce}). Оркал берёт его при
+        // ne01 < 20 && ne00 % 32 == 0; при ne11 < 1024 тюнинг fa_vec_pick
+        // даёт baseline Q=1, NE=baseline_ne (128→1, 64→2) — наш порт именно
+        // его. При ne11 ≥ 1024 оркал может выбрать tuned Q/NE — этот случай
+        // остаётся прежнему пути (паритет длинного KV — отдельная задача).
+        // Фоллбэк INFER_NO_FA_VEC=1.
+        if b == 1
+            && tq <= 19
+            && tkv < 1024
+            && (hd == 64 || hd == 128)
+            && std::env::var("INFER_NO_FA_VEC").is_err()
+        {
+            return self.attn_fa_vec_f16(q, k, v, mask, y, n_heads, kv_heads, hd, tq, tkv);
         }
         // Предфилл: half×half матричные блоки (16 запросов/threadgroup).
         // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел).

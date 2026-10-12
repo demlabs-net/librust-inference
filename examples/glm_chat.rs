@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // оркала (oracle_dump.cpp) — %08x-биты, сравнение побитовое.
     if std::env::var("LLM_DUMP_LOGITS").is_ok() {
         model.reset_cache(backend.as_ref())?;
-        let lg = model.prefill(backend.as_ref(), &ids)?;
+        let lg = model.prefill_last(backend.as_ref(), &ids)?;
         let v = backend.to_cpu_f32(&lg)?;
         let out = std::env::var("LLM_DUMP_LOGITS").unwrap();
         let mut s = String::new();
@@ -95,8 +95,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             s.push_str(&format!("{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " }));
         }
         s.push('\n');
-        std::fs::write(out, s)?;
+        std::fs::write(&out, s)?;
         eprintln!("logits dumped");
+        // Шаг декода (KV = t+1): оркал n_steps=1 жадно декодит argmax шага 0.
+        if std::env::var("LLM_DUMP_DECODE").is_ok() {
+            let v0 = backend.to_cpu_f32(&lg)?;
+            let row = &v0[v0.len() - cfg.vocab_size..];
+            let tok = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            let lg2 = model.decode(backend.as_ref(), tok)?;
+            let v2 = backend.to_cpu_f32(&lg2)?;
+            let mut s = String::new();
+            s.push_str("STEP 1 TENSOR result_output ne=[");
+            s.push_str(&format!("{},1,1,1]\n", cfg.vocab_size));
+            let last = &v2[v2.len() - cfg.vocab_size..];
+            for (i, x) in last.iter().enumerate() {
+                s.push_str(&format!("{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " }));
+            }
+            s.push('\n');
+            std::fs::write(std::env::var("LLM_DUMP_DECODE").unwrap(), s)?;
+            eprintln!("decode logits dumped (tok {tok})");
+        }
     }
 
     let params = rust_inference::inference::generate::GenerateParams {

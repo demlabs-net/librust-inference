@@ -365,7 +365,17 @@ impl Glm4Model {
     }
 
     /// Полный forward: ids → логиты [1, T, V].
-    fn forward(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+    /// `last_tail` — как оркал (llama.cpp 0.4.0, GLM-4-9B m=12): последний
+    /// слой срезается на последний токен СРАЗУ после внимания (kqv), дальше
+    /// wo/FFN/norm считаются при m=1 (mv-путь). Без среза хвост идёт
+    /// mm-кернелом на m=T и логиты не равны побитово. Вызывается из
+    /// prefill_last; обычный prefill — false (все строки).
+    fn forward(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+        last_tail: bool,
+    ) -> Result<Tensor, BackendError> {
         let t = ids.len();
         let pos = self.caches[0].pos;
         // Дамп чекпоинтов — только первого forward (шаг 0 эталона).
@@ -498,12 +508,25 @@ impl Glm4Model {
             if let Some(p) = &dump {
                 Self::dump(backend, p, "l_out-0", &o)?;
             }
+            // Ф8.1e: срез хвоста последнего слоя (см. док forward). Оркал
+            // режет ПОСЛЕ wo (l_out-39 = [4096,1], а wo ещё на m=12 mm):
+            // post_attn_norm/FFN/norm — m=1, mv-путь.
+            let slice_tail = last_tail && t > 1 && i + 1 == self.cfg.n_layers;
+            let (o, inp) = if slice_tail {
+                (
+                    o.view(vec![1, t, dim]).view_offset(vec![1, 1, dim], (t - 1) * dim),
+                    inp.view(vec![1, t, dim]).view_offset(vec![1, 1, dim], (t - 1) * dim),
+                )
+            } else {
+                (o, inp)
+            };
+            let tt = if slice_tail { 1 } else { t };
             // Sandwich: post-attention norm ДО residual.
             let o = layer.post_attn_norm.forward(backend, &o)?;
             if let Some(p) = &dump {
                 Self::dump(backend, p, &format!("post_attn_norm-{i}"), &o)?;
             }
-            let y = backend.zeros(vec![1, t, dim])?;
+            let y = backend.zeros(vec![1, tt, dim])?;
             backend.add(&o, &inp, &y)?;
             let f = layer.ffn_norm.forward(backend, &y)?;
             if let Some(p) = &dump {
@@ -536,7 +559,7 @@ impl Glm4Model {
             if let Some(p) = &dump {
                 Self::dump(backend, p, &format!("post_mlp_norm-{i}"), &f)?;
             }
-            let z = backend.zeros(vec![1, t, dim])?;
+            let z = backend.zeros(vec![1, tt, dim])?;
             backend.add(&f, &y, &z)?;
             x = z;
             if std::env::var("GLM4_DEBUG_L").is_ok() {
@@ -552,10 +575,12 @@ impl Glm4Model {
         if let Some(p) = &dump {
             Self::dump(backend, p, "result_norm", &h)?;
         }
-        let h2 = h.view(vec![t, dim]);
-        let logits = backend.zeros(vec![t, self.cfg.vocab_size])?;
+        // При срезе хвоста (last_tail) x имеет 1 строку — логиты тоже [1,1,V].
+        let tx = x.shape()[1];
+        let h2 = h.view(vec![tx, dim]);
+        let logits = backend.zeros(vec![tx, self.cfg.vocab_size])?;
         backend.gemm_nt(&h2, &self.output, &logits)?;
-        Ok(logits.view(vec![1, t, self.cfg.vocab_size]))
+        Ok(logits.view(vec![1, tx, self.cfg.vocab_size]))
     }
 
     /// Размер блока префилла — как у Qwen3 (маска плотная [Tq, Tkv]).
@@ -587,25 +612,27 @@ impl CausalLm for Glm4Model {
 
     fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         backend.begin_batch()?;
-        let r = self.forward(backend, ids);
+        let r = self.forward(backend, ids, false);
         backend.end_batch()?;
         r
     }
 
     fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         // Блочный префилл с логитами только последней позиции (как qwen3).
+        // last_tail=true — хвост последнего слоя срезается на последний
+        // токен (паритет с оркалом: wo/FFN при m=1, mv-путь).
         let chunk = Self::prefill_chunk();
         let mut done = 0usize;
         let mut last: Option<Tensor> = None;
         while done < ids.len() {
             let n = chunk.min(ids.len() - done);
             let part = &ids[done..done + n];
-            let t = part.len();
-            let logits = self.prefill(backend, part)?;
+            backend.begin_batch()?;
+            let logits = self.forward(backend, part, true);
+            backend.end_batch()?;
+            let logits = logits?;
             if done + n == ids.len() {
                 last = Some(self.slice_last_row(backend, &logits)?);
-            } else {
-                let _ = t;
             }
             done += n;
         }
@@ -633,7 +660,7 @@ impl CausalLm for Glm4Model {
 
     fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<Tensor, BackendError> {
         backend.begin_batch()?;
-        let r = self.forward(backend, &[id]);
+        let r = self.forward(backend, &[id], false);
         backend.end_batch()?;
         r
     }

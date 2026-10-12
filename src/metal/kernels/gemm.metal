@@ -1045,6 +1045,128 @@ kernel void gemm_nt_q5_k_mm(
     }
 }
 
+// Q5_0-вариант тайлового GEMM (Ф8.1e, GLM-4-9B: ffn_down в слоях 5,6,8,9,… —
+// Q5_0, а оркал при ne00>=64 && ne11>8 берёт kernel_mul_mm без требования
+// K%256). Каркас — побитово сверенный gemm_nt_iq4_xs_mm; загрузчик весов —
+// ДОСЛОВНЫЙ dequantize_q5_0 из ggml-metal (блок 22 Б: d@0, qh@2, qs@6;
+// nl = 32/16 = 2, поток берёт чанк il0 блока kb; рег — float4x4 с ОДНИМ
+// округлением в half). Скалярный gemm_nt_q5_0 при m>8 расходится с оркалом
+// на ~1e-3 (ffn_out-5 GLM m=12).
+struct mm_block_q5_0 { half d; uchar qh[4]; uchar qs[16]; };
+
+kernel void gemm_nt_q5_0_mm(
+    device const float* A [[buffer(0)]],     // активации [M, K]
+    device const uchar* B [[buffer(1)]],     // веса Q5_0 [N, K] (22 Б/32)
+    device float* C [[buffer(2)]],           // [M, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half* sa = (threadgroup half*)(shmem);          // 64×32 весов
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);   // 32×32 активаций
+    const int r0 = tgpig.y * 64;   // строки весов (N)
+    const int r1 = tgpig.x * 32;   // строки активаций (M)
+    const short nr0 = ((int)N - r0 < 64) ? (short)((int)N - r0) : 64;
+    const short nr1 = ((int)M - r1 < 32) ? (short)((int)M - r1) : 32;
+    const short lr0 = ((short)tiitg / 2) < nr0 ? ((short)tiitg / 2) : nr0 - 1;
+    const short lr1 = ((short)tiitg / 4) < nr1 ? ((short)tiitg / 4) : nr1 - 1;
+    const short il0 = tiitg % 2;
+    const uint nbs = K / 32u;                  // 32-значных блоков в строке
+    device const uchar* x = B + (ulong)(r0 + lr0) * nbs * 22u;
+    const short iy = 8 * (tiitg % 4);
+    device const float* y = A + (ulong)(r1 + lr1) * K + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    const uint nk = K / 32u;
+    for (uint kb = 0; kb < nk; ++kb) {
+        // деквант 16 значений строки весов — дословный dequantize_q5_0
+        {
+            device const mm_block_q5_0* xb =
+                (device const mm_block_q5_0*)(x + kb * 22u);
+            device const uint16_t* qs = ((device const uint16_t*)xb) + 3;
+            const float d = xb->d;
+            const float md = -16.0h * xb->d;
+            const ushort mask = il0 ? (ushort)0x00F0 : (ushort)0x000F;
+
+            const uint32_t qh = *((device const uint32_t*)xb->qh);
+
+            const int x_mv = il0 ? 4 : 0;
+            const int gh_mv = il0 ? 12 : 0;
+            const int gh_bk = il0 ? 0 : 4;
+
+            float4x4 reg;
+            for (short i = 0; i < 8; ++i) {
+                const uint8_t xh_0 = ((qh >> (gh_mv + 2 * i)) << gh_bk) & 0x10;
+                const uint8_t xh_1 = ((qh >> (gh_mv + 2 * i + 1)) << gh_bk) & 0x10;
+                const int32_t x0 = ((((uint32_t)qs[i]) & mask) >> x_mv) | xh_0;
+                const int32_t x1 = (((((uint32_t)qs[i]) >> 8) & mask) >> x_mv) | xh_1;
+                reg[i / 2][2 * (i % 2) + 0] = d * x0 + md;
+                reg[i / 2][2 * (i % 2) + 1] = d * x1 + md;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (tiitg / 2) / 8;
+                const short lx = (tiitg / 2) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = (half)reg[i / 4][i % 4];
+            }
+        }
+        // активации: 8 значений строки → блочная раскладка [m][k]
+        {
+            const short sx = tiitg % 4;
+            const short sy = (tiitg / 4) / 8;
+            const short ly = (tiitg / 4) % 8;
+            const short ib = 4 * sx + sy;
+            device const float4* y4 = (device const float4*)(y + kb * 32u);
+            const float4 v0 = y4[0], v1 = y4[1];
+            threadgroup half4* dst = (threadgroup half4*)(sb + 64 * ib + 8 * ly);
+            dst[0] = half4(v0);
+            dst[1] = half4(v1);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64 <= (int)N && r1 + 32 <= (int)M) {
+        device float* Cp = C + (r0 + 32 * (sgitg & 1)) + (ulong)(r1 + 16 * (sgitg >> 1)) * N;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], Cp + 8 * (i % 4) + 8 * (ulong)N * (i / 4), N, 0, false);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* ts = ((threadgroup float*)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * 64;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], ts + 8 * (i % 4) + 8 * 64 * (i / 4), 64, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = tiitg; j < nr1; j += 128) {
+            device float* D = C + (ulong)(r1 + j) * N + r0;
+            threadgroup float* Cs = ((threadgroup float*)shmem) + j * 64;
+            for (int i = 0; i < nr0; i++) D[i] = Cs[i];
+        }
+    }
+}
+
 // Q6_K-вариант тайлового GEMM (порт kernel_mul_mm_q6_K_f32, тот же sgemm-
 // каркас, что у gemm_nt_q5_k_mm): скалярный gemm_nt_q6_k при m>8 читает веса
 // по разу на строку активаций (lm_head 27B [248320,5120]: m=128 — 423 мс в

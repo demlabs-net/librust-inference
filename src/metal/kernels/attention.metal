@@ -1653,7 +1653,8 @@ struct fa_pad_args {
     ulong nb31; ulong nb32; ulong nb33;
 };
 
-kernel void fa_vec_pad(
+template <int C>
+kernel void fa_pad_k(
     constant fa_pad_args & args [[buffer(0)]],
     device const char * k [[buffer(1)]],
     device const char * v [[buffer(2)]],
@@ -1663,7 +1664,7 @@ kernel void fa_vec_pad(
     ushort  tiitg [[thread_index_in_threadgroup]],
     ushort3 ntg   [[threads_per_threadgroup]])
 {
-    const int32_t C = 32; // FC_flash_attn_ext_pad_ncpsg
+    // C = FC_flash_attn_ext_pad_ncpsg: 32 для vec-пути, 64 для tile-пути
 
     device char * k_pad    = dst;
     device char * v_pad    = k_pad + args.nb11*C*args.ne_12_2*args.ne_12_3;
@@ -2157,6 +2158,9 @@ template [[host_name("fa_vec_dk64")]]             kernel decltype(fa_vec<64, 64,
 template [[host_name("fa_vec_reduce_dv128")]] kernel decltype(fa_vec_reduce<128>) fa_vec_reduce<128>;
 template [[host_name("fa_vec_reduce_dv64")]]  kernel decltype(fa_vec_reduce<64>)  fa_vec_reduce<64>;
 
+template [[host_name("fa_vec_pad")]]  kernel decltype(fa_pad_k<32>) fa_pad_k<32>;
+template [[host_name("fa_tile_pad")]] kernel decltype(fa_pad_k<64>) fa_pad_k<64>;
+
 // маска f32 → f16 (0/-inf переходят точно; оркал получает маску уже в f16)
 kernel void cvt_f32_f16(
     device const float* X [[buffer(0)]],
@@ -2167,3 +2171,510 @@ kernel void cvt_f32_f16(
     if (gid >= N) return;
     Y[gid] = (half) X[gid];
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Ф8.1f: tile-путь flash attention (побитовый порт kernel_flash_attn_ext +
+// kernel_flash_attn_ext_blk из ggml-metal 0.23.0). Оркал берёт его при
+// !(ne01 < 20 && ne00%32==0), т.е. для префилла ne01 >= 20 (и для vec-случаев
+// с ne00%32!=0). Параметры для dense-f16 KV: Q=OP_FLASH_ATTN_EXT_NQPSG=8,
+// C=OP_FLASH_ATTN_EXT_NCPSG=64, NSG=4 (ne00<512), типы FA_TYPES (half-фрагменты,
+// float-аккумуляция), прямое чтение K/V (is_same ветки), без sinks/bias/scap.
+// NS10/NS20 — фактический stride ключа из args (в нашей interleaved-раскладке
+// NKV*HD). Дословность формы IR обязательна (урок Ф8.1b).
+// ════════════════════════════════════════════════════════════════════════════
+
+#define FA_FOR(x) _Pragma("clang loop unroll(full)") for (x)
+#define FA_PAD2(x, n) (((x) + (n) - 1) & ~((n) - 1))
+#define FA_MIN(a, b) ((a) < (b) ? (a) : (b))
+
+struct fa_tile_args {
+    int   ne01;   // число запросов (tq)
+    int   ne02;   // nh
+    int   ne03;   // 1
+    ulong nb01;   // байт: stride запроса = qd*4
+    ulong nb02;   // байт: stride головы Q = hd*4
+    ulong nb03;
+    int   ne11;   // длина KV
+    int   ne_12_2; // nkv
+    int   ne_12_3; // 1
+    int   ns10;   // элементы на ключ = nb11/2
+    ulong nb11;
+    ulong nb12;
+    ulong nb13;
+    int   ns20;   // элементы на ключ V = nb21/2
+    ulong nb21;
+    ulong nb22;
+    ulong nb23;
+    int   ne31;   // строк маски (tq)
+    int   ne32;   // 1
+    int   ne33;   // 1
+    ulong nb31;   // байт: stride строки маски = tkv*2
+    ulong nb32;
+    ulong nb33;
+    int   ne1;    // nh
+    int   ne2;    // tq
+    int   ne3;    // 1
+    float scale;
+};
+
+struct fa_blk_args {
+    int   ne01;   // tq
+    int   ne30;   // tkv (ширина маски)
+    int   ne31;   // tq
+    int   ne32;   // 1
+    int   ne33;   // 1
+    ulong nb31;
+    ulong nb32;
+    ulong nb33;
+};
+
+// скан блоков маски: 0 = весь -INF (пропустить), 1 = проверить, 2 = все нули
+kernel void fa_tile_blk(
+    constant fa_blk_args & args [[buffer(0)]],
+    device const char * mask [[buffer(1)]],
+    device       char * dst [[buffer(2)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]])
+{
+    const int32_t Q = 8;  // FC_flash_attn_ext_blk_nqptg
+    const int32_t C = 64; // FC_flash_attn_ext_blk_ncpsg
+
+    constexpr short NW = 32;
+
+    const int32_t i3 = tgpig[2]/args.ne32;
+    const int32_t i2 = tgpig[2]%args.ne32;
+    const int32_t i1 = tgpig[1];
+    const int32_t i0 = tgpig[0];
+
+    char res = i0*C + C > args.ne30 ? 1 : 0;
+
+    device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
+
+    if ((C > NW || Q > 1) && res == 0) {
+        half mmin =  FA_MAXHALF;
+        half mmax = -FA_MAXHALF;
+
+        FA_FOR (short j = 0; j < Q; ++j) {
+            FA_FOR (short ii = 0; ii < C/NW; ++ii) {
+                mmin = min(mmin, mask_src[ii*NW]);
+                mmax = max(mmax, mask_src[ii*NW]);
+            }
+
+            mask_src += args.nb31/2;
+        }
+
+        mmin = simd_min(mmin);
+        mmax = simd_max(mmax);
+
+        if (mmax > -FA_MAXHALF) {
+            if (mmin == 0.0 && mmax == 0.0) {
+                res = 2;
+            } else {
+                res = 1;
+            }
+        }
+    }
+
+    const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
+    const int32_t nblk0 = ((args.ne30 + C - 1)/C);
+
+    if (tiisg == 0) {
+        dst[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res;
+    }
+}
+
+template <short DK, short DV, bool HAS_MASK, bool HAS_KVPAD, bool BC_MASK>
+kernel void fa_tile(
+    constant fa_tile_args & args [[buffer(0)]],
+    device const char * q [[buffer(1)]],
+    device const char * k [[buffer(2)]],
+    device const char * v [[buffer(3)]],
+    device const char * mask [[buffer(4)]],
+    device const char * sinks [[buffer(5)]],
+    device const char * pad [[buffer(6)]],
+    device const char * blk [[buffer(7)]],
+    device       char * dst [[buffer(8)]],
+    threadgroup  half * shmem_f16 [[threadgroup(0)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    ushort  tiisg [[thread_index_in_simdgroup]],
+    ushort  sgitg [[simdgroup_index_in_threadgroup]])
+{
+#define NS10 (args.ns10)
+#define NS20 (args.ns20)
+#define NSG 4
+#define Q 8
+#define C 64
+
+    const ushort iq3 = tgpig[2];
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0]*Q;
+
+    constexpr short KV   = 8;
+
+    constexpr short DK4  = DK/4;
+    constexpr short DK8  = DK/8;
+    constexpr short DV4  = DV/4;
+    constexpr short DV16 = DV/16;
+
+    constexpr short PV   = FA_PAD2(DV, 64);
+    constexpr short PV4  = PV/4;
+    constexpr short PV8  = PV/8;
+
+    constexpr short NW  = 32;
+    constexpr short NQ  = Q/NSG;
+    constexpr short SH  = 2*C;
+
+    constexpr short TS = 2*SH;
+    constexpr short T  = DK + 2*PV;
+
+    threadgroup half  * sq  = (threadgroup half  *) (shmem_f16 + 0*T);
+    threadgroup half4 * sq4 = (threadgroup half4 *) (shmem_f16 + 0*T);
+    threadgroup float * so  = (threadgroup float *) (shmem_f16 + 0*T + Q*DK);
+    threadgroup float4* so4 = (threadgroup float4*) (shmem_f16 + 0*T + Q*DK);
+    threadgroup float * ss  = (threadgroup float *) (shmem_f16 + Q*T);
+    threadgroup float2* ss2 = (threadgroup float2*) (shmem_f16 + Q*T);
+
+    // маска в half2 лежит во второй половине строки ss (дословно оракалу)
+    threadgroup half2 * sm2 = (threadgroup half2 *) (shmem_f16 + Q*T + 2*C);
+
+    device const half2 * pm2[NQ];
+
+    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+
+        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+    }
+
+    {
+        const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
+        const int32_t nblk0 = ((args.ne11 + C - 1)/C);
+
+        blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0;
+    }
+
+    {
+        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    // load heads from Q to shared memory
+    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+
+        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+
+        for (short i = tiisg; i < DK4; i += NW) {
+            if (iq1 + j < args.ne01) {
+                sq4[j*DK4 + i] = (half4) q4[i];
+            } else {
+                sq4[j*DK4 + i] = 0;
+            }
+        }
+    }
+
+    // zero out
+    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+
+        for (short i = tiisg; i < DV4; i += NW) {
+            so4[j*PV4 + i] = 0;
+        }
+
+        for (short i = tiisg; i < SH; i += NW) {
+            ss[j*SH + i] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ] = { [0 ... NQ-1] = 0.0f };
+
+    {
+        float M[NQ] = { [0 ... NQ-1] = -FLT_MAX/2 };
+
+        const float slope = 1.0f;
+        (void) slope;
+
+        for (int ic0 = 0; ; ++ic0) {
+            int ic = ic0*C;
+            if (ic >= args.ne11) {
+                break;
+            }
+
+            if (HAS_KVPAD && ic + C > args.ne11) {
+                k    = pad;
+                v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+                const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+                const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+                k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+                v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+                if (!HAS_MASK) {
+                    threadgroup half * sm = (threadgroup half *) (sm2);
+
+                    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        for (short i = tiisg; i < C; i += NW) {
+                            if (ic + i >= args.ne11) {
+                                sm[2*j*SH + i] = -FA_MAXHALF;
+                            }
+                        }
+                    }
+                } else {
+                    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        pm2[jj] = (device const half2 *) ((device const half *) mask +
+                                (iq1 + j)*C +
+                                (iq2%args.ne32)*(C*args.ne31) +
+                                (iq3%args.ne33)*(C*args.ne31*args.ne32));
+                    }
+                }
+
+                ic = 0;
+            }
+
+            char blk_cur = 1;
+
+            if (HAS_MASK) {
+                blk_cur = blk[ic0];
+
+                if (blk_cur == 0) {
+                    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+                        pm2[jj] += NW;
+                    }
+
+                    continue;
+                }
+
+                if (blk_cur == 1) {
+                    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        if (BC_MASK) {
+                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-FA_MAXHALF, -FA_MAXHALF);
+                        } else {
+                            sm2[j*SH + tiisg] = pm2[jj][tiisg];
+                        }
+
+                        pm2[jj] += NW;
+                    }
+                } else if (blk_cur == 2) {
+                    FA_FOR (short jj = 0; jj < NQ; ++jj) {
+                        pm2[jj] += NW;
+                    }
+                }
+            }
+
+            // Q*K^T — прямое чтение f16 KV (is_same-ветка оракала)
+            {
+                device      const half * pk = (device const half *) (k + ic*args.nb11);
+                threadgroup const half * pq = sq;
+                threadgroup       float* ps = ss;
+
+                pk += sgitg*(8*NS10);
+                ps += sgitg*(8*1);
+
+                static_assert((C/8) % NSG == 0, "");
+
+                constexpr short NC = (C/8)/NSG;
+
+                FA_FOR (short cc = 0; cc < NC; ++cc) {
+                    simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+                    simdgroup_half8x8 mk[2];
+                    simdgroup_half8x8 mq[2];
+
+                    // note: too much unroll can tank the performance for large heads
+                    #pragma unroll (FA_MIN(DK8/2, 4*NSG))
+                    for (short i = 0; i < DK8/2; ++i) {
+                        simdgroup_barrier(mem_flags::mem_none);
+
+                        simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+                        simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+
+                        simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
+                        simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
+
+                        simdgroup_barrier(mem_flags::mem_none);
+
+                        simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
+                        simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+                    }
+
+                    simdgroup_store(mqk, ps, SH, 0, false);
+
+                    pk += 8*(NSG*NS10);
+                    ps += 8*(NSG);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // online softmax
+            FA_FOR (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+
+                const float m = M[jj];
+
+                float2 s2 = ss2[j*SH/2 + tiisg]*args.scale;
+
+                if (blk_cur != 2) {
+                    s2 += float2(sm2[j*SH + tiisg]);
+                }
+
+                M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
+
+                const float  ms  = exp(m  - M[jj]);
+                const float2 vs2 = exp(s2 - M[jj]);
+
+                S[jj] = S[jj]*ms + simd_sum(vs2[0] + vs2[1]);
+
+                ss2[j*SH/2 + tiisg] = vs2;
+
+                if (DV4 % NW == 0) {
+                    FA_FOR (short ii = 0; ii < DV4/NW; ++ii) {
+                        const short i = ii*NW + tiisg;
+
+                        so4[j*PV4 + i] *= ms;
+                    }
+                } else {
+                    for (short i = tiisg; i < DV4; i += NW) {
+                        so4[j*PV4 + i] *= ms;
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // O = O + (Q*K^T)*V — прямое чтение f16 V
+            {
+                static_assert(PV8 % NSG == 0, "");
+
+                constexpr short NO = PV8/NSG;
+
+                simdgroup_float8x8 lo[NO];
+
+                {
+                    auto sot = so + 8*sgitg;
+
+                    FA_FOR (short ii = 0; ii < NO; ++ii) {
+                        simdgroup_load(lo[ii], sot, PV, 0, false);
+
+                        sot += 8*NSG;
+                    }
+                }
+
+                {
+                    device const half * pv = (device const half *) (v + ic*args.nb21);
+
+                    pv += 8*sgitg;
+
+                    if (DV <= 64) {
+                        FA_FOR (short cc = 0; cc < C/8; ++cc) {
+                            simdgroup_float8x8 vs;
+                            simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+
+                            FA_FOR (short ii = 0; ii < NO/2; ++ii) {
+                                simdgroup_half8x8 mv[2];
+
+                                simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
+                                simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
+
+                                simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
+                                simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
+                            }
+
+                            pv  += 8*NS20;
+                        }
+                    } else {
+                        constexpr short NC = (C/8)/2;
+
+                        FA_FOR (short cc = 0; cc < NC; ++cc) {
+                            simdgroup_float8x8 vs[2];
+
+                            simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
+                            simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+
+                            FA_FOR (short ii = 0; ii < NO/2; ++ii) {
+                                simdgroup_half8x8 mv[4];
+
+                                simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                                simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+
+                                simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+                                simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+                                simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+                                simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                            }
+
+                            pv  += 2*8*NS20;
+                        }
+                    }
+                }
+
+                {
+                    auto sot = so + 8*sgitg;
+
+                    FA_FOR (short ii = 0; ii < NO; ++ii) {
+                        simdgroup_store(lo[ii], sot, PV, 0, false);
+
+                        sot += 8*NSG;
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // store to global memory
+    for (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        if (iq1 + j >= args.ne01) {
+            break;
+        }
+
+        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
+
+        const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
+
+        if (DV4 % NW == 0) {
+            FA_FOR (short ii = 0; ii < DV4/NW; ++ii) {
+                const short i = ii*NW + tiisg;
+
+                dst4[i] = (float4) so4[j*PV4 + i]*scale;
+            }
+        } else {
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[i] = (float4) so4[j*PV4 + i]*scale;
+            }
+        }
+    }
+
+#undef NS10
+#undef NS20
+#undef NSG
+#undef Q
+#undef C
+}
+
+template [[host_name("fa_tile_dk128_mask")]]      kernel decltype(fa_tile<128, 128, true,  false, false>) fa_tile<128, 128, true,  false, false>;
+template [[host_name("fa_tile_dk128_mask_pad")]]  kernel decltype(fa_tile<128, 128, true,  true,  false>) fa_tile<128, 128, true,  true,  false>;
+template [[host_name("fa_tile_dk128_mask_bcm")]]      kernel decltype(fa_tile<128, 128, true,  false, true>) fa_tile<128, 128, true,  false, true>;
+template [[host_name("fa_tile_dk128_mask_pad_bcm")]]  kernel decltype(fa_tile<128, 128, true,  true,  true>) fa_tile<128, 128, true,  true,  true>;
+template [[host_name("fa_tile_dk64_mask")]]       kernel decltype(fa_tile<64, 64, true,  false, false>) fa_tile<64, 64, true,  false, false>;
+template [[host_name("fa_tile_dk64_mask_pad")]]   kernel decltype(fa_tile<64, 64, true,  true,  false>) fa_tile<64, 64, true,  true,  false>;
+template [[host_name("fa_tile_dk64_mask_bcm")]]       kernel decltype(fa_tile<64, 64, true,  false, true>) fa_tile<64, 64, true,  false, true>;
+template [[host_name("fa_tile_dk64_mask_pad_bcm")]]   kernel decltype(fa_tile<64, 64, true,  true,  true>) fa_tile<64, 64, true,  true,  true>;

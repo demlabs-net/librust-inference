@@ -3312,6 +3312,265 @@ impl MetalCtx {
         Ok(())
     }
 
+    /// Ф8.1f: побитов путь эталонного FA TILE (kernel_flash_attn_ext_{blk,pad}
+    /// + kernel_flash_attn_ext, Q=8, C=64, NSG=4, f16 KV, dense-маска).
+    /// Оркал берёт его при ne01 >= 20. Требует маску (наши префиллы её имеют).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_fa_tile_f16(
+        &self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        mask: Option<&GpuTensor>,
+        y: &GpuTensor,
+        n_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        tq: usize,
+        tkv: usize,
+    ) -> Result<(), MetalError> {
+        #[repr(C)]
+        struct FaTileArgs {
+            ne01: i32,
+            ne02: i32,
+            ne03: i32,
+            nb01: u64,
+            nb02: u64,
+            nb03: u64,
+            ne11: i32,
+            ne_12_2: i32,
+            ne_12_3: i32,
+            ns10: i32,
+            nb11: u64,
+            nb12: u64,
+            nb13: u64,
+            ns20: i32,
+            nb21: u64,
+            nb22: u64,
+            nb23: u64,
+            ne31: i32,
+            ne32: i32,
+            ne33: i32,
+            nb31: u64,
+            nb32: u64,
+            nb33: u64,
+            ne1: i32,
+            ne2: i32,
+            ne3: i32,
+            scale: f32,
+        }
+        #[repr(C)]
+        struct FaPadArgs {
+            ne11: i32,
+            ne_12_2: i32,
+            ne_12_3: i32,
+            nb11: u64,
+            nb12: u64,
+            nb13: u64,
+            nb21: u64,
+            nb22: u64,
+            nb23: u64,
+            ne31: i32,
+            ne32: i32,
+            ne33: i32,
+            nb31: u64,
+            nb32: u64,
+            nb33: u64,
+        }
+        #[repr(C)]
+        struct FaBlkArgs {
+            ne01: i32,
+            ne30: i32,
+            ne31: i32,
+            ne32: i32,
+            ne33: i32,
+            nb31: u64,
+            nb32: u64,
+            nb33: u64,
+        }
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let qd = n_heads * hd;
+        let kd = kv_heads * hd;
+        let nb11 = (kd * 2) as u64;
+        let nb12 = (hd * 2) as u64;
+        let nb31 = (tkv * 2) as u64;
+        if std::env::var("INFER_FA_TILE_DEBUG").is_ok() {
+            eprintln!("fa_tile ENTER tq={tq} tkv={tkv} nh={n_heads} nkv={kv_heads} hd={hd} mask={}", mask.is_some());
+        }
+        if let Ok(path) = std::env::var("INFER_FA_TILE_DUMP") {
+            if !std::path::Path::new(&path).exists() {
+                use std::io::Write;
+                let qv = q.to_cpu_f32(self)?;
+                let kv = k.to_cpu_f16(self)?;
+                let vv = v.to_cpu_f16(self)?;
+                let mut f = std::fs::File::create(&path).unwrap();
+                let n = tq * n_heads * hd;
+                let kn = tkv * kv_heads * hd;
+                for x in &qv[..n] {
+                    f.write_all(&x.to_be_bytes()).unwrap();
+                }
+                for x in &kv[..kn] {
+                    f.write_all(&x.to_f32().to_be_bytes()).unwrap();
+                }
+                for x in &vv[..kn] {
+                    f.write_all(&x.to_f32().to_be_bytes()).unwrap();
+                }
+                eprintln!("fa_tile dumped to {path}");
+            }
+        }
+
+        let mask16 = match mask {
+            Some(m) => {
+                let n = tq * tkv;
+                let mt = GpuTensor::zeros_f16(&self.device, vec![n])?;
+                let n32 = n as u32;
+                self.run(
+                    "cvt_f32_f16",
+                    MTLSize::new(n as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                    |enc| {
+                        enc.set_buffer(0, Some(&m.buffer), m.offset as u64);
+                        enc.set_buffer(1, Some(&mt.buffer), mt.offset as u64);
+                        enc.set_bytes(2, 4, (&n32 as *const u32).cast());
+                    },
+                )?;
+                Some(mt)
+            }
+            None => None,
+        };
+        let dummy = q;
+
+        // pad хвостового чанка C=64
+        let has_kvpad = tkv % 64 != 0;
+        let pad = if has_kvpad {
+            let bytes = nb11 * 64 * kv_heads as u64 * 2 + 64 * tq as u64 * 2;
+            Some(GpuTensor::zeros(&self.device, vec![bytes.div_ceil(4) as usize])?)
+        } else {
+            None
+        };
+        if has_kvpad {
+            let p = pad.as_ref().unwrap();
+            let a = FaPadArgs {
+                ne11: tkv as i32,
+                ne_12_2: kv_heads as i32,
+                ne_12_3: 1,
+                nb11,
+                nb12,
+                nb13: nb12,
+                nb21: nb11,
+                nb22: nb12,
+                nb23: nb12,
+                ne31: tq as i32,
+                ne32: 1,
+                ne33: 1,
+                nb31,
+                nb32: (tq * tkv * 2) as u64,
+                nb33: (tq * tkv * 2) as u64,
+            };
+            // threadgroups (64, nkv, 1) × (32,1,1)
+            self.run(
+                "fa_tile_pad",
+                MTLSize::new(64 * 32, kv_heads as u64, 1),
+                MTLSize::new(32, 1, 1),
+                |enc| {
+                    enc.set_bytes(0, std::mem::size_of::<FaPadArgs>() as u64, (&a as *const FaPadArgs).cast());
+                    enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+                    enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+                    enc.set_buffer(3, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                    enc.set_buffer(4, Some(&p.buffer), p.offset as u64);
+                },
+            )?;
+        }
+
+        // скан блоков маски (0 = весь -INF, 1 = проверять, 2 = все нули)
+        let nblk1 = tq.div_ceil(8);
+        let nblk0 = tkv.div_ceil(64);
+        let blk = GpuTensor::zeros(&self.device, vec![(nblk1 * nblk0 * kv_heads).div_ceil(4)])?;
+        let ba = FaBlkArgs {
+            ne01: tq as i32,
+            ne30: tkv as i32,
+            ne31: tq as i32,
+            ne32: 1,
+            ne33: 1,
+            nb31,
+            nb32: (tq * tkv * 2) as u64,
+            nb33: (tq * tkv * 2) as u64,
+        };
+        self.run(
+            "fa_tile_blk",
+            MTLSize::new((nblk0 * 32) as u64, nblk1 as u64, 1),
+            MTLSize::new(32, 1, 1),
+            |enc| {
+                enc.set_bytes(0, std::mem::size_of::<FaBlkArgs>() as u64, (&ba as *const FaBlkArgs).cast());
+                enc.set_buffer(1, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(2, Some(&blk.buffer), blk.offset as u64);
+            },
+        )?;
+
+        let a = FaTileArgs {
+            ne01: tq as i32,
+            ne02: n_heads as i32,
+            ne03: 1,
+            nb01: (qd * 4) as u64,
+            nb02: (hd * 4) as u64,
+            nb03: (tq * qd * 4) as u64,
+            ne11: tkv as i32,
+            ne_12_2: kv_heads as i32,
+            ne_12_3: 1,
+            ns10: (nb11 / 2) as i32,
+            nb11,
+            nb12,
+            nb13: nb12,
+            ns20: (nb11 / 2) as i32,
+            nb21: nb11,
+            nb22: nb12,
+            nb23: nb12,
+            ne31: tq as i32,
+            ne32: 1,
+            ne33: 1,
+            nb31,
+            nb32: (tq * tkv * 2) as u64,
+            nb33: (tq * tkv * 2) as u64,
+            ne1: n_heads as i32,
+            ne2: tq as i32,
+            ne3: 1,
+            scale,
+        };
+        let bcm = tq % 8 != 0;
+        let name = match (hd, has_kvpad, bcm) {
+            (128, true, true) => "fa_tile_dk128_mask_pad_bcm",
+            (128, true, false) => "fa_tile_dk128_mask_pad",
+            (128, false, true) => "fa_tile_dk128_mask_bcm",
+            (128, false, false) => "fa_tile_dk128_mask",
+            (64, true, true) => "fa_tile_dk64_mask_pad_bcm",
+            (64, true, false) => "fa_tile_dk64_mask_pad",
+            (64, false, true) => "fa_tile_dk64_mask_bcm",
+            _ => "fa_tile_dk64_mask",
+        };
+        // FATTN_SMEM: PAD2(Q*(DK + 2*PAD2(DV,64) + 4*C) * 2, 16)
+        let pv = (hd.max(64) + 63) / 64 * 64;
+        let smem = ((8 * (hd + 2 * pv + 4 * 64) * 2) + 15) / 16 * 16;
+        self.run(
+            name,
+            MTLSize::new((nblk1 * 128) as u64, n_heads as u64, 1),
+            MTLSize::new(128, 1, 1),
+            |enc| {
+                enc.set_bytes(0, std::mem::size_of::<FaTileArgs>() as u64, (&a as *const FaTileArgs).cast());
+                enc.set_buffer(1, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(2, Some(&k.buffer), k.offset as u64);
+                enc.set_buffer(3, Some(&v.buffer), v.offset as u64);
+                enc.set_buffer(4, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(5, Some(&q.buffer), q.offset as u64);
+                enc.set_buffer(6, Some(&pad.as_ref().unwrap_or(dummy).buffer), pad.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(7, Some(&blk.buffer), blk.offset as u64);
+                enc.set_buffer(8, Some(&y.buffer), y.offset as u64);
+                enc.set_threadgroup_memory_length(0, smem as u64);
+            },
+        )?;
+        Ok(())
+    }
+
     fn attn_ar_f16(
         &self,
         q: &GpuTensor,
@@ -3362,6 +3621,17 @@ impl MetalCtx {
             && std::env::var("INFER_NO_FA_VEC").is_err()
         {
             return self.attn_fa_vec_f16(q, k, v, mask, y, n_heads, kv_heads, hd, tq, tkv);
+        }
+        // Ф8.1f: tile-путь (побитовый порт kernel_flash_attn_ext) — оркал
+        // берёт его при ne01 >= 20. Требует маску (префиллы её имеют) и
+        // hd ∈ {64,128}. Фоллбэк INFER_NO_FA_TILE=1 — прежний mma-путь.
+        if b == 1
+            && tq >= 20
+            && mask.is_some()
+            && (hd == 64 || hd == 128)
+            && std::env::var("INFER_NO_FA_TILE").is_err()
+        {
+            return self.attn_fa_tile_f16(q, k, v, mask, y, n_heads, kv_heads, hd, tq, tkv);
         }
         // Предфилл: half×half матричные блоки (16 запросов/threadgroup).
         // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел).

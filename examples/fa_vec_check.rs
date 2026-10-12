@@ -7,8 +7,12 @@ use rust_inference::metal::MetalBackend;
 
 fn main() {
     let be = MetalBackend::new().unwrap();
-    let (tq, nh, nkv, hd) = (13usize, 32usize, 2usize, 128usize);
-    let tkv = 13usize;
+    let tq: usize = std::env::var("FA_TQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(13);
+    let (nh, nkv, hd) = (32usize, 2usize, 128usize);
+    let tkv = tq;
     let mut q = vec![0f32; tq * nh * hd];
     let mut k = vec![half::f16::from_f32(0.0f32); tkv * nkv * hd];
     let mut v = vec![half::f16::from_f32(0.0f32); tkv * nkv * hd];

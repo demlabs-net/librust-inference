@@ -238,6 +238,14 @@ impl BufferPoolState {
     fn push(&self, buf: &Buffer) {
         if batch_depth() > 0 {
             DEFERRED.with(|d| d.borrow_mut().push(buf.clone()));
+            DEFERRED_BYTES.with(|b| b.set(b.get() + buf.length() as usize));
+            // Давление: один длинный префилл освобождает сотни мегабайт за
+            // слой, а end_batch будет только в конце — без сброса машина
+            // уходит в своп (watchdog-паника 2026-10-12). Commit+wait +
+            // возврат в пул прямо сейчас.
+            if DEFERRED_BYTES.with(|b| b.get()) > deferred_cap_bytes() {
+                drain_deferred_now();
+            }
             return;
         }
         let class = (buf.length() as usize + 4095) & !4095;
@@ -276,6 +284,54 @@ thread_local! {
     /// Буферы, освобождённые внутри batch — возвращаются в пул после
     /// закрытия последнего batch (все command buffers выполнены, wait сделан).
     static DEFERRED: RefCell<Vec<Buffer>> = const { RefCell::new(Vec::new()) };
+
+    /// Байты в DEFERRED (для сброса по давлению — см. BufferPoolState::push).
+    static DEFERRED_BYTES: Cell<usize> = const { Cell::new(0) };
+
+    /// Batch-состояние текущего потока (ставится в begin_batch): нужно,
+    /// чтобы push() мог сделать commit+wait и вернуть DEFERRED в пул, не
+    /// дожидаясь end_batch — иначе один длинный префилл копит гигабайты
+    /// живых command-buffer'ом занятых буферов и уводит машину в своп
+    /// (watchdog-паника 2026-10-12 на префилле 4k).
+    static BATCH_BS: RefCell<Option<Arc<Mutex<BatchState>>>> = const { RefCell::new(None) };
+}
+
+/// Предел DEFERRED до принудительного commit+wait-слияния (МБ).
+fn deferred_cap_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("INFER_METAL_DEFERRED_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1536)
+            * 1024
+            * 1024
+    })
+}
+
+/// commit+wait открытого батча и возврат DEFERRED в пул. Вызывается из
+/// push() по давлению и из end_batch. try_lock: если батч держит другой
+/// фрейм — пропустить (попробуем на следующем push).
+fn drain_deferred_now() {
+    let bs = BATCH_BS.with(|c| c.borrow().clone());
+    let Some(bs) = bs else { return };
+    let Ok(mut batch) = bs.try_lock() else { return };
+    if batch.depth == 0 {
+        return;
+    }
+    batch.commit_open();
+    batch.wait_last();
+    drop(batch);
+    let deferred = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    DEFERRED_BYTES.with(|b| b.set(0));
+    with_pool(|p| {
+        let mut free = p.free.lock().unwrap();
+        for buf in deferred {
+            let class = (buf.length() as usize + 4095) & !4095;
+            let class = class.max(4096);
+            p.put_free(&mut free, class, buf);
+        }
+    });
 }
 
 fn with_pool<R>(f: impl FnOnce(&BufferPoolState) -> R) -> R {
@@ -611,7 +667,7 @@ pub struct MetalCtx {
     /// whole window this way — per-op sync made a wake window (~60 small
     /// ops) cost ~97 ms against an 80 ms real-time budget, so the engine
     /// fell behind the mic and the wake word never fired live.
-    batch: Mutex<BatchState>,
+    batch: Arc<Mutex<BatchState>>,
 }
 
 #[derive(Default)]
@@ -686,7 +742,7 @@ impl MetalCtx {
             queue,
             pipelines: Mutex::new(HashMap::new()),
             library: OnceLock::new(),
-            batch: Mutex::new(BatchState::default()),
+            batch: Arc::new(Mutex::new(BatchState::default())),
         };
         // Compile the whole kernel library once; pipelines are built lazily
         // and cached.
@@ -876,7 +932,9 @@ impl MetalCtx {
         let mut batch = self.batch.lock().unwrap();
         batch.depth += 1;
         batch.enters += 1;
+        drop(batch);
         BATCH_DEPTH.with(|d| d.set(d.get() + 1));
+        BATCH_BS.with(|c| *c.borrow_mut() = Some(self.batch.clone()));
     }
 
     /// How many batches were opened since the context was created
@@ -901,6 +959,7 @@ impl MetalCtx {
             // (см. BufferPoolState::push).
             if batch_depth() == 0 {
                 let deferred = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+                DEFERRED_BYTES.with(|b| b.set(0));
                 with_pool(|p| {
                     let mut free = p.free.lock().unwrap();
                     for buf in deferred {
@@ -3036,11 +3095,84 @@ impl MetalCtx {
 
     /// y (B,Tq,H*HD). Mask (B,Tq,Tkv) or None (generation, causal).
     #[allow(clippy::too_many_arguments)]
+    /// pipeline() требует &'static str (кэш по имени); имена tuned-vec
+    /// собираются из частей — интерним уникальные строки (набор конечен:
+    /// 18 баз × 4 суффикса, утечка ограничена этим).
+    fn static_kernel_name(name: String) -> &'static str {
+        static CACHE: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> =
+            OnceLock::new();
+        let m = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut g = m.lock().unwrap();
+        if let Some(s) = g.get(&name) {
+            return *s;
+        }
+        let s: &'static str = Box::leak(name.clone().into_boxed_str());
+        g.insert(name, s);
+        s
+    }
+
+    /// Точная копия ggml_metal_tuning::fa_vec_pick для SKU M3 Max и f16 KV
+    /// (строки таблицы ggml-metal-tuning.cpp: device M3_MAX, type F16).
+    /// ne11 < 1024 → baseline; далее exact-бакет (ne11_b, ne01_b) → domain
+    /// default (ne11_b = −1, decode/batch) → baseline. Бакеты:
+    /// ne11 ∈ {1024, 4096, 16384}, ne01 ∈ {2, 3, 4, 5}.
+    fn fa_vec_pick(dk: usize, dv: usize, ne11: usize, ne01: usize) -> (usize, usize) {
+        let baseline_ne: usize = match (dk, dv) {
+            (64, 64) => 2,
+            (128, 128) => 1,
+            (256, 256) => 1,
+            _ => 4,
+        };
+        let ne11_b = if ne11 < 1024 {
+            0
+        } else if ne11 < 4096 {
+            1
+        } else if ne11 < 16384 {
+            2
+        } else {
+            3
+        };
+        if ne11_b == 0 {
+            return (1, baseline_ne);
+        }
+        let ne01_b = if ne01 < 2 {
+            0
+        } else if ne01 < 3 {
+            1
+        } else if ne01 < 4 {
+            2
+        } else if ne01 < 5 {
+            3
+        } else {
+            4
+        };
+        let exact = match (dk as i32, dv as i32, ne11_b, ne01_b) {
+            (128, 128, 1, 4) => Some((1, 1)),
+            (128, 128, 2, 4) => Some((1, 1)),
+            (64, 64, 2, 0) => Some((1, 4)),
+            (64, 64, 1, 2) => Some((1, 2)),
+            (64, 64, 2, 2) => Some((1, 4)),
+            (64, 64, 3, 1) => Some((1, 4)),
+            (64, 64, 3, 2) => Some((4, 4)),
+            _ => None,
+        };
+        if let Some(q) = exact {
+            return q;
+        }
+        let domain = if ne01_b == 0 { 0 } else { 1 };
+        match (dk as i32, dv as i32, domain) {
+            (128, 128, 1) => (2, 2),
+            (64, 64, 1) => (2, 4),
+            _ => (1, baseline_ne),
+        }
+    }
+
     /// Внимание по f16-кэшу (Ф8.2f). Требует f16 у всех трёх входов: fused
     /// `qkv_norm_rope_kv` пишет Q сразу в half, поэтому смешанных форматов
     /// на этом пути нет (не-fused ветки модель для f16-кэша не выбирает).
     /// Ф8.1c: побитов путь эталонного FA VEC (pad → vec → reduce) для f16 KV,
-    /// hd ∈ {64,128}, ne01 < 20, ne11 < 1024 (baseline Q=1/NE оркала).
+    /// hd ∈ {64,128}, ne01 < 20. Ф8.1g: tuned Q/NE по таблице M3 Max при
+    /// ne11 ≥ 1024 + nsg ∈ {1,2,4} от ne11 (ggml-metal-ops.cpp).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_fa_vec_f16(
         &self,
@@ -3161,6 +3293,20 @@ impl MetalCtx {
                     &kv[kd..kd + 4]
                 );
             }
+            if let Ok(path) = std::env::var("INFER_FA_VEC_DUMP_DEC") {
+                // дамп входов ШАГА ДЕКОДА (tq==1), первый вызов
+                if tq == 1 && !std::path::Path::new(&path).exists() {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(&path).unwrap();
+                    let n = tq * n_heads * hd;
+                    let kn = tkv * kv_heads * hd;
+                    for x in &qv[..n] { f.write_all(&x.to_le_bytes()).unwrap(); }
+                    let kvv = v.to_cpu_f16(self)?;
+                    for x in &kv[..kn] { f.write_all(&x.to_f32().to_le_bytes()).unwrap(); }
+                    for x in &kvv[..kn] { f.write_all(&x.to_f32().to_le_bytes()).unwrap(); }
+                    eprintln!("  fa_vec DEC dumped tkv={tkv}");
+                }
+            }
             if let Ok(path) = std::env::var("INFER_FA_VEC_DUMP") {
                 // только слой 0 (первый вызов)
                 if !std::path::Path::new(&path).exists() {
@@ -3269,21 +3415,53 @@ impl MetalCtx {
             ne3: 1,
             scale,
         };
-        let name = match (hd, mask.is_some(), has_kvpad) {
-            (128, true, true) => "fa_vec_dk128_mask_pad",
-            (128, true, false) => "fa_vec_dk128_mask",
-            (128, false, true) => "fa_vec_dk128_pad",
-            (128, false, false) => "fa_vec_dk128",
-            (64, true, true) => "fa_vec_dk64_mask_pad",
-            (64, true, false) => "fa_vec_dk64_mask",
-            (64, false, true) => "fa_vec_dk64_pad",
-            _ => "fa_vec_dk64",
+        // Ф8.1g: tuned Q/NE (таблица M3 Max) + nsg от ne11 — ровно как оркал:
+        // nsg = 1 при ne11 < 2048, 2 при < 4096, иначе 4; grid.x = ⌈ne01/Q⌉
+        // threadgroup'ов по 32*nsg потоков.
+        let (q_q, q_ne) = Self::fa_vec_pick(hd, hd, tkv, tq);
+        let nsg = if tkv < 2048 { 1 } else if tkv < 4096 { 2 } else { 4 };
+        let base = match (hd, q_q, q_ne, nsg) {
+            (128, 1, 1, 1) => "fa_vec_dk128",
+            (128, 1, 1, 2) => "fa_vec_dk128_q1ne1_nsg2",
+            (128, 1, 1, 4) => "fa_vec_dk128_q1ne1_nsg4",
+            (128, 2, 2, 1) => "fa_vec_dk128_q2ne2",
+            (128, 2, 2, 2) => "fa_vec_dk128_q2ne2_nsg2",
+            (128, 2, 2, 4) => "fa_vec_dk128_q2ne2_nsg4",
+            (64, 1, 2, 1) => "fa_vec_dk64",
+            (64, 1, 2, 2) => "fa_vec_dk64_q1ne2_nsg2",
+            (64, 1, 2, 4) => "fa_vec_dk64_q1ne2_nsg4",
+            (64, 1, 4, 1) => "fa_vec_dk64_q1ne4",
+            (64, 1, 4, 2) => "fa_vec_dk64_q1ne4_nsg2",
+            (64, 1, 4, 4) => "fa_vec_dk64_q1ne4_nsg4",
+            (64, 2, 4, 1) => "fa_vec_dk64_q2ne4",
+            (64, 2, 4, 2) => "fa_vec_dk64_q2ne4_nsg2",
+            (64, 2, 4, 4) => "fa_vec_dk64_q2ne4_nsg4",
+            (64, 4, 4, 1) => "fa_vec_dk64_q4ne4",
+            (64, 4, 4, 2) => "fa_vec_dk64_q4ne4_nsg2",
+            (64, 4, 4, 4) => "fa_vec_dk64_q4ne4_nsg4",
+            _ => {
+                return Err(MetalError::Shape(format!(
+                    "fa_vec: нет инстанциации Q={q_q} NE={q_ne} nsg={nsg} hd={hd}"
+                )))
+            }
         };
-        let smem = (((hd.max(128) + 4 * 32 + 2 * hd.max(128)) * 2) + 15) / 16 * 16;
+        let name = Self::static_kernel_name(format!(
+            "{}{}{}",
+            base,
+            if mask.is_some() { "_mask" } else { "" },
+            if has_kvpad { "_pad" } else { "" }
+        ));
+        let smem = (((hd.max(128) + 4 * 32 + 2 * hd.max(128)) * nsg * q_q * 2) + 15) / 16 * 16;
+        if std::env::var("INFER_FA_VEC_ARGS").is_ok() {
+            eprintln!("fa_vec ARGS name={name} smem={smem} grid=({},{},{}) q.off={} k.off={} v.off={} \
+                nb01={} nb02={} nb11={} nb12={} ns10={} nb31={} ne31={} scale={:08x}",
+                ((tq + q_q - 1) / q_q * 32 * nsg), n_heads, 32, q.offset, k.offset, v.offset,
+                a.nb01, a.nb02, a.nb11, a.nb12, a.ns10, a.nb31, a.ne31, a.scale.to_bits());
+        }
         self.run(
             name,
-            MTLSize::new((tq * 32) as u64, n_heads as u64, 32),
-            MTLSize::new(32, 1, 1),
+            MTLSize::new(((tq + q_q - 1) / q_q * 32 * nsg) as u64, n_heads as u64, 32),
+            MTLSize::new((32 * nsg) as u64, 1, 1),
             |enc| {
                 enc.set_bytes(0, std::mem::size_of::<FaVecArgs>() as u64, (&a as *const FaVecArgs).cast());
                 enc.set_buffer(1, Some(&q.buffer), q.offset as u64);
@@ -3609,14 +3787,13 @@ impl MetalCtx {
         }
         // Ф8.1c: побитово воспроизведённый эталонный FA VEC (fa.metal
         // kernel_flash_attn_ext_{pad,vec,vec_reduce}). Оркал берёт его при
-        // ne01 < 20 && ne00 % 32 == 0; при ne11 < 1024 тюнинг fa_vec_pick
-        // даёт baseline Q=1, NE=baseline_ne (128→1, 64→2) — наш порт именно
-        // его. При ne11 ≥ 1024 оркал может выбрать tuned Q/NE — этот случай
-        // остаётся прежнему пути (паритет длинного KV — отдельная задача).
+        // ne01 < 20 && ne00 % 32 == 0 — без ограничения на ne11: при
+        // ne11 < 1024 тюнинг fa_vec_pick даёт baseline Q=1, NE=baseline_ne
+        // (128→1, 64→2), при ne11 ≥ 1024 — tuned Q/NE из таблицы SKU
+        // (Ф8.1g, M3 Max) плюс nsg ∈ {1,2,4} от ne11.
         // Фоллбэк INFER_NO_FA_VEC=1.
         if b == 1
             && tq <= 19
-            && tkv < 1024
             && (hd == 64 || hd == 128)
             && std::env::var("INFER_NO_FA_VEC").is_err()
         {

@@ -26,6 +26,9 @@ use crate::inference::generate::CausalLm;
 use crate::nn::{KvCache, Linear, RmsNorm, SwiGLU, build_causal_mask};
 use crate::weights_map::{WeightsMap, dequant_f32};
 
+/// Шаг текущего forward для GLM4_DUMP (0 = префилл, 1 = декод).
+static DUMP_STEP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Конфигурация GLM-4.
 #[derive(Debug, Clone)]
 pub struct Glm4Config {
@@ -337,6 +340,14 @@ impl Glm4Model {
     }
 
     fn dump(backend: &dyn Backend, path: &str, name: &str, x: &Tensor) -> Result<(), BackendError> {
+        let step = DUMP_STEP.load(std::sync::atomic::Ordering::Relaxed);
+        // GLM4_DUMP_WATCH — фильтр подстрок (через запятую): на длинном m
+        // полный дамп 321 чекпоинта это гигабайты; бисект пишет только нужное.
+        if let Ok(w) = std::env::var("GLM4_DUMP_WATCH") {
+            if !w.split(',').any(|s| !s.is_empty() && name.contains(s)) {
+                return Ok(());
+            }
+        }
         let v = backend.to_cpu_f32(&x.view_restricted(vec![x.numel()]))?;
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -344,7 +355,7 @@ impl Glm4Model {
             .append(true)
             .open(path)
             .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
-        writeln!(f, "STEP 0 TENSOR {name} ne=[{},1,1,1]", v.len())
+        writeln!(f, "STEP {step} TENSOR {name} ne=[{},1,1,1]", v.len())
             .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
         for (i, val) in v.iter().enumerate() {
             write!(f, "{:08x}{}", val.to_bits(), if i % 8 == 7 { "\n" } else { " " })
@@ -378,8 +389,16 @@ impl Glm4Model {
     ) -> Result<Tensor, BackendError> {
         let t = ids.len();
         let pos = self.caches[0].pos;
-        // Дамп чекпоинтов — только первого forward (шаг 0 эталона).
-        let dump = Self::dump_path().filter(|_| pos == 0);
+        // Дамп чекпоинтов — только первого forward (шаг 0 эталона);
+        // GLM4_DUMP_DECODE=1 добавляет шаг декода (STEP 1) — бисект Ф8.1g.
+                DUMP_STEP.store(if pos == 0 { 0 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        let dump = Self::dump_path().filter(|_| {
+            if std::env::var("GLM4_DUMP_DECODE").is_ok() {
+                pos > 0
+            } else {
+                pos == 0
+            }
+        });
         let t_state = pos;
         let (nh, nkv, hd, dim) = (
             self.cfg.n_heads,
@@ -467,6 +486,9 @@ impl Glm4Model {
             if i == 0 {
                 Self::dbg(backend, "q_rope", &q)?;
                 Self::dbg(backend, "k_rope", &k)?;
+            }
+            if let Some(p) = &dump {
+                Self::dump(backend, p, "Kcur-0", &k)?;
             }
             self.caches[i].update(backend, &k, &v)?;
             if i == 0 && Self::dbg_on() {

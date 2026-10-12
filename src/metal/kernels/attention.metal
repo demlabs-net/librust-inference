@@ -1611,6 +1611,12 @@ template [[host_name("attn_prefill_mma_f16_nf32")]] kernel attn_prefill_mma_f16_
 
 #define FA_MAXHALF ((half)65504.0f)
 
+// оркальский FOR_UNROLL: полному развороту циклов КРИТИЧЕСКИ важно —
+// без него Metal-компилятор даёт ДРУГОЕ округление накоплений (Ф8.1g:
+// много-чанговый vec расходился на единицу ulp именно из-за `for` вместо
+// `FOR_UNROLL`)
+#define FA_FOR(x) _Pragma("clang loop unroll(full)") for (x)
+
 struct fa_vec_args {
     int   ne01;   // число запросов (tq)
     int   ne02;   // число голов Q (nh)
@@ -1722,7 +1728,10 @@ kernel void fa_pad_k(
 }
 
 // ── vec: онлайн-softmax по чанкам C=32 ключей, NWG=32 workgroup'ов делят KV ──
-template <short DK, short DV, short NE, bool HAS_MASK, bool HAS_KVPAD>
+// NE/Q — тюнинг fa_vec_pick (при ne11 >= 1024 оркал берёт tuned-инстанциации
+// из таблицы ggml-metal-tuning.cpp для своего SKU); NSG — от ne11:
+// nsg = 1 при ne11 < 2048, 2 при < 4096, иначе 4 (ggml-metal-ops.cpp).
+template <short DK, short DV, short NE, short Q, short NSG, bool HAS_MASK, bool HAS_KVPAD>
 kernel void fa_vec(
     constant fa_vec_args & args [[buffer(0)]],
     device const char * q [[buffer(1)]],
@@ -1738,7 +1747,6 @@ kernel void fa_vec(
     ushort  sgitg [[simdgroup_index_in_threadgroup]])
 {
 #define NWG  32
-#define NSG  1
 #define NS10 (args.ns10)
 #define NS20 (args.ns20)
 
@@ -1760,7 +1768,6 @@ kernel void fa_vec(
     constexpr short NW  = 32;
     // NE = fa_vec_baseline_ne(DK, DV): 128→1, 64→2
     constexpr short NL  = NW/NE;
-    constexpr short Q   = 1;   // baseline
     constexpr short C   = 32;  // OP_FLASH_ATTN_EXT_VEC_NCPSG
     constexpr short SH  = 4*Q*C;
 
@@ -1768,7 +1775,8 @@ kernel void fa_vec(
     threadgroup float  * ss  = (threadgroup float  *) (shmem_f16 +   sgitg*SH         + Q*NSG*PK);
     threadgroup float4 * ss4 = (threadgroup float4 *) (shmem_f16 +   sgitg*SH         + Q*NSG*PK);
     threadgroup half   * sm  = (threadgroup half   *) (shmem_f16 +   sgitg*SH + 2*Q*C + Q*NSG*PK);
-    threadgroup float4 * so4 = (threadgroup float4 *) (shmem_f16 + 2*sgitg*Q*PV4 + Q*NSG*PK + NSG*SH);
+    // оракул: 2*sgitg*Q*PV (шаг в half; so4 — float4 ⇒ шаг simdgroup = Q*PV4 float4)
+    threadgroup float4 * so4 = (threadgroup float4 *) (shmem_f16 + 2*sgitg*Q*PV + Q*NSG*PK + NSG*SH);
 
     so4 += tiisg;
 
@@ -1784,7 +1792,7 @@ kernel void fa_vec(
 
     // загрузка Q в shared (f32 → half4 — оркал ОКРУГЛЯЕТ Q до f16 здесь)
     {
-        for (short qq = 0; qq < Q; ++qq) {
+        FA_FOR (short qq = 0; qq < Q; ++qq) {
             const int iq1_q = iq1*Q + qq;
             device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
             if (iq1_q < args.ne01) {
@@ -1803,7 +1811,7 @@ kernel void fa_vec(
         }
     }
 
-    for (short qq = 0; qq < Q; ++qq) {
+    FA_FOR (short qq = 0; qq < Q; ++qq) {
         for (short i = 0; i < DV4/NL; ++i) {
             so4[qq*DV4 + i*NL] = (float4) 0.0f;
         }
@@ -1818,7 +1826,7 @@ kernel void fa_vec(
     {
         float S[Q];
         float M[Q];
-        for (short qq = 0; qq < Q; ++qq) {
+        FA_FOR (short qq = 0; qq < Q; ++qq) {
             S[qq] = 0.0f;
             M[qq] = -FLT_MAX/2;
         }
@@ -1835,7 +1843,7 @@ kernel void fa_vec(
             }
 
             device const half * pm[Q];
-            for (short qq = 0; qq < Q; ++qq) {
+            FA_FOR (short qq = 0; qq < Q; ++qq) {
                 pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
             }
 
@@ -1851,13 +1859,13 @@ kernel void fa_vec(
                 v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
 
                 if (!HAS_MASK) {
-                    for (short qq = 0; qq < Q; ++qq) {
+                    FA_FOR (short qq = 0; qq < Q; ++qq) {
                         if (ic + tiisg >= args.ne11) {
                             sm[qq*C + tiisg] = -FA_MAXHALF;
                         }
                     }
                 } else {
-                    for (short qq = 0; qq < Q; ++qq) {
+                    FA_FOR (short qq = 0; qq < Q; ++qq) {
                         pm[qq] = (device const half *) (mask) +
                             (iq1*Q + qq)*C +
                             (iq2%args.ne32)*(C*args.ne31) +
@@ -1869,7 +1877,7 @@ kernel void fa_vec(
             }
 
             if (HAS_MASK) {
-                for (short qq = 0; qq < Q; ++qq) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
                     if ((iq1*Q + qq) < args.ne01) {
                         sm[qq*C + tiisg] = pm[qq][ic + tiisg];
                     } else {
@@ -1877,7 +1885,7 @@ kernel void fa_vec(
                     }
                 }
             } else {
-                for (short qq = 0; qq < Q; ++qq) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
                     if ((iq1*Q + qq) >= args.ne01) {
                         sm[qq*C + tiisg] = -FA_MAXHALF;
                     }
@@ -1887,7 +1895,7 @@ kernel void fa_vec(
             // skip -INF mask
             {
                 bool any_finite = false;
-                for (short qq = 0; qq < Q; ++qq) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
                     if (simd_max(sm[qq*C + tiisg]) > -FA_MAXHALF) {
                         any_finite = true;
                     }
@@ -1903,21 +1911,21 @@ kernel void fa_vec(
                 pk4 += ty*NS10/4 + tx;
 
                 float mqk[Q][C/NE];
-                for (short qq = 0; qq < Q; ++qq) {
-                    for (short cc = 0; cc < C/NE; ++cc) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
+                    FA_FOR (short cc = 0; cc < C/NE; ++cc) {
                         mqk[qq][cc] = 0.0f;
                     }
                 }
 
-                for (short cc = 0; cc < C/NE; ++cc) {
-                    for (short ii = 0; ii < DK4/NL; ++ii) {
+                FA_FOR (short cc = 0; cc < C/NE; ++cc) {
+                    FA_FOR (short ii = 0; ii < DK4/NL; ++ii) {
                         const half4 k_elem = pk4[cc*NE*NS10/4 + ii*NL];
-                        for (short qq = 0; qq < Q; ++qq) {
+                        FA_FOR (short qq = 0; qq < Q; ++qq) {
                             mqk[qq][cc] += dot((float4) k_elem, (float4) sq4[qq*PK4 + ii*NL + tx]);
                         }
                     }
 
-                    for (short qq = 0; qq < Q; ++qq) {
+                    FA_FOR (short qq = 0; qq < Q; ++qq) {
                         if (NE == 1) {
                             mqk[qq][cc] = simd_sum(mqk[qq][cc]);
                         } else {
@@ -1944,7 +1952,7 @@ kernel void fa_vec(
                     }
                 }
 
-                for (short qq = 0; qq < Q; ++qq) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
                     if (HAS_MASK) {
                         ss[qq*C + NE*tx + ty] = fma(mqk[qq][tx], args.scale, (float) sm[qq*C + NE*tx + ty]);
                     } else {
@@ -1959,7 +1967,7 @@ kernel void fa_vec(
 
             // online softmax
             {
-                for (short qq = 0; qq < Q; ++qq) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
                     const float m = M[qq];
                     const float s = ss[qq*C + tiisg];
 
@@ -1974,7 +1982,7 @@ kernel void fa_vec(
 
                     // O = diag(ms)*O
                     if ((DV4/NL % NW == 0) || ty == 0) {
-                        for (short ii = 0; ii < DV4/NL; ++ii) {
+                        FA_FOR (short ii = 0; ii < DV4/NL; ++ii) {
                             so4[qq*DV4 + ii*NL] *= ms;
                         }
                     }
@@ -1986,8 +1994,8 @@ kernel void fa_vec(
             // O = O + (Q*K^T)*V
             {
                 float4 lo[Q][DV4/NL];
-                for (short qq = 0; qq < Q; ++qq) {
-                    for (short ii = 0; ii < DV4/NL; ++ii) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
+                    FA_FOR (short ii = 0; ii < DV4/NL; ++ii) {
                         lo[qq][ii] = 0.0f;
                     }
                 }
@@ -1995,17 +2003,17 @@ kernel void fa_vec(
                 device const half4 * pv4 = (device const half4 *) (v + ic*args.nb21);
                 pv4 += ty*NS20/4 + tx;
 
-                for (short cc = 0; cc < C/NE; ++cc) {
-                    for (short ii = 0; ii < DV4/NL; ++ii) {
+                FA_FOR (short cc = 0; cc < C/NE; ++cc) {
+                    FA_FOR (short ii = 0; ii < DV4/NL; ++ii) {
                         const half4 v_elem = pv4[cc*NE*NS20/4 + ii*NL];
-                        for (short qq = 0; qq < Q; ++qq) {
+                        FA_FOR (short qq = 0; qq < Q; ++qq) {
                             lo[qq][ii] += float4(float4(v_elem)*float4(ss[qq*C + cc*NE + ty]));
                         }
                     }
                 }
 
-                for (short qq = 0; qq < Q; ++qq) {
-                    for (short ii = 0; ii < DV4/NL; ++ii) {
+                FA_FOR (short qq = 0; qq < Q; ++qq) {
+                    FA_FOR (short ii = 0; ii < DV4/NL; ++ii) {
                         if (NE > 1) {
                             lo[qq][ii][0] += simd_shuffle_down(lo[qq][ii][0], 16);
                             lo[qq][ii][1] += simd_shuffle_down(lo[qq][ii][1], 16);
@@ -2044,8 +2052,8 @@ kernel void fa_vec(
                 }
 
                 if ((DV4/NL % NW == 0) || ty == 0) {
-                    for (short qq = 0; qq < Q; ++qq) {
-                        for (short ii = 0; ii < DV4/NL; ++ii) {
+                    FA_FOR (short qq = 0; qq < Q; ++qq) {
+                        FA_FOR (short ii = 0; ii < DV4/NL; ++ii) {
                             so4[qq*DV4 + ii*NL] += lo[qq][ii];
                         }
                     }
@@ -2054,7 +2062,7 @@ kernel void fa_vec(
         }
 
         if (tiisg == 0) {
-            for (short qq = 0; qq < Q; ++qq) {
+            FA_FOR (short qq = 0; qq < Q; ++qq) {
                 ss[2*qq + 0] = S[qq];
                 ss[2*qq + 1] = M[qq];
             }
@@ -2065,7 +2073,37 @@ kernel void fa_vec(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // parallel reduce по simdgroup'ам: NSG == 1 → цикл не выполняется
+    // parallel reduce по simdgroup'ам (дословно оркал): NSG == 1 → не выполняется
+    for (short r = NSG/2; r > 0; r >>= 1) {
+        if (sgitg < r) {
+            FA_FOR (short qq = 0; qq < Q; ++qq) {
+                const float S0 = ss[                2*qq + 0];
+                const float S1 = ss[r*(SH/2) +      2*qq + 0];
+
+                const float M0 = ss[                2*qq + 1];
+                const float M1 = ss[r*(SH/2) +      2*qq + 1];
+
+                const float Mx  = max(M0, M1);
+
+                const float ms0 = exp(M0 - Mx);
+                const float ms1 = exp(M1 - Mx);
+
+                const float Sx  = S0*ms0 + S1*ms1;
+
+                if (tiisg == 0) {
+                    ss[2*qq + 0] = Sx;
+                    ss[2*qq + 1] = Mx;
+                }
+
+                // O_0 = diag(ms0)*O_0 + diag(ms1)*O_1
+                for (short i = tiisg; i < DV4; i += NW) {
+                    so4[qq*DV4 + i] = so4[qq*DV4 + i]*ms0 + so4[qq*DV4 + i + r*Q*PV4]*ms1;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     if (sgitg == 0) {
         const int64_t nrows = args.ne3*args.ne2*args.ne1;
@@ -2073,7 +2111,7 @@ kernel void fa_vec(
         device float4 * dst4 = (device float4 *) dst;
         device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
 
-        for (short qq = 0; qq < Q; ++qq) {
+        FA_FOR (short qq = 0; qq < Q; ++qq) {
             const int iq1_q = iq1*Q + qq;
             if (iq1_q >= args.ne01) {
                 continue;
@@ -2145,15 +2183,35 @@ kernel void fa_vec_reduce(
 #undef DV4
 }
 
-typedef decltype(fa_vec<128, 128, 1, true,  true>)  fa_vec_t;
-template [[host_name("fa_vec_dk128_mask_pad")]]   kernel fa_vec_t fa_vec<128, 128, 1, true,  true>;
-template [[host_name("fa_vec_dk128_mask")]]       kernel fa_vec_t fa_vec<128, 128, 1, true,  false>;
-template [[host_name("fa_vec_dk128_pad")]]        kernel fa_vec_t fa_vec<128, 128, 1, false, true>;
-template [[host_name("fa_vec_dk128")]]            kernel fa_vec_t fa_vec<128, 128, 1, false, false>;
-template [[host_name("fa_vec_dk64_mask_pad")]]    kernel decltype(fa_vec<64, 64, 2, true,  true>)  fa_vec<64, 64, 2, true,  true>;
-template [[host_name("fa_vec_dk64_mask")]]        kernel decltype(fa_vec<64, 64, 2, true,  false>) fa_vec<64, 64, 2, true,  false>;
-template [[host_name("fa_vec_dk64_pad")]]         kernel decltype(fa_vec<64, 64, 2, false, true>)  fa_vec<64, 64, 2, false, true>;
-template [[host_name("fa_vec_dk64")]]             kernel decltype(fa_vec<64, 64, 2, false, false>) fa_vec<64, 64, 2, false, false>;
+// Инстанциации vec: baseline (Q=1, NE=baseline_ne, nsg=1) + tuned-конфиги,
+// которые fa_vec_pick(M3 Max, F16) реально возвращает при ne11 >= 1024,
+// кратно nsg ∈ {1,2,4} (nsg = 1 при ne11<2048, 2 при <4096, иначе 4):
+//   dk128: (Q,NE) ∈ {(1,1), (2,2)}
+//   dk64:  (Q,NE) ∈ {(1,2), (1,4), (2,4), (4,4)}
+#define FA_VEC4(DK, NE, Q, NSG, BASE) \
+    template [[host_name(BASE "_mask_pad")]] kernel decltype(fa_vec<DK, DK, NE, Q, NSG, true, true>)   fa_vec<DK, DK, NE, Q, NSG, true, true>; \
+    template [[host_name(BASE "_mask")]]     kernel decltype(fa_vec<DK, DK, NE, Q, NSG, true, false>)  fa_vec<DK, DK, NE, Q, NSG, true, false>; \
+    template [[host_name(BASE "_pad")]]      kernel decltype(fa_vec<DK, DK, NE, Q, NSG, false, true>)  fa_vec<DK, DK, NE, Q, NSG, false, true>; \
+    template [[host_name(BASE)]]             kernel decltype(fa_vec<DK, DK, NE, Q, NSG, false, false>) fa_vec<DK, DK, NE, Q, NSG, false, false>;
+
+FA_VEC4(128, 1, 1, 1, "fa_vec_dk128")
+FA_VEC4(128, 1, 1, 2, "fa_vec_dk128_q1ne1_nsg2")
+FA_VEC4(128, 1, 1, 4, "fa_vec_dk128_q1ne1_nsg4")
+FA_VEC4(128, 2, 2, 1, "fa_vec_dk128_q2ne2")
+FA_VEC4(128, 2, 2, 2, "fa_vec_dk128_q2ne2_nsg2")
+FA_VEC4(128, 2, 2, 4, "fa_vec_dk128_q2ne2_nsg4")
+FA_VEC4(64, 2, 1, 1, "fa_vec_dk64")
+FA_VEC4(64, 2, 1, 2, "fa_vec_dk64_q1ne2_nsg2")
+FA_VEC4(64, 2, 1, 4, "fa_vec_dk64_q1ne2_nsg4")
+FA_VEC4(64, 4, 1, 1, "fa_vec_dk64_q1ne4")
+FA_VEC4(64, 4, 1, 2, "fa_vec_dk64_q1ne4_nsg2")
+FA_VEC4(64, 4, 1, 4, "fa_vec_dk64_q1ne4_nsg4")
+FA_VEC4(64, 4, 2, 1, "fa_vec_dk64_q2ne4")
+FA_VEC4(64, 4, 2, 2, "fa_vec_dk64_q2ne4_nsg2")
+FA_VEC4(64, 4, 2, 4, "fa_vec_dk64_q2ne4_nsg4")
+FA_VEC4(64, 4, 4, 1, "fa_vec_dk64_q4ne4")
+FA_VEC4(64, 4, 4, 2, "fa_vec_dk64_q4ne4_nsg2")
+FA_VEC4(64, 4, 4, 4, "fa_vec_dk64_q4ne4_nsg4")
 
 template [[host_name("fa_vec_reduce_dv128")]] kernel decltype(fa_vec_reduce<128>) fa_vec_reduce<128>;
 template [[host_name("fa_vec_reduce_dv64")]]  kernel decltype(fa_vec_reduce<64>)  fa_vec_reduce<64>;
@@ -2183,7 +2241,6 @@ kernel void cvt_f32_f16(
 // NKV*HD). Дословность формы IR обязательна (урок Ф8.1b).
 // ════════════════════════════════════════════════════════════════════════════
 
-#define FA_FOR(x) _Pragma("clang loop unroll(full)") for (x)
 #define FA_PAD2(x, n) (((x) + (n) - 1) & ~((n) - 1))
 #define FA_MIN(a, b) ((a) < (b) ? (a) : (b))
 

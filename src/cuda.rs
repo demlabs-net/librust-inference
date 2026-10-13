@@ -1932,15 +1932,21 @@ impl Backend for CudaBackend {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (_, cout, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
         let tout = (t - 1) * stride + k;
-        // Zero the output in place first (scatter with atomics accumulates).
-        self.stream.memset_zeros(y.as_cuda_mut()).map_err(map_err)?;
-        let n = b * t * cin;
+        // Детерминированный вариант (аудит 2026-10-13): поток на выход,
+        // аккумулятор в регистре, bias слит — без memset и без atomicAdd.
+        let n = b * tout * cout;
         let f = self.function("conv_transpose1d_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);
         la.arg(x.as_cuda());
         la.arg(w.as_cuda());
-        la.arg(x.as_cuda()); // dummy — the kernel never reads bias (separate pass)
+        let hb = bias.is_some() as i32;
+        if let Some(bi) = bias {
+            la.arg(bi.as_cuda());
+        } else {
+            la.arg(x.as_cuda()); // dummy — kernel guards via has_bias
+        }
+        la.arg(&hb);
         la.arg(y.as_cuda());
         let __a32 = b as i32;
         la.arg(&__a32);
@@ -1957,19 +1963,6 @@ impl Backend for CudaBackend {
         let __a38 = tout as i32;
         la.arg(&__a38);
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
-        if let Some(bi) = bias {
-            let nb = b * tout * cout;
-            let f = self.function("conv_transpose_bias_f32")?;
-            let cfg = LaunchConfig::for_num_elems(nb as u32);
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(y.as_cuda());
-            la.arg(bi.as_cuda());
-            let __a39 = nb as i32;
-            la.arg(&__a39);
-            let __a40 = cout as i32;
-            la.arg(&__a40);
-            unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
-        }
         Ok(())
     }
 

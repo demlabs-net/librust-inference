@@ -1255,10 +1255,17 @@ extern "C" __global__ void maxpool2d_f32(
 
 /// Transposed 1D conv (stride upsample): w (cin, cout, k), x (b, t, cin),
 /// y (b, (t-1)·stride + k, cout) — sparse scatter (matches the Metal kernel).
+/// Детерминированная транспонированная свёртка (candle-раскладка W[Cin,Cout,K]):
+/// поток на выход, аккумулятор в регистре, фиксированный порядок (k по
+/// возрастанию, внутри — ci) — та же схема, что у Metal conv_transpose1d_f32,
+/// так что два бэкенда совпадают и побитово. Прежний scatter через atomicAdd
+/// давал разные младшие биты на каждом прогоне (TTS-вокодер невоспроизводим,
+/// аудит 2026-10-13).
 extern "C" __global__ void conv_transpose1d_f32(
     const float* __restrict__ x,
     const float* __restrict__ w,
     const float* __restrict__ bias,
+    int has_bias,
     float* __restrict__ y,
     int b,
     int t,
@@ -1269,30 +1276,24 @@ extern "C" __global__ void conv_transpose1d_f32(
     int tout)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= b * t * cin) return;
-    int bi = i / (t * cin);
-    int rem = i % (t * cin);
-    int ti = rem / cin;
-    int ci = rem % cin;
-    float xv = x[i];
-    for (int co = 0; co < cout; ++co) {
-        for (int kk = 0; kk < k; ++kk) {
-            int to = ti * stride + kk;
-            atomicAdd(&y[(bi * tout + to) * cout + co], xv * w[(ci * cout + co) * k + kk]);
+    const int per = tout * cout;
+    if (i >= b * per) return;
+    const int bi = i / per;
+    const int rem = i % per;
+    const int n = rem / cout;
+    const int co = rem % cout;
+    float acc = has_bias ? bias[co] : 0.0f;
+    // k ≡ n (mod stride), k < K, m = (n - k)/stride in [0, T)
+    const int k0 = n % stride;
+    for (int kk = k0; kk < k; kk += stride) {
+        const int m = (n - kk) / stride;
+        if (m >= t) continue;
+        const float* xrow = x + (bi * t + m) * cin;
+        for (int ci = 0; ci < cin; ++ci) {
+            acc += xrow[ci] * w[(ci * cout + co) * k + kk];
         }
     }
-}
-
-/// bias add for transposed conv output (separate pass to avoid atomics on bias).
-extern "C" __global__ void conv_transpose_bias_f32(
-    float* __restrict__ y,
-    const float* __restrict__ bias,
-    int n,
-    int cout)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    y[i] += bias[i % cout];
+    y[i] = acc;
 }
 
 // ── fused attention ──────────────────────────────────────────────────────

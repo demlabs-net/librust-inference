@@ -638,13 +638,20 @@ impl DFlashModel {
             extract_layers,
             mask_token,
         )?;
-        // перезагрузить селектор с метаданными, если они есть
+        // перезагрузить селектор с метаданными, если они есть. Имена в
+        // z-lab GGUF — с суффиксом ".weight" (selector_predecessor.weight),
+        // в фикстурах/тестах — без; пробуем оба. Без этого селектор DFlash2
+        // молча не загружался, и драфтер шёл v1-аргмаксом (приёмка 32%
+        // против эталонных 68%).
+        let getw = |name: &str| -> Option<&crate::weights_map::WeightTensor<'_>> {
+            w.get(name).or_else(|| w.get(&format!("{name}.weight")))
+        };
         if let (Some(rank), Some(top_k), Some(_)) =
-            (sel_rank, sel_top_k, w.get("selector_predecessor"))
+            (sel_rank, sel_top_k, getw("selector_predecessor"))
         {
             let up_f32 = |name: &str, shape: Vec<usize>| -> Result<Tensor, BackendError> {
                 let f = dequant_f32(
-                    w.get(name)
+                    getw(name)
                         .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?,
                 );
                 backend.from_cpu_f32(&f, shape)
@@ -987,7 +994,8 @@ impl DFlashModel {
 
     /// Селектор v2 (спека build_dflash2_selector): жадный путь через лэттис.
     /// logits [1, T, V] (позиция 0 — anchor, 1..T — MASK), hidden [1, T, D]
-    /// (t_embd после out_norm). Возвращает draft-токены MASK-позиций и их
+    /// (t_embd после out_norm), anchor — фактический токен позиции 0.
+    /// Возвращает draft-токены MASK-позиций и их
     /// честные q (softmax-вероятность по полному ряду logits).
     /// Лэттис-строка: [cand_ids(top_k), scores(top_k·top_k)]; score[k] для
     /// pred: Σ_r succ[r, cand[k]] · (prev[r, pred] · hidden[r, pos]) + unary[k].
@@ -996,6 +1004,7 @@ impl DFlashModel {
         backend: &dyn Backend,
         logits: &Tensor,
         hidden: &Tensor,
+        anchor: u32,
     ) -> Result<SelectResult, BackendError> {
         let sel = self
             .selector
@@ -1036,11 +1045,13 @@ impl DFlashModel {
                 hid[pos][r] = acc;
             }
         }
-        // жадный путь: на позиции 1 предшественник — anchor (позиция 0),
-        // на позициях i>1 — выбранный кандидат i−1.
+        // жадный путь: на позиции 1 предшественник — ЯКОРЬ (фактический токен
+        // позиции 0; у эталона score_run(1, 1, anchor_ids)), на позициях i>1 —
+        // выбранный кандидат i−1. Прежний cand[0][0] (top-1 логитов якорной
+        // позиции) ломал весь путь каскадом: приёмка 32% против эталонных 68%.
         let mut tokens = Vec::with_capacity(t - 1);
         let mut probs = Vec::with_capacity(t - 1);
-        let mut pred = cand[0][0];
+        let mut pred = anchor;
         for pos in 1..t {
             let pred_col: Vec<f32> = (0..rank).map(|r| pd[pred as usize * rank + r]).collect();
             let mut best = 0usize;
@@ -1319,7 +1330,7 @@ impl crate::spec::Drafter for DFlashDrafter {
         let t_diffuse = tp.elapsed().as_secs_f64();
         let ts = std::time::Instant::now();
         let (tokens, probs) = if self.model.selector.is_some() {
-            match self.model.select(backend, &res.logits, &res.hidden) {
+            match self.model.select(backend, &res.logits, &res.hidden, anchor) {
                 Ok(s) => (s.tokens, s.probs),
                 Err(e) => {
                     eprintln!("DFlashDrafter: селектор не удался: {e}");
@@ -1396,6 +1407,9 @@ impl crate::spec::Drafter for DFlashDrafter {
         self.model.truncate_caches(pos);
         self.commit(&tokens);
         let t_tail = tt.elapsed().as_secs_f64();
+        if std::env::var("LLM_DBG_SPEC").is_ok() {
+            eprintln!("draft@{pos}: {tokens:?}");
+        }
         if prof {
             self.prof.0 += tp.elapsed().as_secs_f64();
             self.prof.1 += 1;
@@ -1449,6 +1463,11 @@ fn conv_side(
 ) -> Result<Tensor, BackendError> {
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let kernel = base.shape()[1];
+    // Диагностика A/B (приёмка DFlash2 против эталона): INFER_DFLASH_NO_CONV=1
+    // выключает two-tap conv (тождество) — сравнить приёмку с conv и без.
+    if std::env::var("INFER_DFLASH_NO_CONV").is_ok() {
+        return Ok(x.clone());
+    }
     // N (iter-9): degenerate conv metadata (kernel 0 / groups 0) used to
     // div-by-zero — clean error instead.
     if kernel == 0 {
@@ -1999,7 +2018,7 @@ mod tests {
         rng.fill(&mut hd);
         let lt = backend.from_cpu_f32(&lg, vec![1, 4, 8]).unwrap();
         let ht = backend.from_cpu_f32(&hd, vec![1, 4, 16]).unwrap();
-        let res = m.select(&backend, &lt, &ht).unwrap();
+        let res = m.select(&backend, &lt, &ht, 3).unwrap();
         assert_eq!(res.tokens.len(), 3);
         assert_eq!(res.probs.len(), 3);
         // ── CPU-референс (независимый, по спеке, ggml-порядок) ──
@@ -2026,7 +2045,8 @@ mod tests {
             }
         }
         let mut exp_tok = Vec::new();
-        let mut pred = cand[0][0];
+        // предок позиции 1 — якорь (как у эталона), далее — выбранный токен
+        let mut pred = 3u32;
         for pos in 1..t {
             let mut best = 0usize;
             let mut bs = f32::NEG_INFINITY;

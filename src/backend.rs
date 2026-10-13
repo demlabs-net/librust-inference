@@ -2159,6 +2159,60 @@ pub trait Backend: Send + Sync {
         ))
     }
 
+    /// Непрямой sgemm `mul_mat_id` — путь ЭТАЛОНА при ≥32 токенах ubatch
+    /// (ggml_metal_op_mul_mat_id_use_mm: has_simdgroup_mm && ne00>=64 &&
+    /// ne21>=32). Порядок суммирования отличается от mv_id ⇒ для побитового
+    /// паритета префилла MoE обязателен.
+    ///
+    /// * `a` — src1: `[t, K]` при `ne11 = 1` (вещание по слотам, gate/up) или
+    ///   `[t*k, ffn]` при `ne11 = k` (down); `nb11`/`nb12` — байтовые шаги
+    ///   слота и токена;
+    /// * `ids` — `[t*k]` u32 (слот быстрее токена, как `nb21 = k` у оркала);
+    /// * `b` — плоские веса экспертов `[E, n_rows, K]`;
+    /// * `c` — выход `[t, k, n_rows]` f32 БЕЗ весов (веса — `moe_acc_slots`).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_mm(
+        &self,
+        _a: &Tensor,
+        _ids: &Tensor,
+        _b: &Tensor,
+        _c: &Tensor,
+        _n_rows: usize,
+        _n_expert: usize,
+        _t: usize,
+        _k: usize,
+        _ne11: usize,
+        _nb11: u64,
+        _nb12: u64,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_experts_mm: бэкенд не умеет mul_mm_id".into(),
+        ))
+    }
+
+    /// Взвешенная сумма слотов: `acc[t, d] += Σ_j w[t*k + j] · src[(t*k + j), d]`.
+    /// Порядок сложения — слоты по возрастанию из нуля (тот же, что
+    /// последовательных `add_scaled` в по-слотовом пути).
+    fn moe_acc_slots(
+        &self,
+        _src: &Tensor,
+        _w: &Tensor,
+        _acc: &Tensor,
+        _t: usize,
+        _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_acc_slots: бэкенд не умеет".into(),
+        ))
+    }
+
+    /// SwiGLU оркального графа MoE: `y = (x / (1 + exp(-x))) · u` ОДНИМ
+    /// кернелом (ggml GGML_OP_GLU/SWIGLU). Двухпроходный silu+mul не битуется
+    /// из-за регистровой свёртки деления в кернеле оркала.
+    fn swiglu(&self, _x: &Tensor, _u: &Tensor, _y: &Tensor) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat("swiglu: бэкенд не умеет".into()))
+    }
+
     // ── GLU ──
     /// Gated linear unit: X (rows, 2d) → Y (rows, d), y = a·sigmoid(b).
     fn glu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;

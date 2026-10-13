@@ -579,6 +579,16 @@ impl MoeLayer {
                 )
                 .is_ok();
         }
+        // Эталон при ≥32 токенах ubatch считает mul_mat_id кернелом mm_id
+        // (ggml_metal_op_mul_mat_id_use_mm), у которого свой порядок
+        // суммирования — без него префилл MoE не битуется. Пакетный путь на
+        // весь чанк; UnsupportedFormat (чужой квант/бэкенд) → по-слотовый цикл.
+        if t >= 32 && std::env::var("INFER_MOE_NO_MM").is_err() {
+            match self.ffn_id_mm(backend, x2, routed, t, d, ffn, e, k, device_route, device_ids.as_ref(), device_wts.as_ref()) {
+                Err(BackendError::UnsupportedFormat(_)) => {}
+                r => return r,
+            }
+        }
         let acc = backend.zeros(vec![t, d])?;
         for ti in 0..t {
             let x_t = x2.view_offset(vec![1, d], ti * d);
@@ -607,13 +617,123 @@ impl MoeLayer {
             let gate = backend.zeros(vec![k, ffn])?;
             backend.moe_experts_mv(&x_t, &ids_t, &wts_t, &self.gate.w, &gate, ffn, false)?;
             // silu(gate)·up поэлементно по всем слотам сразу.
-            let act = backend.zeros(vec![k, ffn])?;
-            backend.silu(&gate, &act)?;
+            // swiglu_split оркала — ОДИН кернел (см. moe::ffn_id_mm).
             let prod = backend.zeros(vec![k, ffn])?;
-            backend.mul(&act, &up, &prod)?;
+            backend.swiglu(&gate, &up, &prod)?;
             // down: у каждого слота свой вход, выход — взвешенная сумма [dim].
             let out_t = acc.view_offset(vec![1, d], ti * d);
             backend.moe_experts_mv(&prod, &ids_t, &wts_t, &self.down.w, &out_t, d, true)?;
+        }
+        Ok(acc.view(vec![1, t, d]))
+    }
+
+    /// Пакетный mul_mat_id на весь чанк (путь оркала mm_id): три вызова на
+    /// слой вместо 3·t, ids [t*k] одним куском, веса применяются в
+    /// moe_acc_slots в том же порядке слотов, что по-слотовый add_scaled.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_id_mm(
+        &self,
+        backend: &dyn Backend,
+        x2: &Tensor,
+        routed: &[(Vec<u32>, Vec<f32>)],
+        t: usize,
+        d: usize,
+        ffn: usize,
+        e: usize,
+        k: usize,
+        device_route: bool,
+        device_ids: Option<&Tensor>,
+        device_wts: Option<&Tensor>,
+    ) -> Result<Tensor, BackendError> {
+        // ids/weights одним куском: [t*k], слот быстрее токена (= оркальный
+        // ids [ne20=k, ne21=t] с nb21=k).
+        let (ids_t, wts_t) = if device_route {
+            (
+                device_ids.expect("device_ids есть").view(vec![t * k]),
+                device_wts.expect("device_wts есть").view(vec![t * k]),
+            )
+        } else {
+            let mut idv = Vec::with_capacity(t * k);
+            let mut wv = Vec::with_capacity(t * k);
+            for (ids, ws) in routed.iter().take(t) {
+                idv.extend_from_slice(ids);
+                wv.extend_from_slice(ws);
+            }
+            (
+                backend.from_cpu_u32(&idv, vec![t * k])?,
+                backend.from_cpu_f32(&wv, vec![t * k])?,
+            )
+        };
+        // gate/up: src1 = строка токена, ne11=1 (вещание по слотам).
+        let up = backend.zeros(vec![t, k, ffn])?;
+        backend.moe_experts_mm(&x2.view(vec![t, d]), &ids_t, &self.up.w, &up, ffn, e, t, k, 1, 0, (d * 4) as u64)?;
+        let gate = backend.zeros(vec![t, k, ffn])?;
+        backend.moe_experts_mm(&x2.view(vec![t, d]), &ids_t, &self.gate.w, &gate, ffn, e, t, k, 1, 0, (d * 4) as u64)?;
+        let prod = backend.zeros(vec![t, k, ffn])?;
+        backend.swiglu(&gate, &up, &prod)?;
+        // down: src1 [ffn, k, t] (слот-за-слотом, ne11=k), выход [t, k, d].
+        let dn = backend.zeros(vec![t, k, d])?;
+        backend.moe_experts_mm(
+            &prod,
+            &ids_t,
+            &self.down.w,
+            &dn,
+            d,
+            e,
+            t,
+            k,
+            k,
+            (ffn * 4) as u64,
+            (ffn * k * 4) as u64,
+        )?;
+        // INFER_MOE_DUMP=<файл> — побитовые дампы выходов mm_id (первый
+        // вызов) для сверки с узлами оркального графа ffn_moe_{up,gate,down}.
+        if let Ok(path) = std::env::var("INFER_MOE_DUMP") {
+            use std::io::Write as _;
+            static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call < 16 {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(&mut f, "# call {call}");
+                    for (name, tt, ne) in [
+                        ("up", &up, format!("{ffn},{k},{t},1")),
+                        ("gate", &gate, format!("{ffn},{k},{t},1")),
+                        ("prod", &prod, format!("{ffn},{k},{t},1")),
+                        ("dn", &dn, format!("{d},{k},{t},1")),
+                    ] {
+                        let v = backend.to_cpu_f32(tt)?;
+                        writeln!(f, "STEP {call} TENSOR {name} ne=[{ne}]")?;
+                        for (i, x) in v.iter().enumerate() {
+                            write!(f, "{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " })?;
+                        }
+                        writeln!(f)?;
+                    }
+                }
+            }
+        }
+        let acc = backend.zeros(vec![t, d])?;
+        backend.moe_acc_slots(&dn, &wts_t, &acc, t, k)?;
+        if std::env::var("INFER_MOE_DUMP_ACC").is_ok() {
+            use std::io::Write as _;
+            static ACALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let call = ACALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call >= 16 {
+                return Ok(acc.view(vec![1, t, d]));
+            }
+            let v = backend.to_cpu_f32(&acc)?;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::var("INFER_MOE_DUMP").unwrap_or_else(|_| "/tmp/llama_ref/olm_acc.txt".into()))?;
+            writeln!(f, "STEP {call} TENSOR acc ne=[{d},{t},1,1]")?;
+            for (i, x) in v.iter().enumerate() {
+                write!(f, "{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " })?;
+            }
+            writeln!(f)?;
         }
         Ok(acc.view(vec![1, t, d]))
     }

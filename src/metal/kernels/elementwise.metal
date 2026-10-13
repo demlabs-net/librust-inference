@@ -623,3 +623,22 @@ kernel void tg_barrier_test(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     C[tid] = v[0];
 }
+
+// ── SwiGLU (порт kernel_swiglu из ggml unary.metal, GGML_OP_GLU/SWIGLU) ─────
+// Именно ОДНИМ кернелом: в исходнике оркала silu = x0/(1+exp(-x0)) и
+// silu*x1 живут в одном теле цикла, и компилятор Metal сворачивает деление
+// в регистровый rcp-вариант — двухпроходные silu+mul расходятся на 1 ulp
+// (приёмка Ф8.1h: 151610/434176 на OLMoE).
+kernel void swiglu_f32(
+    device const float* A [[buffer(0)]],   // gate (к нему silu)
+    device const float* B [[buffer(1)]],   // up
+    device float* Y [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    const float x0 = A[gid];
+    const float x1 = B[gid];
+    const float silu = x0 / (1.0f + exp(-x0));
+    Y[gid] = silu * x1;
+}

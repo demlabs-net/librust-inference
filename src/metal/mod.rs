@@ -1204,6 +1204,18 @@ impl MetalCtx {
         })
     }
 
+    pub fn swiglu_f32(&self, x: &GpuTensor, u: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+        let n = x.numel();
+        let grid = MTLSize::new(n as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        self.run("swiglu_f32", grid, group, |enc| {
+            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+            enc.set_buffer(1, Some(&u.buffer), u.offset as u64);
+            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+            enc.set_bytes(3, 8, (&n as *const usize).cast());
+        })
+    }
+
     /// Fused SwiGLU gate: Y[i] = silu(X[i]) * X[FFN + i]; X [rows, 2*FFN].
     pub fn silu_mul_fused_f32(
         &self,
@@ -1573,6 +1585,28 @@ impl MetalCtx {
                     enc.set_bytes(5, 8, (&n as *const usize).cast());
                 },
             );
+        }
+        // Эталонный выбор (ggml_metal_op_mul_mat_use_mm): f32-веса при
+        // ne00>=64 && ne11>8 идут kernel_mul_mm_f32_f32 (MMA-порядок). Без
+        // этого роутер OLMoE (gate_inp f32, m=префилл) расходится с оркалом
+        // на ~1e-4, веса слотов — и весь длинный префилл (Ф8.1h).
+        if b.dtype == GpuDtype::F32
+            && k >= 64
+            && m > 8
+            && k % 32 == 0
+            && std::env::var("INFER_NO_F32_MM").is_err()
+        {
+            let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+            let group = MTLSize::new(128, 1, 1);
+            return self.run("gemm_nt_f32_mm", grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 8, (&m as *const usize).cast());
+                enc.set_bytes(4, 8, (&k as *const usize).cast());
+                enc.set_bytes(5, 8, (&n as *const usize).cast());
+                enc.set_threadgroup_memory_length(0, 8192);
+            });
         }
         let name = match b.dtype {
             // F32 при 16-байтном выравнивании и K%4==0 — v4-вариант:
@@ -5582,6 +5616,16 @@ impl crate::backend::Backend for MetalBackend {
         Ok(())
     }
 
+    fn swiglu(
+        &self,
+        x: &crate::backend::Tensor,
+        u: &crate::backend::Tensor,
+        y: &crate::backend::Tensor,
+    ) -> Result<(), crate::error::BackendError> {
+        self.ctx.swiglu_f32(x.as_gpu(), u.as_gpu(), y.as_gpu())?;
+        Ok(())
+    }
+
     fn silu_mul_fused(
         &self,
         x: &crate::backend::Tensor,
@@ -6121,6 +6165,162 @@ impl crate::backend::Backend for MetalBackend {
             enc.set_bytes(7, 4, (&ks32 as *const u32).cast());
         })
         .map_err(|e| BackendError::Shape(format!("moe_experts_mv: {e}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_mm(
+        &self,
+        a: &crate::backend::Tensor,
+        ids: &crate::backend::Tensor,
+        b: &crate::backend::Tensor,
+        c: &crate::backend::Tensor,
+        n_rows: usize,
+        n_expert: usize,
+        t: usize,
+        k: usize,
+        ne11: usize,
+        nb11: u64,
+        nb12: u64,
+    ) -> Result<(), crate::error::BackendError> {
+        use crate::error::BackendError;
+        // Дословные копии ggml_metal_kargs_mul_mm_id_{map0,} (порядок и
+        // выравнивание полей = C-layout, repr(C) совпадает с MSL).
+        #[repr(C)]
+        struct MmIdMap0Args {
+            ne02: i32,
+            ne10: i32,
+            ne11: i32,
+            nb11: u64,
+            nb12: u64,
+            ne21: i32,
+            ne20: i32,
+            nb21: u64,
+        }
+        #[repr(C)]
+        struct MmIdArgs {
+            ne00: i32,
+            ne02: i32,
+            nb01: u64,
+            nb02: u64,
+            nb03: u64,
+            ne11: i32,
+            nb10: u64,
+            nb11: u64,
+            nb12: u64,
+            nb13: u64,
+            ne20: i32,
+            ne21: i32,
+            ne0: i32,
+            ne1: i32,
+        }
+        let (ag, bg, cg, ig) = (
+            a.inner_metal(),
+            b.inner_metal(),
+            c.inner_metal(),
+            ids.inner_metal(),
+        );
+        let kk = a.shape()[a.shape().len() - 1];
+        let name = match bg.dtype {
+            GpuDtype::Q4_K => "mm_id_q4_k",
+            GpuDtype::Q6_K => "mm_id_q6_k",
+            other => {
+                return Err(BackendError::UnsupportedFormat(format!(
+                    "moe_experts_mm: квант {other:?} не поддержан (Q4_K/Q6_K)"
+                )));
+            }
+        };
+        let blk = bg.dtype.block_bytes().unwrap_or(0) as u64;
+        if blk == 0 || kk % 256 != 0 || n_expert == 0 || t == 0 || k == 0 {
+            return Err(BackendError::Shape(format!(
+                "moe_experts_mm: K={kk} E={n_expert} t={t} k={k}"
+            )));
+        }
+        let nb01 = (kk as u64 / 256) * blk;
+        // scratch: tpe [E] u32 + hids [E*t] i32 (у оркала — хвост dst-буфера)
+        let scratch = self.ctx.device.new_buffer(
+            ((n_expert * (1 + t)) * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let map0_name = MetalCtx::static_kernel_name(format!("mm_id_map0_ne20_{k}"));
+        let m0 = MmIdMap0Args {
+            ne02: n_expert as i32,
+            ne10: 0,
+            ne11: 0,
+            nb11: 0,
+            nb12: 0,
+            ne21: t as i32,
+            ne20: k as i32,
+            nb21: (k * 4) as u64,
+        };
+        let smem0 = (((n_expert * k * 2) + 15) / 16 * 16) as u64;
+        self.ctx
+            .run(map0_name, MTLSize::new(n_expert as u64, 1, 1), MTLSize::new(n_expert as u64, 1, 1), |enc| {
+                enc.set_bytes(0, std::mem::size_of::<MmIdMap0Args>() as u64, (&m0 as *const MmIdMap0Args).cast());
+                enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
+                enc.set_buffer(2, Some(&scratch), 0);
+                enc.set_buffer(3, Some(&scratch), (n_expert * 4) as u64);
+                enc.set_threadgroup_memory_length(0, smem0);
+            })
+            .map_err(|e| BackendError::Shape(format!("moe_experts_mm map0: {e}")))?;
+        let args = MmIdArgs {
+            ne00: kk as i32,
+            ne02: n_expert as i32,
+            nb01,
+            nb02: nb01 * n_rows as u64,
+            nb03: 0,
+            ne11: ne11 as i32,
+            nb10: 4,
+            nb11,
+            nb12,
+            nb13: 0,
+            ne20: k as i32,
+            ne21: t as i32,
+            ne0: n_rows as i32,
+            ne1: k as i32,
+        };
+        // dispatch_threadgroups ((t+31)/32, (N+63)/64, E) × 128; run() мыслит
+        // потоками: grid.x = тайлов × 128.
+        let grid = MTLSize::new(
+            (t.div_ceil(32) * 128) as u64,
+            n_rows.div_ceil(64) as u64,
+            n_expert as u64,
+        );
+        self.ctx
+            .run(name, grid, MTLSize::new(128, 1, 1), |enc| {
+                enc.set_bytes(0, std::mem::size_of::<MmIdArgs>() as u64, (&args as *const MmIdArgs).cast());
+                enc.set_buffer(1, Some(&bg.buffer), bg.offset as u64);
+                enc.set_buffer(2, Some(&ag.buffer), ag.offset as u64);
+                enc.set_buffer(3, Some(&scratch), 0);
+                enc.set_buffer(4, Some(&scratch), (n_expert * 4) as u64);
+                enc.set_buffer(5, Some(&cg.buffer), cg.offset as u64);
+                enc.set_threadgroup_memory_length(0, 8192);
+            })
+            .map_err(|e| BackendError::Shape(format!("moe_experts_mm: {e}")))
+    }
+
+    fn moe_acc_slots(
+        &self,
+        src: &crate::backend::Tensor,
+        w: &crate::backend::Tensor,
+        acc: &crate::backend::Tensor,
+        t: usize,
+        k: usize,
+    ) -> Result<(), crate::error::BackendError> {
+        use crate::error::BackendError;
+        let (sg, wg, agt) = (src.inner_metal(), w.inner_metal(), acc.inner_metal());
+        let d = acc.shape()[acc.shape().len() - 1];
+        let (t32, k32, d32) = (t as u32, k as u32, d as u32);
+        let grid = MTLSize::new((t * d) as u64, 1, 1);
+        self.ctx
+            .run("moe_acc_slots", grid, MTLSize::new(64, 1, 1), |enc| {
+                enc.set_buffer(0, Some(&sg.buffer), sg.offset as u64);
+                enc.set_buffer(1, Some(&wg.buffer), wg.offset as u64);
+                enc.set_buffer(2, Some(&agt.buffer), agt.offset as u64);
+                enc.set_bytes(3, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&d32 as *const u32).cast());
+            })
+            .map_err(|e| BackendError::Shape(format!("moe_acc_slots: {e}")))
     }
 
     fn from_cpu_u32(

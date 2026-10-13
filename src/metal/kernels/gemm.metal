@@ -1436,3 +1436,91 @@ kernel void gemm_nt_q4_k_mm(
         }
     }
 }
+
+// ── F32 × F32 тайловой GEMM (порт kernel_mul_mm_f32_f32) ────────────────────
+// Эталон при ne00>=64 && ne11>8 берёт mul_mm и для f32-весов (роутер OLMoE
+// gate_inp — dequant_f32, m=префилл). Отличия от квантовых вариантов:
+// загрузчик без декванта («no need for dequantization» ветка оркала) с
+// проверкой границ loop_k + 16*il + i < K, x — плоские float, шаг 32 на
+// итерацию. Порядок суммирования — MMA, не последовательный v4.
+kernel void gemm_nt_f32_mm(
+    device const float* A [[buffer(0)]],     // активации [M, K]
+    device const float* B [[buffer(1)]],     // веса [N, K] f32
+    device float* C [[buffer(2)]],           // [M, N]
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half* sa = (threadgroup half*)(shmem);          // 64×32 весов
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);   // 32×32 активаций
+    const int r0 = tgpig.y * 64;
+    const int r1 = tgpig.x * 32;
+    const short nr0 = ((int)N - r0 < 64) ? (short)((int)N - r0) : 64;
+    const short nr1 = ((int)M - r1 < 32) ? (short)((int)M - r1) : 32;
+    const short lr0 = ((short)tiitg / 2) < nr0 ? ((short)tiitg / 2) : nr0 - 1;
+    const short lr1 = ((short)tiitg / 4) < nr1 ? ((short)tiitg / 4) : nr1 - 1;
+    const short il0 = tiitg % 2;
+    device const float* x = B + (ulong)(r0 + lr0) * K;
+    const short iy = 8 * (tiitg % 4);
+    device const float* y = A + (ulong)(r1 + lr1) * K + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    const uint nk = K / 32u;
+    for (uint kb = 0; kb < nk; ++kb) {
+        const uint loop_k = kb * 32u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (tiitg / 2) / 8;
+            const short lx = (tiitg / 2) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) =
+                loop_k + 16 * il0 + i < K ? (half)x[loop_k + 16 * il0 + i] : (half)0;
+        }
+        {
+            const short sx = tiitg % 4;
+            const short sy = (tiitg / 4) / 8;
+            const short ly = (tiitg / 4) % 8;
+            const short ib = 4 * sx + sy;
+            device const float4* y4 = (device const float4*)(y + loop_k);
+            const float4 v0 = y4[0], v1 = y4[1];
+            threadgroup half4* dst = (threadgroup half4*)(sb + 64 * ib + 8 * ly);
+            dst[0] = half4(v0);
+            dst[1] = half4(v1);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* ts = ((threadgroup float*)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * 64;
+    for (short i = 0; i < 8; i++)
+        simdgroup_store(mc[i], ts + 8 * (i % 4) + 8 * 64 * (i / 4), 64, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = tiitg; j < nr1; j += 128) {
+        device float* D = C + (ulong)(r1 + j) * N + r0;
+        threadgroup float* Cs = ((threadgroup float*)shmem) + j * 64;
+        for (int i = 0; i < nr0; i++) D[i] = Cs[i];
+    }
+}

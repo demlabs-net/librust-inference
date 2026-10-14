@@ -734,7 +734,10 @@ impl Drafter for MtpDrafter {
             return (Vec::new(), Vec::new());
         }
         if history.len() != self.committed + 1 {
-            tracing::warn!(
+            // eprintln, а не tracing::warn: в примерах/CLI подписчика нет —
+            // рассинхрон границы молча терялся, и «drafter предлагает 1-2
+            // черновика вместо γ» был неотличим от нормальной работы.
+            eprintln!(
                 "MtpDrafter: рассинхрон границы: history={} committed={} — черновиков нет",
                 history.len(),
                 self.committed
@@ -771,6 +774,9 @@ impl Drafter for MtpDrafter {
         self.window = Vec::with_capacity(tokens.len() + 1);
         self.window.push(anchor);
         self.window.extend_from_slice(&tokens);
+        if std::env::var("LLM_DBG_MTP").is_ok() {
+            eprintln!("MTP draft: {} черновиков", tokens.len());
+        }
         (tokens, probs)
     }
 

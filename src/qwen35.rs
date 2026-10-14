@@ -1182,6 +1182,71 @@ mod tests {
         assert!(worst < tol, "{what}: max rel err {worst}");
     }
 
+    /// Побитовое равенство (лосслесс-инвариант спека гибрида): -0.0/0.0
+    /// различаются, NaN не равен ничему — сравнение по bits.
+    fn assert_bits_eq(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: длины");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert!(
+                x.to_bits() == y.to_bits(),
+                "{what}[{i}]: {x} ({:08x}) != {y} ({:08x})",
+                x.to_bits(),
+                y.to_bits()
+            );
+        }
+    }
+
+    /// Ревью Ф2.9: fused-хвост decode-шага (gdn_conv_silu_split_norm, t=1)
+    /// обязан быть ПОБИТОВО равен составному пути (gdn_conv + silu + slice +
+    /// gdn_l2norm, t>1): AR-декод идёт через fused, верификация/реплей
+    /// спек-окна — через состав. Расхождение округления сместило бы траекторию
+    /// на первом же токене спека (лосслессность).
+    #[test]
+    fn gdn_fused_tail_matches_composition_bitwise() {
+        let be = MetalBackend::new().unwrap();
+        let mut r = rng(0xF021);
+        let (hk, s) = (4usize, 16usize);
+        let inner = 3 * s;
+        let qk_size = hk * s;
+        let c = 2 * qk_size + inner;
+        let k = 4usize;
+        let x = rand(c, &mut r);
+        let w = rand(c * k, &mut r);
+        let st = rand(c * (k - 1), &mut r);
+        let xt = be.from_cpu_f32(&x, vec![1, 1, c]).unwrap();
+        let wt = be.from_cpu_f32(&w, vec![c, k]).unwrap();
+        let stt = be.from_cpu_f32(&st, vec![c, k - 1]).unwrap();
+        let eps = 1e-5f32;
+
+        // fused-хвост (путь AR-decode)
+        let (y_f, ns_f) = be
+            .gdn_conv_silu_split_norm(&xt, &wt, &stt, c, k, s, qk_size, eps)
+            .unwrap();
+        // составной путь (верификация/реплей t>1)
+        let (conv_out, ns_c) = be.gdn_conv(&xt, &wt, &stt).unwrap();
+        let act = be.zeros(conv_out.shape().to_vec()).unwrap();
+        be.silu(&conv_out, &act).unwrap();
+        let q = crate::nn::slice_last(&be, &act, qk_size, 0).unwrap();
+        let kk = crate::nn::slice_last(&be, &act, qk_size, qk_size).unwrap();
+        let v = crate::nn::slice_last(&be, &act, inner, 2 * qk_size).unwrap();
+        let qn = be.gdn_l2norm(&q, s, eps).unwrap();
+        let kn = be.gdn_l2norm(&kk, s, eps).unwrap();
+
+        let yf = be.to_cpu_f32(&y_f).unwrap();
+        assert_bits_eq(&yf[..qk_size], &be.to_cpu_f32(&qn).unwrap(), "qn");
+        assert_bits_eq(&yf[qk_size..2 * qk_size], &be.to_cpu_f32(&kn).unwrap(), "kn");
+        assert_bits_eq(
+            &yf[2 * qk_size..],
+            &be.to_cpu_f32(&v).unwrap(),
+            "v (silu-хвост без l2norm)",
+        );
+        assert_bits_eq(
+            &be.to_cpu_f32(&ns_f).unwrap(),
+            &be.to_cpu_f32(&ns_c).unwrap(),
+            "conv-стейт",
+        );
+    }
+
     #[test]
     fn gdn_kernels_match_reference() {
         let be = MetalBackend::new().unwrap();

@@ -347,7 +347,7 @@ impl DFlashModel {
         // поэтому индекс переводится обратно (−1). Без этого фичи брались на
         // слой глубже обученного: Qwen3.5-4B — 3% приёмки вместо рабочей.
         // safetensors-путь (config.json z-lab) уже в индексах выходов.
-        let extract = gf
+        let extract: Vec<usize> = gf
             .get(&p("target_layers"))
             .and_then(GgufValue::as_array)
             .map(|a| {
@@ -357,10 +357,24 @@ impl DFlashModel {
                     .collect()
             })
             .unwrap_or_default();
-        let mask_token = gf
-            .get("tokenizer.ggml.mask_token_id")
-            .and_then(GgufValue::as_u32)
-            .unwrap_or(151850);
+        if extract.is_empty() {
+            // Молчаливый режим без инжекта: драйвер не собирает extract,
+            // драфтер «слеп» (шумовой блок без контекста) — приёмка
+            // околонулевая без единой зацепки (ревью Ф2.9).
+            tracing::warn!(
+                "dflash: target_layers отсутствуют/пусты в GGUF — инжект фич выключен"
+            );
+        }
+        let mask_token = gf.get("tokenizer.ggml.mask_token_id").and_then(GgufValue::as_u32)
+        .ok_or_else(|| {
+            // Молчаливый дефолт (151850 — чужое семейство) диффундировал
+            // не-MASK-входы: приёмка тихо падала без единой зацепки
+            // (ревью Ф2.9). MASK обязателен в вокабуляре диффузионного драфтера.
+            BackendError::Shape(
+                "dflash GGUF: нет tokenizer.ggml.mask_token_id — диффузия без MASK невозможна"
+                    .into(),
+            )
+        })?;
         let sel_rank = u(&p("selector_rank")).ok();
         let sel_top_k = u(&p("selector_top_k")).ok();
         Self::load_with_selector(
@@ -410,11 +424,15 @@ impl DFlashModel {
             .get("dflash_config")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let mask_token = dflash
-            .get("mask_token_id")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(151669);
+        let mask_token = dflash.get("mask_token_id").and_then(|v| v.as_u64()).map(|v| v as u32)
+        .ok_or_else(|| {
+            // Тихий дефолт 151669 (токен чужой семьи) диффундировал
+            // не-MASK-входы — приёмка падала молча (ревью Ф2.9; GGUF-путь
+            // уже честно ошибается).
+            BackendError::Shape(
+                "dflash config.json: dflash_config.mask_token_id обязателен".into(),
+            )
+        })?;
         let target_layers = dflash
             .get("target_layer_ids")
             .and_then(|v| v.as_array())
@@ -791,6 +809,9 @@ impl DFlashModel {
     ) -> Result<DiffusionResult, BackendError> {
         // DFLASH_DIFF_PROF=1: синхронизация после этапов — где время диффузии
         let dprof = std::env::var("DFLASH_DIFF_PROF").is_ok();
+        // Отладочные гейты — ВНЕ цикла слоёв: env::var на каждый слой каждого
+        // блока — мусор в горячем пути (ревью Ф2.9).
+        let dbg = std::env::var("LLM_DBG_SPEC").is_ok();
         let sync = |label: &str, t0: &mut std::time::Instant, x: &Tensor| -> Result<(), BackendError> {
             if dprof {
                 backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
@@ -850,7 +871,7 @@ impl DFlashModel {
             // видел контекст) — приёмка деградировала.
             let kctx_pos = pos.saturating_sub(ctx);
             for (i, layer) in self.layers.iter().enumerate() {
-                if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
+                if dbg && i == 0 {
                     eprintln!(
                         "diffuse: layer0 x={:?} enc={:?}",
                         x.shape(),
@@ -870,7 +891,7 @@ impl DFlashModel {
                     h = conv_side(backend, &h, b, d, 0, self.block_size)?;
                 }
                 let attn = &layer.dense.attn;
-                if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
+                if dbg && i == 0 {
                     eprintln!(
                         "diffuse: layer0 h={:?} wqkv={:?}",
                         h.shape(),
@@ -1059,15 +1080,31 @@ impl DFlashModel {
         let mut unary = vec![vec![0f32; top_k]; t];
         for pos in 0..t {
             let row = &lg[pos * vocab..(pos + 1) * vocab];
-            let mut idx: Vec<usize> = (0..vocab).collect();
-            idx.sort_by(|&a, &b| {
+            // Топ-k через select_nth: полная сортировка 150–250k элементов ×
+            // t позиций на КАЖДЫЙ черновой блок была самым дорогим хвостом
+            // селектора (ревью Ф2.9). NaN-логит — Equal (устойчиво, как было).
+            let cmp = |&a: &usize, &b: &usize| {
                 row[b]
                     .partial_cmp(&row[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for k in 0..top_k {
-                cand[pos][k] = idx[k] as u32;
-                unary[pos][k] = row[idx[k]];
+            };
+            if top_k < vocab {
+                let mut idx: Vec<usize> = (0..vocab).collect();
+                let (head, pivot, _) = idx.select_nth_unstable_by(top_k - 1, cmp);
+                let mut top: Vec<usize> = head.to_vec();
+                top.push(*pivot);
+                top.sort_unstable_by(cmp);
+                for (k, &i) in top.iter().enumerate() {
+                    cand[pos][k] = i as u32;
+                    unary[pos][k] = row[i];
+                }
+            } else {
+                let mut idx: Vec<usize> = (0..vocab).collect();
+                idx.sort_unstable_by(cmp);
+                for k in 0..top_k {
+                    cand[pos][k] = idx[k] as u32;
+                    unary[pos][k] = row[idx[k]];
+                }
             }
         }
         // скрытые → ранг: hid[pos][r] = Σ_d hidden[pos,d]·hw[r,d]
@@ -1445,7 +1482,11 @@ impl crate::spec::Drafter for DFlashDrafter {
         let tt = std::time::Instant::now();
         // кэш после диффузии содержит k/v блока — откат до pos (crop)
         self.model.truncate_caches(pos);
-        self.commit(&tokens);
+        // НЕ коммитим собственные черновики в committed-кольцо (мина из
+        // ревью Ф2.9): здесь они НЕПРОВЕРЕННЫЕ, а док обещал «принятые
+        // таргетом». Кольцо — только fallback якоря при пустой history
+        // (после reset()), наполнить его честно может только драйвер
+        // через pub fn commit; самостоятельно драфтер принятых не знает.
         let t_tail = tt.elapsed().as_secs_f64();
         if std::env::var("LLM_DBG_SPEC").is_ok() {
             eprintln!("draft@{pos}: {tokens:?}");
@@ -2188,8 +2229,11 @@ mod tests {
         for &tok in &toks {
             assert!(tok < 8, "draft-токен вне вокабуляра");
         }
-        // committed-кольцо пополнено, кэш откатан
-        assert!(drafter.committed.len() >= toks.len());
+        // committed-кольцо НЕ пополняется собственными черновиками (ревью
+        // Ф2.9: они непроверенные; док обещал «принятые таргетом») — кольцо
+        // наполняет только драйвер через pub fn commit.
+        assert!(drafter.committed.is_empty());
+        // кэш откатан до pos
         assert!(drafter.model.caches[0].pos <= 8);
         // ещё один шаг — блок от нового anchor
         let (toks2, _) = crate::spec::Drafter::draft(&mut drafter, &backend, &[3], 2);

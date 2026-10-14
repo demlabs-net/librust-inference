@@ -828,7 +828,13 @@ pub fn generate<M: CausalLm + ?Sized>(
             break;
         }
         match emit(next, tok, &mut decoder, &mut acc, &mut on_event) {
-            Emit::Stop => return Ok(generated),
+            // Потребитель попросил стоп: НЕ рвём выход — break ведёт к
+            // finish-хвосту (незавершённый UTF-8, SpecStats, Timings, Done),
+            // иначе стримящий клиент оставался без Done и метрик (ревью Ф2.9).
+            Emit::Stop => {
+                finish = Some(FinishReason::Cancelled);
+                break;
+            }
             Emit::Ok => {}
         }
         generated.push(next);
@@ -932,7 +938,12 @@ pub fn generate<M: CausalLm + ?Sized>(
                         break;
                     }
                     match emit(t, tok, &mut decoder, &mut acc, &mut on_event) {
-                        Emit::Stop => return Ok(generated),
+                        // Стоп принятых черновиков — тот же честный хвост
+                        // (Done/метрики), что и в основном цикле.
+                        Emit::Stop => {
+                            finish = Some(FinishReason::Cancelled);
+                            break;
+                        }
                         Emit::Ok => {}
                     }
                     generated.push(t);

@@ -97,9 +97,9 @@ pub struct RemoteDrafter {
     /// Последняя ошибка транспорта (диагностика/метрики): пустой ответ
     /// означает нулевую приёмку, и без этого поля причина терялась бы.
     pub last_error: Option<String>,
-    /// Слои таргета, запрошенные у соседа (`OnceLock`: спрашиваем один раз и
-    /// отдаём ссылку без unsafe; ошибка соседа кэш не заполняет — повторяем).
-    layers: std::sync::OnceLock<Vec<usize>>,
+    /// Слои таргета, запрошенные у соседа: кэшируется И отказ — иначе каждая
+    /// итерация окна лезла в сеть за одним и тем же «нет» (ревью Ф2.9).
+    layers: std::sync::OnceLock<Result<Vec<usize>, ()>>,
 }
 
 impl RemoteDrafter {
@@ -116,15 +116,14 @@ impl Drafter for RemoteDrafter {
     fn target_layers(&self) -> &[usize] {
         // Слои приезжают от соседа: без них координатор не соберёт extract и
         // драфтер будет слепым (наблюдалось 0% приёмки и вырожденные черновики).
-        if let Some(l) = self.layers.get() {
-            return l.as_slice();
-        }
-        if let Ok(l) = self.transport.remote_target_layers() {
-            let _ = self.layers.set(l);
-        }
-        match self.layers.get() {
-            Some(l) => l.as_slice(),
-            None => &[],
+        let entry = self.layers.get_or_init(|| {
+            self.transport.remote_target_layers().map_err(|e| {
+                tracing::warn!("RemoteDrafter: сосед не отдал target_layers ({e}) — фич не будет");
+            })
+        });
+        match entry {
+            Ok(l) => l.as_slice(),
+            Err(()) => &[],
         }
     }
 

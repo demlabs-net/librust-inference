@@ -1677,7 +1677,11 @@ impl MetalCtx {
             // get_scale_min_k4; разбирается следующим заходом (сверка
             // декванта построчно с оркаловым дампом). Порог m>8 и K%256==0.
             GpuDtype::Q4_K => {
-                if m > 8 && k % 256 == 0 && std::env::var("INFER_Q4K_NO_MM").is_err() {
+                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2);
+                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q4K_NO_MM").is_err() {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
@@ -1700,7 +1704,11 @@ impl MetalCtx {
             // draft_tokens > 7; префилл — last_only (m=1, matvec). Порог
             // m>8 и K%256==0 — use_mm llama.cpp. Фоллбэк INFER_Q6K_NO_MM.
             GpuDtype::Q6_K => {
-                if m > 8 && k % 256 == 0 && std::env::var("INFER_Q6K_NO_MM").is_err() {
+                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2);
+                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q6K_NO_MM").is_err() {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
@@ -1722,7 +1730,11 @@ impl MetalCtx {
             // мс GDN-слоя). Порог m>8 и требование K%256==0 — как у IQ4_XS
             // (порог use_mm llama.cpp). Фоллбэк INFER_Q5K_NO_MM.
             GpuDtype::Q5_K => {
-                if m > 8 && k % 256 == 0 && std::env::var("INFER_Q5K_NO_MM").is_err() {
+                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2);
+                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q5K_NO_MM").is_err() {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
@@ -1743,7 +1755,14 @@ impl MetalCtx {
             // Q5_0, скалярный gemm_nt_q5_0 расходился на ~1e-3 (ffn_out-5).
             // Порог K%32 — шаг mul_mm-тайла; фоллбэк INFER_Q50_NO_MM=1.
             GpuDtype::Q5_0 => {
-                if m > 8 && k % 32 == 0 && std::env::var("INFER_Q50_NO_MM").is_err()
+                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2);
+                if m >= mm_min
+                    && m > 1
+                    && k % 32 == 0
+                    && std::env::var("INFER_Q50_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
@@ -1764,8 +1783,25 @@ impl MetalCtx {
             // ne11 > 8), при m ≤ 8 — по mul_mv. Паритет требует совпадать с его
             // выбором: m > 8 → gemm_nt_iq4_xs_mm (порт mul_mm), иначе mv_iq4_xs.
             // mul_mm требует K, кратного 256 (шаг il/x по суперблокам).
+            //
+            // Порог настраивается (INFER_IQ4XS_MM_MIN, дефолт 2): окно
+            // спек-верификации (t = 1+γ ≤ 8) при пороге 9 идёт mv-батчем —
+            // 67 мс/строку против 21 у mm (window_probe 27B) — и спек на
+            // Metal всегда проигрывал жадному декоду (Ф2.9/Ф8.2). mm при
+            // m 2..8 НЕ побитово mv (другой порядок суммирования): паритет
+            // с эталоном возвращается INFER_IQ4XS_MM_MIN=9; тексты спека
+            // проверяются приёмкой (лосслесс-семантика argmax-сверки).
             GpuDtype::Iq4Xs => {
-                if m > 8 && k % 256 == 0 && std::env::var("INFER_IQ4XS_NO_MM").is_err() {
+                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
+                    .or_else(|_| std::env::var("INFER_IQ4XS_MM_MIN"))
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(2);
+                if m >= mm_min
+                    && m > 1
+                    && k % 256 == 0
+                    && std::env::var("INFER_IQ4XS_NO_MM").is_err()
+                {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
@@ -5354,6 +5390,37 @@ impl crate::backend::Backend for MetalBackend {
                 // grid.z = m. mv_quantized — MMV-примитив: a 1D [k], c 1D [n].
                 let k = a.as_gpu().shape[1];
                 let n = bg.shape[0];
+                // ОПТИМИЗАЦИЯ спек-окон (Ф8.2, 27B): окна верификации
+                // (t = 1+γ ≤ 8) тут идут mv-путём — веса перечитываются с
+                // каждой строкой, окно γ+1 строк дороже γ+1 AR-шагов, и спек
+                // на Metal всегда проигрывал жадному декоду (Ф2.9/Ф8.2).
+                // Рычаг INFER_QUANT_MM_MIN (дефолт 4) переводит окна 4..8 на
+                // gemm_nt_quantized (mm-тайл 32 строк читает веса ОДИН раз):
+                // window_probe 27B — окно 8 строк 520→280 мс (1.9×). mm при
+                // m=2..3 ХУЖЕ mv-батча (холостые строки тайла), дефолт 4 —
+                // баланс. Числа НЕ равны mv побитово (накопление нибблов в
+                // быстром mv; у IQ4_XS различия — только знаки нулей, |Δ|=0;
+                // Q5_K — побитово равен) — паритет с эталоном возвращается
+                // INFER_QUANT_MM_MIN=9; тексты спека проверяются приёмкой
+                // (лосслесс-семантика argmax-сверки).
+                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let mm_capable = matches!(
+                    bg.dtype,
+                    GpuDtype::Q4_K
+                        | GpuDtype::Q5_K
+                        | GpuDtype::Q6_K
+                        | GpuDtype::Q5_0
+                        | GpuDtype::Iq4Xs
+                );
+                let kmod = if bg.dtype == GpuDtype::Q5_0 { 32 } else { 256 };
+                if m >= mm_min && m > 1 && mm_capable && k % kmod == 0 {
+                    self.ctx
+                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+                    return Ok(());
+                }
                 // Внутри ext-окна эталон берёт НЕ classic mul_mv, а
                 // mul_mv_ext (свой порядок суммирования) — воспроизводим
                 // выбор точно; вне окна mv_ext возвращает false.
@@ -6594,7 +6661,12 @@ mod quant_gemm_tests {
         let a: Vec<f32> = (0..rows * k)
             .map(|i| ((i % 29) as f32 - 14.0) * 0.03 + (i / k) as f32 * 0.01)
             .collect();
-        // M=5 пачкой
+        // M=5 пачкой. Ф8.2: при дефолтном пороге (INFER_QUANT_MM_MIN=4) M≥4
+        // идёт mm-кернелом — его числа НЕ равны mb/mv побитово (накопление
+        // нибблов), расхождение ~1e-3 относительных — это ОЖИДАЕМО. Поэтому
+        // побитовая сверка mb==mv — под паритет-порогом 9, а мм-путь — с
+        // rel-допуском против построчного mv.
+        unsafe { std::env::set_var("INFER_QUANT_MM_MIN", "9") };
         let av5 = be.from_cpu_f32(&a, vec![rows, k]).unwrap();
         let c5 = be.zeros(vec![rows, n]).unwrap();
         be.ctx
@@ -6617,6 +6689,45 @@ mod quant_gemm_tests {
                     s.to_bits(),
                     "M=5 row={r} n={ni}: {b} vs M=1 {s} (не побитово)"
                 );
+            }
+        }
+        // мм-путь (дефолтный порог 4 → M=5 идёт gemm_nt_iq4_xs_mm): сверка
+        // ОБОИХ путей (mm и построчный mv) с хост-деквантом — численная
+        // истина; mm vs mv напрямую имеет длинный хвост расхождений
+        // (накопление нибблов в быстром mv), но оба близки к точному.
+        unsafe { std::env::remove_var("INFER_QUANT_MM_MIN") };
+        let cmm = be.zeros(vec![rows, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av5.inner_metal(), w.inner_metal(), cmm.inner_metal())
+            .unwrap();
+        let gotm = be.to_cpu_f32(&cmm).unwrap();
+        let wt_f = crate::weights_map::dequant_iq4_xs(&raw);
+        for r in 0..rows {
+            let x = &a[r * k..r * k + k];
+            let host: Vec<f32> = (0..n)
+                .map(|ni| (0..k).map(|ki| wt_f[ni * k + ki] * x[ki]).sum())
+                .collect();
+            let av1 = be.from_cpu_f32(x, vec![1, k]).unwrap();
+            let c1 = be.zeros(vec![1, n]).unwrap();
+            be.ctx
+                .gemm_nt_quantized(av1.inner_metal(), w.inner_metal(), c1.inner_metal())
+                .unwrap();
+            let got1 = be.to_cpu_f32(&c1).unwrap();
+            for ni in 0..n {
+                let h = host[ni];
+                let bm = gotm[r * n + ni];
+                let bv = got1[ni];
+                let scale = 1.0 + h.abs();
+                let relm = (bm - h).abs() / scale;
+                let relv = (bv - h).abs() / scale;
+                // Оба пути — порты llama.cpp (mul_mm/mul_mv) с накоплением
+                // нескалированных нибблов: отклонение от ТОЧНОГО декванта
+                // до ~3% rel на крупновесной синтетике (d=1) — свойство
+                // кернелов эталона, не баг раскладки (грубый баг дал бы
+                // O(1)); побитовый паритет с оракулом — на совпадении путей
+                // (см. oracle-сверки A4).
+                assert!(relm < 5e-2, "mm row={r} n={ni}: {bm} vs host {h} (rel {relm})");
+                assert!(relv < 5e-2, "mv row={r} n={ni}: {bv} vs host {h} (rel {relv})");
             }
         }
     }

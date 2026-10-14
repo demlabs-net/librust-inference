@@ -20,7 +20,7 @@ use crate::dtype::{Dtype, WeightFormat};
 use crate::error::BackendError;
 use crate::nn::Linear;
 use crate::qwen3::{Qwen3Config, Qwen3Model};
-use crate::weights::{F32Tensors, read_safetensors_f32};
+use crate::weights::F32Tensors;
 use crate::weights_map::{WeightTensor, WeightsMap};
 
 // ─────────────────────────── конфиг ───────────────────────────
@@ -468,32 +468,63 @@ fn map_thinker_name(name: &str) -> Option<String> {
     Some(mapped)
 }
 
+/// Нужен ли тензор thinker'у при потенциальном чтении: мапится
+/// map_thinker_name и не отбрасывается фильтром bias в load_thinker.
+/// Держится в синхроне с отбором load_thinker — расхождение молча потеряло
+/// бы вес (или читало лишнее).
+fn thinker_wants(name: &str) -> bool {
+    match map_thinker_name(name) {
+        Some(m) => {
+            let is_attn_bias = m.ends_with(".bias")
+                && (m.contains("attn_q.") || m.contains("attn_k.") || m.contains("attn_v."));
+            !(m.ends_with(".bias") && !is_attn_bias)
+        }
+        None => false,
+    }
+}
+
 /// Собрать WeightsMap (f32) из прочитанных safetensors-тензоров thinker'а и
 /// загрузить Qwen3Model. raw-хранилище живёт в этой функции — Qwen3Model::load
 /// копирует всё в GPU до возврата.
 fn load_thinker(
     backend: &dyn Backend,
-    t: &F32Tensors,
+    t: &mut F32Tensors,
     cfg: &OmniThinkerConfig,
 ) -> Result<Qwen3Model, BackendError> {
     let mut raw: Vec<(String, Vec<u8>, Vec<u64>)> = Vec::new();
-    for (name, (data, shape)) in t {
-        if let Some(mapped) = map_thinker_name(name) {
-            // attn_q/k/v.bias обрабатывает Qwen3Model::load (qkv_bias);
-            // остальные bias в Qwen3-архитектуре не используются.
-            let is_attn_bias = mapped.ends_with(".bias")
-                && (mapped.contains("attn_q.")
-                    || mapped.contains("attn_k.")
-                    || mapped.contains("attn_v."));
-            if mapped.ends_with(".bias") && !is_attn_bias {
+    // remove() вместо клонов: F32-данные освобождаются по мере сборки raw —
+    // одновременное удержание обеих копий thinker'а (~24 ГБ на Omni-3B)
+    // разоряло память вместе с GPU-заливкой. Порядок детерминирован
+    // (сортировка имён): накопительные офсеты ниже этого не требуют,
+    // лишь бы были непрерывны.
+    let mut names: Vec<String> = t.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        let mapped = match map_thinker_name(&name) {
+            Some(m) => m,
+            None => {
+                t.remove(&name);
                 continue;
             }
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for v in data {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            raw.push((mapped, bytes, shape.iter().map(|&d| d as u64).collect()));
+        };
+        let (data, shape) = match t.remove(&name) {
+            Some(v) => v,
+            None => continue,
+        };
+        // attn_q/k/v.bias обрабатывает Qwen3Model::load (qkv_bias);
+        // остальные bias в Qwen3-архитектуре не используются.
+        let is_attn_bias = mapped.ends_with(".bias")
+            && (mapped.contains("attn_q.")
+                || mapped.contains("attn_k.")
+                || mapped.contains("attn_v."));
+        if mapped.ends_with(".bias") && !is_attn_bias {
+            continue;
         }
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        raw.push((mapped, bytes, shape.iter().map(|&d| d as u64).collect()));
     }
     // Реальные (накопительные) офсеты: tied_aliases в Qwen3Model::load
     // сравнивает offset+len — при offset=0 у всех тензоров output.weight
@@ -544,28 +575,67 @@ impl OmniModel {
     /// dir — каталог с config.json + model-0000{i}-of-00003.safetensors.
     pub fn load(backend: &dyn Backend, dir: &Path) -> Result<Self, BackendError> {
         let cfg = config_from_json(dir)?;
+        // Потенциальный план (фикс памяти): прежний путь читал ВСЕ шейды
+        // read_safetensors_f32 — F32-копия всего стека (~22 ГБ для Omni-3B
+        // thinker+talker+vision) плюс байтовый дубль thinker'а в
+        // load_thinker — пик под 46 ГБ, jetsam убивал процесс (exit 137)
+        // ещё на заливке весов. Теперь: имена и их шейды — из
+        // model.safetensors.index.json (fallback — заголовки шардов),
+        // читаем ТОЛЬКО нужные (audio tower + мапящиеся thinker) по одному
+        // тензору (range-чтение), а load_thinker освобождает F32-данные по
+        // мере сборки raw.
         let mut all: F32Tensors = HashMap::new();
-        let mut i = 1;
-        loop {
-            let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
-            if !p.exists() {
-                break;
+        let mut read = 0usize;
+        let index_path = dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            let mut name_file: HashMap<String, String> = HashMap::new();
+            for (file, names) in crate::weights::load_safetensors_index(&index_path)
+                .map_err(|e| BackendError::Shape(format!("index: {e}")))?
+            {
+                for n in names {
+                    name_file.insert(n, file.clone());
+                }
             }
-            let loaded = read_safetensors_f32(&p)
-                .map_err(|e| BackendError::Shape(format!("{}: {e}", p.display())))?;
-            let n = loaded.len();
-            all.extend(loaded);
-            eprintln!("loaded shard {i}: {n} tensors");
-            i += 1;
+            for (name, file) in &name_file {
+                if !name.starts_with("thinker.audio_tower.") && !thinker_wants(name) {
+                    continue;
+                }
+                let (data, shape) =
+                    crate::weights::read_safetensors_tensor_f32(&dir.join(file), name)
+                        .map_err(|e| BackendError::Shape(format!("{name}: {e}")))?;
+                all.insert(name.clone(), (data, shape));
+                read += 1;
+            }
+        } else {
+            let mut i = 1;
+            loop {
+                let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
+                if !p.exists() {
+                    break;
+                }
+                for name in crate::weights::safetensors_tensor_names(&p)
+                    .map_err(|e| BackendError::Shape(format!("{}: {e}", p.display())))?
+                {
+                    if !name.starts_with("thinker.audio_tower.") && !thinker_wants(&name) {
+                        continue;
+                    }
+                    let (data, shape) = crate::weights::read_safetensors_tensor_f32(&p, &name)
+                        .map_err(|e| BackendError::Shape(format!("{name}: {e}")))?;
+                    all.insert(name, (data, shape));
+                    read += 1;
+                }
+                i += 1;
+            }
+            if i == 1 {
+                return Err(BackendError::Shape(format!(
+                    "no safetensors shards in {}",
+                    dir.display()
+                )));
+            }
         }
-        if i == 1 {
-            return Err(BackendError::Shape(format!(
-                "no safetensors shards in {}",
-                dir.display()
-            )));
-        }
+        eprintln!("omni: прочитано тензоров по одному: {read}");
         let tower = OmniAudioTower::load(backend, &all, &cfg.audio)?;
-        let thinker = load_thinker(backend, &all, &cfg.thinker)?;
+        let thinker = load_thinker(backend, &mut all, &cfg.thinker)?;
         Ok(Self {
             cfg,
             tower,
@@ -944,7 +1014,7 @@ mod tests {
         let mut all: F32Tensors = std::collections::HashMap::new();
         for i in 1..=3 {
             let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
-            let t = read_safetensors_f32(&p).unwrap();
+            let t = crate::weights::read_safetensors_f32(&p).unwrap();
             all.extend(t);
         }
         let mb = MetalBackend::new().expect("metal backend");

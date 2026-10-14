@@ -172,16 +172,30 @@ type StTensorInfo = (String, String, Vec<usize>, usize, usize);
 
 /// Парсинг заголовка safetensors (имена + оффсеты, без данных).
 fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 8 {
-        anyhow::bail!("safetensors: file too short ({} bytes)", bytes.len());
+    // Только заголовок (8 байт длины + JSON-шапка), НЕ весь файл: эта
+    // функция зовётся на каждый тензор при потоковой загрузке, и прежний
+    // std::fs::read перечитывал 5-гигабайтный шард ради 200 КБ заголовка —
+    // 924 тензора Omni-3B = 4.6 ТБ чтений (загрузка 832 с вместо минут).
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    use std::io::Read as _;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf)
+        .with_context(|| format!("{}: чтение длины заголовка", path.display()))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    // Разумный потолок (битый/враждебный файл не превратится в аллокацию
+    // на гигабайты): реальные шапки — сотни КБ.
+    if header_len > 256 * 1024 * 1024 {
+        anyhow::bail!(
+            "safetensors: заголовок {} подозрительно велик ({} B)",
+            path.display(),
+            header_len
+        );
     }
-    let header_len = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
-    let header_end = 8usize
-        .checked_add(header_len)
-        .filter(|&e| e <= bytes.len())
-        .ok_or_else(|| anyhow::anyhow!("safetensors: header len {header_len} exceeds file size"))?;
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..header_end])?;
+    let mut buf = vec![0u8; header_len];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("{}: чтение заголовка", path.display()))?;
+    let header: serde_json::Value = serde_json::from_slice(&buf)?;
     let map = header
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid safetensors header"))?;
@@ -273,7 +287,6 @@ pub fn read_safetensors_tensor_f32(
         .into_iter()
         .find(|(n, _, _, _, _)| n == name)
         .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))?;
-    let bytes = std::fs::read(path)?;
     // checked product (битый shape в заголовке → чистый Err, не wrap).
     let numel: usize = shape
         .iter()
@@ -301,9 +314,22 @@ pub fn read_safetensors_tensor_f32(
             declared_end.saturating_sub(start)
         );
     }
-    let data = bytes
-        .get(start..end)
-        .ok_or_else(|| anyhow::anyhow!("tensor {name}: byte range out of bounds"))?;
+    // Диапазонное чтение (seek+read_exact), а не весь файл: шард Omni-3B —
+    // 5 ГБ, и прежний std::fs::read держал его в RAM целиком РАДИ одного
+    // тензора — при потоковой загрузке модели это разоряло память
+    // (jetsam kill 137 на загрузке omni3b).
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(
+        start
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("tensor {name}: offset overflow"))?,
+    ))?;
+    let mut buf = vec![0u8; nbytes];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("reading tensor {name} ({} B)", nbytes))?;
+    let data = &buf[..];
     let mut vec = Vec::with_capacity(numel);
     match dtype.as_str() {
         "F32" => {

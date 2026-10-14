@@ -38,6 +38,16 @@ pub struct OmniAudioConfig {
     pub max_source_positions: usize,
 }
 
+/// Один ход диалога для [`OmniModel::build_audio_input_multi`].
+pub struct AudioTurn {
+    /// ChatML-роль: "system" | "user" | "assistant".
+    pub role: String,
+    /// Some — аудио-вставка (audio_bos + N×audio_token + audio_eos) ПЕРЕД
+    /// текстом хода; ходов с аудио может быть несколько (мультитурн).
+    pub wav: Option<Vec<f32>>,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct OmniThinkerConfig {
     pub dim: usize,
@@ -653,34 +663,84 @@ impl OmniModel {
         text_after: &str,
         tokenizer: &crate::tokenizer::Tokenizer,
     ) -> Result<(Vec<u32>, Tensor, Vec<u32>, usize), BackendError> {
-        let (mel, t) = audio::log_mel_spectrogram(wav);
-        // mel — [128, T] row-major (m*T+i); tower ждёт time-major [T, 128] —
-        // транспонируем (перестановка, не reshape!)
-        let mut mel_tm = vec![0.0f32; t * 128];
-        for i in 0..t {
-            for m in 0..128 {
-                mel_tm[i * 128 + m] = mel[m * t + i];
+        self.build_audio_input_multi(
+            backend,
+            &[AudioTurn {
+                role: "user".into(),
+                wav: Some(wav.to_vec()),
+                text: text_after.into(),
+            }],
+            tokenizer,
+        )
+    }
+
+    /// Мультитурн-вход (ChatML): system (явный ход или дефолт) → ходы
+    /// (user/assistant; user с `wav` — аудио-вставка перед текстом) →
+    /// генерационный префикс assistant. Аудио-куски гонятся через башню
+    /// КАЖДЫЙ отдельно (mel-фронтенд на свой контекст), их фичи
+    /// конкатенируются в один [Σn_i, 2048]: embedding_override заменяет
+    /// ВСЕ audio_token'ы ids по порядку, так что разрывные блоки ходят
+    /// одним prefill_with_vision.
+    pub fn build_audio_input_multi(
+        &self,
+        backend: &dyn Backend,
+        turns: &[AudioTurn],
+        tokenizer: &crate::tokenizer::Tokenizer,
+    ) -> Result<(Vec<u32>, Tensor, Vec<u32>, usize), BackendError> {
+        let sys = turns
+            .iter()
+            .find(|t| t.role == "system")
+            .map(|t| t.text.clone())
+            .unwrap_or_else(|| "You are a helpful assistant.".into());
+        let mut ids = tokenizer.encode(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+        let mut feats: Vec<Tensor> = Vec::new();
+        let mut total_feat_rows = 0usize;
+        for t in turns.iter().filter(|t| t.role != "system") {
+            ids.extend(tokenizer.encode(&format!("<|im_start|>{}\n", t.role)));
+            if let Some(wav) = &t.wav {
+                let (mel, tm) = audio::log_mel_spectrogram(wav);
+                // mel — [128, T] row-major (m*T+i); tower ждёт time-major
+                // [T, 128] — транспонируем (перестановка, не reshape!)
+                let mut mel_tm = vec![0.0f32; tm * 128];
+                for i in 0..tm {
+                    for m in 0..128 {
+                        mel_tm[i * 128 + m] = mel[m * tm + i];
+                    }
+                }
+                let mel_t = backend.from_cpu_f32(&mel_tm, vec![1, tm, 128])?;
+                let f = self.tower.forward(backend, &mel_t)?;
+                total_feat_rows += f.shape()[0];
+                ids.push(self.cfg.thinker.audio_bos_id);
+                ids.extend(std::iter::repeat_n(
+                    self.cfg.thinker.audio_token_id,
+                    f.shape()[0],
+                ));
+                ids.push(self.cfg.thinker.audio_eos_id);
+                feats.push(f);
             }
+            ids.extend(tokenizer.encode(&format!("{}<|im_end|>\n", t.text)));
         }
-        let mel_t = backend.from_cpu_f32(&mel_tm, vec![1, t, 128])?;
-        let audio_tokens = self.tower.forward(backend, &mel_t)?;
-        let n = audio_tokens.shape()[0];
-        let ids = {
-            let mut ids = tokenizer.encode(
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
-                 <|im_start|>user\n",
-            );
-            ids.push(self.cfg.thinker.audio_bos_id);
-            ids.extend(std::iter::repeat_n(self.cfg.thinker.audio_token_id, n));
-            ids.push(self.cfg.thinker.audio_eos_id);
-            ids.extend(
-                tokenizer.encode(&format!("{text_after}<|im_end|>\n<|im_start|>assistant\n")),
-            );
-            ids
+        ids.extend(tokenizer.encode("<|im_start|>assistant\n"));
+        // Фичи одним тензором: единственное аудио — без копий; несколько —
+        // copy_rows_into (строки ложатся подряд, порядок = порядок токенов).
+        let vemb = match feats.len() {
+            0 => backend.zeros(vec![0, self.cfg.thinker.dim])?,
+            1 => feats.remove(0),
+            _ => {
+                let d = self.cfg.thinker.dim;
+                let mut out = backend.zeros(vec![total_feat_rows, d])?;
+                let mut row = 0usize;
+                for f in &feats {
+                    let n = f.shape()[0];
+                    out = backend.copy_rows_into(f, n, d, out, row, 0, d)?;
+                    row += n;
+                }
+                out
+            }
         };
         let pos4d: Vec<u32> = (0..ids.len() as u32).flat_map(|p| [p, p, p, 0]).collect();
         let n_ids = ids.len();
-        Ok((ids, audio_tokens, pos4d, n_ids))
+        Ok((ids, vemb, pos4d, n_ids))
     }
 }
 
@@ -765,13 +825,24 @@ pub fn tokenizer_from_json(dir: &Path) -> Result<crate::tokenizer::Tokenizer, Ba
 
     let mut tok = crate::tokenizer::Tokenizer::from_parts(pieces, merges, None, None, None);
     // спец-токены (added_tokens special=true) — едиными кусками до BPE
+    let mut eog_candidates: Vec<(String, u32)> = Vec::new();
     if let Some(arr) = v["added_tokens"].as_array() {
         for t in arr {
             if t["special"].as_bool().unwrap_or(false) {
                 let id = t["id"].as_u64().unwrap_or(0) as u32;
                 let content = t["content"].as_str().unwrap_or("");
                 tok.add_special(norm(content), id);
+                eog_candidates.push((content.to_string(), id));
             }
+        }
+    }
+    // EOG (как special_eog_ids llama.cpp для Qwen-семейства): from_parts
+    // строил набор БЕЗ eos, is_eog всегда был false — генерация никогда не
+    // останавливалась на конце ответа и продолжала «Human: …» до лимита
+    // (нечестное ограничение, поймано HTTP-приёмкой). im_end + endoftext.
+    for (content, id) in &eog_candidates {
+        if content == "<|im_end|>" || content == "<|endoftext|>" {
+            tok.add_eog(*id);
         }
     }
     Ok(tok)

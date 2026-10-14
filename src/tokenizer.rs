@@ -196,6 +196,16 @@ impl Tokenizer {
         self.eog.binary_search(&id).is_ok()
     }
 
+    /// Дополнить EOG-набор (загрузчики не из GGUF — tokenizer.json Omni/MLX:
+    /// from_parts строит набор без eos, и генерация никогда не останавливалась
+    /// на конце ответа). Дедуп + сортировка — is_eog ищет binary_search'ем.
+    pub fn add_eog(&mut self, id: u32) {
+        if !self.is_eog(id) {
+            self.eog.push(id);
+            self.eog.sort_unstable();
+        }
+    }
+
     /// Сменить пред-токенизатор (источники не из GGUF: tokenizer.json Omni).
     pub fn with_pre(mut self, pre: PreTokenizer) -> Self {
         self.pre = pre;

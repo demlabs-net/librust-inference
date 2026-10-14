@@ -5407,6 +5407,10 @@ impl crate::backend::Backend for MetalBackend {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(4);
+                // Q5_K остаётся в mm (порог ниже): самодельный mb-кернел
+                // (simdgroup на строку весов, скалярные разбросанные загрузки
+                // A) дал ×3 к mm-тайлу на m=4 — отклонён по замерам; узкоспец
+                // Q5_K small-m тайл — кандидат следующего захода.
                 let mm_capable = matches!(
                     bg.dtype,
                     GpuDtype::Q4_K

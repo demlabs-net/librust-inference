@@ -1836,7 +1836,10 @@ impl MetalCtx {
                             5 => "mv_iq4_xs_mb5",
                             _ => "mv_iq4_xs_mb6",
                         };
-                        let grid = MTLSize::new(32, n as u64, 1);
+                        // tgid.x в кернеле НЕ читается — прежде здесь
+                        // запускалось 32 ИДЕНТИЧНЫХ threadgroup'а на строку
+                        // весов (32× холостая работа GPU, Ф8.2g).
+                        let grid = MTLSize::new(1, n as u64, 1);
                         let group = MTLSize::new(32, 1, 1);
                         let a_off = (a.offset + row0 * k * 4) as u64;
                         let c_off = (c.offset + row0 * n * 4) as u64;

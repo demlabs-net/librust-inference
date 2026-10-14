@@ -181,9 +181,21 @@ impl DFlashModel {
             c.set_max_cap(Some(cfg.rope_max_seq));
         }
         let selector = if w.get("selector_predecessor").is_some() {
-            // rank/top_k — из метаданных драфтера (GGUF KV
-            // dflash.selector_rank / dflash.selector_top_k); задел: параметры
-            let (rank, top_k) = (4usize, 10usize);
+            // rank — из формы тензора (numel / vocab), а не константы: при
+            // файле с рангом ≠ 4 прежний хардкод давал numel-несоответствие
+            // и панику в from_cpu_f32 (ревью Ф2.9). top_k из тензоров не
+            // читается — дефолт 10, load_with_selector перезагружает из
+            // метаданных (GGUF KV dflash.selector_rank / dflash.selector_top_k).
+            let pred = w.get("selector_predecessor").expect("проверено выше");
+            let numel: usize = pred.shape.iter().map(|&d| d as usize).product();
+            let rank = numel / cfg.vocab_size.max(1);
+            if rank == 0 {
+                return Err(BackendError::Shape(format!(
+                    "DFlash: selector_predecessor numel {numel} < vocab {} — ранг не читается",
+                    cfg.vocab_size
+                )));
+            }
+            let top_k = 10usize;
             // Селектор — маленький и читается в select() на CPU (жадный путь):
             // держим в F32, чтобы to_cpu_f32 не падал на f16-тензорах.
             // ggml-порядок (row-major реверс): prev/next [n_vocab, rank]
@@ -646,9 +658,27 @@ impl DFlashModel {
         let getw = |name: &str| -> Option<&crate::weights_map::WeightTensor<'_>> {
             w.get(name).or_else(|| w.get(&format!("{name}.weight")))
         };
-        if let (Some(rank), Some(top_k), Some(_)) =
-            (sel_rank, sel_top_k, getw("selector_predecessor"))
-        {
+        // Класс бага «молчаливого отката» (d511cde кусался дважды): любое
+        // несоответствие тензоров и метаданных селектора теперь ГОВОРИТ, а не
+        // уходит молча в v1-аргмакс с тихой потерей приёмки.
+        let has_tensors = getw("selector_predecessor").is_some()
+            && getw("selector_successor").is_some()
+            && getw("selector_hidden").is_some();
+        let has_meta = sel_rank.is_some() || sel_top_k.is_some();
+        if has_tensors {
+            // Дефолты z-lab (4, 10) допустимы только с явным предупреждением.
+            let rank = sel_rank.unwrap_or(4);
+            let top_k = sel_top_k.unwrap_or(10);
+            if (sel_rank.is_none() || sel_top_k.is_none()) && has_meta {
+                tracing::warn!(
+                    "DFlash: селектор найден, но метаданные неполные (rank={sel_rank:?}, top_k={sel_top_k:?}) — дефолты ({rank}, {top_k})"
+                );
+            }
+            if rank == 0 || top_k == 0 {
+                return Err(BackendError::Shape(format!(
+                    "DFlash: метаданные селектора нулевые (rank={rank}, top_k={top_k})"
+                )));
+            }
             let up_f32 = |name: &str, shape: Vec<usize>| -> Result<Tensor, BackendError> {
                 let f = dequant_f32(
                     getw(name)
@@ -663,6 +693,10 @@ impl DFlashModel {
                 rank,
                 top_k,
             });
+        } else if has_meta {
+            tracing::warn!(
+                "DFlash: метаданные селектора есть, а тензоров selector_* — нет; драфтер пойдёт v1-аргмаксом (приёмка ниже)"
+            );
         }
         Ok(m)
     }
@@ -1011,7 +1045,9 @@ impl DFlashModel {
             .as_ref()
             .ok_or_else(|| BackendError::Shape("select: у драфтера нет селектора (v1)".into()))?;
         let (t, vocab) = (logits.shape()[1], logits.shape()[2]);
-        let (rank, top_k) = (sel.rank, sel.top_k.min(vocab));
+        // top_k=0 из битых метаданных дал бы пустые cand-строки и панику на
+        // cand[pos][best] (ревью Ф2.9).
+        let (rank, top_k) = (sel.rank, sel.top_k.max(1).min(vocab));
         let lg = backend.to_cpu_f32(logits)?; // [T, V]
         let hd = backend.to_cpu_f32(hidden)?; // [T, D]
         // ggml-порядок: prev/next [vocab, rank], hidden [rank, D]
@@ -1068,7 +1104,10 @@ impl DFlashModel {
                 }
             }
             tokens.push(cand[pos][best]);
-            probs.push(softmax_row_prob(&lg, pos, vocab, cand[pos][best]));
+            // Путь решётки детерминирован (жадный argmax) → дельта q=1.0.
+            // Прежняя softmax-вероятность при temperature>0 завышала приём
+            // (черновик не сэмплирован из этого распределения) — ревью Ф2.9.
+            probs.push(1.0);
             pred = cand[pos][best];
         }
         Ok(SelectResult { tokens, probs })
@@ -1081,22 +1120,8 @@ pub struct SelectResult {
     pub probs: Vec<f32>,
 }
 
-/// softmax-вероятность токена в ряду логгитов (честная q драфтера).
-fn softmax_row_prob(lg: &[f32], pos: usize, vocab: usize, tok: u32) -> f32 {
-    softmax_row_prob_t(&lg[pos * vocab..(pos + 1) * vocab], tok, 1.0)
-}
-
-/// Вероятность токена в softmax(row / temperature) — q для rejection
-/// sampling обязана считаться по ТОМУ ЖЕ распределению, из которого
-/// черновик сэмплирован. pub(crate): общий с MTP-драфтером (Ф2.6).
-pub(crate) fn softmax_row_prob_t(row: &[f32], tok: u32, temperature: f32) -> f32 {
-    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for &l in row {
-        sum += ((l - max) / temperature).exp();
-    }
-    ((row[tok as usize] - max) / temperature).exp() / sum
-}
+// (q драфтера — дельта 1.0, см. crate::spec::Drafter::draft; прежние
+// softmax_row_prob/softmax_row_prob_t давали нечестную скалярную q.)
 
 /// DFlash-драфтер (Ф2.5): диффузия блока [anchor, MASK×…] → селектор v2
 /// (или top-1 для v1) → γ draft-токенов с честными q. Кэш на каждый вызов
@@ -1233,7 +1258,11 @@ impl crate::spec::Drafter for DFlashDrafter {
             );
         }
         // extract-тензоры — [1, T, D] (batch=1): строки 0..n_accepted —
-        // принятые токены; их позиции [pos+1-n_accepted .. pos+1).
+        // принятые токены; pos = context_len() ПОСЛЕ окна, значит их позиции
+        // [pos−n_accepted .. pos) (последняя строка — последний принятый,
+        // БОНУСНЫЙ токен отказа в контекст не входит: он станет якорем
+        // следующего блока на позиции pos — ровно как у оракула, где шумовой
+        // блок идёт на [n_past..), а контекст — на [n_past−ctx, n_past)).
         // ВАЖНО (4.2c): z-lab конкат по ПОСЛЕДНЕЙ оси (dim=-1) — фичи
         // строки t = [l0[t]; l1[t]; …; l4[t]] (токен-мажор!). Раньше
         // клали слой-мажор ([L0-все строки, L1-все…]) — fc получал
@@ -1323,7 +1352,10 @@ impl crate::spec::Drafter for DFlashDrafter {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("DFlashDrafter: диффузия не удалась: {e}");
+                    tracing::warn!("DFlashDrafter: диффузия не удалась: {e}");
+                    // Кэш мог остаться с частичными строками блока — откат к
+                    // pos, иначе следующий дрейф пишет поверх дыры (ревью Ф2.9).
+                    self.model.truncate_caches(pos);
                     return (vec![], vec![]);
                 }
             };
@@ -1333,7 +1365,8 @@ impl crate::spec::Drafter for DFlashDrafter {
             match self.model.select(backend, &res.logits, &res.hidden, anchor) {
                 Ok(s) => (s.tokens, s.probs),
                 Err(e) => {
-                    eprintln!("DFlashDrafter: селектор не удался: {e}");
+                    tracing::warn!("DFlashDrafter: селектор не удался: {e}");
+                    self.model.truncate_caches(pos);
                     return (vec![], vec![]);
                 }
             }
@@ -1362,7 +1395,8 @@ impl crate::spec::Drafter for DFlashDrafter {
                 let (ids, _lse) = match backend.argmax_rows(&res.logits, None) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("DFlashDrafter: аргмакс строк не удался: {e}");
+                        tracing::warn!("DFlashDrafter: аргмакс строк не удался: {e}");
+                        self.model.truncate_caches(pos);
                         return (vec![], vec![]);
                     }
                 };
@@ -1377,7 +1411,8 @@ impl crate::spec::Drafter for DFlashDrafter {
                 let lg = match backend.to_cpu_f32(&res.logits) {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("DFlashDrafter: logits недоступны: {e}");
+                        tracing::warn!("DFlashDrafter: logits недоступны: {e}");
+                        self.model.truncate_caches(pos);
                         return (vec![], vec![]);
                     }
                 };
@@ -1396,7 +1431,12 @@ impl crate::spec::Drafter for DFlashDrafter {
                         self.sample_row(row, temp, top_k)
                     };
                     tokens.push(tok);
-                    probs.push(softmax_row_prob_t(row, tok, if argmx { 1.0 } else { temp }));
+                    // Скалярная q честна только как дельта (1.0): sample_row
+                    // усещает top-k и ренормирует, а softmax_row_prob_t
+                    // возвращал вероятность ПОЛНОГО softmax — q занижалась,
+                    // min(1,p/q) завышалась (over-acceptance, ревью Ф2.9).
+                    // Полная раскладка q в интерфейсе Drafter не ездит.
+                    probs.push(1.0);
                 }
             }
             (tokens, probs)
@@ -1481,7 +1521,19 @@ fn conv_side(
             "dflash conv: dynamic width smaller than kernel*2 groups".into(),
         ));
     }
+    // group=0 (строк conv_proj меньше d) — деление на ноль в CPU-референсе;
+    // неделимость — тихая потеря хвостовых каналов (ревью Ф2.9).
+    if d % n_groups != 0 {
+        return Err(BackendError::Shape(format!(
+            "dflash conv: dim {d} не делится на n_groups {n_groups}"
+        )));
+    }
     let group = d / n_groups;
+    if group == 0 {
+        return Err(BackendError::Shape(
+            "dflash conv: нулевая ширина группы".into(),
+        ));
+    }
     let y = backend.zeros(x.shape().to_vec())?;
     backend.dflash2_conv(
         &x.view(vec![b * t, d]),

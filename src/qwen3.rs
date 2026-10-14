@@ -1541,6 +1541,8 @@ impl Qwen3Model {
 
     /// Decode: один токен → logits [1, 1, V]; KV-кэш растёт.
     /// Вероятность токена в softmax-распределении строки.
+    #[cfg(test)] // верификация берёт p из modified_probs; функция осталась
+    // только как эталон «чистого softmax» в тестах rejection-sampling
     fn softmax_prob(row: &[f32], tok: u32) -> f32 {
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
@@ -1548,32 +1550,6 @@ impl Qwen3Model {
             sum += (l - max).exp();
         }
         ((row[tok as usize] - max).exp()) / sum
-    }
-
-    /// Честное rejection-sampling (Leviathan et al.): сэмпл из (p − q)+,
-    /// где q — масса драфтера на draft-токене.
-    fn sample_modified(row: &[f32], draft_tok: u32, q: f32, rng: &mut Option<u64>) -> u32 {
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
-        let sum_exp: f32 = w.iter().sum();
-        // вычесть q-массу (в exp-масштабе) с draft-позиции; p' = (p − q)+
-        w[draft_tok as usize] -= q * sum_exp;
-        let mut total = 0.0f32;
-        for v in w.iter_mut() {
-            *v = v.max(0.0);
-            total += *v;
-        }
-        if total <= 0.0 {
-            return draft_tok; // вырожденный случай — масса целиком в draft
-        }
-        let mut r = Self::uniform01(rng) * total;
-        for (i, &v) in w.iter().enumerate() {
-            r -= v;
-            if r <= 0.0 {
-                return i as u32;
-            }
-        }
-        (w.len() - 1) as u32
     }
 
     /// Равномерное U(0,1) — общий LCG-примитив проекта
@@ -1607,14 +1583,20 @@ impl Qwen3Model {
         // сэмплировал бы из распределения, а обычный decode брал argmax —
         // тексты спек- и жадной генерации расходились (наблюдалось на сервисе).
         greedy: bool,
-        // Для жадной верификации: та же история и штраф за повторы, что у
-        // обычного decode. Без них argmax считался бы без штрафа, и спек
-        // принимал бы токены, которых жадный путь не выбрал бы (расхождение
-        // траекторий на первом же частом токене из истории).
+        // Для верификации: та же история и тот же каскад сэмплирования
+        // (`sp`), что у обычного decode — жадный argmax со штрафом и
+        // сэмплирующая p из модифицированного распределения. Расхождение
+        // каскадов ломает лосслессность (ревью Ф2.9).
         hist: &[u32],
-        repeat_penalty: f32,
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<SpecOutcome, BackendError> {
-        assert_eq!(draft.len(), draft_probs.len());
+        if draft.len() != draft_probs.len() {
+            return Err(BackendError::Shape(format!(
+                "decode_spec: черновиков {} != вероятностей {}",
+                draft.len(),
+                draft_probs.len()
+            )));
+        }
         let prof = std::env::var("LLM_SPEC_PROF").is_ok();
         let tp = std::time::Instant::now();
         let mut ids = Vec::with_capacity(1 + draft.len());
@@ -1628,15 +1610,16 @@ impl Qwen3Model {
         // Жадная проверка без штрафа за повторы (обычный режим сервиса):
         // argmax строк считается на GPU, строка [1+γ, V] на хост не едет.
         // INFER_SPEC_CPU=1 — прежний путь через хост (сверка/замеры).
-        let gpu_greedy =
-            greedy && repeat_penalty == 1.0 && std::env::var("INFER_SPEC_CPU").is_err();
+        let gpu_greedy = greedy
+            && sp.repetition_penalty == 1.0
+            && std::env::var("INFER_SPEC_CPU").is_err();
         let mut ld = Vec::new();
         let (accepted, accepted_len, n_verified) = if gpu_greedy {
             let (am, _lse) = backend.argmax_rows(&logits, None)?;
             verify_greedy_by_argmax(id, draft, &am)
         } else {
             ld = backend.to_cpu_f32(&logits)?;
-            verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, repeat_penalty)
+            verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, sp)
         };
         let t_dl = tv.elapsed().as_secs_f64();
         // 3. KV-откат непринятого хвоста: остаются prefill-база + id + принятые.
@@ -2042,7 +2025,7 @@ pub(crate) fn verify_draft(
     rng: &mut Option<u64>,
     greedy: bool,
     hist: &[u32],
-    repeat_penalty: f32,
+    sp: &crate::inference::sampling::SamplingParams,
 ) -> (Vec<u32>, usize, usize) {
     let mut accepted: Vec<u32> = vec![id];
     let mut accepted_len = 1usize;
@@ -2056,13 +2039,27 @@ pub(crate) fn verify_draft(
         let mut h = Vec::with_capacity(hist.len() + accepted.len());
         h.extend_from_slice(hist);
         h.extend_from_slice(&accepted);
+        // Сэмплирующая ветка: p — ИЗ МОДИФИЦИРОВАННОГО распределения цели
+        // (штраф → температура → top-k/top-p/min-p, ренормировка) — того же,
+        // из которого `sample_next` сэмплирует обычный путь. Сырой softmax
+        // T=1 (прежний softmax_prob) сходился к другой выборке — спек при
+        // temperature>0 не был лосслесс (ревью Ф2.9).
+        let probs = if greedy {
+            Vec::new()
+        } else {
+            crate::inference::sampling::modified_probs(row, sp, &h)
+        };
         let take_draft = if greedy {
             // temperature <= 0: цель — детерминированный argmax СО ШТРАФОМ.
-            crate::inference::sampling::greedy_next(row, &h, repeat_penalty) == draft[i]
+            crate::inference::sampling::greedy_next(row, &h, sp.repetition_penalty) == draft[i]
         } else {
-            // Честное rejection-sampling (Leviathan et al., алгоритм 2):
-            // draft[i] принимается с вероятностью min(1, p/q).
-            let p = Qwen3Model::softmax_prob(row, draft[i]);
+            // Rejection-sampling: draft[i] принимается с вероятностью
+            // min(1, p/q). Скалярная q честна ТОЛЬКО как дельта (1.0):
+            // остаток (p−q)⁺ требует всей раскладки q, а её в интерфейсе
+            // нет; дельта-интерпретация (принять с вероятностью p(x),
+            // отказ — из (p−δ_x)⁺) лосслессна при ЛЮБОМ поведении драфтера
+            // (сверка-семантика оракула sample_and_accept_n).
+            let p = probs.get(draft[i] as usize).copied().unwrap_or(0.0);
             let q = draft_probs[i];
             let u = Qwen3Model::uniform01(rng);
             q <= 0.0 || u * q <= p
@@ -2075,9 +2072,14 @@ pub(crate) fn verify_draft(
             accepted.push(if greedy {
                 // Отказ в жадном режиме: argmax цели СО ШТРАФОМ (пересэмпл не
                 // нужен — распределение вырождено).
-                crate::inference::sampling::greedy_next(row, &h, repeat_penalty)
+                crate::inference::sampling::greedy_next(row, &h, sp.repetition_penalty)
             } else {
-                Qwen3Model::sample_modified(row, draft[i], draft_probs[i], rng)
+                crate::inference::sampling::sample_residual(
+                    &probs,
+                    draft[i],
+                    draft_probs[i],
+                    rng,
+                )
             });
             break;
         }
@@ -2481,6 +2483,19 @@ mod tests {
         mini_cfg()
     }
 
+    /// Каскад «чистый softmax»: T=1, без усечений и штрафа — modified_probs
+    /// с ним побитово == softmax по сырым логитам (тесты верификации).
+    fn sp_softmax_unit() -> crate::inference::sampling::SamplingParams {
+        crate::inference::sampling::SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            seed: None,
+            min_p: 0.0,
+        }
+    }
+
     /// Мини-Qwen3 на Metal (см. `test_util::build_model` — общий конструктор).
     fn mini_model() -> (MetalBackend, Qwen3Model) {
         mini_model_with_cfg(cfg())
@@ -2659,7 +2674,7 @@ mod tests {
                 &mut None,
                 true,
                 &[1, 2],
-                1.0,
+                &sp_softmax_unit(),
             );
 
             assert_eq!((len_g, nv_g), (len_c, nv_c), "draft={draft:?} argmax={argmax:?}");
@@ -2706,7 +2721,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let out = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], 1.0)
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], &sp_softmax_unit())
             .unwrap();
         // Контракт SpecOutcome: accepted[0] — ЯКОРЬ (гарантированный токен);
         // при γ=0 черновиков нет, значит список ровно из якоря.
@@ -2730,7 +2745,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], 1.0)
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], &sp_softmax_unit())
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let p3 = Qwen3Model::softmax_prob(&pv, 3);
@@ -2752,7 +2767,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(crate::inference::sampling::state_from_seed(seed));
         let out = model
-            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[], false, &[], 1.0)
+            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[], false, &[], &sp_softmax_unit())
             .unwrap();
         assert_eq!(out.accepted.len(), 2, "якорь + пересэмпл: draft отклонён");
         assert_eq!(out.accepted[0], 5, "accepted[0] — якорь");
@@ -2783,7 +2798,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], 1.0)
+            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], &sp_softmax_unit())
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let a = pv
@@ -2799,7 +2814,7 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(0xDEAD_BEEF);
         let out = model
-            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[], false, &[], 1.0)
+            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[], false, &[], &sp_softmax_unit())
             .unwrap();
         assert_eq!(
             out.accepted,

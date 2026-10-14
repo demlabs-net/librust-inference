@@ -199,6 +199,102 @@ pub fn top_p_sample_vec_history(
     sample_from(top_tokens, rng_state)
 }
 
+/// Модифицированное целевое распределение для верификации спекулятивного
+/// декодинга: штраф по уникальной истории → температура → softmax →
+/// top-k/top-p/min-p усечение с ренормировкой (вне окна — ноль).
+///
+/// КАСКАД ЗЕРКАЛЕН [`top_p_sample_vec_history`] побайтово (тот же порядок
+/// операций, тот же select_nth+сортировка окна, то же `>=` в top-p и min-p):
+/// p в rejection-sampling обязана браться ИЗ ТОГО ЖЕ распределения, из
+/// которого `sample_next` сэмплирует обычный путь, иначе спек-выход сходится
+/// не к целевой выборке (ревью Ф2.9: верификация считала p по сырым логитам
+/// T=1 без усечений — лосслессность нарушалась при temperature>0).
+pub fn modified_probs(logits: &[f32], params: &SamplingParams, history: &[u32]) -> Vec<f32> {
+    let mut logits_vec = logits.to_vec();
+    apply_repetition_penalty_vec_unique(&mut logits_vec, history, params.repetition_penalty);
+    if params.temperature != 1.0 {
+        for l in logits_vec.iter_mut() {
+            *l /= params.temperature;
+        }
+    }
+    let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp_vals: Vec<f32> = logits_vec.iter().map(|&l| (l - max_logit).exp()).collect();
+    let sum_exp: f32 = exp_vals.iter().sum();
+    let probs_vec: Vec<f32> = if sum_exp.is_finite() && sum_exp > 0.0 {
+        exp_vals.iter().map(|&e| e / sum_exp).collect()
+    } else {
+        let n = logits_vec.len() as f32;
+        vec![1.0 / n; logits_vec.len()]
+    };
+
+    let mut indexed: Vec<(usize, f32)> =
+        probs_vec.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+    let k = if params.top_k > 0 {
+        params.top_k.min(indexed.len())
+    } else {
+        indexed.len()
+    };
+    let window: Vec<(usize, f32)> = if k < indexed.len() {
+        let (head, pivot, _) = indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        let mut w: Vec<(usize, f32)> = head.to_vec();
+        w.push(*pivot);
+        w.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        w
+    } else {
+        indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        indexed
+    };
+    let mut cumsum = 0.0f32;
+    let mut cutoff = k;
+    for (i, (_, p)) in window.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= params.top_p {
+            cutoff = i + 1;
+            break;
+        }
+    }
+    let top = apply_min_p(&window[..cutoff], params.min_p);
+    // Ренормировка окна — как в sample_from (threshold = r·Σtop).
+    let total: f32 = top.iter().map(|(_, p)| p).sum();
+    let mut out = vec![0.0f32; logits.len()];
+    if total > 0.0 {
+        for (i, p) in top {
+            out[*i] = p / total;
+        }
+    } else if let Some((i, _)) = top.first() {
+        out[*i] = 1.0;
+    }
+    out
+}
+
+/// Остаточное распределение rejection-sampling: (p − q·δ_draft)⁺ поверх
+/// модифицированного p — вычесть массу драфтера с draft-позиции, обнулить
+/// отрицательное, ренормировать, сэмплить (индексный порядок — как у
+/// прежнего sample_modified).
+pub fn sample_residual(
+    probs: &[f32],
+    draft_tok: u32,
+    q: f32,
+    rng_state: &mut Option<u64>,
+) -> u32 {
+    let mut w: Vec<f32> = probs.to_vec();
+    if let Some(t) = w.get_mut(draft_tok as usize) {
+        *t = (*t - q).max(0.0);
+    }
+    let total: f32 = w.iter().sum();
+    if total <= 0.0 {
+        return draft_tok; // вырожденный случай — масса целиком в draft
+    }
+    let mut r = next_unit_f32(rng_state) * total;
+    for (i, v) in w.iter_mut().enumerate() {
+        r -= *v;
+        if r <= 0.0 {
+            return i as u32;
+        }
+    }
+    (w.len() - 1) as u32
+}
+
 /// Старое API (без истории) — speech-крейт и прежние вызовы. Без истории
 /// repetition penalty не применяется; для штрафа — top_p_sample_vec_history.
 pub fn top_p_sample_vec(
@@ -536,5 +632,75 @@ mod tests {
             first > 4_000 && second > 4_000,
             "biased selection: token0={first}, token1={second}"
         );
+    }
+
+    fn sp(temperature: f32, top_p: f32, top_k: usize, min_p: f32) -> SamplingParams {
+        SamplingParams {
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty: 1.0,
+            seed: None,
+            min_p,
+        }
+    }
+
+    /// modified_probs при T=1, top_p=1, без усечений == чистый softmax.
+    #[test]
+    fn modified_probs_softmax_unit_matches_softmax() {
+        let logits = [1.0f32, 2.0, 0.5, -1.0, 3.0];
+        let p = modified_probs(&logits, &sp(1.0, 1.0, 0, 0.0), &[]);
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
+        for (i, l) in logits.iter().enumerate() {
+            let want = (l - max).exp() / sum;
+            assert!((p[i] - want).abs() < 1e-6, "p[{i}]={} vs {want}", p[i]);
+        }
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    /// modified_probs с top-k: вне окна — ноль, окно ренормировано.
+    #[test]
+    fn modified_probs_top_k_truncates_and_renormalizes() {
+        let logits = [3.0f32, 2.0, 1.0, 0.0];
+        let p = modified_probs(&logits, &sp(1.0, 1.0, 2, 0.0), &[]);
+        assert_eq!(p[2], 0.0);
+        assert_eq!(p[3], 0.0);
+        let e3 = (3.0f32).exp();
+        let e2 = 2.0f32.exp();
+        let want0 = e3 / (e3 + e2);
+        assert!((p[0] - want0).abs() < 1e-6, "p[0]={} vs {want0}", p[0]);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    /// ЯДРО фикса лосслессности (ревью Ф2.9): дельта-верификация
+    /// (принять с вероятностью p(x), отказ — ресемпл из (p−δ_x)⁺) даёт
+    /// в точности p — при ЛЮБОМ способе выбора черновика. Здесь черновик —
+    /// детерминированный top-1 (намеренно смещённый драфтер).
+    #[test]
+    fn delta_rejection_sampling_is_lossless() {
+        let logits = [2.0f32, 1.0, 0.0, -1.0, 0.5];
+        let p = modified_probs(&logits, &sp(1.0, 1.0, 0, 0.0), &[]);
+        let draft = 0u32; // всегда «топ-1» — намеренно смещённый драфтер
+        let mut st = Some(0x1234_5678u64);
+        let mut counts = vec![0u64; p.len()];
+        let n = 200_000u64;
+        for _ in 0..n {
+            let u = next_unit_f32(&mut st);
+            let out = if u <= p[draft as usize] {
+                draft
+            } else {
+                sample_residual(&p, draft, 1.0, &mut st)
+            };
+            counts[out as usize] += 1;
+        }
+        for (i, &pi) in p.iter().enumerate() {
+            let f = counts[i] as f64 / n as f64;
+            let tol = ((pi.max(1e-3) * 0.03).max(0.004)) as f64;
+            assert!(
+                (f - pi as f64).abs() < tol,
+                "token {i}: freq {f} vs p {pi} (counts {counts:?})"
+            );
+        }
     }
 }

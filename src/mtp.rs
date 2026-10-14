@@ -257,7 +257,10 @@ impl MtpDrafter {
         let v = self.cfg.vocab_size;
         let row = backend.to_cpu_f32(logits)?;
         let id = self.sample_row(&row[..v], temp, top_k);
-        Ok((id, crate::dflash::softmax_row_prob_t(&row[..v], id, temp)))
+        // Скалярная q честна только как дельта (1.0) — sample_row усещает
+        // top-k, а softmax_row_prob_t считал бы вероятность полного softmax
+        // (over-acceptance, ревью Ф2.9).
+        Ok((id, 1.0))
     }
 
     /// Сэмпл из softmax(row/temperature) с топ-K (LCG, как у DFlash).
@@ -674,6 +677,11 @@ impl Drafter for MtpDrafter {
         self.pending_h = None;
         self.pending_rows = None;
         self.window.clear();
+        // Сид черновой LCG — тоже часть состояния последовательности:
+        // без сброса два запроса с одним seed давали разные черновики в
+        // зависимости от того, сколько генераций жил движок (воспроизводимость
+        // спек-против-спека, ревью Ф2.9).
+        self.rng = 0x85ebca6b;
     }
 
     fn target_layers(&self) -> &[usize] {
@@ -690,15 +698,16 @@ impl Drafter for MtpDrafter {
             return (Vec::new(), Vec::new());
         };
         // Отложенное переигрывание префилла: строки h промпта лежат в
-        // pending_rows, токены — в начале history.
-        if self.committed == 0
-            && let Some(rows) = self.pending_rows.take()
-        {
-            let d = self.cfg.dim;
-            let t = rows.shape()[0];
+        // pending_rows, токены — в начале history. Длину проверяем ДО take():
+        // забирая строки и выходя по короткой history, префилл терялся
+        // безвозвратно (драфтер мёртв до конца генерации, ревью Ф2.9).
+        if self.committed == 0 && self.pending_rows.is_some() {
+            let t = self.pending_rows.as_ref().unwrap().shape()[0];
             if history.len() < t + 1 {
                 return (Vec::new(), Vec::new());
             }
+            let rows = self.pending_rows.take().unwrap();
+            let d = self.cfg.dim;
             let r = (|| -> Result<(), BackendError> {
                 for q in 0..t {
                     let h_prev = if q == 0 {
@@ -718,8 +727,18 @@ impl Drafter for MtpDrafter {
         }
         // history = принятые + anchor (anchor ещё не в модели): ровно на 1
         // больше границы. Расхождение = драфтер рассинхронизирован с таргетом
-        // — черновиков не даём.
-        if gamma == 0 || history.len() != self.committed + 1 {
+        // — черновиков не даём. Драйвер теперь ведёт каждый токен через
+        // after_extract (в т.ч. при пустом черновике), так что рассинхрон
+        // возможен только после ошибки инжекта — фиксируем причину в логе.
+        if gamma == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        if history.len() != self.committed + 1 {
+            tracing::warn!(
+                "MtpDrafter: рассинхрон границы: history={} committed={} — черновиков нет",
+                history.len(),
+                self.committed
+            );
             return (Vec::new(), Vec::new());
         }
         let Some(mut h) = self.pending_h.clone() else {
@@ -774,12 +793,17 @@ impl Drafter for MtpDrafter {
             h.shape()[0]
         };
         let n = n_accepted.min(rows);
-        // Префилл узнаётся по pos == rows: он начинается с нулевой позиции,
-        // окно верификации всегда сидит ПОВЕРХ уже накопленного контекста.
+        // Префилл узнаётся по pos == n_accepted: префилл-вызов идёт с
+        // pos = n = длина промпта (позиции [0..n)), а окно верификации —
+        // pos = base + n_accepted при base ≥ 1, т.е. pos > n_accepted
+        // ВСЕГДА. Прежний признак pos == rows (rows — строки extract,
+        // 1+γ в окне) ложно срабатывал на коротких окнах отказа:
+        // base + n_ok == 1+γ (маленький промпт + все черновики отвергнуты)
+        // — nextn-KV сбрасывался посреди генерации (ревью Ф2.9).
         // (Признак по пустому window не годится: повторная попытка после
         // вырождения в сервисе — префилл при непустом окне прошлой
         // последовательности.)
-        if pos == rows {
+        if pos == n_accepted {
             self.kv.reset();
             self.committed = 0;
             self.window.clear();

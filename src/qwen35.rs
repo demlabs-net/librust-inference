@@ -16,9 +16,11 @@
 //! гейтовая RMS-норма с `z = attn_gate·x`; `ssm_out`.
 //!
 //! Состояние сессии — KV-кэши полных слоёв + conv/ssm-стейты рекуррентных.
-//! В отличие от KV, рекуррентный стейт НЕ откатывается усечением: операции,
-//! которым нужен откат (спекулятивная верификация, PP-стадии, перенос
-//! KV-объекта), для гибрида явно отвергаются вызывающим кодом.
+//! Рекуррентный стейт не откатывается усечением (в отличие от KV):
+//! спекулятивная верификация ([`Qwen35Model::decode_spec`]) откатывает её
+//! снимком состояний (snapshot_states) и переигрыванием принятого префикса
+//! (Ф2.6). PP-стадии и перенос KV-объекта для гибрида по-прежнему явно
+//! отвергаются вызывающим кодом.
 
 use crate::backend::{Backend, Tensor};
 use crate::error::BackendError;
@@ -730,7 +732,7 @@ impl Qwen35Model {
         extract_layers: &[usize],
         greedy: bool,
         hist: &[u32],
-        repeat_penalty: f32,
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         if draft.len() != draft_probs.len() {
             return Err(BackendError::Shape(format!(
@@ -759,25 +761,16 @@ impl Qwen35Model {
         // Жадная проверка без штрафа за повторы — argmax строк на GPU
         // (строка [1+γ, V] на хост не едет), как у Qwen3.
         // INFER_SPEC_CPU=1 — прежний путь через хост (сверка/замеры).
-        let gpu_greedy =
-            greedy && repeat_penalty == 1.0 && std::env::var("INFER_SPEC_CPU").is_err();
+        let gpu_greedy = greedy
+            && sp.repetition_penalty == 1.0
+            && std::env::var("INFER_SPEC_CPU").is_err();
         let mut ld = Vec::new();
         let (accepted, accepted_len, n_verified) = if gpu_greedy {
             let (am, _lse) = backend.argmax_rows(&logits, None)?;
             crate::qwen3::verify_greedy_by_argmax(id, draft, &am)
         } else {
             ld = backend.to_cpu_f32(&logits)?;
-            crate::qwen3::verify_draft(
-                &ld,
-                v,
-                id,
-                draft,
-                draft_probs,
-                rng,
-                greedy,
-                hist,
-                repeat_penalty,
-            )
+            crate::qwen3::verify_draft(&ld, v, id, draft, draft_probs, rng, greedy, hist, sp)
         };
         let row_idx = accepted_len - 1;
         if accepted_len < ids.len() {
@@ -796,11 +789,11 @@ impl Qwen35Model {
             self.pos = base;
             let tr = std::time::Instant::now();
             // Логиты реплея не нужны (они уже есть из окна верификации):
-            // lm_head только последней строки — vocab×dim на строку был
-            // заметной долей реплея.
-            self.last_only = true;
+            // no_logits пропускает lm_head ЦЕЛИКОМ — даже last_only гнал бы
+            // vocab×dim GEMM по последней строке (ревью Ф2.9).
+            self.no_logits = true;
             let r = self.prefill(backend, &ids[..accepted_len]);
-            self.last_only = false;
+            self.no_logits = false;
             r?;
             if prof {
                 self.spec_prof.1 += tr.elapsed().as_secs_f64();

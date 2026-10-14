@@ -696,8 +696,8 @@ impl CausalLm for Glm4Model {
         _rng: &mut Option<u64>,
         _extract_layers: &[usize],
         greedy: bool,
-        _hist: &[u32],
-        _repeat_penalty: f32,
+        hist: &[u32],
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         // Оконной верификации (B8/DFlash) для glm4 пока нет: проверяем
         // черновики ПОСЛЕДОВАТЕЛЬНО (γ декодов). Текст идентичен жадному,
@@ -716,8 +716,18 @@ impl CausalLm for Glm4Model {
         for (i, &tok) in ids.iter().enumerate() {
             let logits = self.decode(backend, tok)?;
             let want = draft.get(i);
-            let (argmax, _probs) = backend.argmax_rows(&logits, None)?;
-            let got = argmax.first().copied().unwrap_or(0);
+            // Тот же argmax, что у обычного decode: со штрафом за повторы,
+            // иначе спек принимал бы токены, которых жадный путь не выбрал
+            // бы (расхождение траекторий при repeat_penalty ≠ 1).
+            let got = if sp.repetition_penalty == 1.0 {
+                let (argmax, _probs) = backend.argmax_rows(&logits, None)?;
+                argmax.first().copied().unwrap_or(0)
+            } else {
+                let row = backend.to_cpu_f32(&logits)?;
+                let mut h = hist.to_vec();
+                h.extend_from_slice(&tokens);
+                crate::inference::sampling::greedy_next(&row, &h, sp.repetition_penalty)
+            };
             match want {
                 Some(w) if w == &got => {
                     accepted += 1;

@@ -226,6 +226,8 @@ pub trait CausalLm {
     /// Один токен → логиты [1, 1, V].
     fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError>;
     /// Спек-шаг: верификация [id, draft…] одним forward'ом + откат хвоста.
+    /// `sp` — тот же каскад сэмплирования, что у `sample_next`: верификация
+    /// обязана брать p из модифицированного распределения цели (лосслессность).
     #[allow(clippy::too_many_arguments)]
     fn decode_spec(
         &mut self,
@@ -237,7 +239,7 @@ pub trait CausalLm {
         extract_layers: &[usize],
         greedy: bool,
         hist: &[u32],
-        repeat_penalty: f32,
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError>;
     /// Prefill с картинкой (Qwen3-VL). По умолчанию — не поддержано.
     #[allow(clippy::too_many_arguments)]
@@ -348,7 +350,7 @@ impl CausalLm for crate::qwen3::Qwen3Model {
         extract_layers: &[usize],
         greedy: bool,
         hist: &[u32],
-        repeat_penalty: f32,
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         Qwen3Model::decode_spec(
             self,
@@ -360,7 +362,7 @@ impl CausalLm for crate::qwen3::Qwen3Model {
             extract_layers,
             greedy,
             hist,
-            repeat_penalty,
+            sp,
         )
     }
     fn prefill_with_vision(
@@ -466,7 +468,7 @@ impl CausalLm for crate::qwen35::Qwen35Model {
         extract_layers: &[usize],
         greedy: bool,
         hist: &[u32],
-        repeat_penalty: f32,
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         crate::qwen35::Qwen35Model::decode_spec(
             self,
@@ -478,7 +480,7 @@ impl CausalLm for crate::qwen35::Qwen35Model {
             extract_layers,
             greedy,
             hist,
-            repeat_penalty,
+            sp,
         )
     }
 }
@@ -658,6 +660,15 @@ pub fn generate<M: CausalLm + ?Sized>(
 ) -> Result<Vec<u32>, BackendError> {
     let t_start = std::time::Instant::now();
     let mut spec_stats = SpecStats::default();
+    // Общая (Arc<Mutex>) драфтер-инстанс переживает последовательности:
+    // без reset первое окно новой генерации строилось бы на KV/фичах
+    // прошлой — черновики вслепую (контракт Drafter::reset, ревью Ф2.9).
+    // ДО префилла: префилл ниже кладёт в драфтер фичи промпта, и reset
+    // после него стёр бы их (первое окно осталось бы слепым — приёмка
+    // в разы ниже; поймано на контрольном прогоне DFlash 8B).
+    if let Some(d) = &params.drafter {
+        d.lock().unwrap().reset();
+    }
     // Vision-префилл (2.4b): картинка уже посчитана — идём через M-RoPE.
     let mut logits = if let Some(pp) = params.pp.clone() {
         // PP (7.5): средние слои — на соседе. Vision-путь PP пока не
@@ -709,7 +720,11 @@ pub fn generate<M: CausalLm + ?Sized>(
             && let Some(dr) = params.drafter.as_ref()
         {
             let mut dr = dr.lock().unwrap();
-            let _ = dr.after_extract(backend, &extract, ids.len(), ids.len());
+            if let Err(e) = dr.after_extract(backend, &extract, ids.len(), ids.len()) {
+                // Молчаливый пропуск = драфтер «слеп» (приёмка ~0) без
+                // единой зацепки — фиксируем причину (ревью Ф2.9).
+                tracing::warn!(error = %e, "after_extract (префилл) не удался");
+            }
         }
         if std::env::var("LLM_SPEC_PROF").is_ok() {
             eprintln!(
@@ -855,6 +870,18 @@ pub fn generate<M: CausalLm + ?Sized>(
                     dr.target_layers().to_vec()
                 };
                 let tp = std::time::Instant::now();
+                // Верификация берёт p из ТОГО ЖЕ каскада, что и sample_next:
+                // лосслессность спека = совпадение с обычным прогоном при тех
+                // же параметрах (ревью Ф2.9: раньше p считалась по сырым
+                // логитам T=1 без усечений).
+                let sp = SamplingParams {
+                    temperature: params.temperature,
+                    top_p: params.top_p,
+                    top_k: params.top_k,
+                    repetition_penalty: params.repeat_penalty,
+                    seed: None,
+                    min_p: params.min_p,
+                };
                 let out = model.decode_spec(
                     backend,
                     next,
@@ -867,7 +894,7 @@ pub fn generate<M: CausalLm + ?Sized>(
                     // принимала бы токены, которых жадный путь не выбрал бы).
                     params.temperature <= 0.0,
                     &history,
-                    params.repeat_penalty,
+                    &sp,
                 )?;
                 prof[1] += tp.elapsed().as_secs_f64();
                 prof_n[1] += 1;
@@ -877,7 +904,9 @@ pub fn generate<M: CausalLm + ?Sized>(
                     let tp = std::time::Instant::now();
                     let pos = model.context_len();
                     let mut dr = drafter.lock().unwrap();
-                    let _ = dr.after_extract(backend, &out.extract, pos, n_ok);
+                    if let Err(e) = dr.after_extract(backend, &out.extract, pos, n_ok) {
+                        tracing::warn!(error = %e, "after_extract (окно) не удался");
+                    }
                     prof[2] += tp.elapsed().as_secs_f64();
                     prof_n[2] += 1;
                 }
@@ -941,6 +970,49 @@ pub fn generate<M: CausalLm + ?Sized>(
                     }
                 }
             }
+        } else if params
+            .drafter
+            .as_ref()
+            .map(|d| !d.lock().unwrap().target_layers().is_empty())
+            .unwrap_or(false)
+        {
+            // Графическому драфтеру нужны фичи ЭТОГО токена: гоняем тот же
+            // один forward через decode_spec с пустым черновиком и кормим
+            // after_extract — иначе при пустом черновике (n-грамм без
+            // попаданий, бюджет, вырождение) граница committed отстаёт от
+            // history навсегда, и MTP/DFlash молча умирают (ревью Ф2.9).
+            let tp = std::time::Instant::now();
+            let tlayers: Vec<usize> = {
+                let dr = params.drafter.as_ref().unwrap().lock().unwrap();
+                dr.target_layers().to_vec()
+            };
+            let sp = SamplingParams {
+                temperature: params.temperature,
+                top_p: params.top_p,
+                top_k: params.top_k,
+                repetition_penalty: params.repeat_penalty,
+                seed: None,
+                min_p: params.min_p,
+            };
+            let out = model.decode_spec(
+                backend,
+                next,
+                &[],
+                &[],
+                &mut rng_state,
+                &tlayers,
+                params.temperature <= 0.0,
+                &history,
+                &sp,
+            )?;
+            let pos = model.context_len();
+            let mut dr = params.drafter.as_ref().unwrap().lock().unwrap();
+            if let Err(e) = dr.after_extract(backend, &out.extract, pos, 1) {
+                tracing::warn!(error = %e, "after_extract (пустой черновик) не удался");
+            }
+            prof[3] += tp.elapsed().as_secs_f64();
+            prof_n[3] += 1;
+            out.logits
         } else {
             let tp = std::time::Instant::now();
             let lg = model.decode(backend, next)?;

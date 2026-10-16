@@ -799,6 +799,15 @@ impl Drafter for MtpDrafter {
             h.shape()[0]
         };
         let n = n_accepted.min(rows);
+        let dbg_ac = std::env::var("LLM_DBG_MTP").is_ok();
+        if dbg_ac {
+            eprintln!(
+                "MTP after_extract: pos={pos} n_accepted={n_accepted} rows={rows} window={} committed={} -> n={}",
+                self.window.len(),
+                self.committed,
+                n.min(self.window.len().max(1))
+            );
+        }
         // Префилл узнаётся по pos == n_accepted: префилл-вызов идёт с
         // pos = n = длина промпта (позиции [0..n)), а окно верификации —
         // pos = base + n_accepted при base ≥ 1, т.е. pos > n_accepted

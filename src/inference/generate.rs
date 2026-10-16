@@ -722,8 +722,9 @@ pub fn generate<M: CausalLm + ?Sized>(
             let mut dr = dr.lock().unwrap();
             if let Err(e) = dr.after_extract(backend, &extract, ids.len(), ids.len()) {
                 // Молчаливый пропуск = драфтер «слеп» (приёмка ~0) без
-                // единой зацепки — фиксируем причину (ревью Ф2.9).
-                tracing::warn!(error = %e, "after_extract (префилл) не удался");
+                // единой зацепки. eprintln, а не tracing::warn: в примерах
+                // и CLI подписчика нет — ошибка терялась (Ф8.2g).
+                eprintln!("after_extract (префилл) не удался: {e}");
             }
         }
         if std::env::var("LLM_SPEC_PROF").is_ok() {
@@ -911,7 +912,7 @@ pub fn generate<M: CausalLm + ?Sized>(
                     let pos = model.context_len();
                     let mut dr = drafter.lock().unwrap();
                     if let Err(e) = dr.after_extract(backend, &out.extract, pos, n_ok) {
-                        tracing::warn!(error = %e, "after_extract (окно) не удался");
+                        eprintln!("after_extract (окно) не удался: {e}");
                     }
                     prof[2] += tp.elapsed().as_secs_f64();
                     prof_n[2] += 1;

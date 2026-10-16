@@ -287,6 +287,10 @@ pub struct Qwen35Model {
     /// Логиты вообще не нужны (промежуточные блоки префилла): head не
     /// считается — lm_head по 512 строкам стоил ~100 мс на блок (V=248k).
     no_logits: bool,
+    /// Захват входов GDN-слоёв окна верификации (Ф8.2g): слоты по слоям
+    /// (None — слой не GDN). Заполняется в forward'е, пока Some; по нему
+    /// [`Self::restore_spec_states`] восстанавливает стейты без реплея.
+    spec_capture: Option<Vec<Option<(Tensor, Tensor, Tensor)>>>,
     /// LLM_SPEC_PROF: (с forward окон, с реплеев, число реплеев, число окон).
     spec_prof: (f64, f64, usize, usize),
     spec_prof_snap: f64,
@@ -473,6 +477,7 @@ impl Qwen35Model {
             pos: 0,
             last_only: false,
             no_logits: false,
+            spec_capture: None,
             spec_prof: (0.0, 0.0, 0, 0),
             spec_prof_snap: 0.0,
         })
@@ -712,6 +717,57 @@ impl Qwen35Model {
         r
     }
 
+    /// Начать захват входов GDN для окна верификации (Ф8.2g): слоты по слоям.
+    pub fn begin_spec_capture(&mut self) {
+        self.spec_capture = Some(vec![None; self.layers.len()]);
+    }
+
+    /// Завершить захват (освобождает слоты).
+    pub fn end_spec_capture(&mut self) {
+        self.spec_capture = None;
+    }
+
+    /// Восстановление стейтов GDN после частичного принятия окна БЕЗ реплея
+    /// (Ф8.2g): по захваченным входам (qkv, gate, b) перепрогоняются ТОЛЬКО
+    /// conv/l2norm/delta по принятому префиксу — через тот же код
+    /// ([`Self::gdn_state_update`]) и те же входы, что у окна, поэтому стейты
+    /// бит-в-бит совпадают с результатом полного реплея (проверяется
+    /// паритетом spec==AR и тестом fused==composition).
+    /// Предусловия (выполняет [`Self::decode_spec`]): KV усечён до базы,
+    /// стейты GDN стоят на пред-оконном снимке, `pos = base`.
+    pub fn restore_spec_states(
+        &mut self,
+        backend: &dyn Backend,
+        accepted_len: usize,
+    ) -> Result<(), BackendError> {
+        let cap = self
+            .spec_capture
+            .take()
+            .ok_or_else(|| BackendError::Shape("restore_spec_states: захват не включён".into()))?;
+        if accepted_len == 0 {
+            return Err(BackendError::Shape(
+                "restore_spec_states: пустой префикс".into(),
+            ));
+        }
+        for i in 0..self.layers.len() {
+            let Some((qkv, gate, b)) = cap[i].as_ref() else {
+                continue;
+            };
+            let Mixer::Gdn(g) = &self.layers[i].mixer else {
+                continue;
+            };
+            let st = self.states[i]
+                .as_mut()
+                .ok_or_else(|| BackendError::Shape(format!("restore: слой {i}: нет стейта")))?;
+            let a = accepted_len.min(qkv.shape()[1]);
+            let qkv_a = qkv.view_offset(vec![1, a, qkv.shape()[2]], 0);
+            let gate_a = gate.view_offset(vec![1, a, gate.shape()[2]], 0);
+            let b_a = b.view_offset(vec![1, a, b.shape()[2]], 0);
+            let _ = Self::gdn_state_update(&self.cfg, backend, &qkv_a, &gate_a, &b_a, g, st, None)?;
+        }
+        Ok(())
+    }
+
     /// Спекулятивный шаг (Ф9.4): верификация [id, draft…] ОДНИМ forward'ом.
     /// KV полных слоёв откатывается усечением, а рекуррентный стейт GDN
     /// усечь нельзя (он уже впитал отвергнутые токены) — при неполном
@@ -755,6 +811,13 @@ impl Qwen35Model {
         let mut ids = Vec::with_capacity(1 + draft.len());
         ids.push(id);
         ids.extend_from_slice(draft);
+        // Захват входов GDN окна (Ф8.2g): при отказе стейты восстанавливаются
+        // перепрогоном лёгких стадий по захвату, БЕЗ полного реплея.
+        // INFER_SPEC_REPLAY=1 — прежний путь (сверка/замеры).
+        let use_capture = std::env::var("INFER_SPEC_REPLAY").is_err();
+        if use_capture {
+            self.begin_spec_capture();
+        }
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?;
         let v = self.cfg.vocab_size;
         let t_fwd = tp.elapsed().as_secs_f64();
@@ -774,11 +837,12 @@ impl Qwen35Model {
         };
         let row_idx = accepted_len - 1;
         if accepted_len < ids.len() {
-            // Откат: KV — усечением до базы, стейты — из снимка; затем
-            // реплей принятых (id + принятые черновики) — стейт и KV снова
-            // описывают ровно принятый префикс.
+            // Откат. KV: принятые строки окна — уже КОРРЕКТНЫЙ префикс
+            // (причинность), достаточно усечь отвергнутый хвост до
+            // base+accepted. Стейты GDN усечь нельзя — их восстанавливает
+            // либо захват (Ф8.2g), либо реплей ниже.
             for c in self.caches.iter_mut().flatten() {
-                c.truncate(base);
+                c.truncate(base + accepted_len);
             }
             for (st, s) in self.states.iter_mut().zip(snap) {
                 if let (Some(st), Some((conv, ssm))) = (st.as_mut(), s) {
@@ -786,19 +850,33 @@ impl Qwen35Model {
                     st.ssm = ssm;
                 }
             }
-            self.pos = base;
+            self.pos = base + accepted_len;
             let tr = std::time::Instant::now();
-            // Логиты реплея не нужны (они уже есть из окна верификации):
-            // no_logits пропускает lm_head ЦЕЛИКОМ — даже last_only гнал бы
-            // vocab×dim GEMM по последней строке (ревью Ф2.9).
-            self.no_logits = true;
-            let r = self.prefill(backend, &ids[..accepted_len]);
-            self.no_logits = false;
-            r?;
+            if use_capture {
+                // Ф8.2g: дешёвый откат — только conv/l2norm/delta по
+                // захваченному префиксу (числа бит-в-бит как у реплея).
+                self.restore_spec_states(backend, accepted_len)?;
+            } else {
+                // Прежний путь (INFER_SPEC_REPLAY=1, сверка/замеры): KV
+                // усекается до базы, принятые дописываются полным реплеем
+                // (и KV, и стейты).
+                for c in self.caches.iter_mut().flatten() {
+                    c.truncate(base);
+                }
+                self.pos = base;
+                // Логиты реплея не нужны — no_logits пропускает lm_head.
+                self.no_logits = true;
+                let r = self.prefill(backend, &ids[..accepted_len]);
+                self.no_logits = false;
+                r?;
+            }
             if prof {
                 self.spec_prof.1 += tr.elapsed().as_secs_f64();
                 self.spec_prof.2 += 1;
             }
+        } else if self.spec_capture.is_some() {
+            // Полное принятие — реплей не нужен, захват не пригодился.
+            self.end_spec_capture();
         }
         if prof {
             self.spec_prof.0 += t_fwd;
@@ -878,7 +956,11 @@ impl Qwen35Model {
                     let st = self.states[i]
                         .as_mut()
                         .ok_or_else(|| BackendError::Shape(format!("слой {i}: нет стейта")))?;
-                    Self::gdn_forward(&self.cfg, backend, &h, g, st)?
+                    let cap = self
+                        .spec_capture
+                        .as_mut()
+                        .map(|c| &mut c[i]);
+                    Self::gdn_forward(&self.cfg, backend, &h, g, st, cap)?
                 }
             };
             let x1 = backend.zeros(x.shape().to_vec())?;
@@ -1014,6 +1096,7 @@ impl Qwen35Model {
         h: &Tensor,
         g: &Gdn,
         st: &mut GdnState,
+        cap: Option<&mut Option<(Tensor, Tensor, Tensor)>>,
     ) -> Result<Tensor, BackendError> {
         let t = h.shape()[1];
         let (s, hk) = (cfg.ssm_state, cfg.ssm_k_heads);
@@ -1053,6 +1136,18 @@ impl Qwen35Model {
         gs(t0, &mut t_sl)?;
         t0 = std::time::Instant::now();
         let (gate, b) = backend.gdn_gates(&ba, &g.dt_bias, &g.a)?;
+        // Захват входов state-update за окно верификации (Ф8.2g): qkv и
+        // gate/b — десятки КБ на слой; по ним rewrite-путь восстановит
+        // стейты перепрогоном ТОЛЬКО conv/l2norm/delta (десятки мс),
+        // вместо полного forward-реплея (~треть окна).
+        if let Some(slot) = cap {
+            let cp = |t: &Tensor| -> Result<Tensor, BackendError> {
+                let y = backend.zeros(t.shape().to_vec())?;
+                backend.scale(t, &y, 1.0)?;
+                Ok(y)
+            };
+            *slot = Some((cp(&qkv)?, cp(&gate)?, cp(&b)?));
+        }
         gs(t0, &mut t_gt)?;
         t0 = std::time::Instant::now();
         let qk_size = hk * s;
@@ -1062,7 +1157,11 @@ impl Qwen35Model {
         // машине 8 мелких стадий стоили ~1.4 мс/слой при ~0.15 мс пола на
         // каждую). Головы длины s должны делить C, нитогруппа ≤ 1024.
         let fused = t == 1 && s <= 1024 && cq % s == 0;
-        let (qn, kn, v) = if fused {
+        // State-update: fused-хвост (t=1) или composition через
+        // gdn_state_update — ОДИН код с rewrite-путём спек-откатов (Ф8.2g):
+        // восстановление стейтов обязано совпадать с реплеем бит-в-бит.
+        // Обе ветки дают (qn, kn, v, o); o — выход delta-rule для норм-гейта.
+        let (qn, kn, v, o) = if fused {
             let (y, new_conv) = backend.gdn_conv_silu_split_norm(
                 &qkv,
                 &g.conv_w,
@@ -1077,29 +1176,20 @@ impl Qwen35Model {
             let qn = y.view_offset(vec![1, 1, qk_size], 0);
             let kn = y.view_offset(vec![1, 1, qk_size], qk_size);
             let v = y.view_offset(vec![1, 1, inner], 2 * qk_size);
+            let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, &gate, &b, &st.ssm, hk)?;
+            st.ssm = new_ssm;
             gs(t0, &mut t_cv)?;
             t0 = std::time::Instant::now();
-            (qn, kn, v)
+            (qn, kn, v, o.view(vec![1, 1, inner]))
         } else {
-            let (conv_out, new_conv) = backend.gdn_conv(&qkv, &g.conv_w, &st.conv)?;
-            st.conv = new_conv;
-            let act = backend.zeros(conv_out.shape().to_vec())?;
-            backend.silu(&conv_out, &act)?;
-            gs(t0, &mut t_cv)?;
+            let mut p3 = [0.0f64; 3];
+            let r = Self::gdn_state_update(cfg, backend, &qkv, &gate, &b, g, st, Some(&mut p3))?;
+            t_cv += p3[0];
+            t_nr += p3[1];
+            t_dr += p3[2];
             t0 = std::time::Instant::now();
-            let q = crate::nn::slice_last(backend, &act, qk_size, 0)?;
-            let k = crate::nn::slice_last(backend, &act, qk_size, qk_size)?;
-            let v = crate::nn::slice_last(backend, &act, inner, 2 * qk_size)?;
-            let qn = backend.gdn_l2norm(&q, s, cfg.norm_eps)?;
-            let kn = backend.gdn_l2norm(&k, s, cfg.norm_eps)?;
-            (qn, kn, v)
+            r
         };
-        gs(t0, &mut t_nr)?;
-        t0 = std::time::Instant::now();
-        let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, &gate, &b, &st.ssm, hk)?;
-        st.ssm = new_ssm;
-        gs(t0, &mut t_dr)?;
-        t0 = std::time::Instant::now();
         let normed = backend.gdn_norm_gated(&o.view(vec![1, t, inner]), &z, &g.norm, cfg.norm_eps)?;
         gs(t0, &mut t_og)?;
         t0 = std::time::Instant::now();
@@ -1139,6 +1229,49 @@ impl Qwen35Model {
             }
         }
         Ok(y)
+    }
+
+    /// State-update блока GDN (composition-путь, t ≥ 1): conv → silu →
+    /// split → l2norm → delta-rule. Единственный код этого пути — его же
+    /// вызывает восстановление спек-стейтов ([`Self::restore_spec_states`]),
+    /// поэтому откат совпадает с реплеем бит-в-бит (Ф8.2g).
+    /// `prof` — (conv, l2norm, delta), секунды; None в rewrite-пути.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_state_update(
+        cfg: &Qwen35Config,
+        backend: &dyn Backend,
+        qkv: &Tensor,
+        gate: &Tensor,
+        b: &Tensor,
+        g: &Gdn,
+        st: &mut GdnState,
+        prof: Option<&mut [f64; 3]>,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor), BackendError> {
+        let (s, hk) = (cfg.ssm_state, cfg.ssm_k_heads);
+        let inner = cfg.ssm_inner;
+        let qk_size = hk * s;
+        let mut t0 = std::time::Instant::now();
+        let (conv_out, new_conv) = backend.gdn_conv(qkv, &g.conv_w, &st.conv)?;
+        st.conv = new_conv;
+        let act = backend.zeros(conv_out.shape().to_vec())?;
+        backend.silu(&conv_out, &act)?;
+        let t_conv = t0.elapsed().as_secs_f64();
+        t0 = std::time::Instant::now();
+        let q = crate::nn::slice_last(backend, &act, qk_size, 0)?;
+        let k = crate::nn::slice_last(backend, &act, qk_size, qk_size)?;
+        let v = crate::nn::slice_last(backend, &act, inner, 2 * qk_size)?;
+        let qn = backend.gdn_l2norm(&q, s, cfg.norm_eps)?;
+        let kn = backend.gdn_l2norm(&k, s, cfg.norm_eps)?;
+        let t_norm = t0.elapsed().as_secs_f64();
+        t0 = std::time::Instant::now();
+        let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, gate, b, &st.ssm, hk)?;
+        st.ssm = new_ssm;
+        if let Some(p) = prof {
+            p[0] += t_conv;
+            p[1] += t_norm;
+            p[2] += t0.elapsed().as_secs_f64();
+        }
+        Ok((qn, kn, v, o))
     }
 }
 

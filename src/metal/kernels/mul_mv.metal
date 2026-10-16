@@ -246,6 +246,99 @@ kernel void mv_iq4_xs_mb(
     }
 }
 
+// Q5_K matvec с батчем строк активаций v2 (окно спек-верификации, 1<m≤8) —
+// v1 (simdgroup на строку весов, весь 256-суперблок на лейн) дал ×3 к
+// mm-тайлу: 1280 скалярных загрузок A на суперблок. Здесь 32 потока на
+// строку весов, 16 лейнов ДЕЛЯТ суперблок (c = lane/8 mod 4, l0 = 8·(lane%4)),
+// деквант-множители суперблока считаются один раз, A читается float4
+// (позиции lo/hi одной пары l0..l0+7 лежат подряд) — трафик весов 1× на m
+// строк, как у mv_iq4_xs_mb.
+template<uint M>
+kernel void mv_q5_k_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgid.y;
+    if (n >= N) return;
+    const uint nb = K / 256u;
+    device const uchar* row = B + (ulong)n * nb * 176u;
+
+    // 16 лейнов на суперблок: c 0..3 (подблок 64), l0 = 8·(lane%4).
+    // c = lane/4: 16 лейнов → c 0..3 × 4 позиции l0 (c = lane/8 давала
+    // только 0..1 — два подблока из четырёх, поймано тестом).
+    const uint c = (lane / 4u) & 3u;
+    const uint l0 = (lane & 3u) * 8u;
+    const uint half_sel = lane / 16u; // 0/1 — чётность суперблока (шаг 2)
+
+    float sumf[M];
+#pragma unroll
+    for (uint m = 0; m < M; ++m) sumf[m] = 0.0f;
+    for (uint sb = half_sel; sb < nb; sb += 2u) {
+        device const uchar* blk = row + sb * 176u;
+        device const uchar* qs = blk + 48u + c * 32u + l0;
+        device const uchar* qh = blk + 16u + l0;
+        int sc_lo, mn_lo, sc_hi, mn_hi;
+        q4k_scale_min(blk + 4, 2u * c + 0u, sc_lo, mn_lo);
+        q4k_scale_min(blk + 4, 2u * c + 1u, sc_hi, mn_hi);
+        const float d = (float)load_half_unaligned(blk);
+        const float dmin = (float)load_half_unaligned(blk + 2u);
+        const float dl_lo = d * (float)sc_lo;
+        const float ml_lo = dmin * (float)mn_lo;
+        const float dl_hi = d * (float)sc_hi;
+        const float ml_hi = dmin * (float)mn_hi;
+        // 8 значений lo (позиции c*64 + l0..l0+7) и 8 hi (c*64+32+l0..+7).
+        // Биты qh — по подблокам c (как u1/u2 <<= 2 в dot_q5_k),
+        // маски: lo = 1<<(2c), hi = 1<<(2c+1).
+        const uint u_lo = 1u << (2u * c);
+        const uint u_hi = 1u << (2u * c + 1u);
+        float v_lo[8], v_hi[8];
+#pragma unroll
+        for (uint i = 0; i < 8; ++i) {
+            const uchar b = qs[i];
+            const uchar hb = qh[i];
+            v_lo[i] = dl_lo * ((float)((uint)(b & 0xFu) + ((hb & u_lo) ? 16u : 0u))) - ml_lo;
+            v_hi[i] = dl_hi * ((float)((uint)(b >> 4) + ((hb & u_hi) ? 16u : 0u))) - ml_hi;
+        }
+        // A: float4 (позиции кратны 4), порядок пар (lo[i], hi[i]) — как в
+        // dot_q5_k; внутри пары lo затем hi.
+        const uint off_lo = c * 64u + l0;
+        const uint off_hi = off_lo + 32u;
+#pragma unroll
+        for (uint m = 0; m < M; ++m) {
+            device const float* am = A + (ulong)m * K + (ulong)sb * 256u;
+            const float4 al0 = *(device const float4*)(am + off_lo);
+            const float4 al1 = *(device const float4*)(am + off_lo + 4u);
+            const float4 ah0 = *(device const float4*)(am + off_hi);
+            const float4 ah1 = *(device const float4*)(am + off_hi + 4u);
+            const float4 vl0 = {v_lo[0], v_lo[1], v_lo[2], v_lo[3]};
+            const float4 vl1 = {v_lo[4], v_lo[5], v_lo[6], v_lo[7]};
+            const float4 vh0 = {v_hi[0], v_hi[1], v_hi[2], v_hi[3]};
+            const float4 vh1 = {v_hi[4], v_hi[5], v_hi[6], v_hi[7]};
+            const float4 acc0 = al0 * vl0 + ah0 * vh0;
+            const float4 acc1 = al1 * vl1 + ah1 * vh1;
+            sumf[m] += (acc0.x + acc0.y) + (acc0.z + acc0.w)
+                     + ((acc1.x + acc1.y) + (acc1.z + acc1.w));
+        }
+    }
+#pragma unroll
+    for (uint m = 0; m < M; ++m) {
+        const float v = simd_sum(sumf[m]);
+        if (lane == 0u) C[(ulong)m * N + n] = v;
+    }
+}
+
+typedef decltype(mv_q5_k_mb<1>) mv_q5_k_mb_t;
+template [[host_name("mv_q5_k_mb2")]] kernel mv_q5_k_mb_t mv_q5_k_mb<2>;
+template [[host_name("mv_q5_k_mb3")]] kernel mv_q5_k_mb_t mv_q5_k_mb<3>;
+template [[host_name("mv_q5_k_mb4")]] kernel mv_q5_k_mb_t mv_q5_k_mb<4>;
+template [[host_name("mv_q5_k_mb5")]] kernel mv_q5_k_mb_t mv_q5_k_mb<5>;
+template [[host_name("mv_q5_k_mb6")]] kernel mv_q5_k_mb_t mv_q5_k_mb<6>;
+
 typedef decltype(mv_iq4_xs_mb<1>) mv_iq4_xs_mb_t;
 template [[host_name("mv_iq4_xs_mb1")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<1>;
 template [[host_name("mv_iq4_xs_mb2")]] kernel mv_iq4_xs_mb_t mv_iq4_xs_mb<2>;

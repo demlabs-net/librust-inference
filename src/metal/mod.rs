@@ -2121,6 +2121,61 @@ impl MetalCtx {
         Ok(true)
     }
 
+    /// Q5_K матвек с батчем строк активаций (окно спек-верификации 1 < m ≤ 8).
+    /// Кернел mv_q5_k_mb v2: 32 потока на строку весов, 16 лейнов делят
+    /// суперблок, A читается float4 — веса 1× на m строк (v1 с суперблоком
+    /// на лейн был ×3 к mm-тайлу; отклонён по замерам). m 7/8 — два прохода
+    /// (4+остаток). Требования: K % 256, выравнивание A по 4 (позиции кратны
+    /// 8·(lane%4) при базе, кратной 256 → всегда 4-выровнены).
+    pub fn mv_q5_k_mb(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let k = a.shape[1];
+        let n = b.shape[0];
+        let m = a.shape[0];
+        if a.shape != [m, k] || b.shape != [n, k] || c.shape != [m, n] {
+            return Err(MetalError::Shape(format!(
+                "mv_q5_k_mb {:?}x{:?}->{:?}",
+                a.shape, b.shape, c.shape
+            )));
+        }
+        let (k32, n32) = (k as u32, n as u32);
+        let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
+            let name = match rows {
+                2 => "mv_q5_k_mb2",
+                3 => "mv_q5_k_mb3",
+                4 => "mv_q5_k_mb4",
+                5 => "mv_q5_k_mb5",
+                _ => "mv_q5_k_mb6",
+            };
+            // grid = ПОТОКИ (dispatch_threads): 32 потока на строку весов.
+            let grid = MTLSize::new(32, n as u64, 1);
+            let group = MTLSize::new(32, 1, 1);
+            let a_off = (a.offset + row0 * k * 4) as u64;
+            let c_off = (c.offset + row0 * n * 4) as u64;
+            self.run(name, grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a_off);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c_off);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            })
+        };
+        match m {
+            7 | 8 => {
+                pass(4, 0)?;
+                pass(m - 4, 4)
+            }
+            2..=6 => pass(m, 0),
+            other => Err(MetalError::Shape(format!(
+                "mv_q5_k_mb: m={other} вне 2..=8"
+            ))),
+        }
+    }
+
     pub fn mv_quantized(
         &self,
         a: &GpuTensor,
@@ -5419,10 +5474,15 @@ impl crate::backend::Backend for MetalBackend {
                 // (simdgroup на строку весов, скалярные разбросанные загрузки
                 // A) дал ×3 к mm-тайлу на m=4 — отклонён по замерам; узкоспец
                 // Q5_K small-m тайл — кандидат следующего захода.
+                // Q5_K (gdn.qkv/w_out 27B): mb v2 — веса 1× на m строк без
+                // холостых строк mm-тайла; замер против mm ниже порога.
+                if bg.dtype == GpuDtype::Q5_K && m > 1 && k % 256 == 0 {
+                    self.ctx.mv_q5_k_mb(a.as_gpu(), bg, c.as_gpu())?;
+                    return Ok(());
+                }
                 let mm_capable = matches!(
                     bg.dtype,
                     GpuDtype::Q4_K
-                        | GpuDtype::Q5_K
                         | GpuDtype::Q6_K
                         | GpuDtype::Q5_0
                         | GpuDtype::Iq4Xs
@@ -6740,6 +6800,64 @@ mod quant_gemm_tests {
                 // (см. oracle-сверки A4).
                 assert!(relm < 5e-2, "mm row={r} n={ni}: {bm} vs host {h} (rel {relm})");
                 assert!(relv < 5e-2, "mv row={r} n={ni}: {bv} vs host {h} (rel {relv})");
+            }
+        }
+    }
+
+    /// Q5_K mb v2 (окна спека 2..3, а также проверка кернела при 4..8):
+    /// matvec с батчем строк против точного хост-декванта. Ловит раскладку
+    /// суперблока (c/l0), биты qh по подблокам и векторные загрузки A.
+    #[test]
+    fn q5_k_mb_matches_host_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (n, k, m) = (4usize, 512usize, 5usize);
+        let mut seed = 0x5EED_1A2Bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Q5_K: 176 Б/256 = d | dmin | scales[12] | qh[32] | qs[128]
+        let mut raw = Vec::with_capacity(n * k / 256 * 176);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            raw.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+            for _ in 0..12 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..32 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q5_K)
+            .unwrap();
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
+        let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+        let c = be.zeros(vec![m, n]).unwrap();
+        be.ctx
+            .mv_q5_k_mb(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        for row in 0..n {
+            let bytes = &raw[row * (k / 256) * 176..(row + 1) * (k / 256) * 176];
+            let y = crate::weights_map::dequant_q5_k(bytes);
+            for mi in 0..m {
+                let x = &a[mi * k..(mi + 1) * k];
+                let want: f64 = y.iter().zip(x).map(|(w, x)| (*w as f64) * (*x as f64)).sum();
+                let d = (got[mi * n + row] as f64 - want).abs()
+                    / (1.0 + want.abs());
+                // накопление нибблов в обоих путях — до ~1% rel на синтетике.
+                assert!(
+                    d < 2e-2,
+                    "mb m={mi} n={row}: {} vs host {want} (rel {d})",
+                    got[mi * n + row]
+                );
             }
         }
     }

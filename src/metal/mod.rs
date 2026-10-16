@@ -1836,9 +1836,14 @@ impl MetalCtx {
                             5 => "mv_iq4_xs_mb5",
                             _ => "mv_iq4_xs_mb6",
                         };
-                        // tgid.x в кернеле НЕ читается — прежде здесь
-                        // запускалось 32 ИДЕНТИЧНЫХ threadgroup'а на строку
-                        // весов (32× холостая работа GPU, Ф8.2g).
+                        // grid = ПОТОКИ (run → dispatch_threads), не
+                        // threadgroup'ы: 32 потока на строку весов = один
+                        // simdgroup (lane делит суперблоки, simd_sum).
+                        // «Убрать избыточный grid.x=32» — ошибка чтения
+                        // (Ф8.2g): с grid.x=1 тридцать два потока
+                        // threadgroup'а размазывались по 32 РАЗНЫМ строкам
+                        // (lane указывал на чужие) и mb1 врал на 21% —
+                        // поймано тестом iq4_xs_matvec_batch_consistency.
                         let grid = MTLSize::new(32, n as u64, 1);
                         let group = MTLSize::new(32, 1, 1);
                         let a_off = (a.offset + row0 * k * 4) as u64;

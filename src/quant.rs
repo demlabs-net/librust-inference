@@ -744,7 +744,6 @@ pub fn quant_iq4_xs(weights: &[f32]) -> Vec<u8> {
     let mut scales = [0f32; 8];
     for blk in weights.chunks_exact(256) {
         let mut q4 = [0u8; 128]; // memset(q4, 0, 128) — как в ggml
-        let mut dh_bytes = f16_bits(0.0f32); // dh[0] = 0
         let mut scales_h = 0u16;
         let mut scales_l = [0u8; 4];
         let mut max_scale = 0f32;
@@ -815,7 +814,7 @@ pub fn quant_iq4_xs(weights: &[f32]) -> Vec<u8> {
         // 2 бита scales_h), переквантование L по dl. ВНИМАНИЕ: id/dl в ggml
         // считаются от СЫРОГО f32 d (f16 округляется только записываемый dh).
         let d = -max_scale / 32.0;
-        dh_bytes = f16_bits(d);
+        let dh_bytes = f16_bits(d);
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         for ib in 0..8usize {
             let mut li = nearest_int(id * scales[ib]);

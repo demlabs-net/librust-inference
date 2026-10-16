@@ -63,7 +63,6 @@ fn main() {
     let mm = std::env::var("LLM_MM").ok();
     let m = mm.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
     let m = std::env::var("LLM_M").ok().and_then(|s| s.parse().ok()).unwrap_or(m);
-    let from_bin = mm.is_some_and(|s| s.parse::<usize>().is_ok());
 
     let bytes = if std::env::var("LLM_WF32").is_ok() {
         Vec::new()

@@ -1186,8 +1186,9 @@ impl Qwen35Model {
         // State-update: fused-хвост (t=1) или composition через
         // gdn_state_update — ОДИН код с rewrite-путём спек-откатов (Ф8.2g):
         // восстановление стейтов обязано совпадать с реплеем бит-в-бит.
-        // Обе ветки дают (qn, kn, v, o); o — выход delta-rule для норм-гейта.
-        let (qn, kn, v, o) = if fused {
+        // Обе ветки дают (qn, kn, v, o); наружу нужен только o (выход
+        // delta-rule для норм-гейта) — qn/kn/v живут внутри веток.
+        let (_, _, _, o) = if fused {
             let (y, new_conv) = backend.gdn_conv_silu_split_norm(
                 &qkv,
                 &g.conv_w,

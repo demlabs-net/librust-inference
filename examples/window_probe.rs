@@ -30,16 +30,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Прогрев кернелов всех путей.
     model.reset_cache(&backend)?;
     model.prefill(&backend, &ids)?;
-    for m in [1usize, 2, 4, 8, 16] {
+    for m in [1usize, 2, 4, 5, 8, 16] {
         let mut best = f64::MAX;
+        let mut ops = (0u64, 0u64);
         for _ in 0..5 {
             model.reset_cache(&backend)?;
+            let _ = backend.ctx.ops_snapshot(true);
             let t0 = Instant::now();
             model.prefill(&backend, &ids[..m])?;
             let _ = backend.to_cpu_f32(&backend.zeros(vec![1])?)?; // sync
-            best = best.min(t0.elapsed().as_secs_f64());
+            let dt = t0.elapsed().as_secs_f64();
+            if dt < best {
+                best = dt;
+                ops = backend.ctx.ops_snapshot(false);
+            }
         }
-        eprintln!("m={m:2}: {:.1} мс ({:.1} мс/строку)", best * 1e3, best * 1e3 / m as f64);
+        // INFER_METAL_OPS=1: dispatch'и и хостовое время (вне счётчика —
+        // GPU-ожидание батча). Хост/диспетчинг окна — узел Ф8.2g.
+        let host = ops.1 as f64 / 1e6;
+        let per_op = if ops.0 > 0 { host * 1e3 / ops.0 as f64 } else { 0.0 };
+        eprintln!(
+            "m={m:2}: {:.1} мс ({:.1} мс/строку) · ops {} · хост {:.1} мс ({:.1} мкс/dispatch)",
+            best * 1e3,
+            best * 1e3 / m as f64,
+            ops.0,
+            host,
+            per_op
+        );
     }
     Ok(())
 }

@@ -162,6 +162,16 @@ fn cb_chunk() -> usize {
     })
 }
 
+/// Диагностика хостового пути (Ф8.2g): INFER_METAL_OPS=1 включает счёт
+/// dispatch'ей и суммарное время, проведённое в [`MetalCtx::run`] на хосте
+/// (кодирование энкодера, без GPU-ожидания). Выключено по умолчанию:
+/// два атомика на dispatch — заметная доля стоимости мелкого оверхеда,
+/// который эти счётчики и измеряют.
+fn ops_prof() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFER_METAL_OPS").is_ok())
+}
+
 /// Предел free-листа пула (байты): сверх него освобождённые буферы
 /// отдаются системе, а не копятся. `INFER_METAL_POOL_MB` переопределяет.
 fn pool_cap_bytes() -> usize {
@@ -668,6 +678,16 @@ pub struct MetalCtx {
     /// ops) cost ~97 ms against an 80 ms real-time budget, so the engine
     /// fell behind the mic and the wake word never fired live.
     batch: Arc<Mutex<BatchState>>,
+    /// Диагностика хостового оверхеда (INFER_METAL_OPS): dispatch'ей и
+    /// наносекунд хоста в `run`. Атомики, чтобы читаться из примеров/тестов
+    /// без &mut; на нулевые счётчики никто не смотрит, когда профиль выключен.
+    ops_count: std::sync::atomic::AtomicU64,
+    ops_host_ns: std::sync::atomic::AtomicU64,
+    /// Порог малого-m для батчевых путей квант-GEMM (0 — брать из
+    /// INFER_QUANT_MM_MIN, дефолт 4). Инстанс-переопределение для тестов:
+    /// env-рычаг глобальный, и тесты с разными порогами в одном процессе
+    /// перетирали друг друга (флейк iq4_xs_matvec_batch_consistency).
+    quant_mm_min: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -743,6 +763,9 @@ impl MetalCtx {
             pipelines: Mutex::new(HashMap::new()),
             library: OnceLock::new(),
             batch: Arc::new(Mutex::new(BatchState::default())),
+            ops_count: std::sync::atomic::AtomicU64::new(0),
+            ops_host_ns: std::sync::atomic::AtomicU64::new(0),
+            quant_mm_min: std::sync::atomic::AtomicUsize::new(0),
         };
         // Compile the whole kernel library once; pipelines are built lazily
         // and cached.
@@ -858,7 +881,61 @@ impl MetalCtx {
     /// pool so the borrowed Metal objects are released deterministically.
     /// In batch mode (see [`Self::begin_batch`]) the kernel is appended to
     /// the pending command buffer WITHOUT commit/wait.
+    ///
+    /// INFER_METAL_OPS=1 (см. [`ops_prof`]) добавляет счётчик dispatch'ей и
+    /// суммарное хостовое время — сколько окно/шаг стоит ДО GPU.
     fn run(
+        &self,
+        kernel: &'static str,
+        grid: MTLSize,
+        group: MTLSize,
+        setup: impl FnOnce(&ComputeCommandEncoderRef),
+    ) -> Result<(), MetalError> {
+        if !ops_prof() {
+            return self.run_inner(kernel, grid, group, setup);
+        }
+        let t = std::time::Instant::now();
+        let r = self.run_inner(kernel, grid, group, setup);
+        self.ops_host_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.ops_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+
+    /// (число dispatch'ей, наносекунды хоста в `run`) — и сброс, если `reset`.
+    /// Счётчики живут только под INFER_METAL_OPS=1.
+    pub fn ops_snapshot(&self, reset: bool) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if reset {
+            (
+                self.ops_count.swap(0, Relaxed),
+                self.ops_host_ns.swap(0, Relaxed),
+            )
+        } else {
+            (self.ops_count.load(Relaxed), self.ops_host_ns.load(Relaxed))
+        }
+    }
+
+    /// Переопределить порог малого-m батчевых путей на этом инстансе
+    /// (тесты; 0 — вернуть env-поведение). См. поле `quant_mm_min`.
+    pub fn set_quant_mm_min(&self, v: usize) {
+        self.quant_mm_min.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Порог малого-m: инстанс-переопределение, иначе INFER_QUANT_MM_MIN,
+    /// иначе 4. Env читается на каждом вызове (рычаг сверки живой).
+    pub fn quant_mm_min(&self) -> usize {
+        let v = self.quant_mm_min.load(std::sync::atomic::Ordering::Relaxed);
+        if v > 0 {
+            return v;
+        }
+        std::env::var("INFER_QUANT_MM_MIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+    }
+
+    fn run_inner(
         &self,
         kernel: &'static str,
         grid: MTLSize,
@@ -5486,10 +5563,7 @@ impl crate::backend::Backend for MetalBackend {
                 // Q5_K — побитово равен) — паритет с эталоном возвращается
                 // INFER_QUANT_MM_MIN=9; тексты спека проверяются приёмкой
                 // (лосслесс-семантика argmax-сверки).
-                let mm_min = std::env::var("INFER_QUANT_MM_MIN")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(4);
+                let mm_min = self.ctx.quant_mm_min();
                 // Q5_K (gdn.qkv/w_out 27B): mb v2 — веса 1× на m строк БЕЗ
                 // холостых строк mm-тайла. Замеры (один шумовой прогон):
                 // m=5 паритет с mm (~2-8%); m=8 mb гонит ДВА прохода и
@@ -5524,6 +5598,28 @@ impl crate::backend::Backend for MetalBackend {
                 );
                 let kmod = if bg.dtype == GpuDtype::Q5_0 { 32 } else { 256 };
                 if m >= mm_min && m > 1 && mm_capable && k % kmod == 0 {
+                    self.ctx
+                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+                    return Ok(());
+                }
+                // Q8_0 (окно верификации Q8_0-моделей: MTP γ≤7, DFlash2-блок):
+                // батчевый matvec mv_q8_0_mb — веса читаются 1× на m строк,
+                // m=7..8 — два прохода (4+остаток). ЭТО БЫЛ основной путь окон
+                // с 7247854, но Ф8.1 (b7d8d4e) завёл для паритета MoE-префилла
+                // ветку «m≤8 → mv_ext» для ВСЕХ квантов, и Q8_0-окна молча
+                // вернулись к чтению весов построчно (регресс без замеров:
+                // gemm_small_m 8B M=5 снова 2×, M=8 — 3.5× от m=1). Рычаг
+                // тот же INFER_QUANT_MM_MIN (дефолт 4; m=2..3 остаются mv_ext);
+                // INFER_Q8_NO_MB=1 — откат для сверок. Гейты: 16-байтовый
+                // сдвиг A (float4-загрузки) и K%32 (блок Q8_0) — иначе mv_ext.
+                if bg.dtype == GpuDtype::Q8_0
+                    && m >= mm_min
+                    && m > 1
+                    && m <= 8
+                    && k % 32 == 0
+                    && a.as_gpu().offset.is_multiple_of(16)
+                    && std::env::var("INFER_Q8_NO_MB").is_err()
+                {
                     self.ctx
                         .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
@@ -6577,7 +6673,6 @@ impl crate::backend::Backend for MetalBackend {
         // dispatch_threads: grid — ЧИСЛО ПОТОКОВ (не threadgroup'ов!), т.е.
         // 128 потоков на токен. С `grid = T` запускался один неполный
         // threadgroup, и роутер считал только первый токен (тихо).
-        let bytes = (e * 4 + 2 * 128 * 4) as u64;
         let grid = MTLSize::new((t * 128) as u64, 1, 1);
         let group = MTLSize::new(128, 1, 1);
         self.ctx
@@ -7382,6 +7477,79 @@ mod quant_gemm_tests {
             let got = c.to_cpu_f32(&ctx).unwrap();
             let diff = max_diff(&got, &c_ref);
             assert!(diff <= 1e-3, "M={m}: |Δ| max {diff}");
+        }
+    }
+
+    /// Маршрут трейтового gemm_nt для Q8_0 при m ∈ [4,8] (окно верификации
+    /// MTP/DFlash на Q8_0-моделях) — БАТЧЕВЫЙ mv_q8_0_mb (веса 1× на m строк),
+    /// а не построчный mv_ext. Регресс: Ф8.1 (b7d8d4e) завёл ветку «m≤8 →
+    /// mv_ext» для всех квантов и молча снял Q8_0-окна с mb-пути (7247854);
+    /// замер 4B-Q8_0+DFlash: γ=3 38.1→58.0 tok/s, γ=6 27.8→43.8, приёмка и
+    /// текст SPEC==AR не изменились. Пин маршрута: результат трейта равен
+    /// ПРЯМОМУ gemm_nt_quantized (его гейт Q8_0-mb не зависит от рычага и
+    /// покрыт q8_0_small_batch_matches_cpu против CPU) и ОТЛИЧАЕТСЯ от
+    /// mv_ext-варианта (порог 9, как до правки) — иначе тест вырожден.
+    #[test]
+    fn trait_gemm_nt_q8_0_small_m_goes_batched() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        // Порог — ИНСТАНС-переопределение: env-рычаг глобальный, и тест с
+        // другой его настройкой (iq4_xs: 9) в том же процессе перетирал бы
+        // этот маршрут (и наоборот — этот тест ломал бы тот).
+        be.ctx.set_quant_mm_min(4);
+        let (n, k) = (77usize, 128usize); // k%128==0 — mv_ext вообще применим
+        let bytes: Vec<u8> = (0..n * k / 32)
+            .flat_map(|b| {
+                let mut blk = half::f16::from_f32(0.01 + (b % 7) as f32 * 0.003)
+                    .to_bits()
+                    .to_le_bytes()
+                    .to_vec();
+                blk.extend((0..32).map(|j| {
+                    let q = ((b * 37 + j * 11) % 255) as u8;
+                    q.wrapping_sub(127) as i8 as u8
+                }));
+                blk
+            })
+            .collect();
+        let w = be
+            .from_quantized(&bytes, vec![n, k], crate::dtype::WeightFormat::Q8_0)
+            .unwrap();
+        for m in 4..=8usize {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 7919.0).sin()).collect();
+            let a = be.from_cpu_f32(&a_data, vec![m, k]).unwrap();
+            be.ctx.set_quant_mm_min(4);
+            let c_new = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &w, &c_new).unwrap();
+            let got = be.to_cpu_f32(&c_new).unwrap();
+            // Прямой вызов gemm_nt_quantized — безусловно mb-путь Q8_0.
+            let c_mb = be.zeros(vec![m, n]).unwrap();
+            be.ctx
+                .gemm_nt_quantized(a.inner_metal(), w.inner_metal(), c_mb.inner_metal())
+                .unwrap();
+            let want = be.to_cpu_f32(&c_mb).unwrap();
+            let mut same = true;
+            for (g, wnt) in got.iter().zip(want.iter()) {
+                if g.to_bits() != wnt.to_bits() {
+                    same = false;
+                    break;
+                }
+            }
+            assert!(same, "M={m}: трейтовый gemm_nt не равен mb-пути (маршрут сломан)");
+            // Контроль вырожденности: паритет-порог 9 (окна идут mv_ext,
+            // как до правки) обязан дать ДРУГИЕ числа.
+            be.ctx.set_quant_mm_min(9);
+            let c_old = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &w, &c_old).unwrap();
+            let old = be.to_cpu_f32(&c_old).unwrap();
+            be.ctx.set_quant_mm_min(4);
+            let differs = got
+                .iter()
+                .zip(old.iter())
+                .any(|(g, o)| g.to_bits() != o.to_bits());
+            assert!(
+                differs,
+                "M={m}: mb и mv_ext совпали побитово — пин маршрута недействителен"
+            );
         }
     }
 

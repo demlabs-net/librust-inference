@@ -2,7 +2,6 @@
 //! hd=128), причинная маска; сверка с numpy-эталоном (f16-скругления как в
 //! кернеле). nkv=2 принципиален: K/V лежат interleaved [T, NKV*HD], stride
 //! ключа = NKV*HD ≠ HD — при nkv=1 этот баг не воспроизводится.
-use rust_inference::backend::Backend as _;
 use rust_inference::metal::MetalBackend;
 
 fn main() {

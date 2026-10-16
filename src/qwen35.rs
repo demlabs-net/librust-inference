@@ -18,9 +18,10 @@
 //! Состояние сессии — KV-кэши полных слоёв + conv/ssm-стейты рекуррентных.
 //! Рекуррентный стейт не откатывается усечением (в отличие от KV):
 //! спекулятивная верификация ([`Qwen35Model::decode_spec`]) откатывает её
-//! снимком состояний (snapshot_states) и переигрыванием принятого префикса
-//! (Ф2.6). PP-стадии и перенос KV-объекта для гибрида по-прежнему явно
-//! отвергаются вызывающим кодом.
+//! пред-оконным снимком состояний (snapshot_states) и перепрогоном ТОЛЬКО
+//! GDN-стадий по захваченным входам окна ([`Qwen35Model::restore_spec_states`],
+//! Ф8.2g; полный реплей — фоллбэк INFER_SPEC_REPLAY=1). PP-стадии и перенос
+//! KV-объекта для гибрида по-прежнему явно отвергаются вызывающим кодом.
 
 use crate::backend::{Backend, Tensor};
 use crate::error::BackendError;
@@ -730,11 +731,19 @@ impl Qwen35Model {
     /// Восстановление стейтов GDN после частичного принятия окна БЕЗ реплея
     /// (Ф8.2g): по захваченным входам (qkv, gate, b) перепрогоняются ТОЛЬКО
     /// conv/l2norm/delta по принятому префиксу — через тот же код
-    /// ([`Self::gdn_state_update`]) и те же входы, что у окна, поэтому стейты
-    /// бит-в-бит совпадают с результатом полного реплея (проверяется
-    /// паритетом spec==AR и тестом fused==composition).
-    /// Предусловия (выполняет [`Self::decode_spec`]): KV усечён до базы,
-    /// стейты GDN стоят на пред-оконном снимке, `pos = base`.
+    /// ([`Self::gdn_state_update`]), что и окно.
+    ///
+    /// ЭКВИВАЛЕНТНОСТЬ (честно): стейт получается «состоянием ОКНА на
+    /// принятом префиксе» — самосогласованным (следующие окна продолжают от
+    /// него же; extract-строки MTP/DFlash тоже из окна). Полный реплей
+    /// (INFER_SPEC_REPLAY=1) даёт стейт по входам, пересчитанным батчем
+    /// accepted_len — пути не обязаны совпадать ПОБИТОВО (M-зависимые ветки
+    /// mm/mb), но обязаны быть численно эквивалентны: критерий — идентичная
+    /// приёмка и SPEC==AR байт-в-байт (проверено на 27B, ревью Ф8.2g).
+    ///
+    /// Предусловия (выполняет [`Self::decode_spec`]): стейты GDN стоят на
+    /// пред-оконном снимке; KV уже усечён до `base + accepted_len`, `pos`
+    /// выставлен туда же. После Err модель требует `reset_cache`.
     pub fn restore_spec_states(
         &mut self,
         backend: &dyn Backend,
@@ -749,6 +758,10 @@ impl Qwen35Model {
                 "restore_spec_states: пустой префикс".into(),
             ));
         }
+        // Один батч на весь откат: вне него run() делает commit+wait на
+        // КАЖДЫЙ кернел (~9 × 48 ≈ 430 коммитов — десятки мс; ревью Ф8.2g).
+        backend.begin_batch()?;
+        let r = (|| {
         for i in 0..self.layers.len() {
             let Some((qkv, gate, b)) = cap[i].as_ref() else {
                 continue;
@@ -759,13 +772,24 @@ impl Qwen35Model {
             let st = self.states[i]
                 .as_mut()
                 .ok_or_else(|| BackendError::Shape(format!("restore: слой {i}: нет стейта")))?;
-            let a = accepted_len.min(qkv.shape()[1]);
+            // Превышение захвата — ошибка: тихий зажим восстановил бы
+            // стейт на более коротком префиксе (ревью Ф8.2g).
+            if accepted_len > qkv.shape()[1] {
+                return Err(BackendError::Shape(format!(
+                    "restore_spec_states: accepted_len {accepted_len} > строк захвата {}",
+                    qkv.shape()[1]
+                )));
+            }
+            let a = accepted_len;
             let qkv_a = qkv.view_offset(vec![1, a, qkv.shape()[2]], 0);
             let gate_a = gate.view_offset(vec![1, a, gate.shape()[2]], 0);
             let b_a = b.view_offset(vec![1, a, b.shape()[2]], 0);
             let _ = Self::gdn_state_update(&self.cfg, backend, &qkv_a, &gate_a, &b_a, g, st, None)?;
         }
         Ok(())
+        })();
+        backend.end_batch()?;
+        r
     }
 
     /// Спекулятивный шаг (Ф9.4): верификация [id, draft…] ОДНИМ forward'ом.
@@ -815,7 +839,9 @@ impl Qwen35Model {
         // перепрогоном лёгких стадий по захвату, БЕЗ полного реплея.
         // INFER_SPEC_REPLAY=1 — прежний путь (сверка/замеры).
         let use_capture = std::env::var("INFER_SPEC_REPLAY").is_err();
-        if use_capture {
+        if use_capture && !draft.is_empty() {
+            // Пустой черновик (окно из одного якоря) откатить не может —
+            // захват был бы чистым оверхедом на каждый вырожденный токен.
             self.begin_spec_capture();
         }
         let (logits, extract) = self.prefill_extract(backend, &ids, extract_layers)?;
@@ -883,7 +909,7 @@ impl Qwen35Model {
             self.spec_prof.3 += 1;
             if self.spec_prof.3.is_multiple_of(50) {
                 eprintln!(
-                    "QWEN35_SPEC_PROF окон {}: снимок {:.1} · снимок+forward+логиты {:.1} мс/окно · реплей {:.1} мс × {} раз",
+                    "QWEN35_SPEC_PROF окон {}: снимок {:.1} · снимок+forward+логиты {:.1} мс/окно · откат (restore/реплей) {:.1} мс × {} раз",
                     self.spec_prof.3,
                     self.spec_prof_snap * 1e3 / self.spec_prof.3 as f64,
                     self.spec_prof.0 * 1e3 / self.spec_prof.3 as f64,
@@ -1176,9 +1202,11 @@ impl Qwen35Model {
             let qn = y.view_offset(vec![1, 1, qk_size], 0);
             let kn = y.view_offset(vec![1, 1, qk_size], qk_size);
             let v = y.view_offset(vec![1, 1, inner], 2 * qk_size);
+            gs(t0, &mut t_cv)?;
+            t0 = std::time::Instant::now();
             let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, &gate, &b, &st.ssm, hk)?;
             st.ssm = new_ssm;
-            gs(t0, &mut t_cv)?;
+            gs(t0, &mut t_dr)?;
             t0 = std::time::Instant::now();
             (qn, kn, v, o.view(vec![1, 1, inner]))
         } else {

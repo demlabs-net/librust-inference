@@ -2142,6 +2142,26 @@ impl MetalCtx {
                 a.shape, b.shape, c.shape
             )));
         }
+        // Тихая вера предусловиям недопустима: K без остатка на 256 (иначе
+        // хвост молча не считается), чужой формат и невыровненный A
+        // (float4-загрузки в кернеле) — явные ошибки.
+        if b.dtype != GpuDtype::Q5_K {
+            return Err(MetalError::Shape(format!(
+                "mv_q5_k_mb: dtype {:?} не Q5_K",
+                b.dtype
+            )));
+        }
+        if !k.is_multiple_of(256) {
+            return Err(MetalError::Shape(format!(
+                "mv_q5_k_mb: K={k} не кратен 256 (хвост суперблока не обрабатывается)"
+            )));
+        }
+        if !a.offset.is_multiple_of(16) {
+            return Err(MetalError::Shape(format!(
+                "mv_q5_k_mb: A.offset={} не 16-выровнен (float4-загрузки)",
+                a.offset
+            )));
+        }
         let (k32, n32) = (k as u32, n as u32);
         let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
             let name = match rows {
@@ -5470,19 +5490,34 @@ impl crate::backend::Backend for MetalBackend {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(4);
-                // Q5_K остаётся в mm (порог ниже): самодельный mb-кернел
-                // (simdgroup на строку весов, скалярные разбросанные загрузки
-                // A) дал ×3 к mm-тайлу на m=4 — отклонён по замерам; узкоспец
-                // Q5_K small-m тайл — кандидат следующего захода.
-                // Q5_K (gdn.qkv/w_out 27B): mb v2 — веса 1× на m строк без
-                // холостых строк mm-тайла; замер против mm ниже порога.
-                if bg.dtype == GpuDtype::Q5_K && m > 1 && k % 256 == 0 {
+                // Q5_K (gdn.qkv/w_out 27B): mb v2 — веса 1× на m строк БЕЗ
+                // холостых строк mm-тайла. Замеры (один шумовой прогон):
+                // m=5 паритет с mm (~2-8%); m=8 mb гонит ДВА прохода и
+                // читает веса 2× — mm быстрее ровно вдвое (gdn.qkv 1.03 vs
+                // 2.06 мс), поэтому m 7..8 идут mm. INFER_Q5K_MB=1 —
+                // форсаж mb и там (сверка); INFER_Q5K_NO_MB=1 — откат на
+                // mm для всех m. Кернел грузит A через float4 — гейт
+                // 16-байтного выравнивания (у соседних mb/r2-путей он есть;
+                // misaligned vector load на Metal = мусор/фолт).
+                let q5k_mb = if m >= 7 {
+                    std::env::var("INFER_Q5K_MB").is_ok()
+                } else {
+                    std::env::var("INFER_Q5K_NO_MB").is_err()
+                };
+                if bg.dtype == GpuDtype::Q5_K
+                    && q5k_mb
+                    && m > 1
+                    && m <= 8
+                    && k % 256 == 0
+                    && a.as_gpu().offset.is_multiple_of(16)
+                {
                     self.ctx.mv_q5_k_mb(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
                 let mm_capable = matches!(
                     bg.dtype,
                     GpuDtype::Q4_K
+                        | GpuDtype::Q5_K
                         | GpuDtype::Q6_K
                         | GpuDtype::Q5_0
                         | GpuDtype::Iq4Xs
@@ -6804,60 +6839,62 @@ mod quant_gemm_tests {
         }
     }
 
-    /// Q5_K mb v2 (окна спека 2..3, а также проверка кернела при 4..8):
-    /// matvec с батчем строк против точного хост-декванта. Ловит раскладку
-    /// суперблока (c/l0), биты qh по подблокам и векторные загрузки A.
+    /// Q5_K mb: matvec с батчем строк против точного хост-декванта.
+    /// Формы: m 2/3/5 (один проход) и 7/8 (два прохода 4+остаток); K 512 и
+    /// 768 (nb=2/3 — хвостовые лейны и неполные суперблоки в simd_sum).
+    /// Допуск rel 1e-3: mb деквантует поэлементно (как хост), отличается
+    /// только порядок fp32-суммирования (simd_sum по лейнам) — ожидаемо
+    /// ~1e-5..1e-6; 1e-3 — с запасом, грубые сдвиги раскладки дают O(1).
     #[test]
     fn q5_k_mb_matches_host_dequant() {
         use crate::backend::Backend as _;
         let be = MetalBackend::new().unwrap();
-        let (n, k, m) = (4usize, 512usize, 5usize);
-        let mut seed = 0x5EED_1A2Bu64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        // Q5_K: 176 Б/256 = d | dmin | scales[12] | qh[32] | qs[128]
-        let mut raw = Vec::with_capacity(n * k / 256 * 176);
-        for _ in 0..n * k / 256 {
-            raw.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
-            raw.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
-            for _ in 0..12 {
-                raw.push((next() & 0xFF) as u8);
+        for (n, k, m) in [(4usize, 512usize, 5usize), (4, 512, 2), (3, 768, 3), (4, 512, 7), (4, 768, 8)] {
+            let mut seed = 0x5EED_1A2Bu64 ^ ((k as u64) << 8) ^ (m as u64);
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            // Q5_K: 176 Б/256 = d | dmin | scales[12] | qh[32] | qs[128]
+            let mut raw = Vec::with_capacity(n * k / 256 * 176);
+            for _ in 0..n * k / 256 {
+                raw.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+                raw.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+                for _ in 0..12 {
+                    raw.push((next() & 0xFF) as u8);
+                }
+                for _ in 0..32 {
+                    raw.push((next() & 0xFF) as u8);
+                }
+                for _ in 0..128 {
+                    raw.push((next() & 0xFF) as u8);
+                }
             }
-            for _ in 0..32 {
-                raw.push((next() & 0xFF) as u8);
-            }
-            for _ in 0..128 {
-                raw.push((next() & 0xFF) as u8);
-            }
-        }
-        let w = be
-            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q5_K)
-            .unwrap();
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
-        let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
-        let c = be.zeros(vec![m, n]).unwrap();
-        be.ctx
-            .mv_q5_k_mb(av.inner_metal(), w.inner_metal(), c.inner_metal())
-            .unwrap();
-        let got = be.to_cpu_f32(&c).unwrap();
-        for row in 0..n {
-            let bytes = &raw[row * (k / 256) * 176..(row + 1) * (k / 256) * 176];
-            let y = crate::weights_map::dequant_q5_k(bytes);
-            for mi in 0..m {
-                let x = &a[mi * k..(mi + 1) * k];
-                let want: f64 = y.iter().zip(x).map(|(w, x)| (*w as f64) * (*x as f64)).sum();
-                let d = (got[mi * n + row] as f64 - want).abs()
-                    / (1.0 + want.abs());
-                // накопление нибблов в обоих путях — до ~1% rel на синтетике.
-                assert!(
-                    d < 2e-2,
-                    "mb m={mi} n={row}: {} vs host {want} (rel {d})",
-                    got[mi * n + row]
-                );
+            let w = be
+                .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q5_K)
+                .unwrap();
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
+            let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+            let c = be.zeros(vec![m, n]).unwrap();
+            be.ctx
+                .mv_q5_k_mb(av.inner_metal(), w.inner_metal(), c.inner_metal())
+                .unwrap();
+            let got = be.to_cpu_f32(&c).unwrap();
+            for row in 0..n {
+                let bytes = &raw[row * (k / 256) * 176..(row + 1) * (k / 256) * 176];
+                let y = crate::weights_map::dequant_q5_k(bytes);
+                for mi in 0..m {
+                    let x = &a[mi * k..(mi + 1) * k];
+                    let want: f64 = y.iter().zip(x).map(|(w, x)| (*w as f64) * (*x as f64)).sum();
+                    let d = (got[mi * n + row] as f64 - want).abs() / (1.0 + want.abs());
+                    assert!(
+                        d < 1e-3,
+                        "n={n} k={k} m={m}: mb[{mi},{row}]={} vs host {want} (rel {d})",
+                        got[mi * n + row]
+                    );
+                }
             }
         }
     }

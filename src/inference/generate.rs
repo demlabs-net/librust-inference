@@ -1020,7 +1020,7 @@ pub fn generate<M: CausalLm + ?Sized>(
             let pos = model.context_len();
             let mut dr = params.drafter.as_ref().unwrap().lock().unwrap();
             if let Err(e) = dr.after_extract(backend, &out.extract, pos, 1) {
-                tracing::warn!(error = %e, "after_extract (пустой черновик) не удался");
+                eprintln!("after_extract (пустой черновик) не удался: {e}");
             }
             prof[3] += tp.elapsed().as_secs_f64();
             prof_n[3] += 1;

@@ -1783,16 +1783,20 @@ impl MetalCtx {
                 "gemm_nt_q4_0"
             }
             GpuDtype::Q8_0 => "gemm_nt_q8_0",
-            // Q4_K при m > 8 — тайловой sgemm (порт kernel_mul_mm_q4_K_f32,
-            // каркас как у Q6_K mm). Паритет: при m > 8 эталон считает q/k/v
-            // и FFN ЭТИМ кернелом (use_mm), и его порядок суммирования
-            // отличается и от matvec'а, и от поэлементного GEMM (OLMoE p2).
-            // ПОКА ОПТ-ИН (INFER_Q4K_MM=1): порт численно верен (совпал с
-            // гипотезой A-half+B-half на ф32-точности), но НЕ побитово с
-            // эталонным mm — в эталонном dequantize_q4_K映射 il→подблок/масштаб
-            // (get_scale_min_k4_just2(is, il/2)) отличается от спекового
-            // get_scale_min_k4; разбирается следующим заходом (сверка
-            // декванта построчно с оркаловым дампом). Порог m>8 и K%256==0.
+            // Q4_K при m > 8 — тайловой sgemm: ДОСЛОВНЫЙ порт
+            // kernel_mul_mm_q4_K_f32 (dequantize_q4_K + get_scale_min_k4_just2,
+            // gemm.metal). Паритет: при m > 8 эталон считает q/k/v и FFN
+            // ЭТИМ кернелом (use_mm), и его порядок суммирования отличается
+            // и от matvec'а, и от поэлементного GEMM (OLMoE p2).
+            // Долг «НЕ побитово с эталонным mm» ЗАКРЫТ: загрузчик весов
+            // сверен с эталонной формулой ПОБИТОВО на 39424 half-весах
+            // (тест q4_k_mm_weights_bitwise_match_oracle_dequant — единичные
+            // активации извлекают каждый вес из mm). Причина былого
+            // расхождения: в эталонной формуле нечётных подблоков d делится
+            // на 16, ниббл маскируется 0xF0 — порядок half-округления другой,
+            // чем у «d·sc·q_hi», поэтому рукописный порт и не совпадал.
+            // INFER_Q4K_NO_MM=1 — фоллбэк на скалярный gemm_nt_q4_k.
+            // Порог m>8 и K%256==0.
             GpuDtype::Q4_K => {
                 let mm_min = std::env::var("INFER_QUANT_MM_MIN")
                     .ok()
@@ -7239,6 +7243,115 @@ mod quant_gemm_tests {
                 if want_ext { "" } else { "НЕ " }
             );
         }
+    }
+
+    /// Q4_K mm (m>8, префилл) против ТОЧНОЙ формулы эталонного
+    /// dequantize_q4_K (dequantize.h:431, kernel_mul_mm_q4_K_f32): для
+    /// нечётных подблоков эталон считает `(d/16) * sc * (byte & 0xF0) - ml`,
+    /// а не `d * sc * q_hi - ml` — математически равно, но half-округление
+    /// веса идёт от другой величины. Наш q4k_dequantize_mm — дословный порт.
+    ///
+    /// ПРОВЕРКА ПОБИТОВАЯ: активации — единичная матрица (A[i][i]=1), тогда
+    /// C[k][n] = ровно float(half-вес w[n,k]) (одно слагаемое 1.0*half_w,
+    /// остальные нули — float-сумма точна). Сравниваем биты float с
+    /// эталонной half-формулой: расхождение хотя бы на 1 ulp half падает.
+    /// Долговая запись «НЕ побитово с эталонным mm» относилась к рукописному
+    /// порту ДО дословного (gemm.metal: get_scale_min_k4_just2).
+    #[test]
+    fn q4_k_mm_weights_bitwise_match_oracle_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (n, k) = (77usize, 512usize);
+        let mut seed = 0x44_4B5E_ED01u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Q4_K: d | dmin | scales[12] | qs[128]
+        let mut raw = Vec::with_capacity(n * k / 256 * 144);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            raw.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+            for _ in 0..12 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q4_K)
+            .unwrap();
+        // Единичная A: m = k = 512 (m>8 → mm-тайл), A[i][j] = i==j
+        let mut a = vec![0f32; k * k];
+        for i in 0..k {
+            a[i * k + i] = 1.0;
+        }
+        let av = be.from_cpu_f32(&a, vec![k, k]).unwrap();
+        let c = be.zeros(vec![k, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        // Эталонный dequantize_q4_K: just2 + «d/16, mask 0xF0» для нечётных
+        // подблоков; округление веса в half.
+        let mut checked = 0usize;
+        let mut zeros = 0usize;
+        for r in 0..n {
+            let sb0 = r * (k / 256) * 144;
+            for sb in 0..k / 256 {
+                let b = &raw[sb0 + sb * 144..sb0 + (sb + 1) * 144];
+                let d = half::f16::from_le_bytes([b[0], b[1]]);
+                let dmin = half::f16::from_le_bytes([b[2], b[3]]);
+                let scales = &b[4..16];
+                let qs = &b[16..144];
+                let just2 = |j: usize, kk: usize| -> (f32, f32) {
+                    if j < 4 {
+                        ((scales[j + kk] & 63) as f32, (scales[j + 4 + kk] & 63) as f32)
+                    } else {
+                        (
+                            ((scales[j + 4 + kk] & 0xF) | ((scales[j - 4 + kk] & 0xC0) >> 2))
+                                as f32,
+                            ((scales[j + 4 + kk] >> 4) | ((scales[j + kk] & 0xC0) >> 2)) as f32,
+                        )
+                    }
+                };
+                for il in 0..16usize {
+                    let is = (il / 4) * 2;
+                    let part = il & 1;
+                    let c4 = il / 4;
+                    let (sc, mn) = just2(is, (il & 3) / 2);
+                    let d_eff = if (il & 3) < 2 {
+                        half::f16::to_f32(d)
+                    } else {
+                        half::f16::to_f32(half::f16::from_f32(half::f16::to_f32(d) / 16.0))
+                    };
+                    let mask: u8 = if (il & 3) < 2 { 0x0F } else { 0xF0 };
+                    let dl = d_eff * sc;
+                    let ml = half::f16::to_f32(dmin) * mn;
+                    for i in 0..16usize {
+                        let byte = qs[c4 * 32 + 16 * part + i];
+                        let pos = sb * 256 + (il / 2) * 32 + 16 * part + i;
+                        let want = half::f16::from_f32(dl * (byte & mask) as f32 - ml);
+                        let g = got[pos * n + r];
+                        if want.to_bits() & 0x7FFF == 0 {
+                            zeros += 1;
+                        }
+                        assert_eq!(
+                            g.to_bits(),
+                            half::f16::to_f32(want).to_bits(),
+                            "r={r} k={pos}: mm {} vs эталонный half {} (ila={il})",
+                            g,
+                            half::f16::to_f32(want)
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("q4_k_mm: побитово сверено {checked} весов (из них нулей {zeros})");
     }
 
     /// IQ4_XS mul_mm (m>8): сверка тайлового GEMM с хост-деквантом. Ловит

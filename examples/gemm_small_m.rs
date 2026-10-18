@@ -136,6 +136,53 @@ fn iq4_xs_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// NVFP4: 36 Б на 64 значения (4 UE4M3-скейла + qs[32]).
+fn nvfp4_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 64 * 36);
+    for _ in 0..n * k / 64 {
+        for _ in 0..4 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push(120 + (s % 40) as u8);
+        }
+        for _ in 0..32 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// IQ4_NL: 18 Б (f16 d + 16 байт нибблов).
+fn iq4_nl_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 32 * 18);
+    for _ in 0..n * k / 32 {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+        for _ in 0..16 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// MXFP4: 17 Б (E8M0 + 16 байт нибблов).
+fn mxfp4_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 32 * 17);
+    for _ in 0..n * k / 32 {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        out.push(120 + (s % 16) as u8);
+        for _ in 0..16 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+    }
+    out
+}
+
 fn main() {
     let be = MetalBackend::new().unwrap();
     let iters = 50;
@@ -152,6 +199,9 @@ fn main() {
         "q5_k" => (q5_k_bytes, WeightFormat::Q5_K),
         "q6_k" => (q6_k_bytes, WeightFormat::Q6_K),
         "iq4_xs" => (iq4_xs_bytes, WeightFormat::Iq4Xs),
+        "iq4_nl" => (iq4_nl_bytes, WeightFormat::Iq4Nl),
+        "mxfp4" => (mxfp4_bytes, WeightFormat::Mxfp4),
+        "nvfp4" => (nvfp4_bytes, WeightFormat::Nvfp4),
         _ => (q8_0_bytes, WeightFormat::Q8_0),
     };
     if dtype != "q8_0" {

@@ -89,6 +89,7 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Iq4Xs => WeightFormat::Iq4Xs,
                 GgmlType::Iq4Nl => WeightFormat::Iq4Nl,
                 GgmlType::Mxfp4 => WeightFormat::Mxfp4,
+                GgmlType::Nvfp4 => WeightFormat::Nvfp4,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -343,6 +344,44 @@ fn e8m0_to_fp32_half(e: u8) -> f32 {
     f32::from_bits(bits)
 }
 
+/// UE4M3-скейл NVFP4 → float (порт ggml_ue4m3_to_fp32): unsigned, 4 бита
+/// экспоненты (bias 7), 3 мантиссы; x==0 и x==0x7F — ноль; возвращает
+/// значение·0.5 (компенсация «удвоенных» kvalues_fp4).
+fn ue4m3_to_fp32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0xF) as i32;
+    let man = (x & 0x7) as f32;
+    let raw = if exp == 0 {
+        man * 2f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    };
+    raw * 0.5
+}
+
+/// NVFP4 (ggml `dequantize_row_nvfp4`, 36 Б/64): d[4] (UE4M3, по одному на
+/// 16-эл. подблок) @0, qs[32] @4. Для подблока s: байт qs[s*8+j] — значения
+/// s*16+j (младший ниббл) и s*16+j+8 (старший), умноженные на d_s.
+pub(crate) fn dequant_nvfp4(data: &[u8]) -> Vec<f32> {
+    const KV: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let mut out = Vec::with_capacity(data.len() / 36 * 64);
+    for blk in data.chunks_exact(36) {
+        let mut row = [0f32; 64];
+        for s in 0..4usize {
+            let d = ue4m3_to_fp32(blk[s]);
+            for j in 0..8usize {
+                let b = blk[4 + s * 8 + j];
+                row[s * 16 + j] = KV[(b & 0xF) as usize] as f32 * d;
+                row[s * 16 + j + 8] = KV[(b >> 4) as usize] as f32 * d;
+            }
+        }
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
 /// MXFP4 (ggml `dequantize_row_mxfp4`, 17 Б/32): E8M0-скейл @0, qs[16] @1.
 /// Значения — kvalues_fp4 («удвоенные» E2M1: 0,1,2,3,4,6,8,12,0,-1,…,-12),
 /// порядок как у Q4_0 (байт j — значения j и j+16).
@@ -447,6 +486,7 @@ pub fn dequant_gguf(
         T::Iq4Xs => dequant_iq4_xs(data),
         T::Iq4Nl => dequant_iq4_nl(data),
         T::Mxfp4 => dequant_mxfp4(data),
+        T::Nvfp4 => dequant_nvfp4(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -488,6 +528,7 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Iq4Xs => dequant_iq4_xs(t.data),
         WeightFormat::Iq4Nl => dequant_iq4_nl(t.data),
         WeightFormat::Mxfp4 => dequant_mxfp4(t.data),
+        WeightFormat::Nvfp4 => dequant_nvfp4(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

@@ -137,6 +137,17 @@ constant float KV_FP4[16] = {
     0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
 };
 
+/// UE4M3-скейл NVFP4 → float (порт ggml_ue4m3_to_fp32): unsigned, 4 бита
+/// экспоненты (bias 7), 3 мантиссы; 0 и 0x7F — ноль; значение·0.5
+/// (компенсация «удвоенных» kvalues_fp4).
+static inline float ue4m3_to_fp32(uchar x) {
+    if (x == 0u || x == 0x7Fu) return 0.0f;
+    const int exp = (int)((x >> 3u) & 0xFu);
+    const float man = (float)(x & 0x7u);
+    const float raw = exp == 0 ? ldexp(man, -9) : ldexp(1.0f + man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
 /// E8M0-скейл MXFP4 → float (порт ggml_e8m0_to_fp32_half): d = 2^(e−128);
 /// при e<2 — субнормальные степени (биты 0x00200000 << e).
 static inline float e8m0_to_fp32_half(uchar e) {

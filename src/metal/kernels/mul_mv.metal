@@ -246,6 +246,106 @@ kernel void mv_iq4_xs_mb(
     }
 }
 
+// ── NVFP4: декод (m=1) и окна (1<m≤8) ───────────────────────────────────
+// Блок 36 Б/64: d[4] (UE4M3, по подблоку 16 значений) + qs[32]; байт
+// qs[s*8+j] — значения s*16+j (младший ниббл) и s*16+j+8 (старший),
+// множитель d_s = ue4m3(d[s]); значения — «удвоенные» E2M1 (KV_FP4).
+// Раскладка нибблов внутри подблока — j и j+8 (не j и j+16, как у 32-эл.
+// форматов), поэтому блоки 64 нельзя обрабатывать 32-шагами как Q4_0.
+
+kernel void mv_nvfp4(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 64u;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + ((ulong)n * blocks + b) * 36u;
+        const uint k0 = b * 64u;
+        for (uint s = 0; s < 4u; ++s) {
+            const float d = ue4m3_to_fp32(blk[s]);
+            for (uint j = 0; j < 8u; ++j) {
+                const uchar v = blk[4u + s * 8u + j];
+                acc += A[k0 + s * 16u + j] * KV_FP4[v & 0x0Fu] * d;
+                acc += A[k0 + s * 16u + j + 8u] * KV_FP4[v >> 4u] * d;
+            }
+        }
+    }
+    C[n] = acc;
+}
+
+// Окна: 32 лейна делят блок 64 на 4 подблока по 8 лейнов; лейн — 1 байт =
+// 2 значения (j и j+8). NR строк весов на simdgroup, A — скалярно (сдвиги
+// j/j+8 не кратны float2), веса 1× на m строк.
+template <short M, short NR>
+kernel void mv_nvfp4_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint nb = K / 64u;
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    const uint sub = lane / 8u;   // 0..3 — подблок 16 значений
+    const uint j = lane % 8u;     // байт внутри подблока → значения j, j+8
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * 36u;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = 0; ib < nb; ++ib) {
+        const ulong base = (ulong)ib * 64u + sub * 16u + j;
+        float y_lo[M], y_hi[M];
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            y_lo[m] = A[(ulong)m * K + base];
+            y_hi[m] = A[(ulong)m * K + base + 8u];
+        }
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * 36u;
+            const float d = ue4m3_to_fp32(blk[sub]);
+            const uchar v = blk[4u + sub * 8u + j];
+            const float w_lo = KV_FP4[v & 0x0Fu] * d;
+            const float w_hi = KV_FP4[v >> 4u] * d;
+#pragma unroll
+            for (short m = 0; m < M; ++m) {
+                acc[r][m] += w_lo * y_lo[m] + w_hi * y_hi[m];
+            }
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+typedef decltype(mv_nvfp4_mb<2, 4>) mv_nvfp4_mb_t;
+template [[host_name("mv_nvfp4_mb2")]] kernel mv_nvfp4_mb_t mv_nvfp4_mb<2, 4>;
+template [[host_name("mv_nvfp4_mb3")]] kernel mv_nvfp4_mb_t mv_nvfp4_mb<3, 4>;
+template [[host_name("mv_nvfp4_mb4")]] kernel mv_nvfp4_mb_t mv_nvfp4_mb<4, 4>;
+template [[host_name("mv_nvfp4_mb5")]] kernel mv_nvfp4_mb_t mv_nvfp4_mb<5, 8>;
+template [[host_name("mv_nvfp4_mb6")]] kernel mv_nvfp4_mb_t mv_nvfp4_mb<6, 8>;
+
 // ── IQ4_NL / MXFP4: декод (m=1) и окна (1<m≤8) ──────────────────────────
 // Раскладка нибблов — каноническая ggml (байт j: значение j в младшем
 // ниббле, j+16 в старшем), как у Q4_0; отличаются только блок и кодбук:

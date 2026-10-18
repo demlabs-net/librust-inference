@@ -909,6 +909,131 @@ kernel void gemm_nt_q4_0_mm(
     }
 }
 
+// ── Q2_K / Q3_K GEMM m>8 (порт схемы ggml kernel_mul_mm) ─────────────────
+// Тот же тайл 64(N)×32(M)×32(K) и хвостовой staging, что у q4_0_mm.
+// Шаг K=32 = 2 подблока: t = kb%8, s = 2t + il0 (il0 — половина шага),
+// shift = 2·(t%4), qs-база = qs0 + (t/4)·32 + il0·16 (16 байт = 16 значений),
+// hm-база = il0·16, бит = 1<<(s/2). Q2_K: dl=d·(sc&0xF), ml=dmin·(sc>>4);
+// Q3_K: dl=d·(scales[s]−32), значение −4 при нулевом бите hmask.
+template <bool IS_Q3>
+kernel void gemm_nt_q2_k_q3_k_mm(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const int r0 = tgpig.y * 64;
+    const int r1 = tgpig.x * 32;
+    const short nr0 = ((int)N - r0 < 64) ? (short)((int)N - r0) : 64;
+    const short nr1 = ((int)M - r1 < 32) ? (short)((int)M - r1) : 32;
+    const short lr0 = ((short)tiitg / 2) < nr0 ? ((short)tiitg / 2) : nr0 - 1;
+    const short lr1 = ((short)tiitg / 4) < nr1 ? ((short)tiitg / 4) : nr1 - 1;
+    const short il0 = tiitg % 2;
+    const uint bb = IS_Q3 ? 110u : 84u;
+    const uint nbs = K / 32u;
+    device const uchar* x = B + (ulong)(r0 + lr0) * (K / 256u) * bb;
+    const short iy = 8 * (tiitg % 4);
+    device const float* y = A + (ulong)(r1 + lr1) * K + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint kb = 0; kb < nbs; ++kb) {
+        {
+            device const uchar* blk = x + (kb / 8u) * bb;
+            const uint t = kb % 8u;
+            const uint s = 2u * t + (uint)il0;
+            const float d = (float)load_half_unaligned(blk + (IS_Q3 ? 108u : 80u));
+            int sc[16];
+            if (IS_Q3) q3k_unpack_scales(blk + 96u, sc);
+            float dl, ml;
+            if (IS_Q3) {
+                dl = d * (float)(sc[s] - 32);
+                ml = 0.0f;
+            } else {
+                const uchar v = blk[s];
+                dl = d * (float)(v & 0x0Fu);
+                ml = (float)load_half_unaligned(blk + 82u) * (float)(v >> 4u);
+            }
+            const uint shift = 2u * (t % 4u);
+            const uint qs0 = IS_Q3 ? 32u : 16u;
+            device const uchar* qb = blk + qs0 + (t / 4u) * 32u + (uint)il0 * 16u;
+            const uchar bit = (uchar)(1u << (s / 2u));
+            device const uchar* hb = blk + (uint)il0 * 16u;
+            float4x4 reg;
+            for (short i = 0; i < 16; ++i) {
+                int v = (int)((qb[i] >> shift) & 3u);
+                if (IS_Q3 && (hb[i] & bit) == 0u) v -= 4;
+                reg[i / 4][i % 4] = dl * (float)v - ml;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (short i = 0; i < 16; i++) {
+                const short sx = 2 * il0 + i / 8;
+                const short sy = (tiitg / 2) / 8;
+                const short lx = (tiitg / 2) % 8;
+                const short ly = i % 8;
+                const short ib = 8 * sx + sy;
+                *(sa + 64 * ib + 8 * ly + lx) = (half)reg[i / 4][i % 4];
+            }
+        }
+        {
+            const short sx = tiitg % 4;
+            const short sy = (tiitg / 4) / 8;
+            const short ly = (tiitg / 4) % 8;
+            const short ib = 4 * sx + sy;
+            device const float4* y4 = (device const float4*)(y + kb * 32u);
+            const float4 v0 = y4[0], v1 = y4[1];
+            threadgroup half4* dst = (threadgroup half4*)(sb + 64 * ib + 8 * ly);
+            dst[0] = half4(v0);
+            dst[1] = half4(v1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64 <= (int)N && r1 + 32 <= (int)M) {
+        device float* Cp = C + (r0 + 32 * (sgitg & 1)) + (ulong)(r1 + 16 * (sgitg >> 1)) * N;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], Cp + 8 * (i % 4) + 8 * (ulong)N * (i / 4), N, 0, false);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* ts = ((threadgroup float*)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * 64;
+        for (short i = 0; i < 8; i++)
+            simdgroup_store(mc[i], ts + 8 * (i % 4) + 8 * 64 * (i / 4), 64, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = tiitg; j < nr1; j += 128) {
+            device float* D = C + (ulong)(r1 + j) * N + r0;
+            threadgroup float* Cs = ((threadgroup float*)shmem) + j * 64;
+            for (int i = 0; i < nr0; i++) D[i] = Cs[i];
+        }
+    }
+}
+
+typedef decltype(gemm_nt_q2_k_q3_k_mm<true>) gemm_nt_q2_k_q3_k_mm_t;
+template [[host_name("gemm_nt_q2_k_mm")]] kernel gemm_nt_q2_k_q3_k_mm_t gemm_nt_q2_k_q3_k_mm<false>;
+template [[host_name("gemm_nt_q3_k_mm")]] kernel gemm_nt_q2_k_q3_k_mm_t gemm_nt_q2_k_q3_k_mm<true>;
+
 // ── NVFP4 GEMM m>8 (порт схемы ggml kernel_mul_mm) ───────────────────────
 // Блок 36 Б/64: 4 UE4M3-скейла (подблоки по 16) + qs[32]. Шаг тайла по K —
 // 32 значения = 2 подблока: kb → блок kb/2, подблок s = 2·(kb%2) + il0

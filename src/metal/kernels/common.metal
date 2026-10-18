@@ -129,6 +129,28 @@ constant float KV_IQ4[16] = {
     1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
 };
 
+// ── Q2_K / Q3_K ───────────────────────────────────────────────────────────
+// Q2_K: scales[16] @0 (4 бита scale | 4 бита min), qs[64] @16, d @80, dmin @82.
+// Q3_K: hmask[32] @0, qs[64] @32, scales[12] @96, d @108; 6-битные scale со
+// знаком собираются из 12 байт (старшие 4 бита — в scales[8..12]).
+// Подблок s (16 значений): shift = 2·((s%8)/2), half = s%2 (байты l+16·half),
+// q += 32 на каждые 8 подблоков.
+static inline void q3k_unpack_scales(device const uchar* s12, thread int sc[16]) {
+    uint aux[4];
+    for (int i = 0; i < 3; ++i) {
+        aux[i] = (uint)s12[4 * i] | ((uint)s12[4 * i + 1] << 8)
+               | ((uint)s12[4 * i + 2] << 16) | ((uint)s12[4 * i + 3] << 24);
+    }
+    const uint tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & 0x0f0f0f0fu) | (((tmp >> 4) & 0x03030303u) << 4);
+    aux[3] = ((aux[1] >> 4) & 0x0f0f0f0fu) | (((tmp >> 6) & 0x03030303u) << 4);
+    aux[0] = (aux[0] & 0x0f0f0f0fu) | (((tmp >> 0) & 0x03030303u) << 4);
+    aux[1] = (aux[1] & 0x0f0f0f0fu) | (((tmp >> 2) & 0x03030303u) << 4);
+    for (int i = 0; i < 16; ++i) {
+        sc[i] = (int)(signed char)((aux[i / 4] >> (8 * (i % 4))) & 0xFF);
+    }
+}
+
 // ── MXFP4/NVFP4 (OCP E2M1) ────────────────────────────────────────────────
 // kvalues_fp4 ggml: «удвоенные» значения E2M1 (0,1,2,3,4,6,8,12,0,-1,…,-12);
 // масштаб компенсирует удвоение (E8M0_TO_FP32_HALF / ue4m3_to_fp32·0.5).

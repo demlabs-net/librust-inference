@@ -183,6 +183,35 @@ fn mxfp4_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Q2_K: 84 Б (scales[16] | qs[64] | d | dmin).
+fn q2_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 84);
+    for _ in 0..n * k / 256 {
+        for _ in 0..80 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+        out.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+    }
+    out
+}
+
+/// Q3_K: 110 Б (hmask[32] | qs[64] | scales[12] | d).
+fn q3_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 110);
+    for _ in 0..n * k / 256 {
+        for _ in 0..108 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+    }
+    out
+}
+
 fn main() {
     let be = MetalBackend::new().unwrap();
     let iters = 50;
@@ -193,7 +222,8 @@ fn main() {
         .unwrap_or_else(|| vec![1, 2, 3, 4, 5, 8, 16, 32]);
     let mut total = vec![0f64; ms.len()];
     let dtype = std::env::var("GEMM_DTYPE").unwrap_or_else(|_| "q8_0".into());
-    let (make_w, fmt): (fn(usize, usize, u64) -> Vec<u8>, WeightFormat) = match dtype.as_str() {
+    type BytesGen = fn(usize, usize, u64) -> Vec<u8>;
+    let (make_w, fmt): (BytesGen, WeightFormat) = match dtype.as_str() {
         "q4_0" => (q4_0_bytes, WeightFormat::Q4_0),
         "q4_k" => (q4_k_bytes, WeightFormat::Q4_K),
         "q5_k" => (q5_k_bytes, WeightFormat::Q5_K),
@@ -202,6 +232,8 @@ fn main() {
         "iq4_nl" => (iq4_nl_bytes, WeightFormat::Iq4Nl),
         "mxfp4" => (mxfp4_bytes, WeightFormat::Mxfp4),
         "nvfp4" => (nvfp4_bytes, WeightFormat::Nvfp4),
+        "q2_k" => (q2_k_bytes, WeightFormat::Q2_K),
+        "q3_k" => (q3_k_bytes, WeightFormat::Q3_K),
         _ => (q8_0_bytes, WeightFormat::Q8_0),
     };
     if dtype != "q8_0" {

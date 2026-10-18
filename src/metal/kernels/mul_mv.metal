@@ -246,6 +246,134 @@ kernel void mv_iq4_xs_mb(
     }
 }
 
+// ── Q2_K / Q3_K: декод (m=1) и окна (1<m≤8) ─────────────────────────────
+// Блок 256: Q2_K 84 Б (scales[16], qs[64], d, dmin), Q3_K 110 Б
+// (hmask[32], qs[64], scales[12], d). 16 подблоков по 16 значений:
+// shift = 2·((s%8)/2), half = s%2 (байты l+16·half), q += 32 на 8 подблоков.
+// mb: 32 лейна на строку, 2 лейна на подблок (по 8 байт = 8 значений).
+
+template <bool IS_Q3>
+kernel void mv_q2_k_q3_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 256u;
+    const uint bb = IS_Q3 ? 110u : 84u;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + ((ulong)n * blocks + b) * bb;
+        const float d = (float)load_half_unaligned(blk + (IS_Q3 ? 108u : 80u));
+        const float dmin = IS_Q3 ? 0.0f : (float)load_half_unaligned(blk + 82u);
+        int sc[16];
+        if (IS_Q3) q3k_unpack_scales(blk + 96u, sc);
+        const uint qs0 = IS_Q3 ? 32u : 16u;
+        for (uint s = 0; s < 16u; ++s) {
+            float dl, ml;
+            if (IS_Q3) {
+                dl = d * (float)(sc[s] - 32);
+                ml = 0.0f;
+            } else {
+                const uchar v = blk[s];
+                dl = d * (float)(v & 0x0Fu);
+                ml = dmin * (float)(v >> 4u);
+            }
+            const uint shift = 2u * ((s % 8u) / 2u);
+            const uint hpart = s % 2u;
+            device const uchar* qb = blk + qs0 + (s / 8u) * 32u + hpart * 16u;
+            const uchar bit = (uchar)(1u << (s / 2u));
+            device const uchar* hb = blk + hpart * 16u;
+            const uint k0 = b * 256u + s * 16u;
+            for (uint l = 0; l < 16u; ++l) {
+                int v = (int)((qb[l] >> shift) & 3u);
+                if (IS_Q3 && (hb[l] & bit) == 0u) v -= 4;
+                acc += A[k0 + l] * (dl * (float)v - ml);
+            }
+        }
+    }
+    C[n] = acc;
+}
+
+template <bool IS_Q3, short M>
+kernel void mv_q2_k_q3_k_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgid.y;
+    if (n >= N) return;
+    const uint blocks = K / 256u;
+    const uint bb = IS_Q3 ? 110u : 84u;
+    device const uchar* row = B + (ulong)n * blocks * bb;
+    // 2 лейна на подблок: s = lane/2, l0 = (lane%2)*8
+    const uint s = lane / 2u;
+    const uint l0 = (lane % 2u) * 8u;
+
+    float sumf[M];
+#pragma unroll
+    for (uint m = 0; m < M; ++m) sumf[m] = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = row + b * bb;
+        const float d = (float)load_half_unaligned(blk + (IS_Q3 ? 108u : 80u));
+        const float dmin = IS_Q3 ? 0.0f : (float)load_half_unaligned(blk + 82u);
+        int sc[16];
+        if (IS_Q3) q3k_unpack_scales(blk + 96u, sc);
+        const uint qs0 = IS_Q3 ? 32u : 16u;
+        float dl, ml;
+        if (IS_Q3) {
+            dl = d * (float)(sc[s] - 32);
+            ml = 0.0f;
+        } else {
+            const uchar v = blk[s];
+            dl = d * (float)(v & 0x0Fu);
+            ml = dmin * (float)(v >> 4u);
+        }
+        const uint shift = 2u * ((s % 8u) / 2u);
+        const uint hpart = s % 2u;
+        device const uchar* qb = blk + qs0 + (s / 8u) * 32u + hpart * 16u + l0;
+        const uchar bit = (uchar)(1u << (s / 2u));
+        device const uchar* hb = blk + hpart * 16u + l0;
+        const ulong k0 = (ulong)b * 256u + s * 16u + l0;
+#pragma unroll
+        for (uint m = 0; m < M; ++m) {
+            device const float* am = A + (ulong)m * K + k0;
+            for (uint i = 0; i < 8u; ++i) {
+                int v = (int)((qb[i] >> shift) & 3u);
+                if (IS_Q3 && (hb[i] & bit) == 0u) v -= 4;
+                sumf[m] += am[i] * (dl * (float)v - ml);
+            }
+        }
+    }
+#pragma unroll
+    for (uint m = 0; m < M; ++m) {
+        const float v = simd_sum(sumf[m]);
+        if (lane == 0u) C[(ulong)m * N + n] = v;
+    }
+}
+
+typedef decltype(mv_q2_k_q3_k<true>) mv_q2_k_q3_k_t;
+template [[host_name("mv_q2_k")]] kernel mv_q2_k_q3_k_t mv_q2_k_q3_k<false>;
+template [[host_name("mv_q3_k")]] kernel mv_q2_k_q3_k_t mv_q2_k_q3_k<true>;
+typedef decltype(mv_q2_k_q3_k_mb<true, 2>) mv_q2_k_q3_k_mb_t;
+template [[host_name("mv_q2_k_mb2")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<false, 2>;
+template [[host_name("mv_q2_k_mb3")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<false, 3>;
+template [[host_name("mv_q2_k_mb4")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<false, 4>;
+template [[host_name("mv_q2_k_mb5")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<false, 5>;
+template [[host_name("mv_q2_k_mb6")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<false, 6>;
+template [[host_name("mv_q3_k_mb2")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<true, 2>;
+template [[host_name("mv_q3_k_mb3")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<true, 3>;
+template [[host_name("mv_q3_k_mb4")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<true, 4>;
+template [[host_name("mv_q3_k_mb5")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<true, 5>;
+template [[host_name("mv_q3_k_mb6")]] kernel mv_q2_k_q3_k_mb_t mv_q2_k_q3_k_mb<true, 6>;
+
 // ── NVFP4: декод (m=1) и окна (1<m≤8) ───────────────────────────────────
 // Блок 36 Б/64: d[4] (UE4M3, по подблоку 16 значений) + qs[32]; байт
 // qs[s*8+j] — значения s*16+j (младший ниббл) и s*16+j+8 (старший),

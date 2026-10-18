@@ -90,6 +90,8 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Iq4Nl => WeightFormat::Iq4Nl,
                 GgmlType::Mxfp4 => WeightFormat::Mxfp4,
                 GgmlType::Nvfp4 => WeightFormat::Nvfp4,
+                GgmlType::Q2K => WeightFormat::Q2_K,
+                GgmlType::Q3K => WeightFormat::Q3_K,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -311,6 +313,86 @@ pub fn dequant_iq4_xs(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Q2_K (ggml `dequantize_row_q2_K`, 84 Б/256): scales[16] @0 (4 бита
+/// scale, 4 бита min), qs[64] @16, d @80, dmin @82. 16 подблоков по 16
+/// значений: подблок s — iter = s/8 (q += 32), j = (s%8)/2 (сдвиг 2j),
+/// half = s%2 (байты l + 16·half); значение dl·((q>>shift)&3) − ml.
+pub(crate) fn dequant_q2_k(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(84)
+        .flat_map(|sb| {
+            let qs = &sb[16..80];
+            let d = f16_to_f32([sb[80], sb[81]]);
+            let dmin = f16_to_f32([sb[82], sb[83]]);
+            let mut y = vec![0f32; 256];
+            for s in 0..16usize {
+                let sc = sb[s];
+                let dl = d * (sc & 0xF) as f32;
+                let ml = dmin * (sc >> 4) as f32;
+                let shift = 2 * ((s % 8) / 2) as u32;
+                let half = s % 2;
+                let qb = &qs[(s / 8) * 32 + half * 16..];
+                for l in 0..16usize {
+                    let v = ((qb[l] >> shift) & 3) as i8;
+                    y[s * 16 + l] = dl * v as f32 - ml;
+                }
+            }
+            y
+        })
+        .collect()
+}
+
+/// Q3_K (ggml `dequantize_row_q3_K`, 110 Б/256): hmask[32] @0, qs[64] @32,
+/// scales[12] @96, d @108. 6-битные scale со знаком (scales[i] − 32)
+/// собираются из 12 байт (старшие 4 бита — в scales[8..12]); значение
+/// dl·(((q>>shift)&3) − (hm & bit ? 0 : 4)).
+pub(crate) fn dequant_q3_k(data: &[u8]) -> Vec<f32> {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0F0F_0F0F;
+    data.chunks_exact(110)
+        .flat_map(|sb| {
+            let hm = &sb[0..32];
+            let qs = &sb[32..96];
+            let mut aux = [0u32; 4];
+            for i in 0..3 {
+                aux[i] = u32::from_le_bytes([
+                    sb[96 + 4 * i],
+                    sb[97 + 4 * i],
+                    sb[98 + 4 * i],
+                    sb[99 + 4 * i],
+                ]);
+            }
+            let tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+            aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+            aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+            aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+            let scales: [i8; 16] = {
+                let mut sc = [0i8; 16];
+                for i in 0..16 {
+                    sc[i] = ((aux[i / 4] >> (8 * (i % 4))) & 0xFF) as u8 as i8;
+                }
+                sc
+            };
+            let d = f16_to_f32([sb[108], sb[109]]);
+            let mut y = vec![0f32; 256];
+            for s in 0..16usize {
+                let dl = d * (scales[s] as f32 - 32.0);
+                let shift = 2 * ((s % 8) / 2) as u32;
+                let half = s % 2;
+                let qb = &qs[(s / 8) * 32 + half * 16..];
+                let hb = &hm[half * 16..];
+                let bit = 1u8 << (s / 2);
+                for l in 0..16usize {
+                    let q = ((qb[l] >> shift) & 3) as i8;
+                    let sub = if hb[l] & bit != 0 { 0 } else { 4 };
+                    y[s * 16 + l] = dl * (q - sub) as f32;
+                }
+            }
+            y
+        })
+        .collect()
+}
+
 /// IQ4_NL (ggml `dequantize_row_iq4_nl`, 18 Б/32): d(f16) @0, qs[16] @2.
 /// Раскладка как у Q4_0: байт j — значение j (младший ниббл) и j+16
 /// (старший); ниббл — индекс в нелинейном кодбуке kvalues_iq4nl (тот же,
@@ -487,6 +569,8 @@ pub fn dequant_gguf(
         T::Iq4Nl => dequant_iq4_nl(data),
         T::Mxfp4 => dequant_mxfp4(data),
         T::Nvfp4 => dequant_nvfp4(data),
+        T::Q2K => dequant_q2_k(data),
+        T::Q3K => dequant_q3_k(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -529,6 +613,8 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Iq4Nl => dequant_iq4_nl(t.data),
         WeightFormat::Mxfp4 => dequant_mxfp4(t.data),
         WeightFormat::Nvfp4 => dequant_nvfp4(t.data),
+        WeightFormat::Q2_K => dequant_q2_k(t.data),
+        WeightFormat::Q3_K => dequant_q3_k(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

@@ -79,6 +79,12 @@ pub enum WeightFormat {
     /// NVFP4: 64-эл. блок, 36 Б (4 UE4M3-скейла на подблоки по 16 + 32 Б
     /// нибблов E2M1), 4.5 бита. См. ggml block_nvfp4 / dequantize_row_nvfp4.
     Nvfp4,
+    /// Q2_K: 256-эл. суперблок, 84 Б (scales[16] 4-бит scale/min, qs[64]
+    /// по 2 бита, d, dmin), 2.625 бита.
+    Q2_K,
+    /// Q3_K: 256-эл. суперблок, 110 Б (hmask[32], qs[64] по 2 бита,
+    /// scales[12] — 6-бит со знаком через −32, d), 3.4375 бита.
+    Q3_K,
     Int4,
     Nf4,
 }
@@ -100,6 +106,8 @@ impl WeightFormat {
             WeightFormat::Iq4Nl => 4.5, // 32-elem block: 18 B (ggml block_iq4_nl)
             WeightFormat::Mxfp4 => 4.25, // 32-elem block: 17 B (ggml block_mxfp4)
             WeightFormat::Nvfp4 => 4.5, // 64-elem block: 36 B (ggml block_nvfp4)
+            WeightFormat::Q2_K => 2.625, // 256-elem super-block: 84 B
+            WeightFormat::Q3_K => 3.4375, // 256-elem super-block: 110 B
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -122,6 +130,8 @@ impl WeightFormat {
             WeightFormat::Iq4Nl => Some((32, 18)),
             WeightFormat::Mxfp4 => Some((32, 17)),
             WeightFormat::Nvfp4 => Some((64, 36)),
+            WeightFormat::Q2_K => Some((256, 84)),
+            WeightFormat::Q3_K => Some((256, 110)),
             WeightFormat::Iq4Xs => Some((256, 136)),
             WeightFormat::Q8_0 => Some((32, 34)),
             WeightFormat::Q4_K => Some((256, 144)),
@@ -148,6 +158,8 @@ impl WeightFormat {
             WeightFormat::Iq4Nl => "iq4_nl".into(),
             WeightFormat::Mxfp4 => "mxfp4".into(),
             WeightFormat::Nvfp4 => "nvfp4".into(),
+            WeightFormat::Q2_K => "q2_k".into(),
+            WeightFormat::Q3_K => "q3_k".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
         }

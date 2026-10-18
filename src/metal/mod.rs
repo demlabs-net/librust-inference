@@ -1741,7 +1741,47 @@ impl MetalCtx {
             )));
         }
         let name = match b.dtype {
-            GpuDtype::Q4_0 => "gemm_nt_q4_0",
+            // Q4_0: (а) окно верификации m 2..8 — батчевый matvec (прямые
+            // вызовы ctx; трейт ловит этот диапазон раньше, поэтому здесь
+            // дубль нужен только тестам/прямым вызовам); (б) m>8 — тайловой
+            // sgemm (порт схемы ggml kernel_mul_mm_q4_0: m>8 в эталоне идёт
+            // по mul_mm). До этого обе ветки отсутствовали: окна читали веса
+            // построчно, префилл шёл скалярным gemm_nt_q4_0 (каждый поток —
+            // вся строка весов; 8B-матмулы M=16: 442 против 85 мс у Q8_0).
+            GpuDtype::Q4_0 => {
+                let mm_min = self.quant_mm_min();
+                if (2..=8).contains(&m)
+                    && mm_min <= 8
+                    && k.is_multiple_of(32)
+                    && a.offset.is_multiple_of(16)
+                    && std::env::var("INFER_Q4_0_NO_MB").is_err()
+                {
+                    self.mv_q4_0_mb(a, b, c)?;
+                    return Ok(());
+                }
+                if m > 8
+                    && k.is_multiple_of(32)
+                    && std::env::var("INFER_Q4_0_NO_MM").is_err()
+                {
+                    let (m32, k32, n32) = (m as u32, k as u32, n as u32);
+                    // Тайл 32 (M) × 64 (N), threadgroup 128 потоков —
+                    // схема kernel_mul_mm (как у Q8_0/Q6_K).
+                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let group = MTLSize::new(128, 1, 1);
+                    return self.run("gemm_nt_q4_0_mm", grid, group, |enc| {
+                        enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                        enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                        enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                        enc.set_bytes(3, 4, (&m32 as *const u32).cast());
+                        enc.set_bytes(4, 4, (&k32 as *const u32).cast());
+                        enc.set_bytes(5, 4, (&n32 as *const u32).cast());
+                        // 8 КБ: тайлы весов/активаций (4+2 КБ) и staging
+                        // хвостового тайла выхода (32×64 float).
+                        enc.set_threadgroup_memory_length(0, 8192);
+                    });
+                }
+                "gemm_nt_q4_0"
+            }
             GpuDtype::Q8_0 => "gemm_nt_q8_0",
             // Q4_K при m > 8 — тайловой sgemm (порт kernel_mul_mm_q4_K_f32,
             // каркас как у Q6_K mm). Паритет: при m > 8 эталон считает q/k/v
@@ -5652,7 +5692,7 @@ impl crate::backend::Backend for MetalBackend {
                     && q5k_mb
                     && m > 1
                     && m <= 8
-                    && k % 256 == 0
+                    && k.is_multiple_of(256)
                     && a.as_gpu().offset.is_multiple_of(16)
                 {
                     self.ctx.mv_q5_k_mb(a.as_gpu(), bg, c.as_gpu())?;
@@ -5667,7 +5707,7 @@ impl crate::backend::Backend for MetalBackend {
                         | GpuDtype::Iq4Xs
                 );
                 let kmod = if bg.dtype == GpuDtype::Q5_0 { 32 } else { 256 };
-                if m >= mm_min && m > 1 && mm_capable && k % kmod == 0 {
+                if m >= mm_min && m > 1 && mm_capable && k.is_multiple_of(kmod) {
                     self.ctx
                         .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
@@ -5686,9 +5726,8 @@ impl crate::backend::Backend for MetalBackend {
                 // (float4-загрузки) и K%32 (блок Q8_0) — иначе mv_ext.
                 if bg.dtype == GpuDtype::Q8_0
                     && mm_min <= 8
-                    && m >= 2
-                    && m <= 8
-                    && k % 32 == 0
+                    && (2..=8).contains(&m)
+                    && k.is_multiple_of(32)
                     && a.as_gpu().offset.is_multiple_of(16)
                     && std::env::var("INFER_Q8_NO_MB").is_err()
                 {
@@ -5704,9 +5743,8 @@ impl crate::backend::Backend for MetalBackend {
                 // INFER_Q4_0_NO_MB=1 — откат. Гейты: K%32 и 16Б-сдвиг A.
                 if bg.dtype == GpuDtype::Q4_0
                     && mm_min <= 8
-                    && m >= 2
-                    && m <= 8
-                    && k % 32 == 0
+                    && (2..=8).contains(&m)
+                    && k.is_multiple_of(32)
                     && a.as_gpu().offset.is_multiple_of(16)
                     && std::env::var("INFER_Q4_0_NO_MB").is_err()
                 {
@@ -7736,6 +7774,59 @@ mod quant_gemm_tests {
                 "M={m}: mb и mv_ext совпали побитово — пин маршрута недействителен"
             );
         }
+    }
+
+    /// m>8 → gemm_nt_q4_0_mm (порт схемы ggml kernel_mul_mm_q4_0; до этого
+    /// m>8 шло скалярным gemm_nt_q4_0). Эталон — как mul_mm: деквант f32 →
+    /// округление веса и активаций в half (тайлы sa/sb) → f64-dot; остаётся
+    /// только разница порядка накопления. Раскладка нибблов (каноническая:
+    /// значение j = младший ниббл байта j, j+16 = старший) сдвинула бы
+    /// результат на ≫1e-4. m=33/n=77 — хвостовые тайлы M и N (staging-путь).
+    #[test]
+    fn q4_0_mm_matches_host_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (m, n, k) = (33usize, 77usize, 512usize);
+        let raw = q4_0_bytes(n, k);
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q4_0)
+            .unwrap();
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 29) as f32 - 14.0) * 0.03).collect();
+        let ah: Vec<f32> = a
+            .iter()
+            .map(|&x| half::f16::to_f32(half::f16::from_f32(x)))
+            .collect();
+        let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+        let c = be.zeros(vec![m, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|r| {
+                crate::weights_map::dequant_q4_0(&raw[r * (k / 32) * 18..(r + 1) * (k / 32) * 18])
+                    .into_iter()
+                    .map(|x| half::f16::to_f32(half::f16::from_f32(x)))
+                    .collect()
+            })
+            .collect();
+        let mut worst = 0f64;
+        for mi in 0..m {
+            for ni in 0..n {
+                let want: f64 = rows[ni]
+                    .iter()
+                    .zip(&ah[mi * k..mi * k + k])
+                    .map(|(w, x)| (*w as f64) * (*x as f64))
+                    .sum();
+                let d = (got[mi * n + ni] as f64 - want).abs();
+                let rel = d / (1.0 + want.abs());
+                if rel > worst {
+                    worst = rel;
+                }
+                assert!(rel <= 2e-4, "m={mi} n={ni}: {} vs {want} (Δ {d})", got[mi * n + ni]);
+            }
+        }
+        eprintln!("q4_0_mm worst rel {worst:e}");
     }
 
     /// embedding_quant по всем квант-таблицам (вкл. Q5_K/Q5_0): GPU-декод

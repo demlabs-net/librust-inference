@@ -135,6 +135,10 @@ pub enum GgmlType {
     /// i-кванты (A4): пока только IQ4_XS — код 23 в GGUF (ggml.h эталонного
     /// коммита). 256 элементов на суперблок, 136 байт, 4.25 бита на вес.
     Iq4Xs,
+    /// IQ4_NL — код 20: 32-эл. блок, 18 Б (f16 d + 16 байт нибблов), 4.5 бита.
+    Iq4Nl,
+    /// MXFP4 (OCP microscaling) — код 39: 32-эл. блок, 17 Б (E8M0 + E2M1).
+    Mxfp4,
 }
 
 impl GgmlType {
@@ -154,8 +158,10 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            20 => Self::Iq4Nl,
             23 => Self::Iq4Xs,
             30 => Self::Bf16,
+            39 => Self::Mxfp4,
             _ => return None,
         })
     }
@@ -178,10 +184,12 @@ impl GgmlType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::Iq4Nl => 20,
             Self::Iq4Xs => 23,
             // BF16 = 30 по ggml.h эталонного коммита (27 — это I64);
             // сверено с реальным llama.cpp-файлом (huihui-ai BF16-шейды).
             Self::Bf16 => 30,
+            Self::Mxfp4 => 39,
         }
     }
 
@@ -190,6 +198,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Iq4Nl | Self::Mxfp4 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => 256,
         }
     }
@@ -216,6 +225,10 @@ impl GgmlType {
             // нибблов = 136 Б на 256 весов (4.25 бита); раскладка ggml
             // block_iq4_xs, сверка с llama-quantize/dequant — в тестах.
             Self::Iq4Xs => 136,
+            // IQ4_NL: f16 d + 16 байт нибблов = 18 Б/32 (4.5 бита).
+            Self::Iq4Nl => 18,
+            // MXFP4: E8M0-скейл (1 Б) + 16 байт нибблов E2M1 = 17 Б/32.
+            Self::Mxfp4 => 17,
         }
     }
 
@@ -245,6 +258,8 @@ impl GgmlType {
             Self::Q6K => "Q6_K",
             Self::Q8K => "Q8_K",
             Self::Iq4Xs => "IQ4_XS",
+            Self::Iq4Nl => "IQ4_NL",
+            Self::Mxfp4 => "MXFP4",
         }
     }
 }

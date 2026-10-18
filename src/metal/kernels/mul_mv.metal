@@ -246,6 +246,137 @@ kernel void mv_iq4_xs_mb(
     }
 }
 
+// ── IQ4_NL / MXFP4: декод (m=1) и окна (1<m≤8) ──────────────────────────
+// Раскладка нибблов — каноническая ggml (байт j: значение j в младшем
+// ниббле, j+16 в старшем), как у Q4_0; отличаются только блок и кодбук:
+// IQ4_NL — 18 Б (f16 d + 16 Б), значение d·KV_IQ4[nibble];
+// MXFP4 — 17 Б (E8M0 e + 16 Б), значение KV_FP4[nibble]·2^(e−128).
+// Порядок накопления в mv — последовательный по блокам (как mv_q4_0);
+// побитовый порт эталонного mul_mv для этих типов — отдельный заход.
+
+template <bool IS_NL>
+kernel void mv_iq4_nl_mxfp4(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 32u;
+    const uint blk_bytes = IS_NL ? 18u : 17u;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + ((ulong)n * blocks + b) * blk_bytes;
+        const float d = IS_NL ? (float)load_half_unaligned(blk)
+                              : e8m0_to_fp32_half(blk[0]);
+        device const uchar* q = blk + (IS_NL ? 2u : 1u);
+        const uint k0 = b * 32u;
+        for (uint j = 0; j < 16u; ++j) {
+            const uchar v = q[j];
+            if (IS_NL) {
+                acc += A[k0 + j] * d * KV_IQ4[v & 0x0Fu];
+                acc += A[k0 + j + 16u] * d * KV_IQ4[v >> 4u];
+            } else {
+                acc += A[k0 + j] * KV_FP4[v & 0x0Fu] * d;
+                acc += A[k0 + j + 16u] * KV_FP4[v >> 4u] * d;
+            }
+        }
+    }
+    C[n] = acc;
+}
+
+typedef decltype(mv_iq4_nl_mxfp4<true>) mv_iq4_nl_mxfp4_t;
+template [[host_name("mv_iq4_nl")]] kernel mv_iq4_nl_mxfp4_t mv_iq4_nl_mxfp4<true>;
+template [[host_name("mv_mxfp4")]] kernel mv_iq4_nl_mxfp4_t mv_iq4_nl_mxfp4<false>;
+
+// Окна: батчевый matvec — раскладка как у mv_q4_0_mb (8 лейнов на блок,
+// 2 байта = 4 значения, NR строк весов на simdgroup, A двумя float2).
+template <short M, short NR, bool IS_NL>
+kernel void mv_iq4_nl_mxfp4_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint nb = K / 32u;
+    const uint blk_bytes = IS_NL ? 18u : 17u;
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    const uint bl = lane / 8u;
+    const uint li = lane % 8u;
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * blk_bytes;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = bl; ib < nb; ib += 4u) {
+        float2 y0[M], y1[M];
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const ulong base = (ulong)m * K + ib * 32u + 2u * li;
+            y0[m] = *(device const float2*)(A + base);
+            y1[m] = *(device const float2*)(A + base + 16u);
+        }
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * blk_bytes;
+            const float d = IS_NL ? (float)load_half_unaligned(blk)
+                                  : e8m0_to_fp32_half(blk[0]);
+            device const uchar* q = blk + (IS_NL ? 2u : 1u) + 2u * li;
+            const uchar b0 = q[0];
+            const uchar b1 = q[1];
+            float w0, w1, w2, w3;
+            if (IS_NL) {
+                w0 = d * KV_IQ4[b0 & 0x0Fu];
+                w1 = d * KV_IQ4[b1 & 0x0Fu];
+                w2 = d * KV_IQ4[b0 >> 4u];
+                w3 = d * KV_IQ4[b1 >> 4u];
+            } else {
+                w0 = KV_FP4[b0 & 0x0Fu] * d;
+                w1 = KV_FP4[b1 & 0x0Fu] * d;
+                w2 = KV_FP4[b0 >> 4u] * d;
+                w3 = KV_FP4[b1 >> 4u] * d;
+            }
+#pragma unroll
+            for (short m = 0; m < M; ++m) {
+                acc[r][m] += w0 * y0[m].x + w1 * y0[m].y + w2 * y1[m].x + w3 * y1[m].y;
+            }
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+typedef decltype(mv_iq4_nl_mxfp4_mb<2, 4, true>) mv_iq4_nl_mxfp4_mb_nl_t;
+typedef decltype(mv_iq4_nl_mxfp4_mb<2, 4, false>) mv_iq4_nl_mxfp4_mb_fp_t;
+template [[host_name("mv_iq4_nl_mb2")]] kernel mv_iq4_nl_mxfp4_mb_nl_t mv_iq4_nl_mxfp4_mb<2, 4, true>;
+template [[host_name("mv_iq4_nl_mb3")]] kernel mv_iq4_nl_mxfp4_mb_nl_t mv_iq4_nl_mxfp4_mb<3, 4, true>;
+template [[host_name("mv_iq4_nl_mb4")]] kernel mv_iq4_nl_mxfp4_mb_nl_t mv_iq4_nl_mxfp4_mb<4, 4, true>;
+template [[host_name("mv_iq4_nl_mb5")]] kernel mv_iq4_nl_mxfp4_mb_nl_t mv_iq4_nl_mxfp4_mb<5, 8, true>;
+template [[host_name("mv_iq4_nl_mb6")]] kernel mv_iq4_nl_mxfp4_mb_nl_t mv_iq4_nl_mxfp4_mb<6, 8, true>;
+template [[host_name("mv_mxfp4_mb2")]] kernel mv_iq4_nl_mxfp4_mb_fp_t mv_iq4_nl_mxfp4_mb<2, 4, false>;
+template [[host_name("mv_mxfp4_mb3")]] kernel mv_iq4_nl_mxfp4_mb_fp_t mv_iq4_nl_mxfp4_mb<3, 4, false>;
+template [[host_name("mv_mxfp4_mb4")]] kernel mv_iq4_nl_mxfp4_mb_fp_t mv_iq4_nl_mxfp4_mb<4, 4, false>;
+template [[host_name("mv_mxfp4_mb5")]] kernel mv_iq4_nl_mxfp4_mb_fp_t mv_iq4_nl_mxfp4_mb<5, 8, false>;
+template [[host_name("mv_mxfp4_mb6")]] kernel mv_iq4_nl_mxfp4_mb_fp_t mv_iq4_nl_mxfp4_mb<6, 8, false>;
+
 // Q5_K matvec с батчем строк активаций v2 (окно спек-верификации, 1<m≤8) —
 // v1 (simdgroup на строку весов, весь 256-суперблок на лейн) дал ×3 к
 // mm-тайлу: 1280 скалярных загрузок A на суперблок. Здесь 32 потока на

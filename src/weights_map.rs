@@ -87,6 +87,8 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Q5K => WeightFormat::Q5_K,
                 GgmlType::Q5_0 => WeightFormat::Q5_0,
                 GgmlType::Iq4Xs => WeightFormat::Iq4Xs,
+                GgmlType::Iq4Nl => WeightFormat::Iq4Nl,
+                GgmlType::Mxfp4 => WeightFormat::Mxfp4,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -308,6 +310,57 @@ pub fn dequant_iq4_xs(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// IQ4_NL (ggml `dequantize_row_iq4_nl`, 18 Б/32): d(f16) @0, qs[16] @2.
+/// Раскладка как у Q4_0: байт j — значение j (младший ниббл) и j+16
+/// (старший); ниббл — индекс в нелинейном кодбуке kvalues_iq4nl (тот же,
+/// что у IQ4_XS), масштаб d — на весь 32-эл. блок.
+pub(crate) fn dequant_iq4_nl(data: &[u8]) -> Vec<f32> {
+    const KV: [f32; 16] = [
+        -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+        69.0, 89.0, 113.0,
+    ];
+    let mut out = Vec::with_capacity(data.len() / 18 * 32);
+    for blk in data.chunks_exact(18) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        let mut row = [0f32; 32];
+        for j in 0..16usize {
+            row[j] = d * KV[(blk[2 + j] & 0xF) as usize];
+            row[j + 16] = d * KV[(blk[2 + j] >> 4) as usize];
+        }
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
+/// E8M0-скейл MXFP4 → float (ggml ggml_e8m0_to_fp32_half): d = 0.5·2^(e−127),
+/// т.е. 2^(e−128); e<2 — субнормальные степени через биты 0x00200000<<e.
+fn e8m0_to_fp32_half(e: u8) -> f32 {
+    let bits: u32 = if e < 2 {
+        0x0020_0000u32 << e
+    } else {
+        ((e as u32) - 1) << 23
+    };
+    f32::from_bits(bits)
+}
+
+/// MXFP4 (ggml `dequantize_row_mxfp4`, 17 Б/32): E8M0-скейл @0, qs[16] @1.
+/// Значения — kvalues_fp4 («удвоенные» E2M1: 0,1,2,3,4,6,8,12,0,-1,…,-12),
+/// порядок как у Q4_0 (байт j — значения j и j+16).
+pub(crate) fn dequant_mxfp4(data: &[u8]) -> Vec<f32> {
+    const KV: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let mut out = Vec::with_capacity(data.len() / 17 * 32);
+    for blk in data.chunks_exact(17) {
+        let d = e8m0_to_fp32_half(blk[0]);
+        let mut row = [0f32; 32];
+        for j in 0..16usize {
+            row[j] = KV[(blk[1 + j] & 0xF) as usize] as f32 * d;
+            row[j + 16] = KV[(blk[1 + j] >> 4) as usize] as f32 * d;
+        }
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
 /// Q5_0 (канонический ggml, 22 Б/32): d(f16) @0, qh[4] (u32 LE) @2,
 /// qs[16] @6; парность j (младший ниббл) / j+16 (старший), 5-е биты из qh.
 pub fn dequant_q5_0(data: &[u8]) -> Vec<f32> {
@@ -392,6 +445,8 @@ pub fn dequant_gguf(
         T::Q5K => dequant_q5_k(data),
         T::Q5_0 => dequant_q5_0(data),
         T::Iq4Xs => dequant_iq4_xs(data),
+        T::Iq4Nl => dequant_iq4_nl(data),
+        T::Mxfp4 => dequant_mxfp4(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -431,6 +486,8 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Q5_K => dequant_q5_k(t.data),
         WeightFormat::Q5_0 => dequant_q5_0(t.data),
         WeightFormat::Iq4Xs => dequant_iq4_xs(t.data),
+        WeightFormat::Iq4Nl => dequant_iq4_nl(t.data),
+        WeightFormat::Mxfp4 => dequant_mxfp4(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

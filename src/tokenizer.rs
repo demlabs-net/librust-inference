@@ -791,7 +791,7 @@ fn pre_split_olmo<'a>(text: &'a str) -> Vec<&'a str> {
 
     let mut out: Vec<&'a str> = Vec::new();
     let mut gap: Option<usize> = None;
-    let mut flush = |gap: &mut Option<usize>, end: usize, out: &mut Vec<&'a str>| {
+    let flush = |gap: &mut Option<usize>, end: usize, out: &mut Vec<&'a str>| {
         if let Some(g) = gap.take()
             && g < end
         {

@@ -7354,6 +7354,309 @@ mod quant_gemm_tests {
         eprintln!("q4_k_mm: побитово сверено {checked} весов (из них нулей {zeros})");
     }
 
+    /// Q5_K mm (m>8; gdn.qkv/w_out 27B) — ПОБИТОВАЯ сверка с эталонным
+    /// dequantize_q5_K (dequantize.h:450): та же just2-паковка scales, но
+    /// деквант иной — помимо d/16/0xF0 для нечётных подблоков добавляются
+    /// qh-биты: `dl*((q & mask) + (qh & ul ? 16|256 : 0)) - ml`, ul = 1<<(il/2).
+    /// Единичные активации извлекают каждый half-вес из mm-тайла побитово.
+    #[test]
+    fn q5_k_mm_weights_bitwise_match_oracle_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (n, k) = (77usize, 512usize);
+        let mut seed = 0x55_4B5E_ED02u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Q5_K: d | dmin | scales[12] | qh[32] | qs[128]
+        let mut raw = Vec::with_capacity(n * k / 256 * 176);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            raw.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+            for _ in 0..12 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..32 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q5_K)
+            .unwrap();
+        let mut a = vec![0f32; k * k];
+        for i in 0..k {
+            a[i * k + i] = 1.0;
+        }
+        let av = be.from_cpu_f32(&a, vec![k, k]).unwrap();
+        let c = be.zeros(vec![k, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        let mut checked = 0usize;
+        for r in 0..n {
+            let sb0 = r * (k / 256) * 176;
+            for sb in 0..k / 256 {
+                let b = &raw[sb0 + sb * 176..sb0 + (sb + 1) * 176];
+                let d = half::f16::from_le_bytes([b[0], b[1]]);
+                let dmin = half::f16::from_le_bytes([b[2], b[3]]);
+                let scales = &b[4..16];
+                let qh_base = &b[16..48];
+                let qs = &b[48..176];
+                let just2 = |j: usize, kk: usize| -> (f32, f32) {
+                    if j < 4 {
+                        ((scales[j + kk] & 63) as f32, (scales[j + 4 + kk] & 63) as f32)
+                    } else {
+                        (
+                            ((scales[j + 4 + kk] & 0xF) | ((scales[j - 4 + kk] & 0xC0) >> 2))
+                                as f32,
+                            ((scales[j + 4 + kk] >> 4) | ((scales[j + kk] & 0xC0) >> 2)) as f32,
+                        )
+                    }
+                };
+                for il in 0..16usize {
+                    let is = (il / 4) * 2;
+                    let part = il & 1;
+                    let c4 = il / 4;
+                    let i3 = il & 3;
+                    let ul = 1u8 << (il / 2);
+                    let (sc, mn) = just2(is, i3 / 2);
+                    let dh = half::f16::to_f32(d);
+                    let d_eff = if i3 < 2 { dh } else { dh / 16.0 };
+                    let mask: u8 = if i3 < 2 { 0x0F } else { 0xF0 };
+                    let qh_val = if i3 < 2 { 16f32 } else { 256f32 };
+                    let dl = d_eff * sc;
+                    let ml = half::f16::to_f32(dmin) * mn;
+                    for i in 0..16usize {
+                        let qb = qs[c4 * 32 + 16 * part + i];
+                        let hb = qh_base[16 * part + i];
+                        let add = if hb & ul != 0 { qh_val } else { 0.0 };
+                        let pos = sb * 256 + (il / 2) * 32 + 16 * part + i;
+                        let want = half::f16::from_f32(dl * ((qb & mask) as f32 + add) - ml);
+                        let g = got[pos * n + r];
+                        assert_eq!(
+                            g.to_bits(),
+                            half::f16::to_f32(want).to_bits(),
+                            "r={r} k={pos}: q5_k mm {} vs эталонный half {} (il={il})",
+                            g,
+                            half::f16::to_f32(want)
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("q5_k_mm: побитово сверено {checked} весов");
+    }
+
+    /// Q6_K mm (m>8; lm_head 27B) — ПОБИТОВАЯ сверка с эталонным
+    /// dequantize_q6_K (dequantize.h:474): ql/qh-битовая сборка (kmask1/2,
+    /// shr/shl) и масштабы dl0..dl3 = dl0/256^k; блок 210 Б
+    /// (ql[128] | qh[64] | scales[16 int8] | d). Единичные активации
+    /// извлекают каждый half-вес из mm-тайла побитово.
+    #[test]
+    fn q6_k_mm_weights_bitwise_match_oracle_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (n, k) = (77usize, 512usize);
+        let mut seed = 0x66_4B5E_ED03u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Q6_K: ql[128] | qh[64] | scales[16 int8] | d(f16)
+        let mut raw = Vec::with_capacity(n * k / 256 * 210);
+        for _ in 0..n * k / 256 {
+            for _ in 0..192 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..16 {
+                raw.push(((next() & 0x3F) as i8 - 32) as u8);
+            }
+            raw.extend_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q6_K)
+            .unwrap();
+        let mut a = vec![0f32; k * k];
+        for i in 0..k {
+            a[i * k + i] = 1.0;
+        }
+        let av = be.from_cpu_f32(&a, vec![k, k]).unwrap();
+        let c = be.zeros(vec![k, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        let rd_u16 = |b: &[u8], off: usize| -> u32 {
+            (b[off] as u32) | ((b[off + 1] as u32) << 8)
+        };
+        let mut checked = 0usize;
+        for r in 0..n {
+            let sb0 = r * (k / 256) * 210;
+            for sb in 0..k / 256 {
+                let b = &raw[sb0 + sb * 210..sb0 + (sb + 1) * 210];
+                let d_all = half::f16::to_f32(half::f16::from_le_bytes([b[208], b[209]]));
+                for il in 0..16usize {
+                    // эталонные uint16-смещения → байтовые
+                    let ql_off = 64 * (il / 8) + 32 * ((il / 2) & 1) + 16 * (il & 1);
+                    let qh_off = 128 + 32 * (il / 8) + 16 * (il & 1);
+                    let sc = (b[192 + (il % 2) + 2 * (il / 2)] as i8) as f32;
+                    let i2 = (il / 2) & 3;
+                    let kmask1: u32 = if i2 > 1 {
+                        if i2 > 2 { 0xC0C0_C0C0 } else { 0x3030_3030 }
+                    } else if i2 > 0 {
+                        0x0C0C_0C0C
+                    } else {
+                        0x0303_0303
+                    };
+                    let kmask2: u32 = if i2 > 1 { 0xF0F0_F0F0 } else { 0x0F0F_0F0F };
+                    let ml = d_all * sc * 32.0;
+                    let dl0 = d_all * sc;
+                    let dl1 = dl0 / 256.0;
+                    let dl2 = dl0 / (256.0 * 256.0);
+                    let dl3 = dl0 / (256.0 * 256.0 * 256.0);
+                    let shr_h: u32 = if i2 > 2 { 2 } else { 0 };
+                    let shl_h: u32 = if i2 > 1 {
+                        0
+                    } else if i2 > 0 {
+                        2
+                    } else {
+                        4
+                    };
+                    let shr_l: u32 = if i2 > 1 { 4 } else { 0 };
+                    for i in 0..4usize {
+                        let low =
+                            (rd_u16(b, ql_off + 4 * i) | (rd_u16(b, ql_off + 4 * i + 2) << 16))
+                                & kmask2;
+                        let high =
+                            (rd_u16(b, qh_off + 4 * i) | (rd_u16(b, qh_off + 4 * i + 2) << 16))
+                                & kmask1;
+                        let q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+                        let dl = [dl0, dl1, dl2, dl3];
+                        for (j, dlj) in dl.iter().enumerate() {
+                            let masked = (q & (0xFFu32 << (8 * j))) as f32;
+                            let want = half::f16::from_f32(dlj * masked - ml);
+                            let pos = sb * 256 + (il / 2) * 32 + 16 * (il & 1) + 4 * i + j;
+                            let g = got[pos * n + r];
+                            assert_eq!(
+                                g.to_bits(),
+                                half::f16::to_f32(want).to_bits(),
+                                "r={r} k={pos}: q6_k mm {} vs эталонный half {} (il={il}, i={i}, j={j})",
+                                g,
+                                half::f16::to_f32(want)
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("q6_k_mm: побитово сверено {checked} весов");
+    }
+
+    /// IQ4_XS mm (m>8; осн. веса 27B) — ПОБИТОВАЯ сверка с эталонным
+    /// dequantize_iq4_xs (dequantize.h:699): блок 136 Б
+    /// (d | scales_h | scales_l[4] | qs[128]), 6-битный ls → d·(ls−32),
+    /// кодбук kvalues_iq4nl (16 нелинейных значений), ниббл il2-половины.
+    #[test]
+    fn iq4_xs_mm_weights_bitwise_match_oracle_dequant() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().unwrap();
+        let (n, k) = (77usize, 512usize);
+        let mut seed = 0x1945_EED1u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // IQ4_XS: d(f16) | scales_h(u16) | scales_l[4] | qs[128]
+        let mut raw = Vec::with_capacity(n * k / 256 * 136);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(0.98).to_bits().to_le_bytes());
+            raw.extend_from_slice(&(next() as u16).to_le_bytes());
+            for _ in 0..4 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq4Xs)
+            .unwrap();
+        let mut a = vec![0f32; k * k];
+        for i in 0..k {
+            a[i * k + i] = 1.0;
+        }
+        let av = be.from_cpu_f32(&a, vec![k, k]).unwrap();
+        let c = be.zeros(vec![k, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        const KV: [f32; 16] = [
+            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
+            53.0, 69.0, 89.0, 113.0,
+        ];
+        let mut checked = 0usize;
+        for r in 0..n {
+            let sb0 = r * (k / 256) * 136;
+            for sb in 0..k / 256 {
+                let b = &raw[sb0 + sb * 136..sb0 + (sb + 1) * 136];
+                let d = half::f16::to_f32(half::f16::from_le_bytes([b[0], b[1]]));
+                let scales_h = (b[2] as u32) | ((b[3] as u32) << 8);
+                for ib32 in 0..8usize {
+                    let ls = ((((b[4 + ib32 / 2] >> (4 * (ib32 % 2))) & 0xF) as u32)
+                        | (((scales_h >> (2 * ib32)) & 3) << 4))
+                        as i32
+                        - 32;
+                    let dm = d * ls as f32;
+                    for off in 0..32usize {
+                        let il2 = off / 16;
+                        let ii = (off % 16) / 4;
+                        let j = off % 4;
+                        let qoff = 8 + 16 * ib32 + 4 * ii;
+                        let q4 = (b[qoff] as u32)
+                            | ((b[qoff + 1] as u32) << 8)
+                            | ((b[qoff + 2] as u32) << 16)
+                            | ((b[qoff + 3] as u32) << 24);
+                        let aux = (q4 >> (4 * il2 as u32)) & 0x0f0f_0f0f;
+                        let nib = (aux >> (8 * j as u32)) & 0xF;
+                        let want = half::f16::from_f32(dm * KV[nib as usize]);
+                        let pos = sb * 256 + ib32 * 32 + off;
+                        let g = got[pos * n + r];
+                        // Знак нуля после mma не определён (−0 + +0 = +0):
+                        // у IQ4_XS ls=0 даёт весь подблок ±0, сравниваем
+                        // нули по модулю, остальное — побитово.
+                        let wf = half::f16::to_f32(want);
+                        let ok = if wf == 0.0 && g == 0.0 {
+                            true
+                        } else {
+                            g.to_bits() == wf.to_bits()
+                        };
+                        assert!(
+                            ok,
+                            "r={r} k={pos}: iq4_xs mm {} vs эталонный half {} (ib32={ib32}, off={off})",
+                            g, wf
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("iq4_xs_mm: побитово сверено {checked} весов");
+    }
+
     /// IQ4_XS mul_mm (m>8): сверка тайлового GEMM с хост-деквантом. Ловит
     /// раскладку il/x по суперблокам и попадание весов в K-позиции тайла.
     #[test]

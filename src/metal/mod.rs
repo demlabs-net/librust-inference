@@ -5674,15 +5674,36 @@ impl crate::backend::Backend for MetalBackend {
                 // INFER_QUANT_MM_MIN=9; тексты спека проверяются приёмкой
                 // (лосслесс-семантика argmax-сверки).
                 let mm_min = self.ctx.quant_mm_min();
+                // K-кванты, окна m 4..6: mv_ext (ПОРТ эталона) где он реально
+                // быстрее — матрица по формату×m из чередующихся прогонов
+                // (8B-матмулы, минимум из 3, мс): Q4_K m=4 69 против mm 93
+                // (−27%), m=5 ничья (98≈96), m=6 mm лучше (114 против 99);
+                // Q5_K m=4..6 74/99/115 против mb 98/131/194 (−24/−25/−42%);
+                // Q6_K только m=4 87 против mm 96 (−10%). Поэтому — по-форматная
+                // матрица, а не «4..6 для всех»: широкое правило сначала было
+                // ошибочным (Q4_K m=6 и Q6_K m=5..6 становились хуже).
+                // m=2..3 сюда не входят: у K-квантов ext-кернела для них нет
+                // (mv_ext_kernel: lo=4), там построчный mv. IQ4_XS — без ext
+                // вовсе (окна: mb 2..3, mm 4..8).
+                let k_ext_m = match bg.dtype {
+                    GpuDtype::Q4_K => m == 4,
+                    GpuDtype::Q5_K => (4..=6).contains(&m),
+                    GpuDtype::Q6_K => m == 4,
+                    _ => false,
+                };
+                let k_batched_ext = k_ext_m && std::env::var("INFER_NO_MV_EXT").is_err();
+                if k_batched_ext && self.ctx.mv_ext(a.as_gpu(), bg, c.as_gpu())? {
+                    return Ok(());
+                }
                 // Q5_K (gdn.qkv/w_out 27B): mb v2 — веса 1× на m строк БЕЗ
-                // холостых строк mm-тайла. Замеры (один шумовой прогон):
-                // m=5 паритет с mm (~2-8%); m=8 mb гонит ДВА прохода и
-                // читает веса 2× — mm быстрее ровно вдвое (gdn.qkv 1.03 vs
-                // 2.06 мс), поэтому m 7..8 идут mm. INFER_Q5K_MB=1 —
-                // форсаж mb и там (сверка); INFER_Q5K_NO_MB=1 — откат на
-                // mm для всех m. Кернел грузит A через float4 — гейт
-                // 16-байтного выравнивания (у соседних mb/r2-путей он есть;
-                // misaligned vector load на Metal = мусор/фолт).
+                // холостых строк mm-тайла. Замеренная матрица (8B, мс):
+                // mb 47.5/68.4 (m=2,3) против mm 54.7/71.8 и ext 51.4/71.6 —
+                // mb только для m 2..3; m 4..6 забирает ext выше; m=8 mb
+                // гонит ДВА прохода и читает веса 2× — mm быстрее (~102 vs
+                // 104). INFER_Q5K_MB=1 — форсаж mb и на 7..8 (сверка);
+                // INFER_Q5K_NO_MB=1 — отказ от mb (сверки/замеры). Кернел
+                // грузит A через float4 — гейт 16-байтного выравнивания
+                // (misaligned vector load на Metal = мусор/фолт).
                 let q5k_mb = if m >= 7 {
                     std::env::var("INFER_Q5K_MB").is_ok()
                 } else {
@@ -7118,6 +7139,105 @@ mod quant_gemm_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Маршрут окон K-квантов по m — замеренная матрица, а не «ext для всех»:
+    /// Q4_K — m=4 ext, m=6/7 тайл (на 6 ext ХУЖЕ: 114 против 99 мс); Q5_K —
+    /// m=4..6 ext, m=8 тайл; Q6_K — m=4 ext, m=5 тайл. Пин сравнивает
+    /// трейтовый gemm_nt с ПРЯМЫМ ctx.mv_ext побитово: удаление стадии
+    /// ext-предпочтения или расширение её на чужой m уронят тест.
+    #[test]
+    fn trait_gemm_nt_k_quant_windows_route_by_m() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (n, k) = (77usize, 512usize);
+        let mut seed = 0xC0DE_5150u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Q4_K: 144 Б = d | dmin | scales[12] | qs[128]
+        let mut q4k = Vec::with_capacity(n * k / 256 * 144);
+        for _ in 0..n * k / 256 {
+            q4k.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            q4k.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+            for _ in 0..12 {
+                q4k.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                q4k.push((next() & 0xFF) as u8);
+            }
+        }
+        // Q5_K: 176 Б = d | dmin | scales[12] | qh[32] | qs[128]
+        let mut q5k = Vec::with_capacity(n * k / 256 * 176);
+        for _ in 0..n * k / 256 {
+            q5k.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            q5k.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+            for _ in 0..12 {
+                q5k.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..32 {
+                q5k.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                q5k.push((next() & 0xFF) as u8);
+            }
+        }
+        // Q6_K: 210 Б = ql[128] | qh[64] | scales[16] | d
+        let mut q6k = Vec::with_capacity(n * k / 256 * 210);
+        for _ in 0..n * k / 256 {
+            for _ in 0..192 {
+                q6k.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..16 {
+                q6k.push(((next() & 0x3F) as i8 - 32) as u8);
+            }
+            q6k.extend_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+        }
+        let w4k = be
+            .from_quantized(&q4k, vec![n, k], crate::dtype::WeightFormat::Q4_K)
+            .unwrap();
+        let w5k = be
+            .from_quantized(&q5k, vec![n, k], crate::dtype::WeightFormat::Q5_K)
+            .unwrap();
+        let w6k = be
+            .from_quantized(&q6k, vec![n, k], crate::dtype::WeightFormat::Q6_K)
+            .unwrap();
+        // (формат, m, ожидается ли ext). У K-квантов ext существует только
+        // при m ≥ 4 (mv_ext_kernel: lo=4 для K-квантов), поэтому m=2..3 сюда
+        // не входят — там построчный mv.
+        for (w, tag, m, want_ext) in [
+            (&w4k, "Q4_K", 4usize, true),
+            (&w4k, "Q4_K", 6, false),
+            (&w4k, "Q4_K", 7, false),
+            (&w5k, "Q5_K", 4, true),
+            (&w5k, "Q5_K", 6, true),
+            (&w5k, "Q5_K", 8, false),
+            (&w6k, "Q6_K", 4, true),
+            (&w6k, "Q6_K", 5, false),
+        ] {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 7919.0).sin()).collect();
+            let a = be.from_cpu_f32(&a_data, vec![m, k]).unwrap();
+            be.ctx.set_quant_mm_min(4);
+            let c_new = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, w, &c_new).unwrap();
+            let got = be.to_cpu_f32(&c_new).unwrap();
+            let c_ext = be.zeros(vec![m, n]).unwrap();
+            let used = be
+                .ctx
+                .mv_ext(a.inner_metal(), w.inner_metal(), c_ext.inner_metal())
+                .unwrap();
+            assert!(used, "{tag} m={m}: ext не применим — тест недействителен");
+            let ext = be.to_cpu_f32(&c_ext).unwrap();
+            let same = got.iter().zip(ext.iter()).all(|(g, e)| g.to_bits() == e.to_bits());
+            assert_eq!(
+                same, want_ext,
+                "{tag} m={m}: ожидался {}ext-путь",
+                if want_ext { "" } else { "НЕ " }
+            );
         }
     }
 

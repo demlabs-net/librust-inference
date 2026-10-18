@@ -47,6 +47,75 @@ fn q4_0_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Q4_K: 144 Б на 256 значений (d | dmin | scales[12] | qs[128]); d/dmin —
+/// sane f16, остальное — псевдослучайные байты (перф-замер, не точность).
+fn q4_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 144);
+    for _ in 0..n * k / 256 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+        out.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+        for _ in 0..12 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        for _ in 0..128 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// Q5_K: 176 Б (d | dmin | scales[12] | qh[32] | qs[128]).
+fn q5_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 176);
+    for _ in 0..n * k / 256 {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+        out.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
+        for _ in 0..12 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        for _ in 0..32 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        for _ in 0..128 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// Q6_K: 210 Б (ql[128] | qh[64] | scales[16] | d f16).
+fn q6_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 210);
+    for _ in 0..n * k / 256 {
+        for _ in 0..192 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        for _ in 0..16 {
+            out.push(((s & 0x3F) as i8 - 32) as u8);
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        }
+        out.extend_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+    }
+    out
+}
+
 fn main() {
     let be = MetalBackend::new().unwrap();
     let iters = 50;
@@ -56,14 +125,16 @@ fn main() {
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![1, 2, 3, 4, 5, 8, 16, 32]);
     let mut total = vec![0f64; ms.len()];
-    let q4 = std::env::var("GEMM_DTYPE").ok().as_deref() == Some("q4_0");
-    let (make_w, fmt): (fn(usize, usize, u64) -> Vec<u8>, WeightFormat) = if q4 {
-        (q4_0_bytes, WeightFormat::Q4_0)
-    } else {
-        (q8_0_bytes, WeightFormat::Q8_0)
+    let dtype = std::env::var("GEMM_DTYPE").unwrap_or_else(|_| "q8_0".into());
+    let (make_w, fmt): (fn(usize, usize, u64) -> Vec<u8>, WeightFormat) = match dtype.as_str() {
+        "q4_0" => (q4_0_bytes, WeightFormat::Q4_0),
+        "q4_k" => (q4_k_bytes, WeightFormat::Q4_K),
+        "q5_k" => (q5_k_bytes, WeightFormat::Q5_K),
+        "q6_k" => (q6_k_bytes, WeightFormat::Q6_K),
+        _ => (q8_0_bytes, WeightFormat::Q8_0),
     };
-    if q4 {
-        println!("Q4_0 (18 Б/блок)");
+    if dtype != "q8_0" {
+        println!("{dtype}");
     }
     for (name, n, k, mult) in [
         ("wqkv", 6144usize, 4096usize, 36.0f64),

@@ -2198,6 +2198,76 @@ impl MetalCtx {
         Ok(true)
     }
 
+    /// Q4_0 матвек с батчем строк активаций (окно верификации 1 < m ≤ 8):
+    /// веса читаются 1× на m строк активаций — аналог mv_q8_0_mb для Q4_0.
+    /// До этого у Q4_0 батчевого пути не было вовсе: окна шли mv_ext'ом
+    /// построчно (веса m раз), у mm-тайла Q4_0 тоже нет — m>8 идёт скалярным
+    /// gemm_nt_q4_0. m 7/8 — два прохода (4+остаток). Требования: K % 32,
+    /// A сдвинут на 16 (float2-загрузки; 8-байтового хватило бы, но все
+    /// тензоры движка выровнены по 4096 — единый гейт проще).
+    pub fn mv_q4_0_mb(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), MetalError> {
+        let k = a.shape[1];
+        let n = b.shape[0];
+        let m = a.shape[0];
+        if b.shape != [n, k] || c.shape != [m, n] {
+            return Err(MetalError::Shape(format!(
+                "mv_q4_0_mb {:?}x{:?}->{:?}",
+                a.shape, b.shape, c.shape
+            )));
+        }
+        if b.dtype != GpuDtype::Q4_0 {
+            return Err(MetalError::Shape(format!(
+                "mv_q4_0_mb: dtype {:?} не Q4_0",
+                b.dtype
+            )));
+        }
+        if !k.is_multiple_of(32) {
+            return Err(MetalError::Shape(format!(
+                "mv_q4_0_mb: K={k} не кратен 32 (хвост блока не обрабатывается)"
+            )));
+        }
+        if !a.offset.is_multiple_of(16) {
+            return Err(MetalError::Shape(format!(
+                "mv_q4_0_mb: A.offset={} не 16-выровнен (float2-загрузки)",
+                a.offset
+            )));
+        }
+        let (k32, n32) = (k as u32, n as u32);
+        let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
+            let (name, nr) = match rows {
+                2 => ("mv_q4_0_mb2", 4usize),
+                3 => ("mv_q4_0_mb3", 4),
+                4 => ("mv_q4_0_mb4", 4),
+                5 => ("mv_q4_0_mb5", 8),
+                _ => ("mv_q4_0_mb6", 8),
+            };
+            // 2 simdgroup'а на threadgroup, NR строк весов на simdgroup.
+            let grid = MTLSize::new((n.div_ceil(nr * 2) * 64) as u64, 1, 1);
+            let group = MTLSize::new(64, 1, 1);
+            let a_off = (a.offset + row0 * k * 4) as u64;
+            let c_off = (c.offset + row0 * n * 4) as u64;
+            self.run(name, grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a_off);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c_off);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            })
+        };
+        match m {
+            7 | 8 => {
+                pass(4, 0)?;
+                pass(m - 4, 4)
+            }
+            _ => pass(m, 0),
+        }
+    }
+
     /// Q5_K матвек с батчем строк активаций (окно спек-верификации 1 < m ≤ 8).
     /// Кернел mv_q5_k_mb v2: 32 потока на строку весов, 16 лейнов делят
     /// суперблок, A читается float4 — веса 1× на m строк (v1 с суперблоком
@@ -5626,6 +5696,23 @@ impl crate::backend::Backend for MetalBackend {
                         .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
+                // Q4_0 (saiga-Q4_0, MTP/mmproj-веса Q4_0): тот же класс окон, что
+                // у Q8_0, но батчевого пути не было ВООБЩЕ (ни mb, ни mm-тайла) —
+                // окна m 2..8 читали веса m раз построчным mv_ext. mv_q4_0_mb
+                // закрывает окна (m 7/8 — два прохода). Порог m≥2 — как у Q8_0
+                // (у mb нет холостых строк), паритет-режим mm_min>8 и
+                // INFER_Q4_0_NO_MB=1 — откат. Гейты: K%32 и 16Б-сдвиг A.
+                if bg.dtype == GpuDtype::Q4_0
+                    && mm_min <= 8
+                    && m >= 2
+                    && m <= 8
+                    && k % 32 == 0
+                    && a.as_gpu().offset.is_multiple_of(16)
+                    && std::env::var("INFER_Q4_0_NO_MB").is_err()
+                {
+                    self.ctx.mv_q4_0_mb(a.as_gpu(), bg, c.as_gpu())?;
+                    return Ok(());
+                }
                 // Внутри ext-окна эталон берёт НЕ classic mul_mv, а
                 // mul_mv_ext (свой порядок суммирования) — воспроизводим
                 // выбор точно; вне окна mv_ext возвращает false.
@@ -7550,6 +7637,102 @@ mod quant_gemm_tests {
                 .any(|(g, o)| g.to_bits() != o.to_bits());
             assert!(
                 differs,
+                "M={m}: mb и mv_ext совпали побитово — пин маршрута недействителен"
+            );
+        }
+    }
+
+    /// Генератор Q4_0-блоков (18 Б: f16 d + 16 байт нибблов) для тестов окон.
+    fn q4_0_bytes(n: usize, k: usize) -> Vec<u8> {
+        (0..n * k / 32)
+            .flat_map(|b| {
+                let mut blk = half::f16::from_f32(0.01 + (b % 7) as f32 * 0.003)
+                    .to_bits()
+                    .to_le_bytes()
+                    .to_vec();
+                blk.extend((0..16).map(|j| {
+                    let lo = ((b * 37 + j * 11) % 15) as u8;
+                    let hi = ((b * 53 + j * 7) % 15) as u8;
+                    lo | (hi << 4)
+                }));
+                blk
+            })
+            .collect()
+    }
+
+    /// Батчевый матвек Q4_0 (mv_q4_0_mb, окно m=2..8) против ТОЧНОГО
+    /// хост-декванта: N не кратно строкам на simdgroup, K=96 (3 блока,
+    /// не кратно шагу 4 блоков). m 7/8 — два прохода (4+остаток).
+    #[test]
+    fn q4_0_small_batch_matches_cpu() {
+        let ctx = MetalCtx::new().expect("MetalCtx");
+        let dev = &ctx.device;
+        let (n, k) = (77usize, 96usize);
+        let bytes = q4_0_bytes(n, k);
+        let b = GpuTensor::from_quantized(dev, &bytes, vec![n, k], GpuDtype::Q4_0).unwrap();
+        let tmp = WeightsMap {
+            arch: "t".into(),
+            tensors: vec![crate::weights_map::WeightTensor {
+                name: "w".into(),
+                shape: vec![n as u64, k as u64],
+                format: crate::dtype::WeightFormat::Q4_0,
+                offset: 0,
+                data: &bytes,
+            }],
+            storage: vec![],
+        };
+        let bf = dequant_f32(&tmp.tensors[0]);
+        for m in 2..=8usize {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 104729.0).sin()).collect();
+            let c_ref = cpu_ref(&a_data, m, k, &bf, n);
+            let a = GpuTensor::from_cpu_f32(dev, &a_data, vec![m, k]).unwrap();
+            let c = GpuTensor::zeros(dev, vec![m, n]).unwrap();
+            ctx.mv_q4_0_mb(&a, &b, &c).unwrap();
+            let got = c.to_cpu_f32(&ctx).unwrap();
+            let diff = max_diff(&got, &c_ref);
+            assert!(diff <= 1e-3, "M={m}: |Δ| max {diff}");
+        }
+    }
+
+    /// Маршрут трейтового gemm_nt для Q4_0 при m ∈ [2,8] — mv_q4_0_mb (веса
+    /// 1× на m строк), а не построчный mv_ext: у Q4_0 батчевого пути не было
+    /// вовсе (ни mb, ни mm-тайла — m>8 идёт скалярным gemm_nt_q4_0), поэтому
+    /// окна Q4_0-моделей читали веса m раз. Пин: трейт == прямой mv_q4_0_mb
+    /// (тот покрыт q4_0_small_batch_matches_cpu против CPU) и ≠ mv_ext-пути
+    /// (порог 9). Инстанс-порог — без гонки за общим env.
+    #[test]
+    fn trait_gemm_nt_q4_0_small_m_goes_batched() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        be.ctx.set_quant_mm_min(4);
+        let (n, k) = (77usize, 128usize); // k%128==0 — mv_ext вообще применим
+        let bytes = q4_0_bytes(n, k);
+        let w = be
+            .from_quantized(&bytes, vec![n, k], crate::dtype::WeightFormat::Q4_0)
+            .unwrap();
+        for m in 2..=8usize {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 7919.0).sin()).collect();
+            let a = be.from_cpu_f32(&a_data, vec![m, k]).unwrap();
+            be.ctx.set_quant_mm_min(4);
+            let c_new = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &w, &c_new).unwrap();
+            let got = be.to_cpu_f32(&c_new).unwrap();
+            let c_mb = be.zeros(vec![m, n]).unwrap();
+            be.ctx
+                .mv_q4_0_mb(a.inner_metal(), w.inner_metal(), c_mb.inner_metal())
+                .unwrap();
+            let want = be.to_cpu_f32(&c_mb).unwrap();
+            assert!(
+                got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                "M={m}: трейтовый gemm_nt не равен mv_q4_0_mb (маршрут сломан)"
+            );
+            be.ctx.set_quant_mm_min(9);
+            let c_old = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &w, &c_old).unwrap();
+            let old = be.to_cpu_f32(&c_old).unwrap();
+            be.ctx.set_quant_mm_min(4);
+            assert!(
+                got.iter().zip(old.iter()).any(|(g, o)| g.to_bits() != o.to_bits()),
                 "M={m}: mb и mv_ext совпали побитово — пин маршрута недействителен"
             );
         }

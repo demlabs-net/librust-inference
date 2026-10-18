@@ -4,12 +4,21 @@
 #![cfg(feature = "metal")]
 use metal::*;
 
+/// Исходники оракула — временные дампы прогона Ф8.1g (/tmp/llama_ref),
+/// их может не быть: include_str! делал пример НЕСОБИРАЕМЫМ после чистки
+/// /tmp и валил весь `cargo test --all-targets`. Читаем в рантайме.
+fn read_ref(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("{path}: {e} — пример-арбитр требует дампов оракула в /tmp/llama_ref (см. шапку)")
+    })
+}
+
 fn main() {
     let device = Device::system_default().unwrap();
-    let src = include_str!("/tmp/llama_ref/orc_vec_run.metal");
+    let src = read_ref("/tmp/llama_ref/orc_vec_run.metal");
     let opts = CompileOptions::new();
     let lib = device
-        .new_library_with_source(src, &opts)
+        .new_library_with_source(&src, &opts)
         .expect("compile oracle source");
     let func = lib.get_function("orc_vec", None).unwrap();
     let pipe = device.new_compute_pipeline_state_with_function(&func).unwrap();
@@ -93,8 +102,8 @@ fn main() {
     cmdb.wait_until_completed();
 
     // reduce
-    let rsrc = include_str!("/tmp/llama_ref/orc_reduce.metal");
-    let rlib = device.new_library_with_source(rsrc, &CompileOptions::new()).unwrap();
+    let rsrc = read_ref("/tmp/llama_ref/orc_reduce.metal");
+    let rlib = device.new_library_with_source(&rsrc, &CompileOptions::new()).unwrap();
     let rpipe = device.new_compute_pipeline_state_with_function(&rlib.get_function("orc_reduce", None).unwrap()).unwrap();
     let cmdb2 = q.new_command_buffer().to_owned();
     let enc2 = cmdb2.new_compute_command_encoder();
@@ -115,8 +124,8 @@ fn main() {
     println!("ORACLE-SOURCE kernel vs oracle y: bad={bad}/{}", got.len());
 
     // ── теперь НАШ standalone-кернел, тот же лаунч ──
-    let osrc = include_str!("/tmp/llama_ref/our_vec_run.metal");
-    let olib = device.new_library_with_source(osrc, &CompileOptions::new()).expect("our src");
+    let osrc = read_ref("/tmp/llama_ref/our_vec_run.metal");
+    let olib = device.new_library_with_source(&osrc, &CompileOptions::new()).expect("our src");
     let opipe = device.new_compute_pipeline_state_with_function(&olib.get_function("our_vec", None).unwrap()).unwrap();
     let tmp2 = device.new_buffer((nrows * (hd * 32 + 64) * 4) as u64, MTLResourceOptions::StorageModeShared);
     let yb2 = device.new_buffer((nh * hd * 4) as u64, MTLResourceOptions::StorageModeShared);

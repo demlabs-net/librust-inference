@@ -863,6 +863,82 @@ template [[host_name("mv_q8_0_mb4")]] kernel mv_q8_0_mb_t mv_q8_0_mb<4, 4>;
 template [[host_name("mv_q8_0_mb5")]] kernel mv_q8_0_mb_t mv_q8_0_mb<5, 8>;
 template [[host_name("mv_q8_0_mb6")]] kernel mv_q8_0_mb_t mv_q8_0_mb<6, 8>;
 
+// Q4_0 матвек с батчем строк активаций (окно верификации 1 < m ≤ 8): та же
+// раскладка, что у mv_q8_0_mb (32 лейна делят K шагами по 4 блока, NR строк
+// весов на simdgroup, веса читаются 1× на m строк активаций), но блок Q4_0 —
+// 18 байт (f16 d + 16 байт нибблов). 8 лейнов на блок: лейн берёт 2 байта =
+// 4 значения канонической раскладки ggml — младшие нибблы байтов 2l, 2l+1
+// (значения 2l, 2l+1) и их старшие пары (значения 2l+16, 2l+17); A читается
+// двумя float2 (сдвиги 8·l и 64+8·l байт — 8-байтовое выравнивание).
+template <short M, short NR>
+kernel void mv_q4_0_mb(
+    device const float* A [[buffer(0)]],     // активации [M, K]
+    device const uchar* B [[buffer(1)]],     // веса Q4_0 [N, K]
+    device float* C [[buffer(2)]],           // [M, N]
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint nb = K / 32u;
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    const uint bl = lane / 8u;        // блок внутри шага из 4 блоков
+    const uint li = lane % 8u;        // 2 байта (4 значения) внутри блока
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * 18u;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = bl; ib < nb; ib += 4u) {
+        float2 y0[M], y1[M];
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const ulong base = (ulong)m * K + ib * 32u + 2u * li;
+            y0[m] = *(device const float2*)(A + base);
+            y1[m] = *(device const float2*)(A + base + 16u);
+        }
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * 18u;
+            const float d = (float)load_half_unaligned(blk);
+            device const uchar* q = blk + 2u + 2u * li;
+            const uchar b0 = q[0];
+            const uchar b1 = q[1];
+            const float w0 = ((float)(b0 & 0x0Fu) - 8.0f) * d;
+            const float w1 = ((float)(b1 & 0x0Fu) - 8.0f) * d;
+            const float w2 = ((float)(b0 >> 4u) - 8.0f) * d;
+            const float w3 = ((float)(b1 >> 4u) - 8.0f) * d;
+#pragma unroll
+            for (short m = 0; m < M; ++m) {
+                acc[r][m] += w0 * y0[m].x + w1 * y0[m].y + w2 * y1[m].x + w3 * y1[m].y;
+            }
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+// NR — как у Q8_0 mb (раскладка та же; m 7/8 — два прохода по ≤4 строки).
+typedef decltype(mv_q4_0_mb<2, 4>) mv_q4_0_mb_t;
+template [[host_name("mv_q4_0_mb2")]] kernel mv_q4_0_mb_t mv_q4_0_mb<2, 4>;
+template [[host_name("mv_q4_0_mb3")]] kernel mv_q4_0_mb_t mv_q4_0_mb<3, 4>;
+template [[host_name("mv_q4_0_mb4")]] kernel mv_q4_0_mb_t mv_q4_0_mb<4, 4>;
+template [[host_name("mv_q4_0_mb5")]] kernel mv_q4_0_mb_t mv_q4_0_mb<5, 8>;
+template [[host_name("mv_q4_0_mb6")]] kernel mv_q4_0_mb_t mv_q4_0_mb<6, 8>;
+
 typedef decltype(mv_ks_t<0>) mv_ks_t_t;
 template [[host_name("mv_ks_q4_k")]] kernel mv_ks_t_t mv_ks_t<0>;
 template [[host_name("mv_ks_q6_k")]] kernel mv_ks_t_t mv_ks_t<1>;

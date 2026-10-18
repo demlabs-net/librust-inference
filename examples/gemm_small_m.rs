@@ -1,9 +1,11 @@
-//! Q8_0 GEMM при малом M (окно верификации спека: 1+γ строк) против
+//! Q8_0/Q4_0 GEMM при малом M (окно верификации спека: 1+γ строк) против
 //! matvec декода на формах Qwen3-8B. Матричный GEMM спроектирован под
 //! префилл (тайл 32 строки): при M ≤ 8 он читает веса так же, как при 32,
 //! но считает 4–32× лишнего, и forward 2..8 строк стоит ≈3× декода — спек
 //! с любым драфтером медленнее обычной генерации. Цель — время M строк
 //! ≈ времени одной (веса читаются один раз, как в kernel_mul_mv_ext ggml).
+//! GEMM_DTYPE=q4_0 — тот же прогон на Q4_0 (у него mb- путь и mm-тайл
+//! появились позже; M>8 там пока скалярный gemm_nt_q4_0).
 #![cfg(feature = "metal")]
 
 use rust_inference::backend::Backend;
@@ -26,6 +28,25 @@ fn q8_0_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Q4_0: 18 Б на 32 значения (f16 d + 16 байт нибблов, каноническая
+/// раскладка ggml: байт j — значения j (младший) и j+16 (старший)).
+fn q4_0_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 32 * 18);
+    for _ in 0..n * k / 32 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        out.extend_from_slice(&half::f16::from_f32(0.001 + (s % 1000) as f32 * 1e-5).to_le_bytes());
+        for j in 0..16 {
+            let lo = ((s >> (j % 56)) & 0x0F) as u8 ^ j as u8;
+            let hi = ((s >> ((j + 3) % 56)) & 0x0F) as u8 ^ (j as u8);
+            out.push((lo & 0x0F) | (hi << 4));
+        }
+    }
+    out
+}
+
 fn main() {
     let be = MetalBackend::new().unwrap();
     let iters = 50;
@@ -35,6 +56,15 @@ fn main() {
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![1, 2, 3, 4, 5, 8, 16, 32]);
     let mut total = vec![0f64; ms.len()];
+    let q4 = std::env::var("GEMM_DTYPE").ok().as_deref() == Some("q4_0");
+    let (make_w, fmt): (fn(usize, usize, u64) -> Vec<u8>, WeightFormat) = if q4 {
+        (q4_0_bytes, WeightFormat::Q4_0)
+    } else {
+        (q8_0_bytes, WeightFormat::Q8_0)
+    };
+    if q4 {
+        println!("Q4_0 (18 Б/блок)");
+    }
     for (name, n, k, mult) in [
         ("wqkv", 6144usize, 4096usize, 36.0f64),
         ("wo", 4096, 4096, 36.0),
@@ -42,7 +72,7 @@ fn main() {
         ("w2", 4096, 12288, 36.0),
         ("lm_head", 151936, 4096, 1.0),
     ] {
-        let w = be.from_quantized(&q8_0_bytes(n, k, 7), vec![n, k], WeightFormat::Q8_0).unwrap();
+        let w = be.from_quantized(&make_w(n, k, 7), vec![n, k], fmt).unwrap();
         let mut line = format!("{name:8} [{n}x{k}]");
         let mut base = 0.0;
         for (mi, &m) in ms.iter().enumerate() {

@@ -116,6 +116,26 @@ fn q6_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// IQ4_XS: 136 Б (d f16 | scales_h u16 | scales_l[4] | qs[128]).
+fn iq4_xs_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n * k / 256 * 136);
+    for _ in 0..n * k / 256 {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        out.extend_from_slice(&half::f16::from_f32(0.98).to_bits().to_le_bytes());
+        out.extend_from_slice(&(s as u16).to_le_bytes());
+        for _ in 0..4 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+        for _ in 0..128 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            out.push((s & 0xFF) as u8);
+        }
+    }
+    out
+}
+
 fn main() {
     let be = MetalBackend::new().unwrap();
     let iters = 50;
@@ -131,6 +151,7 @@ fn main() {
         "q4_k" => (q4_k_bytes, WeightFormat::Q4_K),
         "q5_k" => (q5_k_bytes, WeightFormat::Q5_K),
         "q6_k" => (q6_k_bytes, WeightFormat::Q6_K),
+        "iq4_xs" => (iq4_xs_bytes, WeightFormat::Iq4Xs),
         _ => (q8_0_bytes, WeightFormat::Q8_0),
     };
     if dtype != "q8_0" {

@@ -1900,24 +1900,28 @@ impl MetalCtx {
                 }
                 "gemm_nt_q5_0"
             }
-            // IQ4_XS: при m > 8 llama.cpp идёт по kernel_mul_mm (порог use_mm:
-            // ne11 > 8), при m ≤ 8 — по mul_mv. Паритет требует совпадать с его
-            // выбором: m > 8 → gemm_nt_iq4_xs_mm (порт mul_mm), иначе mv_iq4_xs.
-            // mul_mm требует K, кратного 256 (шаг il/x по суперблокам).
-            //
-            // Порог настраивается (INFER_IQ4XS_MM_MIN, дефолт 2): окно
-            // спек-верификации (t = 1+γ ≤ 8) при пороге 9 идёт mv-батчем —
-            // 67 мс/строку против 21 у mm (window_probe 27B) — и спек на
-            // Metal всегда проигрывал жадному декоду (Ф2.9/Ф8.2). mm при
-            // m 2..8 НЕ побитово mv (другой порядок суммирования): паритет
-            // с эталоном возвращается INFER_IQ4XS_MM_MIN=9; тексты спека
-            // проверяются приёмкой (лосслесс-семантика argmax-сверки).
+            // IQ4_XS: при m > 8 эталон идёт по kernel_mul_mm (порог use_mm:
+            // ne11 > 8), при m ≤ 8 — по mul_mv; mul_mm требует K%256.
+            // Замеренная матрица ОКОН (8B-матмулы, мс, чередующиеся пары):
+            // mb 28/42/61/86 против mm 87-92 на m=2..5; на m=6..8 наоборот —
+            // mm 87-92 против mb 122/102/122. Прежний порядок (mm первым при
+            // дефолтном пороге 2) гнал окна γ=1..4 (m=2..5) через тайл 32
+            // строк: m=2 стоил 87 мс против 28 у mb. Теперь mb для 2..5,
+            // mm для 6..8 и m>8. mb побитово равен mv (тест
+            // iq4_xs_matvec_batch_consistency) — порядок ещё и паритет-
+            // положительный; mm при m 2..8 НЕ побитово mv, паритет
+            // возвращается INFER_IQ4XS_MM_MIN/INFER_QUANT_MM_MIN=9 (m 6..8
+            // тогда уходят в mb — битово mv).
             GpuDtype::Iq4Xs => {
                 let mm_min = std::env::var("INFER_QUANT_MM_MIN")
                     .or_else(|_| std::env::var("INFER_IQ4XS_MM_MIN"))
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
+                let mb_on = k % 256 == 0 && std::env::var("INFER_IQ4XS_NO_MB").is_err();
+                if mb_on && (2..=5).contains(&m) {
+                    return self.mv_iq4_xs_mb(a, b, c, k, n);
+                }
                 if m >= mm_min
                     && m > 1
                     && k % 256 == 0
@@ -1936,54 +1940,10 @@ impl MetalCtx {
                         enc.set_threadgroup_memory_length(0, 8192);
                     });
                 }
-                // 1 ≤ m ≤ 8: matvec с батчем (mv_iq4_xs_mb) — квант-блок
-                // строки весов читается ОДИН раз на m строк активаций, плюс
-                // векторные загрузки (u32-пары квантов, float4 активаций) при
-                // выравнивании. Прежний mv_iq4_xs перечитывал веса на каждую
-                // строку и грузил всё поэлементно — ~190 ГБ/с при потолке
-                // ~400. Порядок операций на выход — как у mv_iq4_xs,
-                // побитово тот же результат (тест
-                // iq4_xs_matvec_batch_consistency). m = 7, 8 — два прохода
-                // (4 + остаток), как у Q8_0. INFER_IQ4XS_NO_MB=1 — прежний
-                // путь (сверка).
-                if m <= 8 && std::env::var("INFER_IQ4XS_NO_MB").is_err() {
-                    let (k32, n32) = (k as u32, n as u32);
-                    let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
-                        let name = match rows {
-                            1 => "mv_iq4_xs_mb1",
-                            2 => "mv_iq4_xs_mb2",
-                            3 => "mv_iq4_xs_mb3",
-                            4 => "mv_iq4_xs_mb4",
-                            5 => "mv_iq4_xs_mb5",
-                            _ => "mv_iq4_xs_mb6",
-                        };
-                        // grid = ПОТОКИ (run → dispatch_threads), не
-                        // threadgroup'ы: 32 потока на строку весов = один
-                        // simdgroup (lane делит суперблоки, simd_sum).
-                        // «Убрать избыточный grid.x=32» — ошибка чтения
-                        // (Ф8.2g): с grid.x=1 тридцать два потока
-                        // threadgroup'а размазывались по 32 РАЗНЫМ строкам
-                        // (lane указывал на чужие) и mb1 врал на 21% —
-                        // поймано тестом iq4_xs_matvec_batch_consistency.
-                        let grid = MTLSize::new(32, n as u64, 1);
-                        let group = MTLSize::new(32, 1, 1);
-                        let a_off = (a.offset + row0 * k * 4) as u64;
-                        let c_off = (c.offset + row0 * n * 4) as u64;
-                        self.run(name, grid, group, |enc| {
-                            enc.set_buffer(0, Some(&a.buffer), a_off);
-                            enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
-                            enc.set_buffer(2, Some(&c.buffer), c_off);
-                            enc.set_bytes(3, 4, (&k32 as *const u32).cast());
-                            enc.set_bytes(4, 4, (&n32 as *const u32).cast());
-                        })
-                    };
-                    return match m {
-                        7 | 8 => {
-                            pass(4, 0)?;
-                            pass(m - 4, 4)
-                        }
-                        _ => pass(m, 0),
-                    };
+                // m 6..8 (и паритет-режим при mm_min>8): батчевый matvec;
+                // m=1 — r2-декод внутри dispatch.
+                if mb_on && m <= 8 {
+                    return self.mv_iq4_xs_mb(a, b, c, k, n);
                 }
                 return self.mv_iq4_xs_dispatch(a, b, c, k, n);
             }
@@ -2560,6 +2520,56 @@ impl MetalCtx {
 
     /// IQ4_XS-проекция: C[M,N] = A[M,K] · W[N,K]ᵀ — сетка (N, M), поток на
     /// (токен, строку весов). Один кернел на декод и префилл.
+    /// IQ4_XS матвек с батчем строк активаций (окно m 2..8): квант-блок
+    /// строки весов читается ОДИН раз на m строк, побитово равен mv
+    /// (тест iq4_xs_matvec_batch_consistency). m = 7, 8 — два прохода
+    /// (4 + остаток). grid = ПОТОКИ (run → dispatch_threads), не
+    /// threadgroup'ы: 32 потока на строку весов = один simdgroup (lane делит
+    /// суперблоки, simd_sum). «Убрать избыточный grid.x=32» — ошибка чтения
+    /// (Ф8.2g): с grid.x=1 тридцать два потока размазывались по 32 РАЗНЫМ
+    /// строкам (lane указывал на чужие) и mb1 врал на 21% — поймано тестом
+    /// iq4_xs_matvec_batch_consistency. Требует K%256 (гейт у вызывающих);
+    /// A читается скалярно, выравнивание не нужно.
+    fn mv_iq4_xs_mb(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        k: usize,
+        n: usize,
+    ) -> Result<(), MetalError> {
+        let (k32, n32) = (k as u32, n as u32);
+        let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
+            let name = match rows {
+                1 => "mv_iq4_xs_mb1",
+                2 => "mv_iq4_xs_mb2",
+                3 => "mv_iq4_xs_mb3",
+                4 => "mv_iq4_xs_mb4",
+                5 => "mv_iq4_xs_mb5",
+                _ => "mv_iq4_xs_mb6",
+            };
+            let grid = MTLSize::new(32, n as u64, 1);
+            let group = MTLSize::new(32, 1, 1);
+            let a_off = (a.offset + row0 * k * 4) as u64;
+            let c_off = (c.offset + row0 * n * 4) as u64;
+            self.run(name, grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a_off);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c_off);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            })
+        };
+        let m = a.shape[0];
+        match m {
+            7 | 8 => {
+                pass(4, 0)?;
+                pass(m - 4, 4)
+            }
+            _ => pass(m, 0),
+        }
+    }
+
     fn mv_iq4_xs_dispatch(
         &self,
         a: &GpuTensor,
@@ -5715,6 +5725,7 @@ impl crate::backend::Backend for MetalBackend {
                 };
                 if bg.dtype == GpuDtype::Q5_K
                     && q5k_mb
+                    && mm_min <= 8
                     && m > 1
                     && m <= 8
                     && k.is_multiple_of(256)
@@ -5774,6 +5785,24 @@ impl crate::backend::Backend for MetalBackend {
                     && std::env::var("INFER_Q4_0_NO_MB").is_err()
                 {
                     self.ctx.mv_q4_0_mb(a.as_gpu(), bg, c.as_gpu())?;
+                    return Ok(());
+                }
+                // IQ4_XS, окна m 2..3 (γ=1,2): батчевый матvec уже выбран в
+                // gemm_nt_quantized для m ≤ 8, но trait доходил туда только
+                // при m ≥ mm_min (дефолт 4) — окна γ=1,2 читали веса 2-3
+                // раза построчным mv. Маршрут паритет-НЕЙТРАЛЕН: mb
+                // побитово равен построчному mv (тест
+                // iq4_xs_matvec_batch_consistency), поэтому выигрыш здесь
+                // только скоростной. A читается скалярно — гейт выравнивания
+                // не нужен; K%256 — из раскладки суперблоков.
+                if bg.dtype == GpuDtype::Iq4Xs
+                    && mm_min <= 8
+                    && (2..=3).contains(&m)
+                    && k.is_multiple_of(256)
+                    && std::env::var("INFER_IQ4XS_NO_MB").is_err()
+                {
+                    self.ctx
+                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
                 // Внутри ext-окна эталон берёт НЕ classic mul_mv, а
@@ -7655,6 +7684,59 @@ mod quant_gemm_tests {
             }
         }
         eprintln!("iq4_xs_mm: побитово сверено {checked} весов");
+    }
+
+    /// Приоритет путей окна IQ4_XS по m: m=2..5 — БАТЧЕВЫЙ matvec (mb),
+    /// m=6..8 — mm-тайл. Замеры 8B (мс): mb 29/44/64/87 против mm 87 на
+    /// m=2..5; на m=6..8 mm 87-89 против mb 122/102/122. Ошибка этого
+    /// захода: до перестановки mm стоял первым с порогом по умолчанию 2, и
+    /// окна γ=1..4 (m=2..5) шли тайлом 32 строк (m=2 стоил 3×). Пин: трейт
+    /// побитово равен прямому mv_iq4_xs_mb на m 2..5 и НЕ равен на m 6..8.
+    #[test]
+    fn trait_gemm_nt_iq4_xs_window_routes_by_m() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (n, k) = (77usize, 512usize);
+        let mut seed = 0x1A4B_5150u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut raw = Vec::with_capacity(n * k / 256 * 136);
+        for _ in 0..n * k / 256 {
+            raw.extend_from_slice(&half::f16::from_f32(0.98).to_bits().to_le_bytes());
+            raw.extend_from_slice(&(next() as u16).to_le_bytes());
+            for _ in 0..4 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            for _ in 0..128 {
+                raw.push((next() & 0xFF) as u8);
+            }
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq4Xs)
+            .unwrap();
+        for (m, want_mb) in [(2usize, true), (4, true), (5, true), (6, false), (8, false)] {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 7919.0).sin()).collect();
+            let a = be.from_cpu_f32(&a_data, vec![m, k]).unwrap();
+            be.ctx.set_quant_mm_min(2);
+            let c_new = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &w, &c_new).unwrap();
+            let got = be.to_cpu_f32(&c_new).unwrap();
+            let c_mb = be.zeros(vec![m, n]).unwrap();
+            be.ctx
+                .mv_iq4_xs_mb(a.inner_metal(), w.inner_metal(), c_mb.inner_metal(), k, n)
+                .unwrap();
+            let mb = be.to_cpu_f32(&c_mb).unwrap();
+            let same = got.iter().zip(mb.iter()).all(|(g, m)| g.to_bits() == m.to_bits());
+            assert_eq!(
+                same, want_mb,
+                "m={m}: ожидался {}путь окна IQ4_XS",
+                if want_mb { "mb-" } else { "НЕ mb (mm) " }
+            );
+        }
     }
 
     /// IQ4_XS mul_mm (m>8): сверка тайлового GEMM с хост-деквантом. Ловит

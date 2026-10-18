@@ -46,17 +46,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         // INFER_METAL_OPS=1: dispatch'и и хостовое время (вне счётчика —
-        // GPU-ожидание батча). Хост/диспетчинг окна — узел Ф8.2g.
-        let host = ops.1 as f64 / 1e6;
-        let per_op = if ops.0 > 0 { host * 1e3 / ops.0 as f64 } else { 0.0 };
-        eprintln!(
-            "m={m:2}: {:.1} мс ({:.1} мс/строку) · ops {} · хост {:.1} мс ({:.1} мкс/dispatch)",
-            best * 1e3,
-            best * 1e3 / m as f64,
-            ops.0,
-            host,
-            per_op
-        );
+        // GPU-ожидание батча). Без профиля счётчики нулевые — не печатаем
+        // нули, чтобы не путать с реальным «хост бесплатен».
+        if ops.0 > 0 {
+            let host = ops.1 as f64 / 1e6;
+            eprintln!(
+                "m={m:2}: {:.1} мс ({:.1} мс/строку) · ops {} · хост {:.1} мс ({:.1} мкс/dispatch)",
+                best * 1e3,
+                best * 1e3 / m as f64,
+                ops.0,
+                host,
+                host * 1e3 / ops.0 as f64
+            );
+        } else {
+            eprintln!("m={m:2}: {:.1} мс ({:.1} мс/строку)", best * 1e3, best * 1e3 / m as f64);
+        }
     }
     Ok(())
 }

@@ -139,6 +139,14 @@ pub enum GgmlType {
     Iq4Nl,
     /// MXFP4 (OCP microscaling) — код 39: 32-эл. блок, 17 Б (E8M0 + E2M1).
     Mxfp4,
+    /// TQ1_0 — код 34: 256-эл. суперблок, 54 Б (тернарные, 3^5 в байте + qh).
+    Tq1_0,
+    /// TQ2_0 — код 35: 256-эл. суперблок, 66 Б (2 бита на значение).
+    Tq2_0,
+    /// Q1_0 — код 41: 128-эл. блок, 18 Б (биты → ±d).
+    Q1_0,
+    /// Q2_0 — код 42: 64-эл. блок, 18 Б (2 бита → (q−1)·d).
+    Q2_0,
     /// NVFP4 — код 40: 64-эл. блок, 36 Б (4 UE4M3-скейла на подблоки по 16
     /// + 32 Б нибблов E2M1).
     Nvfp4,
@@ -164,7 +172,11 @@ impl GgmlType {
             20 => Self::Iq4Nl,
             23 => Self::Iq4Xs,
             30 => Self::Bf16,
+            34 => Self::Tq1_0,
+            35 => Self::Tq2_0,
             39 => Self::Mxfp4,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
             40 => Self::Nvfp4,
             _ => return None,
         })
@@ -195,6 +207,10 @@ impl GgmlType {
             Self::Bf16 => 30,
             Self::Mxfp4 => 39,
             Self::Nvfp4 => 40,
+            Self::Tq1_0 => 34,
+            Self::Tq2_0 => 35,
+            Self::Q1_0 => 41,
+            Self::Q2_0 => 42,
         }
     }
 
@@ -205,6 +221,9 @@ impl GgmlType {
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Iq4Nl | Self::Mxfp4 => 32,
             Self::Nvfp4 => 64,
+            Self::Q1_0 => 128,
+            Self::Q2_0 => 64,
+            Self::Tq1_0 | Self::Tq2_0 => 256,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => 256,
         }
     }
@@ -239,6 +258,11 @@ impl GgmlType {
             Self::Mxfp4 => 17,
             // NVFP4: 4 UE4M3-скейла (по подблоку 16) + 32 Б нибблов = 36 Б/64.
             Self::Nvfp4 => 36,
+            // Q1_0: d + 16 Б битов на 128; Q2_0: d + 16 Б на 64.
+            Self::Q1_0 | Self::Q2_0 => 18,
+            // TQ1_0: qs[48] + qh[4] + d = 54; TQ2_0: qs[64] + d = 66.
+            Self::Tq1_0 => 54,
+            Self::Tq2_0 => 66,
         }
     }
 
@@ -271,6 +295,10 @@ impl GgmlType {
             Self::Iq4Nl => "IQ4_NL",
             Self::Mxfp4 => "MXFP4",
             Self::Nvfp4 => "NVFP4",
+            Self::Tq1_0 => "TQ1_0",
+            Self::Tq2_0 => "TQ2_0",
+            Self::Q1_0 => "Q1_0",
+            Self::Q2_0 => "Q2_0",
         }
     }
 }

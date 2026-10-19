@@ -129,6 +129,57 @@ constant float KV_IQ4[16] = {
     1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
 };
 
+// ── Q1_0 / Q2_0 / TQ1_0 / TQ2_0: точечное значение по позиции в блоке ────
+// FMT: 0 — Q1_0 (18 Б/128, биты → ±d), 1 — Q2_0 (18 Б/64, 2 бита →
+// (q−1)·d), 2 — TQ1_0 (54 Б/256: qs[48] по 3^n + qh[4]), 3 — TQ2_0
+// (66 Б/256: 2 бита). Порядок TQ1_0 — как в dequantize_row_tq1_0:
+// 32 байта × 5 (m-major), затем 16 байт × 5, затем qh[4] × 4.
+template <int FMT>
+static inline uint tern_block_elems() {
+    return FMT == 0 ? 128u : (FMT == 1 ? 64u : 256u);
+}
+template <int FMT>
+static inline uint tern_block_bytes() {
+    return FMT == 2 ? 54u : (FMT == 3 ? 66u : 18u);
+}
+template <int FMT>
+static inline float tern_value_at(device const uchar* blk, uint p) {
+    if (FMT == 0) {
+        const float d = (float)load_half_unaligned(blk);
+        return ((blk[2u + p / 8u] >> (p % 8u)) & 1u) ? d : -d;
+    } else if (FMT == 1) {
+        const float d = (float)load_half_unaligned(blk);
+        const uint q = (blk[2u + p / 4u] >> (2u * (p % 4u))) & 3u;
+        return ((float)q - 1.0f) * d;
+    } else if (FMT == 2) {
+        const float d = (float)load_half_unaligned(blk + 52u);
+        uchar byte;
+        uint n;
+        if (p < 160u) {
+            n = p / 32u;
+            byte = blk[p % 32u];
+        } else if (p < 240u) {
+            n = (p - 160u) / 16u;
+            byte = blk[32u + (p - 160u) % 16u];
+        } else {
+            n = (p - 240u) / 4u;
+            byte = blk[48u + (p - 240u) % 4u];
+        }
+        const uint pw = n == 0u ? 1u : (n == 1u ? 3u : (n == 2u ? 9u : (n == 3u ? 27u : 81u)));
+        // Эталон: uint8_t q = byte·3^n (переполнение mod 256), xi = (q·3)>>8.
+        const uint q = ((uint)byte * pw) & 0xFFu;
+        const int xi = (int)((q * 3u) >> 8);
+        return (float)(xi - 1) * d;
+    } else {
+        const float d = (float)load_half_unaligned(blk + 64u);
+        const uint chunk = p / 128u;
+        const uint l = (p % 128u) / 32u;
+        const uint m = p % 32u;
+        const uint q = (blk[chunk * 32u + m] >> (2u * l)) & 3u;
+        return ((float)q - 1.0f) * d;
+    }
+}
+
 // ── Q2_K / Q3_K ───────────────────────────────────────────────────────────
 // Q2_K: scales[16] @0 (4 бита scale | 4 бита min), qs[64] @16, d @80, dmin @82.
 // Q3_K: hmask[32] @0, qs[64] @32, scales[12] @96, d @108; 6-битные scale со

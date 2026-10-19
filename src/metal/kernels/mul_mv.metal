@@ -246,6 +246,115 @@ kernel void mv_iq4_xs_mb(
     }
 }
 
+// ── Q1_0 / Q2_0 / TQ1_0 / TQ2_0: декод и окна ───────────────────────────
+// Точечная функция value_at (common.metal) по позиции внутри блока;
+// блоки 128/64/256, байты 18/18/54/66.
+
+template <int FMT>
+kernel void mv_tern(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint per = tern_block_elems<FMT>();
+    const uint bb = tern_block_bytes<FMT>();
+    const uint blocks = K / per;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + ((ulong)n * blocks + b) * bb;
+        const uint k0 = b * per;
+        for (uint p = 0; p < per; ++p) {
+            acc += A[k0 + p] * tern_value_at<FMT>(blk, p);
+        }
+    }
+    C[n] = acc;
+}
+
+typedef decltype(mv_tern<0>) mv_tern_t;
+template [[host_name("mv_q1_0")]] kernel mv_tern_t mv_tern<0>;
+template [[host_name("mv_q2_0")]] kernel mv_tern_t mv_tern<1>;
+template [[host_name("mv_tq1_0")]] kernel mv_tern_t mv_tern<2>;
+template [[host_name("mv_tq2_0")]] kernel mv_tern_t mv_tern<3>;
+
+template <int FMT, short M, short NR>
+kernel void mv_tern_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint per = tern_block_elems<FMT>();
+    const uint bb = tern_block_bytes<FMT>();
+    const uint nb = K / per;
+    const uint S = per / 32u; // значений на лейн: 128→4, 64→2, 256→8
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * bb;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = 0; ib < nb; ++ib) {
+        const uint p0 = lane * S;
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * bb;
+            const ulong k0 = (ulong)ib * per + p0;
+#pragma unroll
+            for (short m = 0; m < M; ++m) {
+                device const float* am = A + (ulong)m * K + k0;
+                for (uint i = 0; i < S; ++i) {
+                    acc[r][m] += am[i] * tern_value_at<FMT>(blk, p0 + i);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+typedef decltype(mv_tern_mb<0, 2, 4>) mv_tern_mb4_t;
+typedef decltype(mv_tern_mb<0, 2, 8>) mv_tern_mb8_t;
+template [[host_name("mv_q1_0_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<0, 2, 4>;
+template [[host_name("mv_q1_0_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<0, 3, 4>;
+template [[host_name("mv_q1_0_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<0, 4, 4>;
+template [[host_name("mv_q1_0_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<0, 5, 8>;
+template [[host_name("mv_q1_0_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<0, 6, 8>;
+template [[host_name("mv_q2_0_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<1, 2, 4>;
+template [[host_name("mv_q2_0_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<1, 3, 4>;
+template [[host_name("mv_q2_0_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<1, 4, 4>;
+template [[host_name("mv_q2_0_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<1, 5, 8>;
+template [[host_name("mv_q2_0_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<1, 6, 8>;
+template [[host_name("mv_tq1_0_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<2, 2, 4>;
+template [[host_name("mv_tq1_0_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<2, 3, 4>;
+template [[host_name("mv_tq1_0_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<2, 4, 4>;
+template [[host_name("mv_tq1_0_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<2, 5, 8>;
+template [[host_name("mv_tq1_0_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<2, 6, 8>;
+template [[host_name("mv_tq2_0_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<3, 2, 4>;
+template [[host_name("mv_tq2_0_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<3, 3, 4>;
+template [[host_name("mv_tq2_0_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<3, 4, 4>;
+template [[host_name("mv_tq2_0_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<3, 5, 8>;
+template [[host_name("mv_tq2_0_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<3, 6, 8>;
+
 // ── Q8_1 (40 Б/32) и Q8_K (292 Б/256): декод и окна ─────────────────────
 // Q8_1: d f16 @0, s @2, int8 qs[32] @4; Q8_K: f32 d @0, int8 qs[256] @4.
 // Деквант весов — d·q (s/bsums — активационные величины, не нужны).

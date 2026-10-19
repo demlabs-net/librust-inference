@@ -93,6 +93,15 @@ pub enum WeightFormat {
     Q8_1,
     /// Q8_K: 256-эл. суперблок, 292 Б (f32 d, int8[256], int16 bsums[16]).
     Q8_K,
+    /// Q1_0: 128-эл. блок, 18 Б (d + 16 Б битов), значения ±d.
+    Q1_0,
+    /// Q2_0: 64-эл. блок, 18 Б (d + 16 Б по 2 бита), значения (q−1)·d.
+    Q2_0,
+    /// TQ1_0: 256-эл. суперблок, 54 Б (qs[48] по 5 троичных в байте через
+    /// 3^n, qh[4] по 4, d), 1.6875 бита.
+    TQ1_0,
+    /// TQ2_0: 256-эл. суперблок, 66 Б (qs[64] по 4 двухбитных, d), 2.0625.
+    TQ2_0,
     Int4,
     Nf4,
 }
@@ -120,6 +129,10 @@ impl WeightFormat {
             WeightFormat::Q5_1 => 6.0, // 32-elem block: 24 B
             WeightFormat::Q8_1 => 9.0, // 32-elem block: 36 B (d+s+int8[32])
             WeightFormat::Q8_K => 9.125, // 256-elem super-block: 292 B
+            WeightFormat::Q1_0 => 1.125, // 128-elem block: 18 B
+            WeightFormat::Q2_0 => 2.25, // 64-elem block: 18 B
+            WeightFormat::TQ1_0 => 1.6875, // 256-elem super-block: 54 B
+            WeightFormat::TQ2_0 => 2.0625, // 256-elem super-block: 66 B
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -148,6 +161,10 @@ impl WeightFormat {
             WeightFormat::Q5_1 => Some((32, 24)),
             WeightFormat::Q8_1 => Some((32, 36)),
             WeightFormat::Q8_K => Some((256, 292)),
+            WeightFormat::Q1_0 => Some((128, 18)),
+            WeightFormat::Q2_0 => Some((64, 18)),
+            WeightFormat::TQ1_0 => Some((256, 54)),
+            WeightFormat::TQ2_0 => Some((256, 66)),
             WeightFormat::Iq4Xs => Some((256, 136)),
             WeightFormat::Q8_0 => Some((32, 34)),
             WeightFormat::Q4_K => Some((256, 144)),
@@ -180,6 +197,10 @@ impl WeightFormat {
             WeightFormat::Q5_1 => "q5_1".into(),
             WeightFormat::Q8_1 => "q8_1".into(),
             WeightFormat::Q8_K => "q8_k".into(),
+            WeightFormat::Q1_0 => "q1_0".into(),
+            WeightFormat::Q2_0 => "q2_0".into(),
+            WeightFormat::TQ1_0 => "tq1_0".into(),
+            WeightFormat::TQ2_0 => "tq2_0".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
         }

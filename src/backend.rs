@@ -118,7 +118,11 @@ impl Tensor {
             | crate::metal::GpuDtype::Q4_1
             | crate::metal::GpuDtype::Q5_1
             | crate::metal::GpuDtype::Q8_1
-            | crate::metal::GpuDtype::Q8_K => Dtype::I8,
+            | crate::metal::GpuDtype::Q8_K
+            | crate::metal::GpuDtype::Q1_0
+            | crate::metal::GpuDtype::Q2_0
+            | crate::metal::GpuDtype::TQ1_0
+            | crate::metal::GpuDtype::TQ2_0 => Dtype::I8,
         };
         Self {
             inner: TensorInner::Metal(t),

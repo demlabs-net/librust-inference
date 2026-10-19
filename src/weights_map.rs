@@ -96,6 +96,10 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Q5_1 => WeightFormat::Q5_1,
                 GgmlType::Q8_1 => WeightFormat::Q8_1,
                 GgmlType::Q8K => WeightFormat::Q8_K,
+                GgmlType::Q1_0 => WeightFormat::Q1_0,
+                GgmlType::Q2_0 => WeightFormat::Q2_0,
+                GgmlType::Tq1_0 => WeightFormat::TQ1_0,
+                GgmlType::Tq2_0 => WeightFormat::TQ2_0,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -315,6 +319,88 @@ pub fn dequant_iq4_xs(data: &[u8]) -> Vec<f32> {
             y
         })
         .collect()
+}
+
+/// Q1_0 (18 Б/128): d(f16) @0, qs[16] @2; бит j → +d, иначе −d.
+pub(crate) fn dequant_q1_0(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 18 * 128);
+    for blk in data.chunks_exact(18) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        for j in 0..128usize {
+            let bit = (blk[2 + j / 8] >> (j % 8)) & 1;
+            out.push(if bit != 0 { d } else { -d });
+        }
+    }
+    out
+}
+
+/// Q2_0 (18 Б/64): d(f16) @0, qs[16] @2 по 2 бита (младшие вперёд);
+/// значение (q − 1)·d (00=−1, 01=0, 10=+1, 11=+2).
+pub(crate) fn dequant_q2_0(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 18 * 64);
+    for blk in data.chunks_exact(18) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        for j in 0..64usize {
+            let q = (blk[2 + j / 4] >> (2 * (j % 4))) & 3;
+            out.push((q as f32 - 1.0) * d);
+        }
+    }
+    out
+}
+
+/// TQ1_0 (54 Б/256): qs[48] @0 (5 троичных значений в байте через 3^n),
+/// qh[4] @48 (4 значения), d @52. Порядок эталона: 32 байта × 5 (m-major),
+/// затем 16 байт × 5, затем 4 байта qh × 4; value = (xi − 1)·d, где
+/// xi = ((byte·3^n)·3) >> 8.
+pub(crate) fn dequant_tq1_0(data: &[u8]) -> Vec<f32> {
+    const POW3: [u16; 5] = [1, 3, 9, 27, 81];
+    let mut out = Vec::with_capacity(data.len() / 54 * 256);
+    for blk in data.chunks_exact(54) {
+        let d = f16_to_f32([blk[52], blk[53]]);
+        let qs = &blk[0..48];
+        let qh = &blk[48..52];
+        // ВНИМАНИЕ: в эталоне q объявлен uint8_t — произведение берётся
+        // по модулю 256 (переполнение), затем xi = (q·3) >> 8.
+        let push = |byte: u8, n: usize, out: &mut Vec<f32>| {
+            let q = ((byte as u32 * POW3[n] as u32) & 0xFF) as u32;
+            let xi = ((q * 3) >> 8) as i32;
+            out.push((xi - 1) as f32 * d);
+        };
+        for n in 0..5 {
+            for m in 0..32 {
+                push(qs[m], n, &mut out);
+            }
+        }
+        for n in 0..5 {
+            for m in 0..16 {
+                push(qs[32 + m], n, &mut out);
+            }
+        }
+        for n in 0..4 {
+            for j in 0..4 {
+                push(qh[j], n, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// TQ2_0 (66 Б/256): qs[64] @0, d(f16) @64; для позиции p: chunk = p/128,
+/// l = (p%128)/32, m = p%32 → q = (qs[chunk·32 + m] >> 2l) & 3,
+/// значение (q − 1)·d.
+pub(crate) fn dequant_tq2_0(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 66 * 256);
+    for blk in data.chunks_exact(66) {
+        let d = f16_to_f32([blk[64], blk[65]]);
+        for p in 0..256usize {
+            let chunk = p / 128;
+            let l = (p % 128) / 32;
+            let m = p % 32;
+            let q = (blk[chunk * 32 + m] >> (2 * l)) & 3;
+            out.push((q as f32 - 1.0) * d);
+        }
+    }
+    out
 }
 
 /// Q4_1 (ggml `dequantize_row_q4_1`, 20 Б/32): d(f16) @0, m(f16) @2,
@@ -642,6 +728,10 @@ pub fn dequant_gguf(
         T::Q5_1 => dequant_q5_1(data),
         T::Q8_1 => dequant_q8_1(data),
         T::Q8K => dequant_q8_k(data),
+        T::Q1_0 => dequant_q1_0(data),
+        T::Q2_0 => dequant_q2_0(data),
+        T::Tq1_0 => dequant_tq1_0(data),
+        T::Tq2_0 => dequant_tq2_0(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -690,6 +780,10 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Q5_1 => dequant_q5_1(t.data),
         WeightFormat::Q8_1 => dequant_q8_1(t.data),
         WeightFormat::Q8_K => dequant_q8_k(t.data),
+        WeightFormat::Q1_0 => dequant_q1_0(t.data),
+        WeightFormat::Q2_0 => dequant_q2_0(t.data),
+        WeightFormat::TQ1_0 => dequant_tq1_0(t.data),
+        WeightFormat::TQ2_0 => dequant_tq2_0(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

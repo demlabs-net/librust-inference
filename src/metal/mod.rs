@@ -11194,4 +11194,44 @@ mod glm_attention_tests {
             }
         }
     }
+    /// mul_vec: Y[r,c] = X[r,c]·W[c] (по столбцу) и mul_rows: Y[r,c] = X[r,c]·W[r].
+    #[test]
+    fn mul_vec_and_rows_match_host() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (rows, cols) = (6usize, 11usize);
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.7).sin()).collect();
+        let wc: Vec<f32> = (0..cols).map(|c| 0.1 + c as f32 * 0.05).collect();
+        let wr: Vec<f32> = (0..rows).map(|r| 0.2 + r as f32 * 0.3).collect();
+        let xt = be.from_cpu_f32(&x, vec![rows, cols]).unwrap();
+        let wct = be.from_cpu_f32(&wc, vec![cols]).unwrap();
+        let wrt = be.from_cpu_f32(&wr, vec![rows]).unwrap();
+        let yc = be.zeros(vec![rows, cols]).unwrap();
+        be.mul_vec(&xt, &wct, &yc).unwrap();
+        let got = be.to_cpu_f32(&yc).unwrap();
+        for r in 0..rows {
+            for c in 0..cols {
+                let want = x[r * cols + c] * wc[c];
+                assert!(
+                    (got[r * cols + c] - want).abs() <= 1e-6,
+                    "mul_vec r={r} c={c}: {} vs {want}",
+                    got[r * cols + c]
+                );
+            }
+        }
+        let yr = be.zeros(vec![rows, cols]).unwrap();
+        be.mul_rows(&xt, &wrt, &yr).unwrap();
+        let got = be.to_cpu_f32(&yr).unwrap();
+        for r in 0..rows {
+            for c in 0..cols {
+                let want = x[r * cols + c] * wr[r];
+                assert!(
+                    (got[r * cols + c] - want).abs() <= 1e-6,
+                    "mul_rows r={r} c={c}: {} vs {want}",
+                    got[r * cols + c]
+                );
+            }
+        }
+    }
+
 }

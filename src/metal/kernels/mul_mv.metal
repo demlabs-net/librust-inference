@@ -280,6 +280,12 @@ template [[host_name("mv_q2_0")]] kernel mv_tern_t mv_tern<1>;
 template [[host_name("mv_tq1_0")]] kernel mv_tern_t mv_tern<2>;
 template [[host_name("mv_tq2_0")]] kernel mv_tern_t mv_tern<3>;
 template [[host_name("mv_iq2_xxs")]] kernel mv_tern_t mv_tern<4>;
+template [[host_name("mv_iq3_xxs")]] kernel mv_tern_t mv_tern<5>;
+template [[host_name("mv_iq2_xs")]] kernel mv_tern_t mv_tern<6>;
+template [[host_name("mv_iq2_s")]] kernel mv_tern_t mv_tern<7>;
+template [[host_name("mv_iq3_s")]] kernel mv_tern_t mv_tern<8>;
+template [[host_name("mv_iq1_s")]] kernel mv_tern_t mv_tern<9>;
+template [[host_name("mv_iq1_m")]] kernel mv_tern_t mv_tern<10>;
 
 template <int FMT, short M, short NR>
 kernel void mv_tern_mb(
@@ -360,6 +366,36 @@ template [[host_name("mv_iq2_xxs_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<4, 3, 4
 template [[host_name("mv_iq2_xxs_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<4, 4, 4>;
 template [[host_name("mv_iq2_xxs_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<4, 5, 8>;
 template [[host_name("mv_iq2_xxs_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<4, 6, 8>;
+template [[host_name("mv_iq3_xxs_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<5, 2, 4>;
+template [[host_name("mv_iq3_xxs_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<5, 3, 4>;
+template [[host_name("mv_iq3_xxs_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<5, 4, 4>;
+template [[host_name("mv_iq3_xxs_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<5, 5, 8>;
+template [[host_name("mv_iq3_xxs_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<5, 6, 8>;
+template [[host_name("mv_iq2_xs_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<6, 2, 4>;
+template [[host_name("mv_iq2_xs_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<6, 3, 4>;
+template [[host_name("mv_iq2_xs_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<6, 4, 4>;
+template [[host_name("mv_iq2_xs_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<6, 5, 8>;
+template [[host_name("mv_iq2_xs_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<6, 6, 8>;
+template [[host_name("mv_iq2_s_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<7, 2, 4>;
+template [[host_name("mv_iq2_s_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<7, 3, 4>;
+template [[host_name("mv_iq2_s_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<7, 4, 4>;
+template [[host_name("mv_iq2_s_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<7, 5, 8>;
+template [[host_name("mv_iq2_s_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<7, 6, 8>;
+template [[host_name("mv_iq3_s_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<8, 2, 4>;
+template [[host_name("mv_iq3_s_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<8, 3, 4>;
+template [[host_name("mv_iq3_s_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<8, 4, 4>;
+template [[host_name("mv_iq3_s_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<8, 5, 8>;
+template [[host_name("mv_iq3_s_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<8, 6, 8>;
+template [[host_name("mv_iq1_s_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<9, 2, 4>;
+template [[host_name("mv_iq1_s_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<9, 3, 4>;
+template [[host_name("mv_iq1_s_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<9, 4, 4>;
+template [[host_name("mv_iq1_s_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<9, 5, 8>;
+template [[host_name("mv_iq1_s_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<9, 6, 8>;
+template [[host_name("mv_iq1_m_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<10, 2, 4>;
+template [[host_name("mv_iq1_m_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<10, 3, 4>;
+template [[host_name("mv_iq1_m_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<10, 4, 4>;
+template [[host_name("mv_iq1_m_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<10, 5, 8>;
+template [[host_name("mv_iq1_m_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<10, 6, 8>;
 
 // ── Q8_1 (40 Б/32) и Q8_K (292 Б/256): декод и окна ─────────────────────
 // Q8_1: d f16 @0, s @2, int8 qs[32] @4; Q8_K: f32 d @0, int8 qs[256] @4.

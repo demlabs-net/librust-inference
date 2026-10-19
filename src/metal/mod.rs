@@ -2199,7 +2199,10 @@ impl MetalCtx {
                 };
                 if m <= 8 && !mb_off {
                     if m == 1 {
-                        // Прямые вызовы с m=1 — скалярный mv-путь.
+                        // Замер mb1 vs скалярного mv на m=1: mb1 ХУЖЕ на
+                        // IQ4_NL (79 vs 40 мс), MXFP4 (120 vs 36), Q3_K
+                        // (133 vs 47), остальные — паритет. Оставлен
+                        // скалярный mv (порядок суммирования точный).
                         let av = a.view_offset(vec![k], 0);
                         let cv = c.view_offset(vec![n], 0);
                         return self.mv_quantized(&av, b, &cv);
@@ -2968,7 +2971,7 @@ impl MetalCtx {
         let (k32, n32) = (k as u32, n as u32);
         let pass = |rows: usize, row0: usize| -> Result<(), MetalError> {
             let (name, nr) = match rows {
-                2 => ("mv_nvfp4_mb2", 4usize),
+                2 => ("mv_nvfp4_mb2", 4),
                 3 => ("mv_nvfp4_mb3", 4),
                 4 => ("mv_nvfp4_mb4", 4),
                 5 => ("mv_nvfp4_mb5", 8),

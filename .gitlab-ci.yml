@@ -1,0 +1,46 @@
+# CI движка: fmt + clippy(strict) + тесты. Linux — без Metal-фичи;
+# Metal-сборка/тесты — на self-hosted macOS-раннере (tags: [macos]).
+# CUDA-джобы (Фаза 9) добавляются на Linux-машине пользователя.
+
+stages:
+  - check
+  - test
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+cache:
+  paths:
+    - .cargo/
+    - target/
+
+fmt:
+  stage: check
+  image: rust:latest
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: check
+  image: rust:latest
+  script:
+    - rustup component add clippy
+    # Metal-фича на Linux не собирается (metal/objc2 — macOS-only): строгий
+    # clippy для платформо-независимого кода; metal-путь — в джобе macOS.
+    - cargo clippy --all-targets -- -D warnings
+
+test-linux:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo test --workspace
+
+# macOS (Metal): self-hosted раннер; снимается, если раннера нет.
+test-macos:
+  stage: test
+  tags: [macos]
+  script:
+    - cargo test --release --features metal
+  rules:
+    - if: '$CI_RUNNER_TAGS =~ /macos/'
+    - when: manual

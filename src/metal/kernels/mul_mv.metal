@@ -246,6 +246,242 @@ kernel void mv_iq4_xs_mb(
     }
 }
 
+// ── Q8_1 (40 Б/32) и Q8_K (292 Б/256): декод и окна ─────────────────────
+// Q8_1: d f16 @0, s @2, int8 qs[32] @4; Q8_K: f32 d @0, int8 qs[256] @4.
+// Деквант весов — d·q (s/bsums — активационные величины, не нужны).
+template <bool IS_K>
+kernel void mv_q8_1_q8_k(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint per = IS_K ? 256u : 32u;
+    const uint bb = IS_K ? 292u : 36u;
+    const uint blocks = K / per;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + ((ulong)n * blocks + b) * bb;
+        const float d = IS_K ? as_type<float>(*(device const uint*)(blk))
+                             : (float)load_half_unaligned(blk);
+        const uint k0 = b * per;
+        for (uint j = 0; j < per; ++j) {
+            acc += A[k0 + j] * (float)(signed char)blk[4u + j] * d;
+        }
+    }
+    C[n] = acc;
+}
+
+typedef decltype(mv_q8_1_q8_k<true>) mv_q8_1_q8_k_t;
+template [[host_name("mv_q8_1")]] kernel mv_q8_1_q8_k_t mv_q8_1_q8_k<false>;
+template [[host_name("mv_q8_k")]] kernel mv_q8_1_q8_k_t mv_q8_1_q8_k<true>;
+
+template <bool IS_K, short M, short NR>
+kernel void mv_q8_1_q8_k_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint per = IS_K ? 256u : 32u;
+    const uint bb = IS_K ? 292u : 36u;
+    const uint nb = K / per;
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    // Q8_1: 8 лейнов на блок (по 4 значения); Q8_K: 32 лейна на строку
+    // (по 8 значений из 256).
+    const uint bl = IS_K ? 0u : (lane / 8u);
+    const uint li = IS_K ? lane : (lane % 8u);
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * bb;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = bl; ib < nb; ib += (IS_K ? 1u : 4u)) {
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * bb;
+            const float d = IS_K ? as_type<float>(*(device const uint*)(blk))
+                                 : (float)load_half_unaligned(blk);
+            const uint off = IS_K ? (4u + li * 8u) : (4u + li * 4u);
+            const uint cnt = IS_K ? 8u : 4u;
+            const ulong k0 = (ulong)ib * per + (IS_K ? li * 8u : li * 4u);
+#pragma unroll
+            for (short m = 0; m < M; ++m) {
+                device const float* am = A + (ulong)m * K + k0;
+                for (uint i = 0; i < cnt; ++i) {
+                    acc[r][m] += am[i] * (float)(signed char)blk[off + i] * d;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+typedef decltype(mv_q8_1_q8_k_mb<false, 2, 4>) mv_q8_1_mb4_t;
+typedef decltype(mv_q8_1_q8_k_mb<false, 2, 8>) mv_q8_1_mb8_t;
+typedef decltype(mv_q8_1_q8_k_mb<true, 2, 4>) mv_q8_k_mb4_t;
+typedef decltype(mv_q8_1_q8_k_mb<true, 2, 8>) mv_q8_k_mb8_t;
+template [[host_name("mv_q8_1_mb2")]] kernel mv_q8_1_mb4_t mv_q8_1_q8_k_mb<false, 2, 4>;
+template [[host_name("mv_q8_1_mb3")]] kernel mv_q8_1_mb4_t mv_q8_1_q8_k_mb<false, 3, 4>;
+template [[host_name("mv_q8_1_mb4")]] kernel mv_q8_1_mb4_t mv_q8_1_q8_k_mb<false, 4, 4>;
+template [[host_name("mv_q8_1_mb5")]] kernel mv_q8_1_mb8_t mv_q8_1_q8_k_mb<false, 5, 8>;
+template [[host_name("mv_q8_1_mb6")]] kernel mv_q8_1_mb8_t mv_q8_1_q8_k_mb<false, 6, 8>;
+template [[host_name("mv_q8_k_mb2")]] kernel mv_q8_k_mb4_t mv_q8_1_q8_k_mb<true, 2, 4>;
+template [[host_name("mv_q8_k_mb3")]] kernel mv_q8_k_mb4_t mv_q8_1_q8_k_mb<true, 3, 4>;
+template [[host_name("mv_q8_k_mb4")]] kernel mv_q8_k_mb4_t mv_q8_1_q8_k_mb<true, 4, 4>;
+template [[host_name("mv_q8_k_mb5")]] kernel mv_q8_k_mb8_t mv_q8_1_q8_k_mb<true, 5, 8>;
+template [[host_name("mv_q8_k_mb6")]] kernel mv_q8_k_mb8_t mv_q8_1_q8_k_mb<true, 6, 8>;
+
+// ── Q4_1 / Q5_1: декод (m=1) и окна (1<m≤8) ─────────────────────────────
+// Q4_1: блок 20 Б (d, m f16 + 16 Б нибблов), значение d·q + m;
+// Q5_1: блок 24 Б (d, m, qh[4] @4, qs[16] @8), q = ниббл | ((qh>>j)&1)<<4.
+
+template <bool IS_Q5>
+kernel void mv_q4_1_q5_1(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint blocks = K / 32u;
+    const uint bb = IS_Q5 ? 24u : 20u;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* blk = B + ((ulong)n * blocks + b) * bb;
+        const float d = (float)load_half_unaligned(blk);
+        const float m = (float)load_half_unaligned(blk + 2u);
+        const uint qh = IS_Q5 ? ((uint)blk[4] | ((uint)blk[5] << 8) | ((uint)blk[6] << 16) | ((uint)blk[7] << 24)) : 0u;
+        device const uchar* qs = blk + (IS_Q5 ? 8u : 4u);
+        const uint k0 = b * 32u;
+        for (uint j = 0; j < 16u; ++j) {
+            uint lo = (uint)(qs[j] & 0x0Fu);
+            uint hi = (uint)(qs[j] >> 4u);
+            if (IS_Q5) {
+                lo |= ((qh >> j) & 1u) << 4;
+                hi |= ((qh >> (j + 16u)) & 1u) << 4;
+            }
+            acc += A[k0 + j] * ((float)lo * d + m);
+            acc += A[k0 + j + 16u] * ((float)hi * d + m);
+        }
+    }
+    C[n] = acc;
+}
+
+typedef decltype(mv_q4_1_q5_1<true>) mv_q4_1_q5_1_t;
+template [[host_name("mv_q4_1")]] kernel mv_q4_1_q5_1_t mv_q4_1_q5_1<false>;
+template [[host_name("mv_q5_1")]] kernel mv_q4_1_q5_1_t mv_q4_1_q5_1<true>;
+
+template <bool IS_Q5, short M, short NR>
+kernel void mv_q4_1_q5_1_mb(
+    device const float* A [[buffer(0)]],
+    device const uchar* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]])
+{
+    const uint nb = K / 32u;
+    const uint bb = IS_Q5 ? 24u : 20u;
+    const uint r0 = (tgid * nsg + sg) * NR;
+    if (r0 >= N) return;
+    const uint bl = lane / 8u;
+    const uint li = lane % 8u;
+    device const uchar* rows[NR];
+    for (short r = 0; r < NR; ++r) {
+        rows[r] = B + (ulong)min(r0 + r, N - 1u) * nb * bb;
+    }
+    float acc[NR][M];
+#pragma unroll
+    for (short r = 0; r < NR; ++r)
+#pragma unroll
+        for (short m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint ib = bl; ib < nb; ib += 4u) {
+        float2 y0[M], y1[M];
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const ulong base = (ulong)m * K + ib * 32u + 2u * li;
+            y0[m] = *(device const float2*)(A + base);
+            y1[m] = *(device const float2*)(A + base + 16u);
+        }
+#pragma unroll
+        for (short r = 0; r < NR; ++r) {
+            device const uchar* blk = rows[r] + ib * bb;
+            const float d = (float)load_half_unaligned(blk);
+            const float mn = (float)load_half_unaligned(blk + 2u);
+            const uint qh = IS_Q5 ? ((uint)blk[4] | ((uint)blk[5] << 8) | ((uint)blk[6] << 16) | ((uint)blk[7] << 24)) : 0u;
+            device const uchar* q = blk + (IS_Q5 ? 8u : 4u) + 2u * li;
+            const uchar b0 = q[0];
+            const uchar b1 = q[1];
+            uint q0 = (uint)(b0 & 0x0Fu), q1 = (uint)(b1 & 0x0Fu);
+            uint q2 = (uint)(b0 >> 4u), q3 = (uint)(b1 >> 4u);
+            if (IS_Q5) {
+                const uint j0 = 2u * li;
+                q0 |= ((qh >> j0) & 1u) << 4;
+                q1 |= ((qh >> (j0 + 1u)) & 1u) << 4;
+                q2 |= ((qh >> (j0 + 16u)) & 1u) << 4;
+                q3 |= ((qh >> (j0 + 17u)) & 1u) << 4;
+            }
+            const float w0 = (float)q0 * d + mn;
+            const float w1 = (float)q1 * d + mn;
+            const float w2 = (float)q2 * d + mn;
+            const float w3 = (float)q3 * d + mn;
+#pragma unroll
+            for (short m = 0; m < M; ++m) {
+                acc[r][m] += w0 * y0[m].x + w1 * y0[m].y + w2 * y1[m].x + w3 * y1[m].y;
+            }
+        }
+    }
+#pragma unroll
+    for (short r = 0; r < NR; ++r) {
+#pragma unroll
+        for (short m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0u && r0 + r < N) C[(ulong)m * N + r0 + r] = v;
+        }
+    }
+}
+
+typedef decltype(mv_q4_1_q5_1_mb<false, 2, 4>) mv_q4_1_q5_1_mb4_t;
+typedef decltype(mv_q4_1_q5_1_mb<false, 2, 8>) mv_q4_1_q5_1_mb8_t;
+typedef decltype(mv_q4_1_q5_1_mb<true, 2, 4>) mv_q5_1_q5_1_mb4_t;
+typedef decltype(mv_q4_1_q5_1_mb<true, 2, 8>) mv_q5_1_q5_1_mb8_t;
+template [[host_name("mv_q4_1_mb2")]] kernel mv_q4_1_q5_1_mb4_t mv_q4_1_q5_1_mb<false, 2, 4>;
+template [[host_name("mv_q4_1_mb3")]] kernel mv_q4_1_q5_1_mb4_t mv_q4_1_q5_1_mb<false, 3, 4>;
+template [[host_name("mv_q4_1_mb4")]] kernel mv_q4_1_q5_1_mb4_t mv_q4_1_q5_1_mb<false, 4, 4>;
+template [[host_name("mv_q4_1_mb5")]] kernel mv_q4_1_q5_1_mb8_t mv_q4_1_q5_1_mb<false, 5, 8>;
+template [[host_name("mv_q4_1_mb6")]] kernel mv_q4_1_q5_1_mb8_t mv_q4_1_q5_1_mb<false, 6, 8>;
+template [[host_name("mv_q5_1_mb2")]] kernel mv_q5_1_q5_1_mb4_t mv_q4_1_q5_1_mb<true, 2, 4>;
+template [[host_name("mv_q5_1_mb3")]] kernel mv_q5_1_q5_1_mb4_t mv_q4_1_q5_1_mb<true, 3, 4>;
+template [[host_name("mv_q5_1_mb4")]] kernel mv_q5_1_q5_1_mb4_t mv_q4_1_q5_1_mb<true, 4, 4>;
+template [[host_name("mv_q5_1_mb5")]] kernel mv_q5_1_q5_1_mb8_t mv_q4_1_q5_1_mb<true, 5, 8>;
+template [[host_name("mv_q5_1_mb6")]] kernel mv_q5_1_q5_1_mb8_t mv_q4_1_q5_1_mb<true, 6, 8>;
+
 // ── Q2_K / Q3_K: декод (m=1) и окна (1<m≤8) ─────────────────────────────
 // Блок 256: Q2_K 84 Б (scales[16], qs[64], d, dmin), Q3_K 110 Б
 // (hmask[32], qs[64], scales[12], d). 16 подблоков по 16 значений:

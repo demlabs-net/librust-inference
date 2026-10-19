@@ -220,7 +220,9 @@ impl GgmlType {
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
             Self::Q8_0 => 34,
-            Self::Q8_1 => 40,
+            // Q8_1: d(f16) + s(f16) + int8[32] = 36 Б (было 40 — ошибка:
+            // в эталоне block_q8_1 36 Б, QK8_1=32).
+            Self::Q8_1 => 36,
             Self::Q2K => 84,
             Self::Q3K => 110,
             Self::Q4K => 144,

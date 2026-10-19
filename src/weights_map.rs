@@ -92,6 +92,10 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Nvfp4 => WeightFormat::Nvfp4,
                 GgmlType::Q2K => WeightFormat::Q2_K,
                 GgmlType::Q3K => WeightFormat::Q3_K,
+                GgmlType::Q4_1 => WeightFormat::Q4_1,
+                GgmlType::Q5_1 => WeightFormat::Q5_1,
+                GgmlType::Q8_1 => WeightFormat::Q8_1,
+                GgmlType::Q8K => WeightFormat::Q8_K,
                 other => {
                     return Err(GgufError::InvalidTensorType(other as u32));
                 }
@@ -311,6 +315,69 @@ pub fn dequant_iq4_xs(data: &[u8]) -> Vec<f32> {
             y
         })
         .collect()
+}
+
+/// Q4_1 (ggml `dequantize_row_q4_1`, 20 Б/32): d(f16) @0, m(f16) @2,
+/// qs[16] @4; значение d·q + m (без сдвига −8, в отличие от Q4_0).
+pub(crate) fn dequant_q4_1(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 20 * 32);
+    for blk in data.chunks_exact(20) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        let m = f16_to_f32([blk[2], blk[3]]);
+        let mut row = [0f32; 32];
+        for j in 0..16usize {
+            row[j] = (blk[4 + j] & 0xF) as f32 * d + m;
+            row[j + 16] = (blk[4 + j] >> 4) as f32 * d + m;
+        }
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
+/// Q5_1 (ggml `dequantize_row_q5_1`, 24 Б/32): d @0, m @2, qh[4] @4,
+/// qs[16] @8; 5-й бит значения j — бит j qh (j+16 — бит j+16), d·q + m.
+pub(crate) fn dequant_q5_1(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 24 * 32);
+    for blk in data.chunks_exact(24) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        let m = f16_to_f32([blk[2], blk[3]]);
+        let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+        let mut row = [0f32; 32];
+        for j in 0..16usize {
+            let lo = ((blk[8 + j] & 0xF) as u32 | ((qh >> j) & 1) << 4) as f32;
+            let hi = ((blk[8 + j] >> 4) as u32 | ((qh >> (j + 16)) & 1) << 4) as f32;
+            row[j] = lo * d + m;
+            row[j + 16] = hi * d + m;
+        }
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
+/// Q8_1 (36 Б/32): d(f16) @0, s(f16) @2 (сумма — для активаций), int8[32]
+/// @4; деквант весов — d·q (s не используется).
+pub(crate) fn dequant_q8_1(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 36 * 32);
+    for blk in data.chunks_exact(36) {
+        let d = f16_to_f32([blk[0], blk[1]]);
+        for j in 0..32usize {
+            out.push(blk[4 + j] as i8 as f32 * d);
+        }
+    }
+    out
+}
+
+/// Q8_K (292 Б/256): f32 d @0, int8 qs[256] @4, int16 bsums[16] @260;
+/// деквант весов — d·q.
+pub(crate) fn dequant_q8_k(data: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(data.len() / 292 * 256);
+    for blk in data.chunks_exact(292) {
+        let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
+        for j in 0..256usize {
+            out.push(blk[4 + j] as i8 as f32 * d);
+        }
+    }
+    out
 }
 
 /// Q2_K (ggml `dequantize_row_q2_K`, 84 Б/256): scales[16] @0 (4 бита
@@ -571,6 +638,10 @@ pub fn dequant_gguf(
         T::Nvfp4 => dequant_nvfp4(data),
         T::Q2K => dequant_q2_k(data),
         T::Q3K => dequant_q3_k(data),
+        T::Q4_1 => dequant_q4_1(data),
+        T::Q5_1 => dequant_q5_1(data),
+        T::Q8_1 => dequant_q8_1(data),
+        T::Q8K => dequant_q8_k(data),
         // re-quant из прочих форматов — по мере добавления (Ф4.12)
         other => {
             return Err(BackendError::UnsupportedFormat(format!(
@@ -615,6 +686,10 @@ pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
         WeightFormat::Nvfp4 => dequant_nvfp4(t.data),
         WeightFormat::Q2_K => dequant_q2_k(t.data),
         WeightFormat::Q3_K => dequant_q3_k(t.data),
+        WeightFormat::Q4_1 => dequant_q4_1(t.data),
+        WeightFormat::Q5_1 => dequant_q5_1(t.data),
+        WeightFormat::Q8_1 => dequant_q8_1(t.data),
+        WeightFormat::Q8_K => dequant_q8_k(t.data),
         // N (plan 1.1): a stub that returned EMPTY weights (with an
         // eprintln) silently corrupted any model reaching this path —
         // fail loudly instead.

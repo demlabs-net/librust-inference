@@ -147,6 +147,16 @@ pub enum GgmlType {
     Q1_0,
     /// Q2_0 — код 42: 64-эл. блок, 18 Б (2 бита → (q−1)·d).
     Q2_0,
+    /// i-кванты с сеточным кодбуком: IQ2_XXS (16, 66 Б), IQ2_XS (17, 74),
+    /// IQ3_XXS (18, 98), IQ1_S (19, 50), IQ3_S (21, 110), IQ2_S (22, 82),
+    /// IQ1_M (29, 56). 256-эл. суперблоки (IQ1_M — без отдельного d).
+    Iq2Xxs,
+    Iq2Xs,
+    Iq3Xxs,
+    Iq1S,
+    Iq3S,
+    Iq2S,
+    Iq1M,
     /// NVFP4 — код 40: 64-эл. блок, 36 Б (4 UE4M3-скейла на подблоки по 16
     /// + 32 Б нибблов E2M1).
     Nvfp4,
@@ -177,6 +187,13 @@ impl GgmlType {
             39 => Self::Mxfp4,
             41 => Self::Q1_0,
             42 => Self::Q2_0,
+            16 => Self::Iq2Xxs,
+            17 => Self::Iq2Xs,
+            18 => Self::Iq3Xxs,
+            19 => Self::Iq1S,
+            21 => Self::Iq3S,
+            22 => Self::Iq2S,
+            29 => Self::Iq1M,
             40 => Self::Nvfp4,
             _ => return None,
         })
@@ -211,6 +228,13 @@ impl GgmlType {
             Self::Tq2_0 => 35,
             Self::Q1_0 => 41,
             Self::Q2_0 => 42,
+            Self::Iq2Xxs => 16,
+            Self::Iq2Xs => 17,
+            Self::Iq3Xxs => 18,
+            Self::Iq1S => 19,
+            Self::Iq3S => 21,
+            Self::Iq2S => 22,
+            Self::Iq1M => 29,
         }
     }
 
@@ -224,6 +248,8 @@ impl GgmlType {
             Self::Q1_0 => 128,
             Self::Q2_0 => 64,
             Self::Tq1_0 | Self::Tq2_0 => 256,
+            Self::Iq2Xxs | Self::Iq2Xs | Self::Iq3Xxs | Self::Iq1S | Self::Iq3S
+            | Self::Iq2S | Self::Iq1M => 256,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => 256,
         }
     }
@@ -263,6 +289,15 @@ impl GgmlType {
             // TQ1_0: qs[48] + qh[4] + d = 54; TQ2_0: qs[64] + d = 66.
             Self::Tq1_0 => 54,
             Self::Tq2_0 => 66,
+            // i-кванты: IQ2_XXS 66, IQ2_XS 74, IQ3_XXS 98, IQ1_S 50,
+            // IQ3_S 110, IQ2_S 82, IQ1_M 56 (ggml-common.h).
+            Self::Iq2Xxs => 66,
+            Self::Iq2Xs => 74,
+            Self::Iq3Xxs => 98,
+            Self::Iq1S => 50,
+            Self::Iq3S => 110,
+            Self::Iq2S => 82,
+            Self::Iq1M => 56,
         }
     }
 
@@ -299,6 +334,13 @@ impl GgmlType {
             Self::Tq2_0 => "TQ2_0",
             Self::Q1_0 => "Q1_0",
             Self::Q2_0 => "Q2_0",
+            Self::Iq2Xxs => "IQ2_XXS",
+            Self::Iq2Xs => "IQ2_XS",
+            Self::Iq3Xxs => "IQ3_XXS",
+            Self::Iq1S => "IQ1_S",
+            Self::Iq3S => "IQ3_S",
+            Self::Iq2S => "IQ2_S",
+            Self::Iq1M => "IQ1_M",
         }
     }
 }

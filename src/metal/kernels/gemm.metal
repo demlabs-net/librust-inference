@@ -1014,6 +1014,7 @@ template [[host_name("gemm_nt_q1_0_mm")]] kernel gemm_nt_tern_mm_t gemm_nt_tern_
 template [[host_name("gemm_nt_q2_0_mm")]] kernel gemm_nt_tern_mm_t gemm_nt_tern_mm<1>;
 template [[host_name("gemm_nt_tq1_0_mm")]] kernel gemm_nt_tern_mm_t gemm_nt_tern_mm<2>;
 template [[host_name("gemm_nt_tq2_0_mm")]] kernel gemm_nt_tern_mm_t gemm_nt_tern_mm<3>;
+template [[host_name("gemm_nt_iq2_xxs_mm")]] kernel gemm_nt_tern_mm_t gemm_nt_tern_mm<4>;
 
 // ── Q4_1 / Q5_1 GEMM m>8 (порт схемы ggml kernel_mul_mm) ─────────────────
 // Блок 20/24 Б; il0 выбирает половину 32-шага (низ/верх ниббла), Q5_1

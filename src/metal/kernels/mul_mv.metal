@@ -279,6 +279,7 @@ template [[host_name("mv_q1_0")]] kernel mv_tern_t mv_tern<0>;
 template [[host_name("mv_q2_0")]] kernel mv_tern_t mv_tern<1>;
 template [[host_name("mv_tq1_0")]] kernel mv_tern_t mv_tern<2>;
 template [[host_name("mv_tq2_0")]] kernel mv_tern_t mv_tern<3>;
+template [[host_name("mv_iq2_xxs")]] kernel mv_tern_t mv_tern<4>;
 
 template <int FMT, short M, short NR>
 kernel void mv_tern_mb(
@@ -354,6 +355,11 @@ template [[host_name("mv_tq2_0_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<3, 3, 4>;
 template [[host_name("mv_tq2_0_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<3, 4, 4>;
 template [[host_name("mv_tq2_0_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<3, 5, 8>;
 template [[host_name("mv_tq2_0_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<3, 6, 8>;
+template [[host_name("mv_iq2_xxs_mb2")]] kernel mv_tern_mb4_t mv_tern_mb<4, 2, 4>;
+template [[host_name("mv_iq2_xxs_mb3")]] kernel mv_tern_mb4_t mv_tern_mb<4, 3, 4>;
+template [[host_name("mv_iq2_xxs_mb4")]] kernel mv_tern_mb4_t mv_tern_mb<4, 4, 4>;
+template [[host_name("mv_iq2_xxs_mb5")]] kernel mv_tern_mb8_t mv_tern_mb<4, 5, 8>;
+template [[host_name("mv_iq2_xxs_mb6")]] kernel mv_tern_mb8_t mv_tern_mb<4, 6, 8>;
 
 // ── Q8_1 (40 Б/32) и Q8_K (292 Б/256): декод и окна ─────────────────────
 // Q8_1: d f16 @0, s @2, int8 qs[32] @4; Q8_K: f32 d @0, int8 qs[256] @4.

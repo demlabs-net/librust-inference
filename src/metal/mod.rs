@@ -127,6 +127,8 @@ pub enum GpuDtype {
     TQ1_0,
     /// TQ2_0: 256-эл. суперблок, 66 Б (qs[64] по 2 бита, d).
     TQ2_0,
+    /// IQ2_XXS: 256-эл. суперблок, 66 Б (сетка iq2xxs_grid + ksigns).
+    Iq2Xxs,
 }
 
 impl GpuDtype {
@@ -136,7 +138,7 @@ impl GpuDtype {
             GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Iq4Nl | GpuDtype::Mxfp4 => Some(32),
             GpuDtype::Nvfp4 => Some(64),
             GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 => Some(32),
-            GpuDtype::Q8_K | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 => Some(256),
+            GpuDtype::Q8_K | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 | GpuDtype::Iq2Xxs => Some(256),
             GpuDtype::Q1_0 => Some(128),
             GpuDtype::Q2_0 => Some(64),
             GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Iq4Xs
@@ -171,6 +173,7 @@ impl GpuDtype {
             GpuDtype::Q1_0 | GpuDtype::Q2_0 => Some(18),
             GpuDtype::TQ1_0 => Some(54),
             GpuDtype::TQ2_0 => Some(66),
+            GpuDtype::Iq2Xxs => Some(66),
             _ => None,
         }
     }
@@ -441,7 +444,8 @@ impl GpuTensor {
             | GpuDtype::Iq4Xs | GpuDtype::Iq4Nl | GpuDtype::Mxfp4
             | GpuDtype::Nvfp4 | GpuDtype::Q2_K | GpuDtype::Q3_K
             | GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 | GpuDtype::Q8_K
-            | GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 => 1,
+            | GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs => 1,
         }
     }
 
@@ -623,6 +627,7 @@ impl GpuTensor {
             GpuDtype::Q2_0 => 18.0 / 64.0,
             GpuDtype::TQ1_0 => 54.0 / 256.0,
             GpuDtype::TQ2_0 => 66.0 / 256.0,
+            GpuDtype::Iq2Xxs => 66.0 / 256.0,
             other => {
                 return Err(MetalError::Shape(format!(
                     "from_quantized: {other:?} is not a quantized dtype"
@@ -1167,7 +1172,8 @@ impl MetalCtx {
             | GpuDtype::Q1_0
             | GpuDtype::Q2_0
             | GpuDtype::TQ1_0
-            | GpuDtype::TQ2_0 => {
+            | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs => {
                 return Err(MetalError::Shape(
                     "gemm_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
                 ));
@@ -1791,7 +1797,8 @@ impl MetalCtx {
             | GpuDtype::Q1_0
             | GpuDtype::Q2_0
             | GpuDtype::TQ1_0
-            | GpuDtype::TQ2_0 => {
+            | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs => {
                 return Err(MetalError::Shape(
                     "gemm_nt_f32: quantized weights not supported (use gemm_nt_quantized)".into(),
                 ));
@@ -2003,12 +2010,14 @@ impl MetalCtx {
             // весов с кодбуком/E8M0). Блок 32 элемента, K%32.
             // Q1_0 / Q2_0 / TQ1_0 / TQ2_0: окна m 2..8 — точечный mb,
             // m>8 — mm-тайл (блоки 128/64/256 кратны 32).
-            GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 => {
+            GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs => {
                 let mb_off = match b.dtype {
                     GpuDtype::Q1_0 => std::env::var("INFER_Q1_0_NO_MB").is_ok(),
                     GpuDtype::Q2_0 => std::env::var("INFER_Q2_0_NO_MB").is_ok(),
                     GpuDtype::TQ1_0 => std::env::var("INFER_TQ1_0_NO_MB").is_ok(),
-                    _ => std::env::var("INFER_TQ2_0_NO_MB").is_ok(),
+                    GpuDtype::TQ2_0 => std::env::var("INFER_TQ2_0_NO_MB").is_ok(),
+                    _ => std::env::var("INFER_IQ2XXS_NO_MB").is_ok(),
                 };
                 if m <= 8 && !mb_off {
                     if m == 1 {
@@ -2028,7 +2037,8 @@ impl MetalCtx {
                         GpuDtype::Q1_0 => "gemm_nt_q1_0_mm",
                         GpuDtype::Q2_0 => "gemm_nt_q2_0_mm",
                         GpuDtype::TQ1_0 => "gemm_nt_tq1_0_mm",
-                        _ => "gemm_nt_tq2_0_mm",
+                        GpuDtype::TQ2_0 => "gemm_nt_tq2_0_mm",
+                        _ => "gemm_nt_iq2_xxs_mm",
                     };
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
@@ -2381,7 +2391,8 @@ impl MetalCtx {
             GpuDtype::BF16 | GpuDtype::Iq4Xs | GpuDtype::Iq4Nl | GpuDtype::Mxfp4
             | GpuDtype::Nvfp4 | GpuDtype::Q2_K | GpuDtype::Q3_K
             | GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 | GpuDtype::Q8_K
-            | GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 => return None,
+            | GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs => return None,
         };
         let lo = if matches!(dtype, GpuDtype::Q4_K | GpuDtype::Q5_K | GpuDtype::Q6_K) {
             4
@@ -2565,6 +2576,7 @@ impl MetalCtx {
             GpuDtype::Q2_0 => ("mv_q2_0_mb", 64),
             GpuDtype::TQ1_0 => ("mv_tq1_0_mb", 256),
             GpuDtype::TQ2_0 => ("mv_tq2_0_mb", 256),
+            GpuDtype::Iq2Xxs => ("mv_iq2_xxs_mb", 256),
             other => {
                 return Err(MetalError::Shape(format!(
                     "mv_tern_mb: dtype {other:?} не Q1_0/Q2_0/TQ1_0/TQ2_0"
@@ -2595,10 +2607,15 @@ impl MetalCtx {
                 ("mv_tq1_0_mb", 5) => ("mv_tq1_0_mb5", 8),
                 ("mv_tq1_0_mb", _) => ("mv_tq1_0_mb6", 8),
                 ("mv_tq2_0_mb", 2) => ("mv_tq2_0_mb2", 4),
+                ("mv_iq2_xxs_mb", 2) => ("mv_iq2_xxs_mb2", 4),
                 ("mv_tq2_0_mb", 3) => ("mv_tq2_0_mb3", 4),
+                ("mv_iq2_xxs_mb", 3) => ("mv_iq2_xxs_mb3", 4),
                 ("mv_tq2_0_mb", 4) => ("mv_tq2_0_mb4", 4),
+                ("mv_iq2_xxs_mb", 4) => ("mv_iq2_xxs_mb4", 4),
                 ("mv_tq2_0_mb", 5) => ("mv_tq2_0_mb5", 8),
-                _ => ("mv_tq2_0_mb6", 8),
+                ("mv_iq2_xxs_mb", 5) => ("mv_iq2_xxs_mb5", 8),
+                ("mv_tq2_0_mb", _) => ("mv_tq2_0_mb6", 8),
+                _ => ("mv_iq2_xxs_mb6", 8),
             };
             let grid = MTLSize::new((n.div_ceil(nr * 2) * 64) as u64, 1, 1);
             let group = MTLSize::new(64, 1, 1);
@@ -3089,6 +3106,7 @@ impl MetalCtx {
             GpuDtype::Q2_0 => "mv_q2_0",
             GpuDtype::TQ1_0 => "mv_tq1_0",
             GpuDtype::TQ2_0 => "mv_tq2_0",
+            GpuDtype::Iq2Xxs => "mv_iq2_xxs",
             other => {
                 return Err(MetalError::Shape(format!(
                     "mv_quantized: B dtype {other:?} is not quantized"
@@ -6387,6 +6405,7 @@ impl crate::backend::Backend for MetalBackend {
                 | GpuDtype::Q2_0
                 | GpuDtype::TQ1_0
                 | GpuDtype::TQ2_0
+                | GpuDtype::Iq2Xxs
         ) {
             let m = a.as_gpu().shape[0];
             if m <= 8 {
@@ -6523,7 +6542,7 @@ impl crate::backend::Backend for MetalBackend {
                     GpuDtype::Iq4Nl | GpuDtype::Mxfp4 => Some(32usize),
                     GpuDtype::Nvfp4 => Some(64),
                     GpuDtype::Q2_K | GpuDtype::Q3_K | GpuDtype::Q8_K
-                    | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 => Some(256),
+                    | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 | GpuDtype::Iq2Xxs => Some(256),
                     GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 => Some(32),
                     GpuDtype::Q1_0 => Some(128),
                     GpuDtype::Q2_0 => Some(64),
@@ -6606,6 +6625,7 @@ impl crate::backend::Backend for MetalBackend {
             crate::dtype::WeightFormat::Q2_0 => GpuDtype::Q2_0,
             crate::dtype::WeightFormat::TQ1_0 => GpuDtype::TQ1_0,
             crate::dtype::WeightFormat::TQ2_0 => GpuDtype::TQ2_0,
+            crate::dtype::WeightFormat::Iq2Xxs => GpuDtype::Iq2Xxs,
             other => {
                 return Err(crate::error::BackendError::Shape(format!(
                     "from_quantized: {other:?} is not quantized"
@@ -8499,6 +8519,115 @@ mod quant_gemm_tests {
                 same, want_mb,
                 "m={m}: ожидался {}путь окна IQ4_XS",
                 if want_mb { "mb-" } else { "НЕ mb (mm) " }
+            );
+        }
+    }
+
+    /// IQ2_XXS (66 Б/256): канонический блок, mb vs хост, mm побитово,
+    /// маршрут. Нулевые qs → aux32 = 0 → db = d·0.25, grid[0] = 8·0x08,
+    /// signs = 0 → все значения = d·2 (при d=1 → 1.0).
+    #[test]
+    fn iq2_xxs_paths_match_host() {
+        use crate::backend::Backend as _;
+        let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
+        b.extend(std::iter::repeat(0u8).take(64));
+        assert_eq!(b.len(), 66);
+        let d = crate::weights_map::dequant_iq2_xxs(&b);
+        assert_eq!(d.len(), 256);
+        assert!(d.iter().all(|v| *v == 1.0), "нулевой блок IQ2_XXS должен быть 1.0");
+
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (n, k) = (77usize, 256usize);
+        let mut seed = 0x22_5853_0001u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut raw = Vec::with_capacity(n * k / 256 * 66);
+        for _ in 0..n * k / 256 {
+            for _ in 0..66 {
+                raw.push((next() & 0xFF) as u8);
+            }
+            let base = raw.len() - 66;
+            raw[base..base + 2]
+                .copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+        }
+        let w = be
+            .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq2Xxs)
+            .unwrap();
+        let bf = crate::weights_map::dequant_f32(&crate::weights_map::WeightTensor {
+            name: "w".into(),
+            shape: vec![n as u64, k as u64],
+            format: crate::dtype::WeightFormat::Iq2Xxs,
+            offset: 0,
+            data: &raw,
+        });
+        for m in 2..=8usize {
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 104729.0).sin()).collect();
+            let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+            let c = be.zeros(vec![m, n]).unwrap();
+            be.ctx
+                .mv_tern_mb(av.inner_metal(), w.inner_metal(), c.inner_metal())
+                .unwrap();
+            let got = be.to_cpu_f32(&c).unwrap();
+            for r in 0..n {
+                for mi in 0..m {
+                    let want: f64 = bf[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&a[mi * k..(mi + 1) * k])
+                        .map(|(w, x)| (*w as f64) * (*x as f64))
+                        .sum();
+                    let rel = (got[mi * n + r] as f64 - want).abs() / (1.0 + want.abs());
+                    assert!(rel <= 1e-3, "iq2_xxs mb m={m} r={r}: Δ {rel}");
+                }
+            }
+        }
+        let mut a = vec![0f32; k * k];
+        for i in 0..k {
+            a[i * k + i] = 1.0;
+        }
+        let av = be.from_cpu_f32(&a, vec![k, k]).unwrap();
+        let c = be.zeros(vec![k, n]).unwrap();
+        be.ctx
+            .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+            .unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        for r in 0..n {
+            for kk in 0..k {
+                let want = half::f16::from_f32(bf[r * k + kk]);
+                let g = got[kk * n + r];
+                let wf = half::f16::to_f32(want);
+                let ok = if wf == 0.0 && g == 0.0 {
+                    true
+                } else {
+                    g.to_bits() == wf.to_bits()
+                };
+                assert!(ok, "iq2_xxs mm r={r} k={kk}: {g} vs {wf}");
+            }
+        }
+        // маршруты
+        for m in [4usize, 16] {
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 7919.0).sin()).collect();
+            let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+            let c = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&av, &w, &c).unwrap();
+            let got = be.to_cpu_f32(&c).unwrap();
+            let cd = be.zeros(vec![m, n]).unwrap();
+            if m <= 8 {
+                be.ctx
+                    .mv_tern_mb(av.inner_metal(), w.inner_metal(), cd.inner_metal())
+                    .unwrap();
+            } else {
+                be.ctx
+                    .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), cd.inner_metal())
+                    .unwrap();
+            }
+            let want = be.to_cpu_f32(&cd).unwrap();
+            assert!(
+                got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                "iq2_xxs m={m}: маршрут сломан"
             );
         }
     }

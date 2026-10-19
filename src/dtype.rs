@@ -102,6 +102,9 @@ pub enum WeightFormat {
     TQ1_0,
     /// TQ2_0: 256-эл. суперблок, 66 Б (qs[64] по 4 двухбитных, d), 2.0625.
     TQ2_0,
+    /// IQ2_XXS: 256-эл. суперблок, 66 Б (d + qs[32] u16), 2.0625 бита;
+    /// 2-битные коды — индексы в сетке iq2xxs_grid, знаки — ksigns_iq2xs.
+    Iq2Xxs,
     Int4,
     Nf4,
 }
@@ -133,6 +136,7 @@ impl WeightFormat {
             WeightFormat::Q2_0 => 2.25, // 64-elem block: 18 B
             WeightFormat::TQ1_0 => 1.6875, // 256-elem super-block: 54 B
             WeightFormat::TQ2_0 => 2.0625, // 256-elem super-block: 66 B
+            WeightFormat::Iq2Xxs => 2.0625, // 256-elem super-block: 66 B (i-quant)
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -165,6 +169,7 @@ impl WeightFormat {
             WeightFormat::Q2_0 => Some((64, 18)),
             WeightFormat::TQ1_0 => Some((256, 54)),
             WeightFormat::TQ2_0 => Some((256, 66)),
+            WeightFormat::Iq2Xxs => Some((256, 66)),
             WeightFormat::Iq4Xs => Some((256, 136)),
             WeightFormat::Q8_0 => Some((32, 34)),
             WeightFormat::Q4_K => Some((256, 144)),
@@ -201,6 +206,7 @@ impl WeightFormat {
             WeightFormat::Q2_0 => "q2_0".into(),
             WeightFormat::TQ1_0 => "tq1_0".into(),
             WeightFormat::TQ2_0 => "tq2_0".into(),
+            WeightFormat::Iq2Xxs => "iq2_xxs".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
         }

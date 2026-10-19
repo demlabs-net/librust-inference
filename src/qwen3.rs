@@ -3040,10 +3040,21 @@ mod tests {
             .unwrap();
         let v = a.cfg.vocab_size;
         assert_eq!(last.len(), v, "prefill_last: одна строка логитов");
-        assert_eq!(
-            &full[full.len() - v..],
-            &last[..],
-            "последняя строка расходится"
+        // Полный префилл считает lm_head тайлом (m>1), prefill_last — m=1
+        // matvec'ом: порядок суммирования разный (класс MV_KS), поэтому
+        // сверка по невязке, а не побитово. До появления быстрого f16-mv
+        // скалярный m=1 случайно совпадал с m8-тайлом — это не инвариант.
+        let got = &full[full.len() - v..];
+        let dev = got
+            .iter()
+            .zip(&last[..])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            dev <= 1e-5,
+            "последняя строка расходится: |Δ|max {dev:e} ({} vs {})",
+            got[0],
+            last[0]
         );
         assert_eq!(a.caches[0].pos, b.caches[0].pos, "кэш после prefill_last");
     }

@@ -1813,6 +1813,55 @@ impl MetalCtx {
                 },
             );
         }
+        // m==1 F16/BF16 — тот же simdgroup-матвек с half4-чтением весов:
+        // скалярные gemm_nt_f16/bf16 читают строку по 2 байта на поток и на
+        // TTS S2-Pro (8 ГБ веса на шаг) дают ~11 ГБ/с. Фоллбэки
+        // INFER_F16_NO_MV / INFER_BF16_NO_MV.
+        if m == 1
+            && k.is_multiple_of(4)
+            && a.offset.is_multiple_of(16)
+            && b.offset.is_multiple_of(16)
+        {
+            let mv_kernel = match b.dtype {
+                GpuDtype::F16 if std::env::var("INFER_F16_NO_MV").is_err() => Some((
+                    if std::env::var("INFER_F16_NO_MV4").is_err() {
+                        "gemm_nt_f16_mv4"
+                    } else {
+                        "gemm_nt_f16_mv"
+                    },
+                    std::env::var("INFER_F16_NO_MV4").is_err(),
+                )),
+                GpuDtype::BF16 if std::env::var("INFER_BF16_NO_MV").is_err() => Some((
+                    if std::env::var("INFER_BF16_NO_MV4").is_err() {
+                        "gemm_nt_bf16_mv4"
+                    } else {
+                        "gemm_nt_bf16_mv"
+                    },
+                    std::env::var("INFER_BF16_NO_MV4").is_err(),
+                )),
+                _ => None,
+            };
+            if let Some((name, four_rows)) = mv_kernel {
+                // 4 строки на threadgroup (128 потоков) — вариант mv4;
+                // одна строка на группу (32 потока) — базовый mv.
+                let (grid, group) = if four_rows {
+                    (
+                        MTLSize::new((n.div_ceil(4) * 128) as u64, 1, 1),
+                        MTLSize::new(128, 1, 1),
+                    )
+                } else {
+                    (MTLSize::new((n * 32) as u64, 1, 1), MTLSize::new(32, 1, 1))
+                };
+                return self.run(name, grid, group, |enc| {
+                    enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                    enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                    enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                    enc.set_bytes(3, 8, (&m as *const usize).cast());
+                    enc.set_bytes(4, 8, (&k as *const usize).cast());
+                    enc.set_bytes(5, 8, (&n as *const usize).cast());
+                });
+            }
+        }
         // Эталонный выбор (ggml_metal_op_mul_mat_use_mm): f32-веса при
         // ne00>=64 && ne11>8 идут kernel_mul_mm_f32_f32 (MMA-порядок). Без
         // этого роутер OLMoE (gate_inp f32, m=префилл) расходится с оркалом
@@ -1840,7 +1889,8 @@ impl MetalCtx {
             // float4-загрузки при том же порядке накопления (побитово равен
             // скалярному), ~4× меньше латентности загрузок на поток.
             GpuDtype::F32 => {
-                if k.is_multiple_of(4) && a.offset.is_multiple_of(16) && b.offset.is_multiple_of(16) {
+                if k.is_multiple_of(4) && a.offset.is_multiple_of(16) && b.offset.is_multiple_of(16)
+                {
                     "gemm_nt_f32_v4"
                 } else {
                     "gemm_nt_f32"
@@ -1970,7 +2020,10 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k.is_multiple_of(256) && std::env::var("INFER_Q4K_NO_MM").is_err()
+                if m >= mm_min
+                    && m > 1
+                    && k.is_multiple_of(256)
+                    && std::env::var("INFER_Q4K_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid =
@@ -1999,7 +2052,10 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k.is_multiple_of(256) && std::env::var("INFER_Q6K_NO_MM").is_err()
+                if m >= mm_min
+                    && m > 1
+                    && k.is_multiple_of(256)
+                    && std::env::var("INFER_Q6K_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid =
@@ -2027,7 +2083,10 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k.is_multiple_of(256) && std::env::var("INFER_Q5K_NO_MM").is_err()
+                if m >= mm_min
+                    && m > 1
+                    && k.is_multiple_of(256)
+                    && std::env::var("INFER_Q5K_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid =
@@ -3420,18 +3479,19 @@ impl MetalCtx {
                 GpuDtype::Q4_K => Some("mv_ks_q4_k"),
                 GpuDtype::Q6_K => Some("mv_ks_q6_k"),
                 _ => None,
-            } {
-                let (k32, n32) = (k as u32, n as u32);
-                let grid = MTLSize::new((n.div_ceil(4) * 128) as u64, 1, 1);
-                let group = MTLSize::new(128, 1, 1);
-                return self.run(kname, grid, group, |enc| {
-                    enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
-                    enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
-                    enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
-                    enc.set_bytes(3, 4, (&k32 as *const u32).cast());
-                    enc.set_bytes(4, 4, (&n32 as *const u32).cast());
-                });
             }
+        {
+            let (k32, n32) = (k as u32, n as u32);
+            let grid = MTLSize::new((n.div_ceil(4) * 128) as u64, 1, 1);
+            let group = MTLSize::new(128, 1, 1);
+            return self.run(kname, grid, group, |enc| {
+                enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
+                enc.set_buffer(1, Some(&b.buffer), b.offset as u64);
+                enc.set_buffer(2, Some(&c.buffer), c.offset as u64);
+                enc.set_bytes(3, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+            });
+        }
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(64, 1, 1);
         self.run(name, grid, group, |enc| {
@@ -3677,7 +3737,10 @@ impl MetalCtx {
         // Побитовый порт оркального launch (ggml_metal_op_norm): ne00_t = d/4
         // (float4) либо d; nth = 32, удваивать пока nth < ne00_t и < 1024,
         // затем min(1024), min(ceil(ne00_t/32)*32).
-        let vec = d.is_multiple_of(4) && x.offset.is_multiple_of(16) && w.offset.is_multiple_of(16) && y.offset.is_multiple_of(16);
+        let vec = d.is_multiple_of(4)
+            && x.offset.is_multiple_of(16)
+            && w.offset.is_multiple_of(16)
+            && y.offset.is_multiple_of(16);
         let nt = if vec { d / 4 } else { d };
         let mut nth = 32usize;
         while nth < nt && nth < 1024 {
@@ -4207,6 +4270,8 @@ impl MetalCtx {
             GpuDtype::Q5_K => 5,
             GpuDtype::Q5_0 => 6,
             GpuDtype::Iq4Xs => 7,
+            // BF16: таблица в родном bf16 (точное расширение сдвигом).
+            GpuDtype::BF16 => 8,
             other => {
                 return Err(MetalError::Shape(format!(
                     "embedding_quant: таблица {other:?} не поддержана"
@@ -4907,25 +4972,26 @@ impl MetalCtx {
             );
         }
         if let Ok(path) = std::env::var("INFER_FA_TILE_DUMP")
-            && !std::path::Path::new(&path).exists() {
-                use std::io::Write;
-                let qv = q.to_cpu_f32(self)?;
-                let kv = k.to_cpu_f16(self)?;
-                let vv = v.to_cpu_f16(self)?;
-                let mut f = std::fs::File::create(&path).unwrap();
-                let n = tq * n_heads * hd;
-                let kn = tkv * kv_heads * hd;
-                for x in &qv[..n] {
-                    f.write_all(&x.to_be_bytes()).unwrap();
-                }
-                for x in &kv[..kn] {
-                    f.write_all(&x.to_f32().to_be_bytes()).unwrap();
-                }
-                for x in &vv[..kn] {
-                    f.write_all(&x.to_f32().to_be_bytes()).unwrap();
-                }
-                eprintln!("fa_tile dumped to {path}");
+            && !std::path::Path::new(&path).exists()
+        {
+            use std::io::Write;
+            let qv = q.to_cpu_f32(self)?;
+            let kv = k.to_cpu_f16(self)?;
+            let vv = v.to_cpu_f16(self)?;
+            let mut f = std::fs::File::create(&path).unwrap();
+            let n = tq * n_heads * hd;
+            let kn = tkv * kv_heads * hd;
+            for x in &qv[..n] {
+                f.write_all(&x.to_be_bytes()).unwrap();
             }
+            for x in &kv[..kn] {
+                f.write_all(&x.to_f32().to_be_bytes()).unwrap();
+            }
+            for x in &vv[..kn] {
+                f.write_all(&x.to_f32().to_be_bytes()).unwrap();
+            }
+            eprintln!("fa_tile dumped to {path}");
+        }
 
         let mask16 = match mask {
             Some(m) => {
@@ -5961,7 +6027,10 @@ impl MetalCtx {
         let hd32 = hd as u32;
         let grid = MTLSize::new(rows as u64 * h as u64 * 32, 1, 1);
         let group = MTLSize::new(64, 1, 1);
-        let vec = hd.is_multiple_of(4) && x.offset.is_multiple_of(16) && w.offset.is_multiple_of(16) && y.offset.is_multiple_of(16);
+        let vec = hd.is_multiple_of(4)
+            && x.offset.is_multiple_of(16)
+            && w.offset.is_multiple_of(16)
+            && y.offset.is_multiple_of(16);
         self.run(
             if vec {
                 "rmsnorm_head_sg_f32"
@@ -7482,7 +7551,17 @@ impl crate::backend::Backend for MetalBackend {
         table: &crate::backend::Tensor,
         y: &crate::backend::Tensor,
     ) -> Result<(), crate::error::BackendError> {
-        self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
+        // Таблица НЕ в f32 (bf16/f16 TTS-эмбеддинги, квантованные словари):
+        // узкий кернел читает родной формат и расширяет до f32 на лету.
+        // Раньше любой dtype шёл в embedding_f32 — bf16-таблица читалась
+        // как float вдвое длиннее себя (OOB-чтение чужого пулового буфера:
+        // недетерминированный TTS-декод).
+        if table.as_gpu().dtype == GpuDtype::F32 {
+            self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
+        } else {
+            self.ctx
+                .embedding_quant_f32(idx, table.as_gpu(), y.as_gpu())?;
+        }
         Ok(())
     }
 
@@ -11030,6 +11109,89 @@ mod glm_attention_tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(diff16 <= 2e-2, "tq={tq}: f16-KV |Δ| max {diff16}");
+        }
+    }
+    /// F16/BF16 mv (m=1) и BF16-таблица эмбеддингов.
+    ///
+    /// mv4/mv — тот же класс задачи, что f32 mv: 32 лейна делят K, fp32-
+    /// аккумуляция. Порядок суммирования внутри варьируется (4 аккумулятора
+    /// в mv4), поэтому сверка с хостом — по невязке, а не побитово; при
+    /// K-кратном 32 и «ровных» весах невязка должна быть ~1e-5. Побитовая
+    /// часть — эмбеддинги: bf16→f32 расширение точное, Y == значение
+    /// таблицы (это ловит OOB-чтение bf16-таблицы как f32 — прежний баг).
+    #[test]
+    fn f16_bf16_mv_and_bf16_embedding_match_host() {
+        use crate::backend::Backend as _;
+        let be = MetalBackend::new().expect("MetalBackend");
+        let (n, k) = (513usize, 2560usize);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let weights: Vec<f32> = (0..n * k)
+            .map(|_| ((next() % 2001) as f32 - 1000.0) / 4096.0)
+            .collect();
+        let a_data: Vec<f32> = (0..k).map(|i| (i as f32 * 0.017).sin() * 0.5).collect();
+        let a = be.from_cpu_f32(&a_data, vec![1, k]).unwrap();
+
+        for dtype in ["f16", "bf16"] {
+            let (w, widened) = if dtype == "f16" {
+                let h: Vec<half::f16> = weights.iter().map(|&v| half::f16::from_f32(v)).collect();
+                let widened: Vec<f32> = h.iter().map(|v| v.to_f32()).collect();
+                (be.from_cpu_f16(&h, vec![n, k]).unwrap(), widened)
+            } else {
+                let h: Vec<half::bf16> = weights.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                let widened: Vec<f32> = h.iter().map(|v| v.to_f32()).collect();
+                (be.from_cpu_bf16(&h, vec![n, k]).unwrap(), widened)
+            };
+            // Эталон — f64-сумма по точным (расширенным) весам.
+            for row in [0usize, 1, 17, n - 1] {
+                let want: f64 = a_data
+                    .iter()
+                    .zip(&widened[row * k..(row + 1) * k])
+                    .map(|(&x, &y)| x as f64 * y as f64)
+                    .sum();
+                // Оценка ошибки f32-суммы: ~eps·Σ|x·y| (сокращения дают
+                // относительную невязку больше eps на малых результатах).
+                let abs_sum: f64 = a_data
+                    .iter()
+                    .zip(&widened[row * k..(row + 1) * k])
+                    .map(|(&x, &y)| (x as f64 * y as f64).abs())
+                    .sum();
+                let c = be.zeros(vec![1, n]).unwrap();
+                be.gemm_nt(&a, &w, &c).unwrap();
+                let got = be.to_cpu_f32(&c).unwrap()[row];
+                let err = (got as f64 - want).abs();
+                let tol = 4e-7 * abs_sum + 1e-9;
+                assert!(
+                    err <= tol,
+                    "{dtype} row {row}: {got} vs {want} (err {err:e} > tol {tol:e})"
+                );
+            }
+        }
+
+        // BF16-эмбеддинги: точное расширение — Y побитово равен таблице.
+        let (rows, dim) = (8usize, 64usize);
+        let table: Vec<half::bf16> = (0..rows * dim)
+            .map(|i| half::bf16::from_f32((i as f32 - 100.0) / 7.0))
+            .collect();
+        let tbl = be.from_cpu_bf16(&table, vec![rows, dim]).unwrap();
+        let idx = [3u32, 1];
+        let y = be.zeros(vec![1, 2, dim]).unwrap();
+        be.embedding(&idx, &tbl, &y).unwrap();
+        let got = be.to_cpu_f32(&y).unwrap();
+        for (t, &row) in idx.iter().enumerate() {
+            for d in 0..dim {
+                let want = table[row as usize * dim + d].to_f32();
+                assert_eq!(
+                    got[t * dim + d].to_bits(),
+                    want.to_bits(),
+                    "bf16 embedding t={t} d={d}"
+                );
+            }
         }
     }
 }

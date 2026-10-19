@@ -105,6 +105,131 @@ kernel void gemm_nt_f32_mv(
     if (lane == 0u) C[n] = acc;
 }
 
+// m==1: F16/bf16 matvec — тот же simdgroup-расклад (32 лейна делят K по
+// 4 элемента), но веса читаются half4/ushort4 (8 байт на итерацию вместо
+// 16 у f32 и вместо скалярных 2-байтовых чтений в gemm_nt_f16/bf16).
+// TTS S2-Pro: вес шага декода 8 ГБ, скалярный путь давал ~11 ГБ/с;
+// векторизованный mv упирается в полосу памяти.
+kernel void gemm_nt_f16_mv(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgpig.x;
+    if (n >= N) return;
+    device const float4* a = (device const float4*)A;
+    device const half4* b = (device const half4*)(B + (ulong)n * K);
+    const uint k4 = K / 4u;
+    float acc = 0.0f;
+    for (uint k = lane; k < k4; k += 32u) {
+        const float4 av = a[k];
+        const half4 bv = b[k];
+        acc += av.x * float(bv.x);
+        acc += av.y * float(bv.y);
+        acc += av.z * float(bv.z);
+        acc += av.w * float(bv.w);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) C[n] = acc;
+}
+
+kernel void gemm_nt_bf16_mv(
+    device const float* A [[buffer(0)]],
+    device const ushort* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgpig.x;
+    if (n >= N) return;
+    device const float4* a = (device const float4*)A;
+    device const ushort4* b = (device const ushort4*)(B + (ulong)n * K);
+    const uint k4 = K / 4u;
+    float acc = 0.0f;
+    for (uint k = lane; k < k4; k += 32u) {
+        const float4 av = a[k];
+        const ushort4 bv = b[k];
+        acc += av.x * as_type<float>((uint)bv.x << 16);
+        acc += av.y * as_type<float>((uint)bv.y << 16);
+        acc += av.z * as_type<float>((uint)bv.z << 16);
+        acc += av.w * as_type<float>((uint)bv.w << 16);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) C[n] = acc;
+}
+
+// m==1, 4 строки весов на threadgroup (128 потоков): одна simdgroup на
+// строку + 4 независимых аккумулятора на лейн. Вариант mv выше держит
+// ЦЕПОЧКУ из 4 зависимых FMA на итерацию и один simdgroup на группу —
+// на M3 Max это упирается в латентность, а не в полосу (TTS: ~88 ГБ/с из
+// ~400). Порядок суммирования иной (класс MV_KS4) — TTS-критерий звук,
+// не побитовая сверка; для сверок остаётся mv (INFER_F16_NO_MV4).
+kernel void gemm_nt_f16_mv4(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgpig.x * 4u + sg;
+    if (n >= N) return;
+    device const float4* a = (device const float4*)A;
+    device const half4* b = (device const half4*)(B + (ulong)n * K);
+    const uint k4 = K / 4u;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint k = lane; k < k4; k += 32u) {
+        const float4 av = a[k];
+        const half4 bv = b[k];
+        acc0 += av.x * float(bv.x);
+        acc1 += av.y * float(bv.y);
+        acc2 += av.z * float(bv.z);
+        acc3 += av.w * float(bv.w);
+    }
+    float acc = simd_sum((acc0 + acc1) + (acc2 + acc3));
+    if (lane == 0u) C[n] = acc;
+}
+
+kernel void gemm_nt_bf16_mv4(
+    device const float* A [[buffer(0)]],
+    device const ushort* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint n = tgpig.x * 4u + sg;
+    if (n >= N) return;
+    device const float4* a = (device const float4*)A;
+    device const ushort4* b = (device const ushort4*)(B + (ulong)n * K);
+    const uint k4 = K / 4u;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint k = lane; k < k4; k += 32u) {
+        const float4 av = a[k];
+        const ushort4 bv = b[k];
+        acc0 += av.x * as_type<float>((uint)bv.x << 16);
+        acc1 += av.y * as_type<float>((uint)bv.y << 16);
+        acc2 += av.z * as_type<float>((uint)bv.z << 16);
+        acc3 += av.w * as_type<float>((uint)bv.w << 16);
+    }
+    float acc = simd_sum((acc0 + acc1) + (acc2 + acc3));
+    if (lane == 0u) C[n] = acc;
+}
+
 // ── Quantized GEMM: fp32 activations × fp16/bf16 weights, fp32 accumulate ───
 // Same layouts as the f32 kernels; only the B (weight) storage narrows to
 // 2 bytes/element. bf16 has no native MSL type on older stacks — the bits

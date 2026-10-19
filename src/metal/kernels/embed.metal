@@ -156,6 +156,13 @@ kernel void embedding_quant_f32(
         uchar qb = s[8u + ib * 16u + (r % 16u)];
         uint nib = (r < 16u) ? (uint)(qb & 0xF) : (uint)(qb >> 4);
         v = (float)load_half_unaligned(s) * ((float)(int)ls - 32.0f) * KV_IQ4[nib];
+    } else if (FMT == 8u) {
+        // BF16: точное расширение (сдвиг битов, без округления) — таблицы
+        // S2-Pro в родном bf16. Прежний путь скармливал bf16-буфер кернелу
+        // embedding_f32: он читал вдвое больше байт (за границу буфера),
+        // и результат зависел от соседних буферов пула.
+        device const ushort* p = (device const ushort*)table;
+        v = as_type<float>((uint)p[row * D + d] << 16);
     } else {
         device const uchar* s = table + (row * (D / 256u) + d / 256u) * 210u;
         uint e = d % 256u;

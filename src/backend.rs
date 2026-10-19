@@ -727,7 +727,11 @@ pub(crate) fn download_in_dtype<B: Backend + ?Sized>(
     use crate::dtype::Dtype;
     match src.dtype {
         Dtype::F32 => backend.to_cpu_f32(src),
-        Dtype::F16 => Ok(backend.to_cpu_f16(src)?.into_iter().map(f32::from).collect()),
+        Dtype::F16 => Ok(backend
+            .to_cpu_f16(src)?
+            .into_iter()
+            .map(f32::from)
+            .collect()),
         // q8_0 KV (Dtype::I8) has no reader here: its per-32-block scales are
         // not part of the tensor. No cache is constructed with Q8_0 (see
         // make_kv_tensor) — a loud error the day one is, never wrong data.
@@ -1114,7 +1118,11 @@ pub trait Backend: Send + Sync {
     ) -> Result<(Tensor, Tensor), BackendError> {
         let (c, k) = (w.shape()[0], w.shape()[1]);
         let t = x.numel() / c;
-        let (xv, wv, sv) = (self.to_cpu_f32(x)?, self.to_cpu_f32(w)?, self.to_cpu_f32(state)?);
+        let (xv, wv, sv) = (
+            self.to_cpu_f32(x)?,
+            self.to_cpu_f32(w)?,
+            self.to_cpu_f32(state)?,
+        );
         let at = |ch: usize, p: usize| -> f32 {
             if p < k - 1 {
                 sv[ch * (k - 1) + p]
@@ -1171,19 +1179,30 @@ pub trait Backend: Send + Sync {
         qk: usize,
         eps: f32,
     ) -> Result<(Tensor, Tensor), BackendError> {
-        let (xv, wv, sv) = (self.to_cpu_f32(x)?, self.to_cpu_f32(w)?, self.to_cpu_f32(state)?);
+        let (xv, wv, sv) = (
+            self.to_cpu_f32(x)?,
+            self.to_cpu_f32(w)?,
+            self.to_cpu_f32(state)?,
+        );
         let mut y = vec![0.0f32; c];
         let mut ns = vec![0.0f32; c * (k - 1)];
         for ch in 0..c {
             let mut acc = 0.0f32;
             for j in 0..k {
-                let v = if j < k - 1 { sv[ch * (k - 1) + j] } else { xv[ch] };
+                let v = if j < k - 1 {
+                    sv[ch * (k - 1) + j]
+                } else {
+                    xv[ch]
+                };
                 acc += wv[ch * k + j] * v;
             }
             y[ch] = acc / (1.0 + (-acc).exp());
             for j in 0..k - 1 {
-                ns[ch * (k - 1) + j] =
-                    if j + 1 < k - 1 { sv[ch * (k - 1) + j + 1] } else { xv[ch] };
+                ns[ch * (k - 1) + j] = if j + 1 < k - 1 {
+                    sv[ch * (k - 1) + j + 1]
+                } else {
+                    xv[ch]
+                };
             }
         }
         for hbase in (0..2 * qk).step_by(hd) {
@@ -1246,7 +1265,11 @@ pub trait Backend: Send + Sync {
     ) -> Result<(Tensor, Tensor), BackendError> {
         let (hv, s) = (state.shape()[0], state.shape()[1]);
         let t = v.numel() / (hv * s);
-        let (qv, kv, vv) = (self.to_cpu_f32(q)?, self.to_cpu_f32(k)?, self.to_cpu_f32(v)?);
+        let (qv, kv, vv) = (
+            self.to_cpu_f32(q)?,
+            self.to_cpu_f32(k)?,
+            self.to_cpu_f32(v)?,
+        );
         let (gv, bv) = (self.to_cpu_f32(g)?, self.to_cpu_f32(b)?);
         let mut st = self.to_cpu_f32(state)?;
         let mut out = vec![0.0f32; t * hv * s];
@@ -1292,7 +1315,11 @@ pub trait Backend: Send + Sync {
         w: &Tensor,
         eps: f32,
     ) -> Result<Tensor, BackendError> {
-        let (xv, zv, wv) = (self.to_cpu_f32(x)?, self.to_cpu_f32(z)?, self.to_cpu_f32(w)?);
+        let (xv, zv, wv) = (
+            self.to_cpu_f32(x)?,
+            self.to_cpu_f32(z)?,
+            self.to_cpu_f32(w)?,
+        );
         let hd = wv.len();
         let mut y = vec![0.0f32; xv.len()];
         for r in 0..xv.len() / hd {
@@ -1599,7 +1626,11 @@ pub trait Backend: Send + Sync {
             }
             pen.clear();
             ids.push(bi as u32);
-            lse.push(if bv > f32::NEG_INFINITY { sum.ln() } else { f32::NEG_INFINITY });
+            lse.push(if bv > f32::NEG_INFINITY {
+                sum.ln()
+            } else {
+                f32::NEG_INFINITY
+            });
         }
         Ok((ids, lse))
     }
@@ -2230,7 +2261,9 @@ pub trait Backend: Send + Sync {
     /// кернелом (ggml GGML_OP_GLU/SWIGLU). Двухпроходный silu+mul не битуется
     /// из-за регистровой свёртки деления в кернеле оркала.
     fn swiglu(&self, _x: &Tensor, _u: &Tensor, _y: &Tensor) -> Result<(), BackendError> {
-        Err(BackendError::UnsupportedFormat("swiglu: бэкенд не умеет".into()))
+        Err(BackendError::UnsupportedFormat(
+            "swiglu: бэкенд не умеет".into(),
+        ))
     }
 
     // ── GLU ──

@@ -9,7 +9,10 @@ use rust_inference::weights_map::WeightsMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("model")?;
-    let t: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(128);
+    let t: usize = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
     let file = std::fs::File::open(&path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let gf = rust_inference::gguf::parse(&mmap)?;
@@ -43,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     let l = m.prefill_last(&be, &ids)?;
     be.to_cpu_f32(&l)?;
-    eprintln!("prefill_last {t} (PROF): {:.1} мс", t0.elapsed().as_secs_f64() * 1e3);
+    eprintln!(
+        "prefill_last {t} (PROF): {:.1} мс",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
     // FFN одного слоя на реальных весах модели, в одном батче ×10 —
     // сверка с синтетическим prefill_probe (тот же путь ffn_forward).
     let d = m.cfg.dim;
@@ -60,7 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = rust_inference::qwen3::ffn_forward(&be, &x, ffn)?;
     }
     be.end_batch()?;
-    eprintln!("ffn слоя 0 (реальные веса): {:.2} мс", t1.elapsed().as_secs_f64() * 1e3 / 10.0);
+    eprintln!(
+        "ffn слоя 0 (реальные веса): {:.2} мс",
+        t1.elapsed().as_secs_f64() * 1e3 / 10.0
+    );
     // Все слои по разу (как в prefill: каждый раз новые веса, холодный кэш).
     let t2 = std::time::Instant::now();
     be.begin_batch()?;

@@ -38,10 +38,7 @@ fn dump_quant_first_block() {
     let wm = WeightsMap::from_gguf(&parsed).unwrap();
     let t = wm.get(&name).expect("tensor");
     let vals = rust_inference::weights_map::dequant_f32(t);
-    println!(
-        "tensor={name} shape={:?} format={:?}",
-        t.shape, t.format
-    );
+    println!("tensor={name} shape={:?} format={:?}", t.shape, t.format);
     println!(
         "first 8 values: {}",
         vals[..8]

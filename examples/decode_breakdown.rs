@@ -23,7 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut m = Qwen3Model::load(&be, &wm, Qwen3Config::from_gguf(&gf, tok.vocab_size())?)?;
     let n = 32;
     // Контекст для декода: DEC_CTX токенов (по умолчанию 4).
-    let ctx: usize = std::env::var("DEC_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let ctx: usize = std::env::var("DEC_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     let prompt: Vec<u32> = (0..ctx as u32).map(|i| 100 + (i * 7) % 5000).collect();
     let tl = std::time::Instant::now();
     let _ = CausalLm::prefill_last(&mut m, &be, &prompt)?;
@@ -57,7 +60,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c = t0.elapsed().as_secs_f64() / n as f64;
     be.end_batch()?;
     println!("CPU-кодирование шага:  {:.2} мс", c * 1e3);
-    println!("шаг с логитами на хост: {:.2} мс ({:.1} tok/s)", a * 1e3, 1.0 / a);
-    println!("шаг в общем батче:      {:.2} мс ({:.1} tok/s)", b * 1e3, 1.0 / b);
+    println!(
+        "шаг с логитами на хост: {:.2} мс ({:.1} tok/s)",
+        a * 1e3,
+        1.0 / a
+    );
+    println!(
+        "шаг в общем батче:      {:.2} мс ({:.1} tok/s)",
+        b * 1e3,
+        1.0 / b
+    );
     Ok(())
 }

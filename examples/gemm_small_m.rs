@@ -79,19 +79,27 @@ fn q5_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut out = Vec::with_capacity(n * k / 256 * 176);
     for _ in 0..n * k / 256 {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
         out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
         out.extend_from_slice(&half::f16::from_f32(0.005).to_bits().to_le_bytes());
         for _ in 0..12 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
         for _ in 0..32 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
         for _ in 0..128 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
     }
@@ -104,12 +112,16 @@ fn q6_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n * k / 256 * 210);
     for _ in 0..n * k / 256 {
         for _ in 0..192 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
         for _ in 0..16 {
             out.push(((s & 0x3F) as i8 - 32) as u8);
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
         }
         out.extend_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
     }
@@ -121,15 +133,21 @@ fn iq4_xs_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut out = Vec::with_capacity(n * k / 256 * 136);
     for _ in 0..n * k / 256 {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
         out.extend_from_slice(&half::f16::from_f32(0.98).to_bits().to_le_bytes());
         out.extend_from_slice(&(s as u16).to_le_bytes());
         for _ in 0..4 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
         for _ in 0..128 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
     }
@@ -142,11 +160,15 @@ fn nvfp4_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n * k / 64 * 36);
     for _ in 0..n * k / 64 {
         for _ in 0..4 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push(120 + (s % 40) as u8);
         }
         for _ in 0..32 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
     }
@@ -158,10 +180,14 @@ fn iq4_nl_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut out = Vec::with_capacity(n * k / 32 * 18);
     for _ in 0..n * k / 32 {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
         out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
         for _ in 0..16 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
     }
@@ -173,10 +199,14 @@ fn mxfp4_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut out = Vec::with_capacity(n * k / 32 * 17);
     for _ in 0..n * k / 32 {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
         out.push(120 + (s % 16) as u8);
         for _ in 0..16 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
     }
@@ -189,7 +219,9 @@ fn q2_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n * k / 256 * 84);
     for _ in 0..n * k / 256 {
         for _ in 0..80 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
         out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
@@ -204,7 +236,9 @@ fn q3_k_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n * k / 256 * 110);
     for _ in 0..n * k / 256 {
         for _ in 0..108 {
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
             out.push((s & 0xFF) as u8);
         }
         out.extend_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
@@ -246,12 +280,19 @@ fn main() {
         ("w2", 4096, 12288, 36.0),
         ("lm_head", 151936, 4096, 1.0),
     ] {
-        let w = be.from_quantized(&make_w(n, k, 7), vec![n, k], fmt).unwrap();
+        let w = be
+            .from_quantized(&make_w(n, k, 7), vec![n, k], fmt)
+            .unwrap();
         let mut line = format!("{name:8} [{n}x{k}]");
         let mut base = 0.0;
         for (mi, &m) in ms.iter().enumerate() {
             let a = be
-                .from_cpu_f32(&(0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect::<Vec<_>>(), vec![m, k])
+                .from_cpu_f32(
+                    &(0..m * k)
+                        .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+                        .collect::<Vec<_>>(),
+                    vec![m, k],
+                )
                 .unwrap();
             let c = be.zeros(vec![m, n]).unwrap();
             be.begin_batch().unwrap();
@@ -273,6 +314,10 @@ fn main() {
         println!("{line}");
     }
     // Сумма матмулов forward'а 8B (36 слоёв + lm_head), мс
-    let tl: Vec<String> = ms.iter().zip(&total).map(|(m, t)| format!("M={m}: {t:.1}")).collect();
+    let tl: Vec<String> = ms
+        .iter()
+        .zip(&total)
+        .map(|(m, t)| format!("M={m}: {t:.1}"))
+        .collect();
     println!("forward-матмулы 8B: {}", tl.join("  "));
 }

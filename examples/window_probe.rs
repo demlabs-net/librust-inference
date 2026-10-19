@@ -59,7 +59,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 host * 1e3 / ops.0 as f64
             );
         } else {
-            eprintln!("m={m:2}: {:.1} мс ({:.1} мс/строку)", best * 1e3, best * 1e3 / m as f64);
+            eprintln!(
+                "m={m:2}: {:.1} мс ({:.1} мс/строку)",
+                best * 1e3,
+                best * 1e3 / m as f64
+            );
         }
     }
     Ok(())

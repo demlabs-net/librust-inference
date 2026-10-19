@@ -35,7 +35,8 @@ fn main() {
     let vt = be.from_cpu_f16(&vh, vec![1, tkv, nkv * hd]).unwrap();
     let mt = be.from_cpu_f32(&mask, vec![1, tq, tkv]).unwrap();
     let y = be.zeros(vec![1, tq, nh * hd]).unwrap();
-    be.attn_ar(&qt, &kt, &vt, Some(&mt), &y, nh, nkv, hd).unwrap();
+    be.attn_ar(&qt, &kt, &vt, Some(&mt), &y, nh, nkv, hd)
+        .unwrap();
     let got = be.to_cpu_f32(&y).unwrap();
     let mut bad = 0usize;
     let mut worst = 0f32;

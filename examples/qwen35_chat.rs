@@ -22,8 +22,13 @@ use rust_inference::weights_map::WeightsMap;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).ok_or("usage: qwen35_chat <model.gguf> [prompt] [n]")?;
-    let prompt = args.get(2).cloned().unwrap_or_else(|| "The capital of France is".into());
+    let path = args
+        .get(1)
+        .ok_or("usage: qwen35_chat <model.gguf> [prompt] [n]")?;
+    let prompt = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "The capital of France is".into());
     let n: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(32);
 
     let file = std::fs::File::open(path)?;
@@ -57,38 +62,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     // обычным жадным (откат рекуррентного стейта при отказе черновика).
     if let Ok(spec) = std::env::var("QWEN35_SPEC") {
         use rust_inference::inference::generate::{GenerateEvent, GenerateParams, generate};
-        let drafter: std::sync::Arc<std::sync::Mutex<dyn rust_inference::spec::Drafter>> =
-            if spec == "ngram" {
-                std::sync::Arc::new(std::sync::Mutex::new(rust_inference::spec::NGramDrafter::new(4)))
-            } else if spec == "mtp" {
-                // Ф2.6: нативный MTP — nextn-блок из того же файла
-                // (blk.{n_layers}.nextn.*); таблицы эмбеддингов/LM-хед общие
-                // с таргетом (как в эталоне: nextn.embed_tokens/shared_head_head
-                // в этих чекпойнтах нет).
-                let (embed, output) = model.head_tables();
-                std::sync::Arc::new(std::sync::Mutex::new(rust_inference::mtp::MtpDrafter::load(
-                    &backend,
-                    &wm,
-                    &model.cfg,
-                    embed,
-                    output,
-                )?))
-            } else {
-                let (embed, lm_head) = model.shared_tables(&backend, &wm)?;
-                std::sync::Arc::new(std::sync::Mutex::new(rust_inference::dflash::load_drafter_gguf(
+        let drafter: std::sync::Arc<std::sync::Mutex<dyn rust_inference::spec::Drafter>> = if spec
+            == "ngram"
+        {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                rust_inference::spec::NGramDrafter::new(4),
+            ))
+        } else if spec == "mtp" {
+            // Ф2.6: нативный MTP — nextn-блок из того же файла
+            // (blk.{n_layers}.nextn.*); таблицы эмбеддингов/LM-хед общие
+            // с таргетом (как в эталоне: nextn.embed_tokens/shared_head_head
+            // в этих чекпойнтах нет).
+            let (embed, output) = model.head_tables();
+            std::sync::Arc::new(std::sync::Mutex::new(
+                rust_inference::mtp::MtpDrafter::load(&backend, &wm, &model.cfg, embed, output)?,
+            ))
+        } else {
+            let (embed, lm_head) = model.shared_tables(&backend, &wm)?;
+            std::sync::Arc::new(std::sync::Mutex::new(
+                rust_inference::dflash::load_drafter_gguf(
                     &backend,
                     std::path::Path::new(&spec),
                     embed,
                     lm_head,
                     model.cfg.vocab_size,
-                )?))
-            };
+                )?,
+            ))
+        };
         let params = GenerateParams {
             max_tokens: n,
             temperature: 0.0,
             repeat_penalty: 1.0,
             drafter: Some(drafter),
-            spec_gamma: std::env::var("QWEN35_GAMMA").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+            spec_gamma: std::env::var("QWEN35_GAMMA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
             ..Default::default()
         };
         // Прогрев тем же путём (пайплайны таргета и драфтера, подкачка
@@ -140,7 +149,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let vocab = model.cfg.vocab_size;
     let t1 = Instant::now();
     let mut logits = model.prefill_last(&backend, &ids)?;
-    eprintln!("prefill {} ток. за {:.2}s", ids.len(), t1.elapsed().as_secs_f32());
+    eprintln!(
+        "prefill {} ток. за {:.2}s",
+        ids.len(),
+        t1.elapsed().as_secs_f32()
+    );
     let mut dec = IncrementalDecoder::new();
     print!("{prompt}");
     let t2 = Instant::now();
@@ -171,6 +184,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("{}", dec.finish());
     let dt = t2.elapsed().as_secs_f32();
-    eprintln!("decode {produced} ток. за {dt:.2}s ({:.1} tok/s)", produced as f32 / dt.max(1e-6));
+    eprintln!(
+        "decode {produced} ток. за {dt:.2}s ({:.1} tok/s)",
+        produced as f32 / dt.max(1e-6)
+    );
     Ok(())
 }

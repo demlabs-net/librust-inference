@@ -92,7 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s.push_str(&format!("{},1,1,1]\n", cfg.vocab_size));
         let last = &v[v.len() - cfg.vocab_size..];
         for (i, x) in last.iter().enumerate() {
-            s.push_str(&format!("{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " }));
+            s.push_str(&format!(
+                "{:08x}{}",
+                x.to_bits(),
+                if i % 8 == 7 { "\n" } else { " " }
+            ));
         }
         s.push('\n');
         std::fs::write(&out, s)?;
@@ -114,7 +118,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             s.push_str(&format!("{},1,1,1]\n", cfg.vocab_size));
             let last = &v2[v2.len() - cfg.vocab_size..];
             for (i, x) in last.iter().enumerate() {
-                s.push_str(&format!("{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " }));
+                s.push_str(&format!(
+                    "{:08x}{}",
+                    x.to_bits(),
+                    if i % 8 == 7 { "\n" } else { " " }
+                ));
             }
             s.push('\n');
             std::fs::write(std::env::var("LLM_DUMP_DECODE").unwrap(), s)?;

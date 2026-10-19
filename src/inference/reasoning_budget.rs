@@ -103,7 +103,12 @@ impl TokenMatcher {
                 queue.push_back(c);
             }
         }
-        Self { next, fail, out, state: 0 }
+        Self {
+            next,
+            fail,
+            out,
+            state: 0,
+        }
     }
 
     /// Учесть токен; Some(длина) — на нём закончилась последовательность.
@@ -213,7 +218,11 @@ impl ReasoningBudget {
         if start.is_empty() || end.is_empty() {
             return None;
         }
-        let mut forced = if message.is_empty() { Vec::new() } else { tok.encode(message) };
+        let mut forced = if message.is_empty() {
+            Vec::new()
+        } else {
+            tok.encode(message)
+        };
         forced.extend_from_slice(&end[0]);
         Some(Self::new(&[start], &end, forced, budget, BudgetState::Idle))
     }
@@ -370,7 +379,11 @@ pub fn thinking_tags(template_src: &str) -> Option<(&'static str, Vec<&'static s
     let qwen3_coder = template_src.contains("<tool_call>")
         && template_src.contains("<function=")
         && template_src.contains("<parameter=");
-    let ends = if qwen3_coder { vec!["</think>", "<tool_call>"] } else { vec!["</think>"] };
+    let ends = if qwen3_coder {
+        vec!["</think>", "<tool_call>"]
+    } else {
+        vec!["</think>"]
+    };
     Some(("<think>", ends))
 }
 
@@ -411,28 +424,99 @@ mod tests {
         let s = vec![vec![100u32]];
         let e = vec![vec![101u32]];
         // 1: естественный конец раньше бюджета — принуждения нет
-        assert_eq!(run(&[100, 50, 51, 101, 52], &s, &e, &[102], 5, BudgetState::Idle), None);
+        assert_eq!(
+            run(
+                &[100, 50, 51, 101, 52],
+                &s,
+                &e,
+                &[102],
+                5,
+                BudgetState::Idle
+            ),
+            None
+        );
         // 2: бюджет 2 исчерпан на i=2 — принуждение на i=3..4
-        assert_eq!(run(&[100, 50, 51, 52, 53], &s, &e, &[102, 101], 2, BudgetState::Idle), Some((3, 4)));
+        assert_eq!(
+            run(
+                &[100, 50, 51, 52, 53],
+                &s,
+                &e,
+                &[102, 101],
+                2,
+                BudgetState::Idle
+            ),
+            Some((3, 4))
+        );
         // 3: COUNTING с бюджетом 0 — сразу FORCING
-        assert_eq!(run(&[100, 50, 51, 52], &s, &e, &[102, 101], 0, BudgetState::Counting), Some((0, 1)));
+        assert_eq!(
+            run(
+                &[100, 50, 51, 52],
+                &s,
+                &e,
+                &[102, 101],
+                0,
+                BudgetState::Counting
+            ),
+            Some((0, 1))
+        );
         // 4: нет тегов — прозрачно
-        assert_eq!(run(&[50, 51, 52, 53], &[vec![]], &[vec![]], &[102], 2, BudgetState::Idle), None);
+        assert_eq!(
+            run(
+                &[50, 51, 52, 53],
+                &[vec![]],
+                &[vec![]],
+                &[102],
+                2,
+                BudgetState::Idle
+            ),
+            None
+        );
         // 5: открыто сразу (COUNTING), бюджет 2
-        assert_eq!(run(&[50, 51, 52, 53], &s, &e, &[102, 101], 2, BudgetState::Counting), Some((2, 3)));
+        assert_eq!(
+            run(
+                &[50, 51, 52, 53],
+                &s,
+                &e,
+                &[102, 101],
+                2,
+                BudgetState::Counting
+            ),
+            Some((2, 3))
+        );
         // 6: второй блок рассуждений снова получает бюджет
         assert_eq!(
-            run(&[100, 50, 101, 100, 60, 61, 62, 63], &s, &e, &[102, 101], 2, BudgetState::Idle),
+            run(
+                &[100, 50, 101, 100, 60, 61, 62, 63],
+                &s,
+                &e,
+                &[102, 101],
+                2,
+                BudgetState::Idle
+            ),
             Some((6, 7))
         );
         // 7: несколько стартовых последовательностей (многотокенная)
         assert_eq!(
-            run(&[110, 111, 50, 51, 52, 53], &[vec![100], vec![110, 111]], &e, &[102, 101], 2, BudgetState::Idle),
+            run(
+                &[110, 111, 50, 51, 52, 53],
+                &[vec![100], vec![110, 111]],
+                &e,
+                &[102, 101],
+                2,
+                BudgetState::Idle
+            ),
             Some((4, 5))
         );
         // 8: естественный конец второй (многотокенной) конечной последовательностью
         assert_eq!(
-            run(&[100, 50, 103, 104, 52], &s, &[vec![101], vec![103, 104]], &[102, 101], 5, BudgetState::Idle),
+            run(
+                &[100, 50, 103, 104, 52],
+                &s,
+                &[vec![101], vec![103, 104]],
+                &[102, 101],
+                5,
+                BudgetState::Idle
+            ),
             None
         );
     }
@@ -442,7 +526,8 @@ mod tests {
     /// сгенерированным токеном будет закрытие.
     #[test]
     fn zero_budget_with_prompt_opened_reasoning() {
-        let mut b = ReasoningBudget::new(&[vec![100]], &[vec![101]], vec![101], 0, BudgetState::Idle);
+        let mut b =
+            ReasoningBudget::new(&[vec![100]], &[vec![101]], vec![101], 0, BudgetState::Idle);
         b.accept(100); // <think> генпрефикса
         b.accept(7); // «\n» генпрефикса
         assert_eq!(b.forced_token(), Some(101));
@@ -471,7 +556,13 @@ mod tests {
     #[test]
     fn overlapping_end_sequences() {
         // {104} и {103,104} кончаются на одном токене — естественный конец
-        let mut b = ReasoningBudget::new(&[vec![100]], &[vec![104], vec![103, 104]], vec![102, 104], 5, BudgetState::Idle);
+        let mut b = ReasoningBudget::new(
+            &[vec![100]],
+            &[vec![104], vec![103, 104]],
+            vec![102, 104],
+            5,
+            BudgetState::Idle,
+        );
         for t in [100, 103, 104] {
             b.accept(t);
         }
@@ -483,10 +574,26 @@ mod tests {
 
     #[test]
     fn utf8_boundaries() {
-        for s in [&b"hello"[..], b"", b"\xC2\xA0", b"\xE2\x80\x9C", b"\xF0\x9F\x98\x80", b"abc\xC3\xA9"] {
+        for s in [
+            &b"hello"[..],
+            b"",
+            b"\xC2\xA0",
+            b"\xE2\x80\x9C",
+            b"\xF0\x9F\x98\x80",
+            b"abc\xC3\xA9",
+        ] {
             assert!(utf8_is_complete(s), "{s:?}");
         }
-        for s in [&b"\xC2"[..], b"\xE2\x80", b"\xE2", b"\xF0\x9F\x98", b"\xF0\x9F", b"\xF0", b"\x80", b"hello\xC3"] {
+        for s in [
+            &b"\xC2"[..],
+            b"\xE2\x80",
+            b"\xE2",
+            b"\xF0\x9F\x98",
+            b"\xF0\x9F",
+            b"\xF0",
+            b"\x80",
+            b"hello\xC3",
+        ] {
             assert!(!utf8_is_complete(s), "{s:?}");
         }
     }
@@ -498,7 +605,8 @@ mod tests {
     /// следующего токена с целым символом на конце.
     #[test]
     fn waits_for_utf8_completion() {
-        let mut b = ReasoningBudget::new(&[vec![100]], &[vec![101]], vec![101], 1, BudgetState::Idle);
+        let mut b =
+            ReasoningBudget::new(&[vec![100]], &[vec![101]], vec![101], 1, BudgetState::Idle);
         b.accept(100);
         b.accept_piece(60, &[0xF0, 0x9F]); // начало эмодзи
         assert_eq!(b.state(), BudgetState::WaitingUtf8);
@@ -511,14 +619,24 @@ mod tests {
 
     #[test]
     fn draft_room_stops_before_forcing() {
-        let mut b = ReasoningBudget::new(&[vec![100]], &[vec![101]], vec![102, 101], 3, BudgetState::Idle);
+        let mut b = ReasoningBudget::new(
+            &[vec![100]],
+            &[vec![101]],
+            vec![102, 101],
+            3,
+            BudgetState::Idle,
+        );
         b.accept(100);
         b.accept(50); // якорь окна съел 1 из 3
         // черновики — ещё 2, третий уже под вставкой
         assert_eq!(b.draft_room(&[51, 52, 53, 54]), 2);
         // естественный конец в черновиках — окно не режется
         assert_eq!(b.draft_room(&[101, 52, 53]), 3);
-        assert_eq!(b.state(), BudgetState::Counting, "симуляция не трогает автомат");
+        assert_eq!(
+            b.state(),
+            BudgetState::Counting,
+            "симуляция не трогает автомат"
+        );
         b.accept(51);
         b.accept(52);
         assert_eq!(b.draft_room(&[53]), 0, "вставка обязательна — окна нет");
@@ -527,7 +645,10 @@ mod tests {
     #[test]
     fn generation_prefix_is_template_suffix() {
         assert_eq!(
-            generation_prefix("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n", "<|im_start|>user\nhi<|im_end|>\n"),
+            generation_prefix(
+                "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                "<|im_start|>user\nhi<|im_end|>\n"
+            ),
             "<|im_start|>assistant\n<think>\n"
         );
         // общий префикс режет символ — отступаем к границе
@@ -537,7 +658,10 @@ mod tests {
     #[test]
     fn tags_follow_template_family() {
         assert_eq!(thinking_tags("{{ x }}"), None);
-        assert_eq!(thinking_tags("<think>"), Some(("<think>", vec!["</think>"])));
+        assert_eq!(
+            thinking_tags("<think>"),
+            Some(("<think>", vec!["</think>"]))
+        );
         assert_eq!(
             thinking_tags("<think> <tool_call> <function= <parameter="),
             Some(("<think>", vec!["</think>", "<tool_call>"]))

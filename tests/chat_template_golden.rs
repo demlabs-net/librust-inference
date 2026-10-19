@@ -61,8 +61,7 @@ fn chat_templates_match_llama_cpp() {
             .get("tokenizer.chat_template")
             .and_then(GgufValue::as_str)
             .expect("chat_template");
-        let tpl = Template::compile(src, HashMap::new())
-            .unwrap_or_else(|e| panic!("{model}: {e}"));
+        let tpl = Template::compile(src, HashMap::new()).unwrap_or_else(|e| panic!("{model}: {e}"));
         for (case, want) in rendered.as_object().expect("rendered") {
             let ctx = context(&cases[case]);
             let got = tpl.render(&ctx);
@@ -70,7 +69,12 @@ fn chat_templates_match_llama_cpp() {
                 (Some(w), Ok(g)) => {
                     if g != w {
                         let d = g.chars().zip(w.chars()).take_while(|(a, b)| a == b).count();
-                        let tail = |s: &str| s.chars().skip(d.saturating_sub(30)).take(90).collect::<String>();
+                        let tail = |s: &str| {
+                            s.chars()
+                                .skip(d.saturating_sub(30))
+                                .take(90)
+                                .collect::<String>()
+                        };
                         panic!(
                             "{model}/{case}: расхождение с символа {d}\n  наш:   {:?}\n  llama: {:?}",
                             tail(&g),

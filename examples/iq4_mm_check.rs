@@ -64,40 +64,40 @@ fn main() {
         ("IQ4_XS", WeightFormat::Iq4Xs, iq4_xs_bytes(n, k, 0xBEEF)),
         ("Q5_K", WeightFormat::Q5_K, q5_k_bytes(n, k, 0x5EED)),
     ] {
-    let wt = be.from_quantized(&bytes, vec![n, k], fmt).unwrap();
-    for m in 2..=8usize {
-        let x: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
-        let a = be.from_cpu_f32(&x, vec![m, k]).unwrap();
-        // mv/mb-путь (дефолтный порог 9 не задет m≤8)
-        // SAFETY: однопоточный бенч до старта потоков бэкенда
-        unsafe { std::env::set_var("INFER_IQ4XS_MM_MIN", "9") };
-        let cm = be.zeros(vec![m, n]).unwrap();
-        be.gemm_nt(&a, &wt, &cm).unwrap();
-        let ref_c = be.to_cpu_f32(&cm).unwrap();
-        // mm-путь (порог 2)
-        unsafe { std::env::set_var("INFER_IQ4XS_MM_MIN", "2") };
-        let c2 = be.zeros(vec![m, n]).unwrap();
-        be.gemm_nt(&a, &wt, &c2).unwrap();
-        let got = be.to_cpu_f32(&c2).unwrap();
-        unsafe { std::env::remove_var("INFER_IQ4XS_MM_MIN") };
-        let bit_eq = got
-            .iter()
-            .zip(&ref_c)
-            .all(|(g, r)| g.to_bits() == r.to_bits());
-        let diffs = got
-            .iter()
-            .zip(&ref_c)
-            .filter(|(g, r)| g.to_bits() != r.to_bits())
-            .count();
-        let max_abs = got
-            .iter()
-            .zip(&ref_c)
-            .map(|(g, r)| (g - r).abs())
-            .fold(0f32, f32::max);
-        println!(
-            "{fmt_name} m={m}: bit_eq={bit_eq} diffs={diffs}/{} max|Δ|={max_abs:.3e}",
-            m * n
-        );
-    }
+        let wt = be.from_quantized(&bytes, vec![n, k], fmt).unwrap();
+        for m in 2..=8usize {
+            let x: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+            let a = be.from_cpu_f32(&x, vec![m, k]).unwrap();
+            // mv/mb-путь (дефолтный порог 9 не задет m≤8)
+            // SAFETY: однопоточный бенч до старта потоков бэкенда
+            unsafe { std::env::set_var("INFER_IQ4XS_MM_MIN", "9") };
+            let cm = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &wt, &cm).unwrap();
+            let ref_c = be.to_cpu_f32(&cm).unwrap();
+            // mm-путь (порог 2)
+            unsafe { std::env::set_var("INFER_IQ4XS_MM_MIN", "2") };
+            let c2 = be.zeros(vec![m, n]).unwrap();
+            be.gemm_nt(&a, &wt, &c2).unwrap();
+            let got = be.to_cpu_f32(&c2).unwrap();
+            unsafe { std::env::remove_var("INFER_IQ4XS_MM_MIN") };
+            let bit_eq = got
+                .iter()
+                .zip(&ref_c)
+                .all(|(g, r)| g.to_bits() == r.to_bits());
+            let diffs = got
+                .iter()
+                .zip(&ref_c)
+                .filter(|(g, r)| g.to_bits() != r.to_bits())
+                .count();
+            let max_abs = got
+                .iter()
+                .zip(&ref_c)
+                .map(|(g, r)| (g - r).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "{fmt_name} m={m}: bit_eq={bit_eq} diffs={diffs}/{} max|Δ|={max_abs:.3e}",
+                m * n
+            );
+        }
     }
 }

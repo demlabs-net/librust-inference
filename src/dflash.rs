@@ -361,20 +361,20 @@ impl DFlashModel {
             // Молчаливый режим без инжекта: драйвер не собирает extract,
             // драфтер «слеп» (шумовой блок без контекста) — приёмка
             // околонулевая без единой зацепки (ревью Ф2.9).
-            tracing::warn!(
-                "dflash: target_layers отсутствуют/пусты в GGUF — инжект фич выключен"
-            );
+            tracing::warn!("dflash: target_layers отсутствуют/пусты в GGUF — инжект фич выключен");
         }
-        let mask_token = gf.get("tokenizer.ggml.mask_token_id").and_then(GgufValue::as_u32)
-        .ok_or_else(|| {
-            // Молчаливый дефолт (151850 — чужое семейство) диффундировал
-            // не-MASK-входы: приёмка тихо падала без единой зацепки
-            // (ревью Ф2.9). MASK обязателен в вокабуляре диффузионного драфтера.
-            BackendError::Shape(
-                "dflash GGUF: нет tokenizer.ggml.mask_token_id — диффузия без MASK невозможна"
-                    .into(),
-            )
-        })?;
+        let mask_token = gf
+            .get("tokenizer.ggml.mask_token_id")
+            .and_then(GgufValue::as_u32)
+            .ok_or_else(|| {
+                // Молчаливый дефолт (151850 — чужое семейство) диффундировал
+                // не-MASK-входы: приёмка тихо падала без единой зацепки
+                // (ревью Ф2.9). MASK обязателен в вокабуляре диффузионного драфтера.
+                BackendError::Shape(
+                    "dflash GGUF: нет tokenizer.ggml.mask_token_id — диффузия без MASK невозможна"
+                        .into(),
+                )
+            })?;
         let sel_rank = u(&p("selector_rank")).ok();
         let sel_top_k = u(&p("selector_top_k")).ok();
         Self::load_with_selector(
@@ -424,15 +424,18 @@ impl DFlashModel {
             .get("dflash_config")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let mask_token = dflash.get("mask_token_id").and_then(|v| v.as_u64()).map(|v| v as u32)
-        .ok_or_else(|| {
-            // Тихий дефолт 151669 (токен чужой семьи) диффундировал
-            // не-MASK-входы — приёмка падала молча (ревью Ф2.9; GGUF-путь
-            // уже честно ошибается).
-            BackendError::Shape(
-                "dflash config.json: dflash_config.mask_token_id обязателен".into(),
-            )
-        })?;
+        let mask_token = dflash
+            .get("mask_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .ok_or_else(|| {
+                // Тихий дефолт 151669 (токен чужой семьи) диффундировал
+                // не-MASK-входы — приёмка падала молча (ревью Ф2.9; GGUF-путь
+                // уже честно ошибается).
+                BackendError::Shape(
+                    "dflash config.json: dflash_config.mask_token_id обязателен".into(),
+                )
+            })?;
         let target_layers = dflash
             .get("target_layer_ids")
             .and_then(|v| v.as_array())
@@ -812,14 +815,18 @@ impl DFlashModel {
         // Отладочные гейты — ВНЕ цикла слоёв: env::var на каждый слой каждого
         // блока — мусор в горячем пути (ревью Ф2.9).
         let dbg = std::env::var("LLM_DBG_SPEC").is_ok();
-        let sync = |label: &str, t0: &mut std::time::Instant, x: &Tensor| -> Result<(), BackendError> {
-            if dprof {
-                backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
-                eprintln!("  diffuse {label}: {:.2} мс", t0.elapsed().as_secs_f64() * 1e3);
-                *t0 = std::time::Instant::now();
-            }
-            Ok(())
-        };
+        let sync =
+            |label: &str, t0: &mut std::time::Instant, x: &Tensor| -> Result<(), BackendError> {
+                if dprof {
+                    backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
+                    eprintln!(
+                        "  diffuse {label}: {:.2} мс",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                    *t0 = std::time::Instant::now();
+                }
+                Ok(())
+            };
         let mut t0 = std::time::Instant::now();
         backend.begin_batch()?;
         let r = (|| {
@@ -1205,7 +1212,10 @@ impl DFlashDrafter {
     /// posterior чаще, если распределения совпадают на топах).
     fn sample_row(&mut self, row: &[f32], temperature: f32, top_k: usize) -> u32 {
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut w: Vec<f32> = row.iter().map(|&l| ((l - max) / temperature).exp()).collect();
+        let mut w: Vec<f32> = row
+            .iter()
+            .map(|&l| ((l - max) / temperature).exp())
+            .collect();
         if top_k > 0 && top_k < w.len() {
             // оставить топ-N по весу, остальные — 0
             let mut idx: Vec<usize> = (0..w.len()).collect();
@@ -1611,9 +1621,7 @@ fn load_dense_layer(
             | WeightFormat::Q4_K
             | WeightFormat::Q6_K
             | WeightFormat::Q5_K
-            | WeightFormat::Q5_0 => {
-                backend.from_quantized(tensor.raw(), shape, tensor.format)
-            }
+            | WeightFormat::Q5_0 => backend.from_quantized(tensor.raw(), shape, tensor.format),
             _ => {
                 let f = dequant_f32(tensor);
                 upload_f16(backend, &f, shape)
@@ -1629,7 +1637,11 @@ fn load_dense_layer(
         wqkv: Some(crate::qwen3::Qwen3Model::upload_fused(
             backend,
             w,
-            &[&p("attn_q.weight"), &p("attn_k.weight"), &p("attn_v.weight")],
+            &[
+                &p("attn_q.weight"),
+                &p("attn_k.weight"),
+                &p("attn_v.weight"),
+            ],
             vec![
                 cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
                 cfg.dim,
@@ -1639,7 +1651,10 @@ fn load_dense_layer(
         // wo [dim, n_heads·head_dim]: у драфтера Qwen3.5-4B 32·128 = 4096 ≠
         // dim 2560 — форма [dim, dim] отвергала корректный тензор (как у
         // Qwen3Model::load, где wo всегда [dim, n_heads·head_dim]).
-        wo: up(&p("attn_output.weight"), vec![cfg.dim, cfg.n_heads * cfg.head_dim])?,
+        wo: up(
+            &p("attn_output.weight"),
+            vec![cfg.dim, cfg.n_heads * cfg.head_dim],
+        )?,
         qkv_bias: None,
         q_norm: Some(
             backend.from_cpu_f32(

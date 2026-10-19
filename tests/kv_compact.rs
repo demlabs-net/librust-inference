@@ -26,7 +26,11 @@ fn read_kv_f32(b: &dyn Backend, t: &Tensor) -> Vec<f32> {
             .map(|&h| f32::from(h))
             .collect(),
         other => {
-            assert_eq!(other, rust_inference::dtype::Dtype::F32, "KV dtype {other:?}");
+            assert_eq!(
+                other,
+                rust_inference::dtype::Dtype::F32,
+                "KV dtype {other:?}"
+            );
             b.to_cpu_f32(t).unwrap()
         }
     }

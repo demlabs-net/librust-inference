@@ -115,28 +115,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cb = backend.to_cpu_f32(&model.tower.conv1_b)?;
         eprintln!("OMNI_REF our_conv1_b[:8]={:?}", &cb[..8.min(cb.len())]);
         let w1: f64 = (0..128)
-            .map(|ci| {
-                conv3(&cw, 1, ci)
-                    .iter()
-                    .map(|&v| v as f64)
-                    .sum::<f64>()
-            })
+            .map(|ci| conv3(&cw, 1, ci).iter().map(|&v| v as f64).sum::<f64>())
             .sum();
         let w7: f64 = (0..128)
-            .map(|ci| {
-                conv3(&cw, 7, ci)
-                    .iter()
-                    .map(|&v| v as f64)
-                    .sum::<f64>()
-            })
+            .map(|ci| conv3(&cw, 7, ci).iter().map(|&v| v as f64).sum::<f64>())
             .sum();
         eprintln!("OMNI_REF our_w1_sum={w1} our_w7_sum={w7}");
         let m30 = &mel_c[30..36];
         eprintln!("OMNI_REF mel[0][30..36]={m30:?}");
-        eprintln!(
-            "OMNI_REF our_w[5,0,:3]={:?}",
-            conv3(&cw, 5, 0)
-        );
+        eprintln!("OMNI_REF our_w[5,0,:3]={:?}", conv3(&cw, 5, 0));
         eprintln!("OMNI_REF after_prefill conv1_w[0,0,:3]={:?}", &cw[..3]);
         let af = backend.to_cpu_f32(&audio_features)?;
         let d = model.cfg.thinker.dim;

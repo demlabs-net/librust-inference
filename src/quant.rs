@@ -540,7 +540,11 @@ pub fn quant_q4_k(weights: &[f32]) -> Vec<u8> {
                 max_min = mins[j];
             }
         }
-        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
         let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
         let mut scales_packed = [0u8; 12];
         for j in 0..8 {
@@ -634,7 +638,11 @@ pub fn quant_q5_k(weights: &[f32]) -> Vec<u8> {
                 max_min = mins[j];
             }
         }
-        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
         let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
         let mut scales_packed = [0u8; 12];
         for j in 0..8 {
@@ -1766,8 +1774,7 @@ pub fn quantize_gguf(
         "general.file_type".to_string(),
         GgufValue::U32(file_type_of(fmt) as u32),
     ));
-    let meta_refs: Vec<(&str, &MetaValue)> =
-        meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let meta_refs: Vec<(&str, &MetaValue)> = meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
     // запись: шапка, затем тензоры потоково (по слабам строк)
     let mut out = std::fs::File::create(dst)
@@ -1811,7 +1818,11 @@ pub fn quantize_gguf(
             // Энкодер — по ЦЕЛЕВОМУ типу (не по формату файла: у эмбеддингов
             // и выхода тип выше — Q6_K/Q8_0).
             let enc = QuantFormat::from_ggml_type(target).ok_or_else(|| {
-                BackendError::Shape(format!("{}: тип {} не поддержан движком", t.name, target.name()))
+                BackendError::Shape(format!(
+                    "{}: тип {} не поддержан движком",
+                    t.name,
+                    target.name()
+                ))
             })?;
             let rows_total = t.data.len().checked_div(src_row.max(1)).unwrap_or(0);
             let rows_per_slab = (SLAB_BYTES / src_row.max(1)).max(1);
@@ -2017,14 +2028,8 @@ mod tests {
         ));
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let mut progress = |_d: u64, _t: u64| {};
-        let err = quantize_gguf(
-            &src,
-            &dst,
-            QuantFormat::Q4_0,
-            &mut progress,
-            Some(&cancel),
-        )
-        .expect_err("отмена должна вернуть ошибку");
+        let err = quantize_gguf(&src, &dst, QuantFormat::Q4_0, &mut progress, Some(&cancel))
+            .expect_err("отмена должна вернуть ошибку");
         assert!(
             matches!(err, crate::error::BackendError::Cancelled),
             "ожидали Cancelled, получили {err:?}"
@@ -2138,9 +2143,16 @@ mod tests {
     fn iq4_xs_zero_block() {
         let w = vec![0.0f32; 256];
         let enc = quant_iq4_xs(&w);
-        assert_eq!(&enc[0..2], &[0x00, 0x80], "d = −0.0 (f16 0x8000), как у ggml");
+        assert_eq!(
+            &enc[0..2],
+            &[0x00, 0x80],
+            "d = −0.0 (f16 0x8000), как у ggml"
+        );
         let deq = crate::weights_map::dequant_iq4_xs(&enc);
-        assert!(deq.iter().all(|v| *v == 0.0), "нулевой блок должен деквантоваться в нули");
+        assert!(
+            deq.iter().all(|v| *v == 0.0),
+            "нулевой блок должен деквантоваться в нули"
+        );
     }
 
     /// Layout-вектор: вручную собранный блок читается деквантером именно так
@@ -2153,8 +2165,14 @@ mod tests {
         let mut data = vec![0u8; 136];
         data[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
         data[4] = 0x01; // scales_l[0]: низшая четверка (ib=0) = 1
-        let scales_h: u16 = 0b01 | (0b10 << 2) | (0b10 << 4) | (0b10 << 6) | (0b10 << 8)
-            | (0b10 << 10) | (0b10 << 12) | (0b10 << 14);
+        let scales_h: u16 = 0b01
+            | (0b10 << 2)
+            | (0b10 << 4)
+            | (0b10 << 6)
+            | (0b10 << 8)
+            | (0b10 << 10)
+            | (0b10 << 12)
+            | (0b10 << 14);
         data[2..4].copy_from_slice(&scales_h.to_le_bytes());
         for j in 0..16 {
             data[8 + j] = 8 | (8 << 4); // элементы 0..15 и 16..31 → L=8

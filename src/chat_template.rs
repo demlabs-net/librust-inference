@@ -155,7 +155,11 @@ impl Template {
         env.add_filter("tojson", tojson);
         env.add_template_owned(NAME, resolved.to_string())
             .map_err(|e| TemplateError::Compile(error_chain(&e)))?;
-        Ok(Self { env, source: resolved.to_string(), special_tokens })
+        Ok(Self {
+            env,
+            source: resolved.to_string(),
+            special_tokens,
+        })
     }
 
     pub fn source(&self) -> &str {
@@ -171,16 +175,25 @@ impl Template {
         for (k, v) in &self.special_tokens {
             vars.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
-        vars.insert("messages".into(), serde_json::Value::Array(ctx.messages.clone()));
+        vars.insert(
+            "messages".into(),
+            serde_json::Value::Array(ctx.messages.clone()),
+        );
         if !ctx.tools.is_empty() {
             vars.insert("tools".into(), serde_json::Value::Array(ctx.tools.clone()));
         }
-        vars.insert("enable_thinking".into(), serde_json::Value::Bool(ctx.enable_thinking));
+        vars.insert(
+            "enable_thinking".into(),
+            serde_json::Value::Bool(ctx.enable_thinking),
+        );
         for (k, v) in &ctx.extra {
             vars.insert(k.clone(), v.clone());
         }
         if ctx.add_generation_prompt {
-            vars.insert("add_generation_prompt".into(), serde_json::Value::Bool(true));
+            vars.insert(
+                "add_generation_prompt".into(),
+                serde_json::Value::Bool(true),
+            );
         }
         tpl.render(Value::from_serialize(&vars))
             .map_err(|e| TemplateError::Render(error_chain(&e)))
@@ -213,8 +226,18 @@ fn strftime_now(fmt: String) -> String {
     let (y, mo, d) = civil_from_days(secs.div_euclid(86_400));
     let sod = secs.rem_euclid(86_400);
     const MONTHS: [&str; 12] = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September",
-        "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     let mut out = String::new();
     let mut it = fmt.chars();
@@ -348,8 +371,7 @@ mod tests {
         };
         let out = t.render(&ctx).unwrap();
         assert_eq!(
-            out,
-            "[gMASK]<sop><|system|>\nТы краток.<|user|>\nСтолица Франции?<|assistant|>\n",
+            out, "[gMASK]<sop><|system|>\nТы краток.<|user|>\nСтолица Франции?<|assistant|>\n",
             "{out:?}"
         );
     }
@@ -382,7 +404,12 @@ mod tests {
              {{ ns.n }}|{{ 'a</think>b'.split('</think>')[-1] }}|{{ '\\nx\\n'.strip('\\n') }}|\
              {{ 'abc'.startswith('ab') }}|{% for m in messages %}{{ loop.last }}{% endfor %}",
         );
-        let out = t.render(&TemplateContext::from_pairs(&[("user", "a"), ("assistant", "b")])).unwrap();
+        let out = t
+            .render(&TemplateContext::from_pairs(&[
+                ("user", "a"),
+                ("assistant", "b"),
+            ]))
+            .unwrap();
         // булевы — как в Python/Jinja2 (`True`/`False`)
         assert_eq!(out, "2|b|x|True|FalseTrue");
     }
@@ -391,7 +418,11 @@ mod tests {
     fn raise_exception_is_a_render_error() {
         let t = compile("{{ raise_exception('System message must be at the beginning.') }}");
         let e = t.render(&TemplateContext::default()).unwrap_err();
-        assert!(e.to_string().contains("System message must be at the beginning."), "{e}");
+        assert!(
+            e.to_string()
+                .contains("System message must be at the beginning."),
+            "{e}"
+        );
     }
 
     #[test]

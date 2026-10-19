@@ -217,18 +217,28 @@ impl Glm4Model {
             )?,
             None => t_f32(wm, backend, "token_embd.weight")?,
         };
-        let out_norm = RmsNorm::from_weights(backend, dequant_f32(wm.get("output_norm.weight").ok_or_else(
-            || BackendError::Shape("missing output_norm.weight".into()),
-        )?), cfg.eps)?;
+        let out_norm = RmsNorm::from_weights(
+            backend,
+            dequant_f32(
+                wm.get("output_norm.weight")
+                    .ok_or_else(|| BackendError::Shape("missing output_norm.weight".into()))?,
+            ),
+            cfg.eps,
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut caches = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |s: &str| format!("blk.{i}.{s}");
             let norm = |name: &str| -> Result<RmsNorm, BackendError> {
-                RmsNorm::from_weights(backend, dequant_f32(wm.get(name).ok_or_else(|| {
-                    BackendError::Shape(format!("missing tensor {name}"))
-                })?), cfg.eps)
+                RmsNorm::from_weights(
+                    backend,
+                    dequant_f32(
+                        wm.get(name)
+                            .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?,
+                    ),
+                    cfg.eps,
+                )
             };
             let bias = |name: &str, n: usize| -> Result<Option<Tensor>, BackendError> {
                 match wm.get(name) {
@@ -303,10 +313,8 @@ impl Glm4Model {
                 .get("token_embd.weight")
                 .ok_or_else(|| BackendError::Shape("missing tensor token_embd.weight".into()))?;
             let rows = emb.shape.first().copied().unwrap_or(0) as usize;
-            self.embed_f32 = Some(backend.from_cpu_f32(
-                &dequant_f32(emb),
-                vec![rows, self.cfg.dim],
-            )?);
+            self.embed_f32 =
+                Some(backend.from_cpu_f32(&dequant_f32(emb), vec![rows, self.cfg.dim])?);
         }
         let embed = self.embed_f32.clone().expect("embed_f32 собран выше");
         Ok((embed, self.output.clone()))
@@ -358,8 +366,13 @@ impl Glm4Model {
         writeln!(f, "STEP {step} TENSOR {name} ne=[{},1,1,1]", v.len())
             .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
         for (i, val) in v.iter().enumerate() {
-            write!(f, "{:08x}{}", val.to_bits(), if i % 8 == 7 { "\n" } else { " " })
-                .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
+            write!(
+                f,
+                "{:08x}{}",
+                val.to_bits(),
+                if i % 8 == 7 { "\n" } else { " " }
+            )
+            .map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
         }
         writeln!(f).map_err(|e| BackendError::Native(format!("GLM4_DUMP: {e}")))?;
         Ok(())
@@ -391,7 +404,10 @@ impl Glm4Model {
         let pos = self.caches[0].pos;
         // Дамп чекпоинтов — только первого forward (шаг 0 эталона);
         // GLM4_DUMP_DECODE=1 добавляет шаг декода (STEP 1) — бисект Ф8.1g.
-                DUMP_STEP.store(if pos == 0 { 0 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        DUMP_STEP.store(
+            if pos == 0 { 0 } else { 1 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let dump = Self::dump_path().filter(|_| {
             if std::env::var("GLM4_DUMP_DECODE").is_ok() {
                 pos > 0
@@ -536,8 +552,10 @@ impl Glm4Model {
             let slice_tail = last_tail && t > 1 && i + 1 == self.cfg.n_layers;
             let (o, inp) = if slice_tail {
                 (
-                    o.view(vec![1, t, dim]).view_offset(vec![1, 1, dim], (t - 1) * dim),
-                    inp.view(vec![1, t, dim]).view_offset(vec![1, 1, dim], (t - 1) * dim),
+                    o.view(vec![1, t, dim])
+                        .view_offset(vec![1, 1, dim], (t - 1) * dim),
+                    inp.view(vec![1, t, dim])
+                        .view_offset(vec![1, 1, dim], (t - 1) * dim),
                 )
             } else {
                 (o, inp)
@@ -749,8 +767,11 @@ impl CausalLm for Glm4Model {
             }
         }
         let logits = outcome_logits.ok_or_else(|| {
-            BackendError::Shape("glm4 spec: все черновики приняты (ре-сэмпл не нужен) — \
-                                кэш уже содержит принятые токены".into())
+            BackendError::Shape(
+                "glm4 spec: все черновики приняты (ре-сэмпл не нужен) — \
+                                кэш уже содержит принятые токены"
+                    .into(),
+            )
         })?;
         Ok(crate::qwen3::SpecOutcome {
             accepted: tokens,
@@ -772,7 +793,11 @@ impl CausalLm for Glm4Model {
 
 impl Glm4Model {
     /// Логиты только последней строки ([1, 1, V]).
-    fn slice_last_row(&self, backend: &dyn Backend, logits: &Tensor) -> Result<Tensor, BackendError> {
+    fn slice_last_row(
+        &self,
+        backend: &dyn Backend,
+        logits: &Tensor,
+    ) -> Result<Tensor, BackendError> {
         let t = logits.shape()[1];
         let v = logits.shape()[2];
         let view = logits.view_restricted(vec![t * v]);

@@ -74,10 +74,7 @@ pub fn split_cols(
 
 /// Собрать части выходных фич (all-gather колоночного шарда) в один
 /// [rows, cols] — конкатенация по последней оси.
-pub fn gather_cols(
-    backend: &dyn Backend,
-    parts: &[Tensor],
-) -> Result<Tensor, BackendError> {
+pub fn gather_cols(backend: &dyn Backend, parts: &[Tensor]) -> Result<Tensor, BackendError> {
     let Some(first) = parts.first() else {
         return Err(BackendError::Shape("gather_cols: пустой список".into()));
     };

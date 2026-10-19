@@ -44,7 +44,11 @@ impl ReasoningParser {
     /// генерационный префикс на `<think>`).
     pub fn new(start_open: bool) -> Self {
         Self {
-            state: if start_open { State::Reasoning } else { State::Start },
+            state: if start_open {
+                State::Reasoning
+            } else {
+                State::Start
+            },
             pending: String::new(),
             trim_lead: true,
         }
@@ -119,7 +123,11 @@ impl ReasoningParser {
                         self.trim_lead = true;
                         continue;
                     }
-                    let keep = if finish { 0 } else { hold_back(&self.pending, CLOSE) };
+                    let keep = if finish {
+                        0
+                    } else {
+                        hold_back(&self.pending, CLOSE)
+                    };
                     let n = self.pending.len() - keep;
                     if n > 0 {
                         let chunk: String = self.pending.drain(..n).collect();
@@ -188,8 +196,12 @@ mod tests {
         let (r, c) = split("Думаю...\n</think>\n\nОтвет", true);
         assert_eq!(r.as_deref(), Some("Думаю...\n"));
         assert_eq!(c, "Ответ");
-        assert!(ReasoningParser::prompt_opens_reasoning("<|im_start|>assistant\n<think>\n"));
-        assert!(!ReasoningParser::prompt_opens_reasoning("<|im_start|>assistant\n"));
+        assert!(ReasoningParser::prompt_opens_reasoning(
+            "<|im_start|>assistant\n<think>\n"
+        ));
+        assert!(!ReasoningParser::prompt_opens_reasoning(
+            "<|im_start|>assistant\n"
+        ));
     }
 
     #[test]
@@ -234,7 +246,11 @@ mod tests {
                 }
             }
             let (wr, wc) = split(text, open);
-            assert_eq!((r.as_str(), c.as_str()), (wr.as_deref().unwrap_or(""), wc.as_str()), "{text:?}");
+            assert_eq!(
+                (r.as_str(), c.as_str()),
+                (wr.as_deref().unwrap_or(""), wc.as_str()),
+                "{text:?}"
+            );
         }
     }
 }

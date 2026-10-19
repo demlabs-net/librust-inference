@@ -21,13 +21,18 @@ use rust_inference::weights_map::WeightsMap;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).ok_or("usage: llm_bench <model.gguf> [pp] [tg] [reps]")?;
+    let path = args
+        .get(1)
+        .ok_or("usage: llm_bench <model.gguf> [pp] [tg] [reps]")?;
     let pp: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(128);
     let tg: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(64);
     let reps: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(3);
     // ctx — длина контекста ПЕРЕД замером tg (как llama-bench -p N -n M:
     // декод с длинным KV). 0 — без контекста.
-    let ctx: usize = std::env::var("LLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ctx: usize = std::env::var("LLM_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -37,9 +42,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let be = MetalBackend::new()?;
     let arch = gf.architecture().unwrap_or("qwen3").to_string();
     let mut model: Box<dyn CausalLm> = if Qwen35Config::is_hybrid_arch(&arch) {
-        Box::new(Qwen35Model::load(&be, &wm, Qwen35Config::from_gguf(&gf, tok.vocab_size())?)?)
+        Box::new(Qwen35Model::load(
+            &be,
+            &wm,
+            Qwen35Config::from_gguf(&gf, tok.vocab_size())?,
+        )?)
     } else {
-        Box::new(Qwen3Model::load(&be, &wm, Qwen3Config::from_gguf(&gf, tok.vocab_size())?)?)
+        Box::new(Qwen3Model::load(
+            &be,
+            &wm,
+            Qwen3Config::from_gguf(&gf, tok.vocab_size())?,
+        )?)
     };
     let vocab = model.vocab_size() as u32;
     // Детерминированные «случайные» токены (как llama-bench: не текст).

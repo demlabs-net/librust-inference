@@ -43,8 +43,14 @@ pub struct RopeYarn {
 
 impl RopeYarn {
     /// Тождественные параметры: кернелы идут старым путём.
-    pub const IDENTITY: RopeYarn =
-        RopeYarn { freq_scale: 1.0, ext_factor: 0.0, attn_factor: 1.0, corr_lo: 0.0, corr_hi: 0.0, theta_scale: 0.0 };
+    pub const IDENTITY: RopeYarn = RopeYarn {
+        freq_scale: 1.0,
+        ext_factor: 0.0,
+        attn_factor: 1.0,
+        corr_lo: 0.0,
+        corr_hi: 0.0,
+        theta_scale: 0.0,
+    };
 
     pub fn is_identity(&self) -> bool {
         self.ext_factor == 0.0 && self.freq_scale == 1.0 && self.attn_factor == 1.0
@@ -94,14 +100,35 @@ impl RopeYarn {
         let n_ctx_orig = get_u32(&key("original_context_length")).unwrap_or(n_ctx_train);
         let beta_fast = get_f32(&key("yarn_beta_fast")).unwrap_or(32.0);
         let beta_slow = get_f32(&key("yarn_beta_slow")).unwrap_or(1.0);
-        let (corr_lo, corr_hi) = Self::corr_dims(n_dims as f32, n_ctx_orig as f32, freq_base, beta_fast, beta_slow);
+        let (corr_lo, corr_hi) = Self::corr_dims(
+            n_dims as f32,
+            n_ctx_orig as f32,
+            freq_base,
+            beta_fast,
+            beta_slow,
+        );
         let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
-        Some(RopeYarn { freq_scale, ext_factor, attn_factor, corr_lo, corr_hi, theta_scale })
+        Some(RopeYarn {
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            corr_lo,
+            corr_hi,
+            theta_scale,
+        })
     }
 
     /// ggml_rope_yarn_corr_dims: [max(0,floor(c(beta_fast))), min(n−1,ceil(c(beta_slow)))].
-    fn corr_dims(n_dims: f32, n_ctx_orig: f32, base: f32, beta_fast: f32, beta_slow: f32) -> (f32, f32) {
-        let c = |n_rot: f32| n_dims * (n_ctx_orig / (n_rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+    fn corr_dims(
+        n_dims: f32,
+        n_ctx_orig: f32,
+        base: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> (f32, f32) {
+        let c = |n_rot: f32| {
+            n_dims * (n_ctx_orig / (n_rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln())
+        };
         let start = c(beta_fast).floor();
         let end = c(beta_slow).ceil();
         (0.0f32.max(start), (n_dims - 1.0).min(end))
@@ -138,12 +165,25 @@ mod tests {
     /// base=1e6, n_dims=128, attn_factor по умолчанию (1.0).
     fn abliterated() -> RopeYarn {
         let get_f32: &dyn Fn(&str) -> Option<f32> = &|k| {
-            if k.ends_with("rope.scaling.factor") { Some(4.0) } else { None }
+            if k.ends_with("rope.scaling.factor") {
+                Some(4.0)
+            } else {
+                None
+            }
         };
-        let get_str: &dyn Fn(&str) -> Option<String> =
-            &|k| if k.ends_with("rope.scaling.type") { Some("yarn".into()) } else { None };
+        let get_str: &dyn Fn(&str) -> Option<String> = &|k| {
+            if k.ends_with("rope.scaling.type") {
+                Some("yarn".into())
+            } else {
+                None
+            }
+        };
         let get_u32: &dyn Fn(&str) -> Option<u32> = &|k| {
-            if k.ends_with("original_context_length") { Some(32768) } else { None }
+            if k.ends_with("original_context_length") {
+                Some(32768)
+            } else {
+                None
+            }
         };
         RopeYarn::from_meta(get_f32, get_str, get_u32, "qwen3", 1e6, 128, 131072).unwrap()
     }
@@ -176,15 +216,27 @@ mod tests {
         let get_f32: &dyn Fn(&str) -> Option<f32> = &|_| None;
         let get_str: &dyn Fn(&str) -> Option<String> = &|_| None;
         let get_u32: &dyn Fn(&str) -> Option<u32> = &|_| None;
-        assert!(RopeYarn::from_meta(get_f32, get_str, get_u32, "qwen3", 1e6, 128, 131072).is_none());
+        assert!(
+            RopeYarn::from_meta(get_f32, get_str, get_u32, "qwen3", 1e6, 128, 131072).is_none()
+        );
     }
 
     #[test]
     fn linear_scaling_has_no_ramp() {
-        let get_f32: &dyn Fn(&str) -> Option<f32> =
-            &|k| if k.ends_with("rope.scaling.factor") { Some(2.0) } else { None };
-        let get_str: &dyn Fn(&str) -> Option<String> =
-            &|k| if k.ends_with("rope.scaling.type") { Some("linear".into()) } else { None };
+        let get_f32: &dyn Fn(&str) -> Option<f32> = &|k| {
+            if k.ends_with("rope.scaling.factor") {
+                Some(2.0)
+            } else {
+                None
+            }
+        };
+        let get_str: &dyn Fn(&str) -> Option<String> = &|k| {
+            if k.ends_with("rope.scaling.type") {
+                Some("linear".into())
+            } else {
+                None
+            }
+        };
         let get_u32: &dyn Fn(&str) -> Option<u32> = &|_| None;
         let y = RopeYarn::from_meta(get_f32, get_str, get_u32, "qwen3", 1e6, 128, 131072).unwrap();
         assert_eq!(y.freq_scale, 0.5);

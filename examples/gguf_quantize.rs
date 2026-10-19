@@ -14,8 +14,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let (src, dst) = (args[1].clone(), args[2].clone());
-    let fmt = QuantFormat::parse(&args[3])
-        .ok_or_else(|| format!("неизвестный формат {} (F32/F16/BF16/Q4_0/Q8_0/Q4_K_M/Q6_K)", args[3]))?;
+    let fmt = QuantFormat::parse(&args[3]).ok_or_else(|| {
+        format!(
+            "неизвестный формат {} (F32/F16/BF16/Q4_0/Q8_0/Q4_K_M/Q6_K)",
+            args[3]
+        )
+    })?;
 
     let t0 = std::time::Instant::now();
     let mut last_line = std::time::Instant::now();

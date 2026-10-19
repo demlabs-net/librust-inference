@@ -351,7 +351,8 @@ impl Qwen35Model {
         let mut states = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = |x: &str| format!("blk.{i}.{x}");
-            let attn_norm = RmsNorm::from_weights(backend, f32v(&p("attn_norm.weight"))?, cfg.norm_eps)?;
+            let attn_norm =
+                RmsNorm::from_weights(backend, f32v(&p("attn_norm.weight"))?, cfg.norm_eps)?;
             let post_norm = RmsNorm::from_weights(
                 backend,
                 f32v(&p("post_attention_norm.weight"))?,
@@ -421,9 +422,24 @@ impl Qwen35Model {
                 let q_out = 2 * cfg.n_heads * hd;
                 let kv_out = cfg.n_kv_heads * hd;
                 Mixer::Attn(FullAttn {
-                    wq: Qwen3Model::upload_q(backend, w, &p("attn_q.weight"), vec![q_out, cfg.dim])?,
-                    wk: Qwen3Model::upload_q(backend, w, &p("attn_k.weight"), vec![kv_out, cfg.dim])?,
-                    wv: Qwen3Model::upload_q(backend, w, &p("attn_v.weight"), vec![kv_out, cfg.dim])?,
+                    wq: Qwen3Model::upload_q(
+                        backend,
+                        w,
+                        &p("attn_q.weight"),
+                        vec![q_out, cfg.dim],
+                    )?,
+                    wk: Qwen3Model::upload_q(
+                        backend,
+                        w,
+                        &p("attn_k.weight"),
+                        vec![kv_out, cfg.dim],
+                    )?,
+                    wv: Qwen3Model::upload_q(
+                        backend,
+                        w,
+                        &p("attn_v.weight"),
+                        vec![kv_out, cfg.dim],
+                    )?,
                     wo: Qwen3Model::upload_q(
                         backend,
                         w,
@@ -520,9 +536,10 @@ impl Qwen35Model {
                 .get("token_embd.weight")
                 .ok_or_else(|| BackendError::Shape("missing tensor token_embd.weight".into()))?;
             let rows = emb.shape.first().copied().unwrap_or(0) as usize;
-            self.embed_f32 = Some(
-                backend.from_cpu_f32(&crate::weights_map::dequant_f32(emb), vec![rows, self.cfg.dim])?,
-            );
+            self.embed_f32 = Some(backend.from_cpu_f32(
+                &crate::weights_map::dequant_f32(emb),
+                vec![rows, self.cfg.dim],
+            )?);
         }
         let embed = self.embed_f32.clone().expect("embed_f32 собран выше");
         Ok((embed, self.output.clone()))
@@ -545,7 +562,6 @@ impl Qwen35Model {
     pub fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
         Ok(self.prefill_extract(backend, ids, &[])?.0)
     }
-
 
     /// Prefill + выходы слоёв `layers` (по возрастанию; без out_norm) —
     /// фичи таргета для DFlash-драфтера (его target_layers — индексы слоёв
@@ -632,8 +648,9 @@ impl Qwen35Model {
             backend.end_batch()?;
             done = end;
         }
-        let logits = logits
-            .ok_or_else(|| BackendError::Shape("prefill_extract_last: логиты не посчитаны".into()))?;
+        let logits = logits.ok_or_else(|| {
+            BackendError::Shape("prefill_extract_last: логиты не посчитаны".into())
+        })?;
         Ok((logits, extract))
     }
 
@@ -649,7 +666,11 @@ impl Qwen35Model {
     /// читает лишь их; lm_head (V=248K строк!) идёт по одной строке вместо T.
     /// Длинный промпт режется на блоки: маска внимания плотная [Tq, Tkv],
     /// при 14k токенов это 0.8 ГБ на маску, при 32k — 4 ГБ.
-    pub fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+    pub fn prefill_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
         if ids.is_empty() {
             return Err(BackendError::Shape("qwen35 prefill: пустой промпт".into()));
         }
@@ -687,7 +708,12 @@ impl Qwen35Model {
     }
 
     /// Логиты lm_head из нормированных скрытых (общий путь с forward).
-    fn head_rows(&self, backend: &dyn Backend, h: &Tensor, t: usize) -> Result<Tensor, BackendError> {
+    fn head_rows(
+        &self,
+        backend: &dyn Backend,
+        h: &Tensor,
+        t: usize,
+    ) -> Result<Tensor, BackendError> {
         let d = self.cfg.dim;
         let logits = backend.zeros(vec![t, self.cfg.vocab_size])?;
         backend.gemm_nt(&h.view(vec![t, d]), &self.output, &logits)?;
@@ -699,7 +725,10 @@ impl Qwen35Model {
     /// Копии стейтов всех GDN-слоёв — ОДНИМ command buffer'ом: копирование
     /// по слою с синхронизацией каждой (≈48 коммитов на окно спека) стоило
     /// 10 мс — треть верификации на Qwen3.5-4B.
-    fn snapshot_states(&self, backend: &dyn Backend) -> Result<Vec<Option<(Tensor, Tensor)>>, BackendError> {
+    fn snapshot_states(
+        &self,
+        backend: &dyn Backend,
+    ) -> Result<Vec<Option<(Tensor, Tensor)>>, BackendError> {
         let copy = |t: &Tensor| -> Result<Tensor, BackendError> {
             let y = backend.zeros(t.shape().to_vec())?;
             backend.scale(t, &y, 1.0)?;
@@ -762,31 +791,32 @@ impl Qwen35Model {
         // КАЖДЫЙ кернел (~9 × 48 ≈ 430 коммитов — десятки мс; ревью Ф8.2g).
         backend.begin_batch()?;
         let r = (|| {
-        for i in 0..self.layers.len() {
-            let Some((qkv, gate, b)) = cap[i].as_ref() else {
-                continue;
-            };
-            let Mixer::Gdn(g) = &self.layers[i].mixer else {
-                continue;
-            };
-            let st = self.states[i]
-                .as_mut()
-                .ok_or_else(|| BackendError::Shape(format!("restore: слой {i}: нет стейта")))?;
-            // Превышение захвата — ошибка: тихий зажим восстановил бы
-            // стейт на более коротком префиксе (ревью Ф8.2g).
-            if accepted_len > qkv.shape()[1] {
-                return Err(BackendError::Shape(format!(
-                    "restore_spec_states: accepted_len {accepted_len} > строк захвата {}",
-                    qkv.shape()[1]
-                )));
+            for i in 0..self.layers.len() {
+                let Some((qkv, gate, b)) = cap[i].as_ref() else {
+                    continue;
+                };
+                let Mixer::Gdn(g) = &self.layers[i].mixer else {
+                    continue;
+                };
+                let st = self.states[i]
+                    .as_mut()
+                    .ok_or_else(|| BackendError::Shape(format!("restore: слой {i}: нет стейта")))?;
+                // Превышение захвата — ошибка: тихий зажим восстановил бы
+                // стейт на более коротком префиксе (ревью Ф8.2g).
+                if accepted_len > qkv.shape()[1] {
+                    return Err(BackendError::Shape(format!(
+                        "restore_spec_states: accepted_len {accepted_len} > строк захвата {}",
+                        qkv.shape()[1]
+                    )));
+                }
+                let a = accepted_len;
+                let qkv_a = qkv.view_offset(vec![1, a, qkv.shape()[2]], 0);
+                let gate_a = gate.view_offset(vec![1, a, gate.shape()[2]], 0);
+                let b_a = b.view_offset(vec![1, a, b.shape()[2]], 0);
+                let _ =
+                    Self::gdn_state_update(&self.cfg, backend, &qkv_a, &gate_a, &b_a, g, st, None)?;
             }
-            let a = accepted_len;
-            let qkv_a = qkv.view_offset(vec![1, a, qkv.shape()[2]], 0);
-            let gate_a = gate.view_offset(vec![1, a, gate.shape()[2]], 0);
-            let b_a = b.view_offset(vec![1, a, b.shape()[2]], 0);
-            let _ = Self::gdn_state_update(&self.cfg, backend, &qkv_a, &gate_a, &b_a, g, st, None)?;
-        }
-        Ok(())
+            Ok(())
         })();
         backend.end_batch()?;
         r
@@ -850,9 +880,8 @@ impl Qwen35Model {
         // Жадная проверка без штрафа за повторы — argmax строк на GPU
         // (строка [1+γ, V] на хост не едет), как у Qwen3.
         // INFER_SPEC_CPU=1 — прежний путь через хост (сверка/замеры).
-        let gpu_greedy = greedy
-            && sp.repetition_penalty == 1.0
-            && std::env::var("INFER_SPEC_CPU").is_err();
+        let gpu_greedy =
+            greedy && sp.repetition_penalty == 1.0 && std::env::var("INFER_SPEC_CPU").is_err();
         let mut ld = Vec::new();
         let (accepted, accepted_len, n_verified) = if gpu_greedy {
             let (am, _lse) = backend.argmax_rows(&logits, None)?;
@@ -952,7 +981,13 @@ impl Qwen35Model {
         backend.embedding_quant(ids, &self.embed, &x)?;
         // Одна маска на forward (все полные слои видят одни и те же позиции).
         let mask = if t > 1 {
-            Some(crate::nn::build_causal_mask(backend, t, self.pos + t, self.pos, None)?)
+            Some(crate::nn::build_causal_mask(
+                backend,
+                t,
+                self.pos + t,
+                self.pos,
+                None,
+            )?)
         } else {
             None
         };
@@ -982,10 +1017,7 @@ impl Qwen35Model {
                     let st = self.states[i]
                         .as_mut()
                         .ok_or_else(|| BackendError::Shape(format!("слой {i}: нет стейта")))?;
-                    let cap = self
-                        .spec_capture
-                        .as_mut()
-                        .map(|c| &mut c[i]);
+                    let cap = self.spec_capture.as_mut().map(|c| &mut c[i]);
                     Self::gdn_forward(&self.cfg, backend, &h, g, st, cap)?
                 }
             };
@@ -1014,7 +1046,11 @@ impl Qwen35Model {
                 let rms = (last.iter().map(|a| a * a).sum::<f32>() / d as f32).sqrt();
                 eprintln!(
                     "QWEN35 layer {i:>2} ({}) out[-1] rms={rms:.4} [:4]={:?}",
-                    if self.cfg.recurrent[i] { "gdn " } else { "attn" },
+                    if self.cfg.recurrent[i] {
+                        "gdn "
+                    } else {
+                        "attn"
+                    },
                     &last[..4]
                 );
             }
@@ -1035,7 +1071,10 @@ impl Qwen35Model {
             None
         };
         let (x, t) = if self.last_only && t > 1 {
-            (x.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d), 1)
+            (
+                x.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d),
+                1,
+            )
         } else {
             (x, t)
         };
@@ -1099,8 +1138,10 @@ impl Qwen35Model {
         backend.rmsnorm_head(&q, &a.q_norm, &qn, nh, cfg.norm_eps)?;
         let kn = backend.zeros(vec![1, t, kv_size])?;
         backend.rmsnorm_head(&k, &a.k_norm, &kn, nkv, cfg.norm_eps)?;
-        let qr = backend.rope_imrope_text(&qn, pos, hd, cfg.rope_theta, cfg.rope_sections, cfg.n_rot)?;
-        let kr = backend.rope_imrope_text(&kn, pos, hd, cfg.rope_theta, cfg.rope_sections, cfg.n_rot)?;
+        let qr =
+            backend.rope_imrope_text(&qn, pos, hd, cfg.rope_theta, cfg.rope_sections, cfg.n_rot)?;
+        let kr =
+            backend.rope_imrope_text(&kn, pos, hd, cfg.rope_theta, cfg.rope_sections, cfg.n_rot)?;
         cache.update(backend, &kr, &v)?;
         let out = backend.zeros(vec![1, t, nh * hd])?;
         backend.attn_ar(&qr, &cache.view(), &cache.view_v(), mask, &out, nh, nkv, hd)?;
@@ -1137,8 +1178,9 @@ impl Qwen35Model {
             }
             Ok(())
         };
-        let (mut t_in, mut t_sl, mut t_gt, mut t_cv, mut t_nr, mut t_dr, mut t_og, mut t_out) =
-            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut t_in, mut t_sl, mut t_gt, mut t_cv, mut t_nr, mut t_dr, mut t_og, mut t_out) = (
+            0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64,
+        );
         let mut t0 = std::time::Instant::now();
         // Четыре проекции каждая в своём кванте (см. [`Gdn`]); строки выхода
         // в том же порядке, что был у склеенного proj.
@@ -1219,7 +1261,8 @@ impl Qwen35Model {
             t0 = std::time::Instant::now();
             r
         };
-        let normed = backend.gdn_norm_gated(&o.view(vec![1, t, inner]), &z, &g.norm, cfg.norm_eps)?;
+        let normed =
+            backend.gdn_norm_gated(&o.view(vec![1, t, inner]), &z, &g.norm, cfg.norm_eps)?;
         gs(t0, &mut t_og)?;
         t0 = std::time::Instant::now();
         let y = Linear {
@@ -1229,13 +1272,17 @@ impl Qwen35Model {
         .forward(backend, &normed)?;
         gs(t0, &mut t_out)?;
         if gp {
-            static GDN_ACC: std::sync::Mutex<(u32, [f64; 8])> = std::sync::Mutex::new((0, [0.0; 8]));
+            static GDN_ACC: std::sync::Mutex<(u32, [f64; 8])> =
+                std::sync::Mutex::new((0, [0.0; 8]));
             let every: u32 = std::env::var("QWEN35_GDN_N")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(48);
             let mut g = GDN_ACC.lock().unwrap();
-            for (i, x) in [t_in, t_sl, t_gt, t_cv, t_nr, t_dr, t_og, t_out].iter().enumerate() {
+            for (i, x) in [t_in, t_sl, t_gt, t_cv, t_nr, t_dr, t_og, t_out]
+                .iter()
+                .enumerate()
+            {
                 g.1[i] += x;
             }
             g.0 += 1;
@@ -1396,7 +1443,11 @@ mod tests {
 
         let yf = be.to_cpu_f32(&y_f).unwrap();
         assert_bits_eq(&yf[..qk_size], &be.to_cpu_f32(&qn).unwrap(), "qn");
-        assert_bits_eq(&yf[qk_size..2 * qk_size], &be.to_cpu_f32(&kn).unwrap(), "kn");
+        assert_bits_eq(
+            &yf[qk_size..2 * qk_size],
+            &be.to_cpu_f32(&kn).unwrap(),
+            "kn",
+        );
         assert_bits_eq(
             &yf[2 * qk_size..],
             &be.to_cpu_f32(&v).unwrap(),
@@ -1422,7 +1473,13 @@ mod tests {
         let stt = be.from_cpu_f32(&st, vec![c, k - 1]).unwrap();
         let (y, ns) = be.gdn_conv(&xt, &wt, &stt).unwrap();
         // эталон: прямое вычисление по определению ggml_ssm_conv
-        let at = |ch: usize, p: usize| if p < k - 1 { st[ch * (k - 1) + p] } else { x[(p - (k - 1)) * c + ch] };
+        let at = |ch: usize, p: usize| {
+            if p < k - 1 {
+                st[ch * (k - 1) + p]
+            } else {
+                x[(p - (k - 1)) * c + ch]
+            }
+        };
         let mut ry = vec![0.0f32; t * c];
         for tt in 0..t {
             for ch in 0..c {
@@ -1596,8 +1653,9 @@ mod tests {
                     let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
                     let sum: f32 = e.iter().sum();
                     for d in 0..hd {
-                        ro[(t * nh + h) * hd + d] =
-                            (0..lim).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                        ro[(t * nh + h) * hd + d] = (0..lim)
+                            .map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d])
+                            .sum();
                     }
                 }
             }
@@ -1659,8 +1717,9 @@ mod tests {
                     let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
                     let sum: f32 = e.iter().sum();
                     for d in 0..hd {
-                        ro[(t * nh + h) * hd + d] =
-                            (0..lim).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                        ro[(t * nh + h) * hd + d] = (0..lim)
+                            .map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d])
+                            .sum();
                     }
                 }
             }
@@ -1687,15 +1746,28 @@ mod tests {
                 } else {
                     crate::metal::with_attn_path(path, || run(&k32, &v32))
                 };
-                assert!(got.iter().all(|x| x.is_finite()), "{path} tq={tq} past={past}: NaN в выходе");
+                assert!(
+                    got.iter().all(|x| x.is_finite()),
+                    "{path} tq={tq} past={past}: NaN в выходе"
+                );
                 let tol = if path == "mma" { 1e-4 } else { 3e-3 };
-                close(&got, &ro, tol, &format!("{path} f32 tq={tq} past={past} hd={hd}"));
+                close(
+                    &got,
+                    &ro,
+                    tol,
+                    &format!("{path} f32 tq={tq} past={past} hd={hd}"),
+                );
             }
-            let h16 = |x: &[f32]| -> Vec<half::f16> { x.iter().map(|&a| half::f16::from_f32(a)).collect() };
+            let h16 = |x: &[f32]| -> Vec<half::f16> {
+                x.iter().map(|&a| half::f16::from_f32(a)).collect()
+            };
             let k16 = be.from_cpu_f16(&h16(&k), vec![1, cap, nkv * hd]).unwrap();
             let v16 = be.from_cpu_f16(&h16(&v), vec![1, cap, nkv * hd]).unwrap();
             let got = run(&k16, &v16);
-            assert!(got.iter().all(|x| x.is_finite()), "f16 tq={tq} past={past}: NaN в выходе");
+            assert!(
+                got.iter().all(|x| x.is_finite()),
+                "f16 tq={tq} past={past}: NaN в выходе"
+            );
             close(&got, &ro, 3e-3, &format!("f16 tq={tq} past={past} hd={hd}"));
         }
     }
@@ -1783,8 +1855,9 @@ mod tests {
                     let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
                     let sum: f32 = e.iter().sum();
                     for d in 0..hd {
-                        ro[(t * nh + h) * hd + d] =
-                            (0..lim).map(|j| e[j] / sum * v[(j * nkv + khd) * hd + d]).sum();
+                        ro[(t * nh + h) * hd + d] = (0..lim)
+                            .map(|j| e[j] / sum * v[(j * nkv + khd) * hd + d])
+                            .sum();
                     }
                 }
             }
@@ -1823,9 +1896,16 @@ mod tests {
                 be.from_cpu_f16(&vec![half::f16::from_f32(0.0); n], vec![1, cap, kvh * hd])
                     .unwrap()
             };
-            let (k1, v1, k2, v2) = (z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd), z16(&be, cap * kvh * hd));
+            let (k1, v1, k2, v2) = (
+                z16(&be, cap * kvh * hd),
+                z16(&be, cap * kvh * hd),
+                z16(&be, cap * kvh * hd),
+                z16(&be, cap * kvh * hd),
+            );
             let q1 = be
-                .qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6, None)
+                .qkv_norm_rope_kv(
+                    &qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6, None,
+                )
                 .unwrap();
             // Q — f32 (в llama.cpp запрос не округляется; f16-окружение
             // запроса давало расхождение текста на десятках токенов).
@@ -1844,13 +1924,34 @@ mod tests {
                 .rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6, None)
                 .unwrap();
             be.kv_update(&k2, &kr, pos).unwrap();
-            be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
+            be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos)
+                .unwrap();
             let q1f: Vec<f32> = be.to_cpu_f32(&q1).unwrap();
             close(&q1f, &be.to_cpu_f32(&q2).unwrap(), 1e-3, "fused f32 q");
-            let k1f: Vec<f32> = be.to_cpu_f16(&k1).unwrap().iter().map(|&x| f32::from(x)).collect();
-            let k2f: Vec<f32> = be.to_cpu_f16(&k2).unwrap().iter().map(|&x| f32::from(x)).collect();
-            let v1f: Vec<f32> = be.to_cpu_f16(&v1).unwrap().iter().map(|&x| f32::from(x)).collect();
-            let v2f: Vec<f32> = be.to_cpu_f16(&v2).unwrap().iter().map(|&x| f32::from(x)).collect();
+            let k1f: Vec<f32> = be
+                .to_cpu_f16(&k1)
+                .unwrap()
+                .iter()
+                .map(|&x| f32::from(x))
+                .collect();
+            let k2f: Vec<f32> = be
+                .to_cpu_f16(&k2)
+                .unwrap()
+                .iter()
+                .map(|&x| f32::from(x))
+                .collect();
+            let v1f: Vec<f32> = be
+                .to_cpu_f16(&v1)
+                .unwrap()
+                .iter()
+                .map(|&x| f32::from(x))
+                .collect();
+            let v2f: Vec<f32> = be
+                .to_cpu_f16(&v2)
+                .unwrap()
+                .iter()
+                .map(|&x| f32::from(x))
+                .collect();
             close(&k1f, &k2f, 1e-6, "fused f16 k в кэше");
             close(&v1f, &v2f, 1e-6, "fused f16 v в кэше");
         }
@@ -1861,15 +1962,27 @@ mod tests {
     #[test]
     fn fused_qkv_norm_rope_kv_matches_composite() {
         let be = MetalBackend::new().unwrap();
-        for &(t, h, kvh, hd, pos) in &[(1usize, 16usize, 8usize, 128usize, 37usize), (5, 4, 2, 64, 0)] {
+        for &(t, h, kvh, hd, pos) in &[
+            (1usize, 16usize, 8usize, 128usize, 37usize),
+            (5, 4, 2, 64, 0),
+        ] {
             let mut r = rng((t * 7 + hd) as u64);
-            let qkv = be.from_cpu_f32(&rand(t * (h + 2 * kvh) * hd, &mut r), vec![1, t, (h + 2 * kvh) * hd]).unwrap();
+            let qkv = be
+                .from_cpu_f32(
+                    &rand(t * (h + 2 * kvh) * hd, &mut r),
+                    vec![1, t, (h + 2 * kvh) * hd],
+                )
+                .unwrap();
             let qn = be.from_cpu_f32(&rand(hd, &mut r), vec![hd]).unwrap();
             let kn = be.from_cpu_f32(&rand(hd, &mut r), vec![hd]).unwrap();
             let cap = pos + t + 3;
             let mk = || be.zeros(vec![1, cap, kvh * hd]).unwrap();
             let (k1, v1, k2, v2) = (mk(), mk(), mk(), mk());
-            let q1 = be.qkv_norm_rope_kv(&qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6, None).unwrap();
+            let q1 = be
+                .qkv_norm_rope_kv(
+                    &qkv, &qn, &kn, &k1, &v1, h, kvh, hd, pos, pos, 1e6, 1e-6, None,
+                )
+                .unwrap();
             // составной путь из тех же примитивов (как default трейта)
             let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
             let part = |w: usize, off: usize| {
@@ -1877,13 +1990,33 @@ mod tests {
                 be.slice_last(&rows, &y, off).unwrap();
                 y.view(vec![1, t, w])
             };
-            let q2 = be.rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6, None).unwrap();
-            let kr = be.rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6, None).unwrap();
+            let q2 = be
+                .rmsnorm_head_rope(&part(h * hd, 0), &qn, pos, hd, 1e6, h, 1e-6, None)
+                .unwrap();
+            let kr = be
+                .rmsnorm_head_rope(&part(kvh * hd, h * hd), &kn, pos, hd, 1e6, kvh, 1e-6, None)
+                .unwrap();
             be.kv_update(&k2, &kr, pos).unwrap();
-            be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos).unwrap();
-            close(&be.to_cpu_f32(&q1).unwrap(), &be.to_cpu_f32(&q2).unwrap(), 1e-6, "fused q");
-            close(&be.to_cpu_f32(&k1).unwrap(), &be.to_cpu_f32(&k2).unwrap(), 1e-6, "fused k в кэше");
-            close(&be.to_cpu_f32(&v1).unwrap(), &be.to_cpu_f32(&v2).unwrap(), 1e-6, "fused v в кэше");
+            be.kv_update(&v2, &part(kvh * hd, (h + kvh) * hd), pos)
+                .unwrap();
+            close(
+                &be.to_cpu_f32(&q1).unwrap(),
+                &be.to_cpu_f32(&q2).unwrap(),
+                1e-6,
+                "fused q",
+            );
+            close(
+                &be.to_cpu_f32(&k1).unwrap(),
+                &be.to_cpu_f32(&k2).unwrap(),
+                1e-6,
+                "fused k в кэше",
+            );
+            close(
+                &be.to_cpu_f32(&v1).unwrap(),
+                &be.to_cpu_f32(&v2).unwrap(),
+                1e-6,
+                "fused v в кэше",
+            );
         }
     }
 
@@ -1929,10 +2062,17 @@ mod tests {
                 let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
                 let sum: f32 = e.iter().sum();
                 for d in 0..hd {
-                    ro[h * hd + d] = (0..tkv).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                    ro[h * hd + d] = (0..tkv)
+                        .map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d])
+                        .sum();
                 }
             }
-            close(&be.to_cpu_f32(&out).unwrap(), &ro, 1e-4, &format!("decode attn tkv={tkv} hd={hd}"));
+            close(
+                &be.to_cpu_f32(&out).unwrap(),
+                &ro,
+                1e-4,
+                &format!("decode attn tkv={tkv} hd={hd}"),
+            );
         }
     }
 
@@ -1970,7 +2110,11 @@ mod tests {
                 exp[j % hd] += 1.0 / (t + 1) as f32;
             }
             let row = &got[t * hd..(t + 1) * hd];
-            let worst = row.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let worst = row
+                .iter()
+                .zip(&exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             assert!(worst < 1e-5, "строка {t}: получили {row:?}, ждали {exp:?}");
         }
     }
@@ -2012,8 +2156,9 @@ mod tests {
                 let e: Vec<f32> = sc.iter().map(|s| (s - mx).exp()).collect();
                 let sum: f32 = e.iter().sum();
                 for d in 0..hd {
-                    ro[(t * nh + h) * hd + d] =
-                        (0..tkv).map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d]).sum();
+                    ro[(t * nh + h) * hd + d] = (0..tkv)
+                        .map(|j| e[j] / sum * v[(j * nkv + kh) * hd + d])
+                        .sum();
                 }
             }
         }

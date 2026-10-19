@@ -148,13 +148,24 @@ impl GpuDtype {
             GpuDtype::Q4_0 | GpuDtype::Q8_0 | GpuDtype::Iq4Nl | GpuDtype::Mxfp4 => Some(32),
             GpuDtype::Nvfp4 => Some(64),
             GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 => Some(32),
-            GpuDtype::Q8_K | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 | GpuDtype::Iq2Xxs
-            | GpuDtype::Iq3Xxs | GpuDtype::Iq2Xs | GpuDtype::Iq2S
-            | GpuDtype::Iq3S | GpuDtype::Iq1S | GpuDtype::Iq1M => Some(256),
+            GpuDtype::Q8_K
+            | GpuDtype::TQ1_0
+            | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs
+            | GpuDtype::Iq3Xxs
+            | GpuDtype::Iq2Xs
+            | GpuDtype::Iq2S
+            | GpuDtype::Iq3S
+            | GpuDtype::Iq1S
+            | GpuDtype::Iq1M => Some(256),
             GpuDtype::Q1_0 => Some(128),
             GpuDtype::Q2_0 => Some(64),
-            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Iq4Xs
-            | GpuDtype::Q2_K | GpuDtype::Q3_K => Some(256),
+            GpuDtype::Q4_K
+            | GpuDtype::Q6_K
+            | GpuDtype::Q5_K
+            | GpuDtype::Iq4Xs
+            | GpuDtype::Q2_K
+            | GpuDtype::Q3_K => Some(256),
             GpuDtype::Q5_0 => Some(32),
             _ => None,
         }
@@ -217,7 +228,10 @@ pub struct BufferPoolState {
 fn cb_chunk() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        match std::env::var("INFER_METAL_CB_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        match std::env::var("INFER_METAL_CB_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             Some(0) => usize::MAX,
             Some(n) => n,
             // Замер (M3 Max, pp128/tg64): 8–32 — плато, 0 (без порций) —
@@ -289,7 +303,8 @@ impl BufferPoolState {
                 .get_mut(&class)
                 .and_then(|v| v.pop())
         {
-            self.free_bytes.set(self.free_bytes.get().saturating_sub(class));
+            self.free_bytes
+                .set(self.free_bytes.get().saturating_sub(class));
             return buf;
         }
         // newBuffer* — семейство `new` (Cocoa ownership): объект приходит
@@ -458,13 +473,31 @@ impl GpuTensor {
             GpuDtype::F32 => 4,
             GpuDtype::F16 | GpuDtype::BF16 => 2,
             GpuDtype::Q8_0 | GpuDtype::Q4_0 => 1,
-            GpuDtype::Q4_K | GpuDtype::Q6_K | GpuDtype::Q5_K | GpuDtype::Q5_0
-            | GpuDtype::Iq4Xs | GpuDtype::Iq4Nl | GpuDtype::Mxfp4
-            | GpuDtype::Nvfp4 | GpuDtype::Q2_K | GpuDtype::Q3_K
-            | GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 | GpuDtype::Q8_K
-            | GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0
-            | GpuDtype::Iq2Xxs | GpuDtype::Iq3Xxs | GpuDtype::Iq2Xs | GpuDtype::Iq2S
-            | GpuDtype::Iq3S | GpuDtype::Iq1S | GpuDtype::Iq1M => 1,
+            GpuDtype::Q4_K
+            | GpuDtype::Q6_K
+            | GpuDtype::Q5_K
+            | GpuDtype::Q5_0
+            | GpuDtype::Iq4Xs
+            | GpuDtype::Iq4Nl
+            | GpuDtype::Mxfp4
+            | GpuDtype::Nvfp4
+            | GpuDtype::Q2_K
+            | GpuDtype::Q3_K
+            | GpuDtype::Q4_1
+            | GpuDtype::Q5_1
+            | GpuDtype::Q8_1
+            | GpuDtype::Q8_K
+            | GpuDtype::Q1_0
+            | GpuDtype::Q2_0
+            | GpuDtype::TQ1_0
+            | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs
+            | GpuDtype::Iq3Xxs
+            | GpuDtype::Iq2Xs
+            | GpuDtype::Iq2S
+            | GpuDtype::Iq3S
+            | GpuDtype::Iq1S
+            | GpuDtype::Iq1M => 1,
         }
     }
 
@@ -722,9 +755,7 @@ impl GpuTensor {
     /// the stored keys back re-rotates them through this.
     pub fn to_cpu_f16(&self, ctx: &MetalCtx) -> Result<Vec<half::f16>, MetalError> {
         if self.dtype != GpuDtype::F16 {
-            return Err(MetalError::Shape(
-                "to_cpu_f16 on a non-f16 tensor".into(),
-            ));
+            return Err(MetalError::Shape("to_cpu_f16 on a non-f16 tensor".into()));
         }
         ctx.flush_batch()?;
         let barrier = ctx.queue.new_command_buffer();
@@ -986,9 +1017,12 @@ impl MetalCtx {
         }
         let t = std::time::Instant::now();
         let r = self.run_inner(kernel, grid, group, setup);
-        self.ops_host_ns
-            .fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.ops_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ops_host_ns.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.ops_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         r
     }
 
@@ -1009,7 +1043,8 @@ impl MetalCtx {
     /// Переопределить порог малого-m батчевых путей на этом инстансе
     /// (тесты; 0 — вернуть env-поведение). См. поле `quant_mm_min`.
     pub fn set_quant_mm_min(&self, v: usize) {
-        self.quant_mm_min.store(v, std::sync::atomic::Ordering::Relaxed);
+        self.quant_mm_min
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Порог малого-m: инстанс-переопределение, иначе INFER_QUANT_MM_MIN,
@@ -1391,7 +1426,12 @@ impl MetalCtx {
         })
     }
 
-    pub fn swiglu_f32(&self, x: &GpuTensor, u: &GpuTensor, y: &GpuTensor) -> Result<(), MetalError> {
+    pub fn swiglu_f32(
+        &self,
+        x: &GpuTensor,
+        u: &GpuTensor,
+        y: &GpuTensor,
+    ) -> Result<(), MetalError> {
         let n = x.numel();
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(256, 1, 1);
@@ -1889,14 +1929,12 @@ impl MetalCtx {
                     self.mv_q4_0_mb(a, b, c)?;
                     return Ok(());
                 }
-                if m > 8
-                    && k.is_multiple_of(32)
-                    && std::env::var("INFER_Q4_0_NO_MM").is_err()
-                {
+                if m > 8 && k.is_multiple_of(32) && std::env::var("INFER_Q4_0_NO_MM").is_err() {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     // Тайл 32 (M) × 64 (N), threadgroup 128 потоков —
                     // схема kernel_mul_mm (как у Q8_0/Q6_K).
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run("gemm_nt_q4_0_mm", grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -1932,9 +1970,11 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q4K_NO_MM").is_err() {
+                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q4K_NO_MM").is_err()
+                {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run("gemm_nt_q4_k_mm", grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -1959,9 +1999,11 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q6K_NO_MM").is_err() {
+                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q6K_NO_MM").is_err()
+                {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run("gemm_nt_q6_k_mm", grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -1985,9 +2027,11 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q5K_NO_MM").is_err() {
+                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q5K_NO_MM").is_err()
+                {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run("gemm_nt_q5_k_mm", grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2016,7 +2060,8 @@ impl MetalCtx {
                     && std::env::var("INFER_Q50_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run("gemm_nt_q5_0_mm", grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2047,9 +2092,17 @@ impl MetalCtx {
             // весов с кодбуком/E8M0). Блок 32 элемента, K%32.
             // Q1_0 / Q2_0 / TQ1_0 / TQ2_0: окна m 2..8 — точечный mb,
             // m>8 — mm-тайл (блоки 128/64/256 кратны 32).
-            GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0
-            | GpuDtype::Iq2Xxs | GpuDtype::Iq3Xxs | GpuDtype::Iq2Xs | GpuDtype::Iq2S
-            | GpuDtype::Iq3S | GpuDtype::Iq1S | GpuDtype::Iq1M => {
+            GpuDtype::Q1_0
+            | GpuDtype::Q2_0
+            | GpuDtype::TQ1_0
+            | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs
+            | GpuDtype::Iq3Xxs
+            | GpuDtype::Iq2Xs
+            | GpuDtype::Iq2S
+            | GpuDtype::Iq3S
+            | GpuDtype::Iq1S
+            | GpuDtype::Iq1M => {
                 let mb_off = match b.dtype {
                     GpuDtype::Q1_0 => std::env::var("INFER_Q1_0_NO_MB").is_ok(),
                     GpuDtype::Q2_0 => std::env::var("INFER_Q2_0_NO_MB").is_ok(),
@@ -2091,7 +2144,8 @@ impl MetalCtx {
                         _ => "gemm_nt_iq1_m_mm",
                     };
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run(name, grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2136,7 +2190,8 @@ impl MetalCtx {
                         _ => "gemm_nt_q8_k_mm",
                     };
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run(name, grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2175,7 +2230,8 @@ impl MetalCtx {
                         "gemm_nt_q3_k_mm"
                     };
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run(name, grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2224,7 +2280,8 @@ impl MetalCtx {
                         _ => "gemm_nt_nvfp4_mm",
                     };
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run(name, grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2257,7 +2314,8 @@ impl MetalCtx {
                     && std::env::var("INFER_IQ4XS_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
-                    let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
+                    let grid =
+                        MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
                     let group = MTLSize::new(128, 1, 1);
                     return self.run("gemm_nt_iq4_xs_mm", grid, group, |enc| {
                         enc.set_buffer(0, Some(&a.buffer), a.offset as u64);
@@ -2438,15 +2496,49 @@ impl MetalCtx {
                 "mv_ext_q8_0_x8_r5",
                 "mv_ext_q8_0_x16_r2",
             ),
-            GpuDtype::Q4_K => ("", "mv_ext_q4_k_x8_r3", "mv_ext_q4_k_x8_r4", "mv_ext_q4_k_x8_r5", ""),
-            GpuDtype::Q5_K => ("", "mv_ext_q5_k_x8_r3", "mv_ext_q5_k_x8_r4", "mv_ext_q5_k_x8_r5", ""),
-            GpuDtype::Q6_K => ("", "mv_ext_q6_k_x8_r3", "mv_ext_q6_k_x8_r4", "mv_ext_q6_k_x8_r5", ""),
-            GpuDtype::BF16 | GpuDtype::Iq4Xs | GpuDtype::Iq4Nl | GpuDtype::Mxfp4
-            | GpuDtype::Nvfp4 | GpuDtype::Q2_K | GpuDtype::Q3_K
-            | GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 | GpuDtype::Q8_K
-            | GpuDtype::Q1_0 | GpuDtype::Q2_0 | GpuDtype::TQ1_0 | GpuDtype::TQ2_0
-            | GpuDtype::Iq2Xxs | GpuDtype::Iq3Xxs | GpuDtype::Iq2Xs | GpuDtype::Iq2S
-            | GpuDtype::Iq3S | GpuDtype::Iq1S | GpuDtype::Iq1M => return None,
+            GpuDtype::Q4_K => (
+                "",
+                "mv_ext_q4_k_x8_r3",
+                "mv_ext_q4_k_x8_r4",
+                "mv_ext_q4_k_x8_r5",
+                "",
+            ),
+            GpuDtype::Q5_K => (
+                "",
+                "mv_ext_q5_k_x8_r3",
+                "mv_ext_q5_k_x8_r4",
+                "mv_ext_q5_k_x8_r5",
+                "",
+            ),
+            GpuDtype::Q6_K => (
+                "",
+                "mv_ext_q6_k_x8_r3",
+                "mv_ext_q6_k_x8_r4",
+                "mv_ext_q6_k_x8_r5",
+                "",
+            ),
+            GpuDtype::BF16
+            | GpuDtype::Iq4Xs
+            | GpuDtype::Iq4Nl
+            | GpuDtype::Mxfp4
+            | GpuDtype::Nvfp4
+            | GpuDtype::Q2_K
+            | GpuDtype::Q3_K
+            | GpuDtype::Q4_1
+            | GpuDtype::Q5_1
+            | GpuDtype::Q8_1
+            | GpuDtype::Q8_K
+            | GpuDtype::Q1_0
+            | GpuDtype::Q2_0
+            | GpuDtype::TQ1_0
+            | GpuDtype::TQ2_0
+            | GpuDtype::Iq2Xxs
+            | GpuDtype::Iq3Xxs
+            | GpuDtype::Iq2Xs
+            | GpuDtype::Iq2S
+            | GpuDtype::Iq3S
+            | GpuDtype::Iq1S
+            | GpuDtype::Iq1M => return None,
         };
         let lo = if matches!(dtype, GpuDtype::Q4_K | GpuDtype::Q5_K | GpuDtype::Q6_K) {
             4
@@ -2456,7 +2548,11 @@ impl MetalCtx {
         if m < lo {
             return None;
         }
-        let nxpsg = if k.is_multiple_of(256) && m < 3 { 16 } else { 8 };
+        let nxpsg = if k.is_multiple_of(256) && m < 3 {
+            16
+        } else {
+            8
+        };
         let r1ptg = match m {
             2 => 2,
             3 | 6 => 3,
@@ -2482,12 +2578,7 @@ impl MetalCtx {
     /// см. ext-секцию mul_mv.metal). Ok(true) — кернел запущен; Ok(false) —
     /// случай вне ext-окна/раскладки, вызывающий идёт своим путём (как
     /// эталон вне ext).
-    pub fn mv_ext(
-        &self,
-        a: &GpuTensor,
-        b: &GpuTensor,
-        c: &GpuTensor,
-    ) -> Result<bool, MetalError> {
+    pub fn mv_ext(&self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> Result<bool, MetalError> {
         let m = a.shape[0];
         let k = a.shape[1];
         let n = b.shape[0];
@@ -2512,7 +2603,13 @@ impl MetalCtx {
         };
         let nb11: u64 = (k * 4) as u64;
         if std::env::var("INFER_EXT_DBG").is_ok() {
-            eprintln!("mv_ext {name}: m={m} n={n} k={k} nb01={nb01} nb11={nb11} a.off={} b.off={} ntg=({},{})", a.offset, b.offset, n.div_ceil(32 / nxpsg * 2), m.div_ceil(r1ptg));
+            eprintln!(
+                "mv_ext {name}: m={m} n={n} k={k} nb01={nb01} nb11={nb11} a.off={} b.off={} ntg=({},{})",
+                a.offset,
+                b.offset,
+                n.div_ceil(32 / nxpsg * 2),
+                m.div_ceil(r1ptg)
+            );
         }
         let (ne00, ne01, ne11, ne0) = (k as i32, n as i32, m as i32, n as i32);
         // Диспатч эталона: threadgroups (ceil(ne01/r0ptg), ceil(ne11/r1ptg), 1),
@@ -3581,10 +3678,7 @@ impl MetalCtx {
         // Побитовый порт оркального launch (ggml_metal_op_norm): ne00_t = d/4
         // (float4) либо d; nth = 32, удваивать пока nth < ne00_t и < 1024,
         // затем min(1024), min(ceil(ne00_t/32)*32).
-        let vec = d % 4 == 0
-            && x.offset % 16 == 0
-            && w.offset % 16 == 0
-            && y.offset % 16 == 0;
+        let vec = d % 4 == 0 && x.offset % 16 == 0 && w.offset % 16 == 0 && y.offset % 16 == 0;
         let nt = if vec { d / 4 } else { d };
         let mut nth = 32usize;
         while nth < nt && nth < 1024 {
@@ -3603,12 +3697,13 @@ impl MetalCtx {
             grid,
             group,
             |enc| {
-            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
-            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
-            enc.set_bytes(3, 4, (&d32 as *const u32).cast());
-            enc.set_bytes(4, 4, (&eps as *const f32).cast());
-        })
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+                enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(3, 4, (&d32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&eps as *const f32).cast());
+            },
+        )
     }
 
     /// LayerNorm over the last dim: X (rows, D), W/B (D), Y (rows, D).
@@ -3726,15 +3821,20 @@ impl MetalCtx {
             None => Some(logits.clone()),
         };
         let factors = factors.unwrap_or_else(|| fallback.as_ref().unwrap());
-        self.run("argmax_lse_rows_f32", grid, MTLSize::new(group, 1, 1), |enc| {
-            enc.set_buffer(0, Some(&logits.buffer), logits.offset as u64);
-            enc.set_buffer(1, Some(&factors.buffer), factors.offset as u64);
-            enc.set_buffer(2, Some(&ids.buffer), ids.offset as u64);
-            enc.set_buffer(3, Some(&lse.buffer), lse.offset as u64);
-            enc.set_bytes(4, 4, (&t32 as *const u32).cast());
-            enc.set_bytes(5, 4, (&v32 as *const u32).cast());
-            enc.set_bytes(6, 4, (&has as *const u32).cast());
-        })?;
+        self.run(
+            "argmax_lse_rows_f32",
+            grid,
+            MTLSize::new(group, 1, 1),
+            |enc| {
+                enc.set_buffer(0, Some(&logits.buffer), logits.offset as u64);
+                enc.set_buffer(1, Some(&factors.buffer), factors.offset as u64);
+                enc.set_buffer(2, Some(&ids.buffer), ids.offset as u64);
+                enc.set_buffer(3, Some(&lse.buffer), lse.offset as u64);
+                enc.set_bytes(4, 4, (&t32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&v32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&has as *const u32).cast());
+            },
+        )?;
         let idv = ids.to_cpu_f32(self)?;
         let lsev = lse.to_cpu_f32(self)?;
         Ok((idv.into_iter().map(|x| x as u32).collect(), lsev))
@@ -4470,11 +4570,7 @@ impl MetalCtx {
             let kv = k.to_cpu_f16(self)?;
             if tq > 1 && tkv > 1 {
                 eprintln!("  q r0: {:?} r1: {:?}", &qv[0..4], &qv[qd..qd + 4]);
-                eprintln!(
-                    "  k r0: {:?} r1: {:?}",
-                    &kv[0..4],
-                    &kv[kd..kd + 4]
-                );
+                eprintln!("  k r0: {:?} r1: {:?}", &kv[0..4], &kv[kd..kd + 4]);
             }
             if let Ok(path) = std::env::var("INFER_FA_VEC_DUMP_DEC") {
                 // дамп входов ШАГА ДЕКОДА (tq==1), первый вызов
@@ -4483,10 +4579,16 @@ impl MetalCtx {
                     let mut f = std::fs::File::create(&path).unwrap();
                     let n = tq * n_heads * hd;
                     let kn = tkv * kv_heads * hd;
-                    for x in &qv[..n] { f.write_all(&x.to_le_bytes()).unwrap(); }
+                    for x in &qv[..n] {
+                        f.write_all(&x.to_le_bytes()).unwrap();
+                    }
                     let kvv = v.to_cpu_f16(self)?;
-                    for x in &kv[..kn] { f.write_all(&x.to_f32().to_le_bytes()).unwrap(); }
-                    for x in &kvv[..kn] { f.write_all(&x.to_f32().to_le_bytes()).unwrap(); }
+                    for x in &kv[..kn] {
+                        f.write_all(&x.to_f32().to_le_bytes()).unwrap();
+                    }
+                    for x in &kvv[..kn] {
+                        f.write_all(&x.to_f32().to_le_bytes()).unwrap();
+                    }
                     eprintln!("  fa_vec DEC dumped tkv={tkv}");
                 }
             }
@@ -4517,9 +4619,8 @@ impl MetalCtx {
         // pad-буфер хвостового чанка (K, V, маска) — при ne11 % 32 != 0
         let has_kvpad = tkv % 32 != 0;
         let pad = if has_kvpad {
-            let bytes = nb11 * 32 * kv_heads as u64
-                + nb11 * 32 * kv_heads as u64
-                + 32 * tq as u64 * 2;
+            let bytes =
+                nb11 * 32 * kv_heads as u64 + nb11 * 32 * kv_heads as u64 + 32 * tq as u64 * 2;
             Some(GpuTensor::zeros(
                 &self.device,
                 vec![bytes.div_ceil(4) as usize],
@@ -4553,10 +4654,18 @@ impl MetalCtx {
                 MTLSize::new(32 * 32, kv_heads as u64, 1),
                 MTLSize::new(32, 1, 1),
                 |enc| {
-                    enc.set_bytes(0, std::mem::size_of::<FaPadArgs>() as u64, (&a as *const FaPadArgs).cast());
+                    enc.set_bytes(
+                        0,
+                        std::mem::size_of::<FaPadArgs>() as u64,
+                        (&a as *const FaPadArgs).cast(),
+                    );
                     enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
                     enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
-                    enc.set_buffer(3, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                    enc.set_buffer(
+                        3,
+                        Some(&mask16.as_ref().unwrap_or(dummy).buffer),
+                        mask16.as_ref().unwrap_or(dummy).offset as u64,
+                    );
                     enc.set_buffer(4, Some(&p.buffer), p.offset as u64);
                 },
             )?;
@@ -4602,7 +4711,13 @@ impl MetalCtx {
         // nsg = 1 при ne11 < 2048, 2 при < 4096, иначе 4; grid.x = ⌈ne01/Q⌉
         // threadgroup'ов по 32*nsg потоков.
         let (q_q, q_ne) = Self::fa_vec_pick(hd, hd, tkv, tq);
-        let nsg = if tkv < 2048 { 1 } else if tkv < 4096 { 2 } else { 4 };
+        let nsg = if tkv < 2048 {
+            1
+        } else if tkv < 4096 {
+            2
+        } else {
+            4
+        };
         let base = match (hd, q_q, q_ne, nsg) {
             (128, 1, 1, 1) => "fa_vec_dk128",
             (128, 1, 1, 2) => "fa_vec_dk128_q1ne1_nsg2",
@@ -4625,7 +4740,7 @@ impl MetalCtx {
             _ => {
                 return Err(MetalError::Shape(format!(
                     "fa_vec: нет инстанциации Q={q_q} NE={q_ne} nsg={nsg} hd={hd}"
-                )))
+                )));
             }
         };
         let name = Self::static_kernel_name(format!(
@@ -4636,30 +4751,60 @@ impl MetalCtx {
         ));
         let smem = (((hd.max(128) + 4 * 32 + 2 * hd.max(128)) * nsg * q_q * 2) + 15) / 16 * 16;
         if std::env::var("INFER_FA_VEC_ARGS").is_ok() {
-            eprintln!("fa_vec ARGS name={name} smem={smem} grid=({},{},{}) q.off={} k.off={} v.off={} \
+            eprintln!(
+                "fa_vec ARGS name={name} smem={smem} grid=({},{},{}) q.off={} k.off={} v.off={} \
                 nb01={} nb02={} nb11={} nb12={} ns10={} nb31={} ne31={} scale={:08x}",
-                ((tq + q_q - 1) / q_q * 32 * nsg), n_heads, 32, q.offset, k.offset, v.offset,
-                a.nb01, a.nb02, a.nb11, a.nb12, a.ns10, a.nb31, a.ne31, a.scale.to_bits());
+                ((tq + q_q - 1) / q_q * 32 * nsg),
+                n_heads,
+                32,
+                q.offset,
+                k.offset,
+                v.offset,
+                a.nb01,
+                a.nb02,
+                a.nb11,
+                a.nb12,
+                a.ns10,
+                a.nb31,
+                a.ne31,
+                a.scale.to_bits()
+            );
         }
         self.run(
             name,
             MTLSize::new(((tq + q_q - 1) / q_q * 32 * nsg) as u64, n_heads as u64, 32),
             MTLSize::new((32 * nsg) as u64, 1, 1),
             |enc| {
-                enc.set_bytes(0, std::mem::size_of::<FaVecArgs>() as u64, (&a as *const FaVecArgs).cast());
+                enc.set_bytes(
+                    0,
+                    std::mem::size_of::<FaVecArgs>() as u64,
+                    (&a as *const FaVecArgs).cast(),
+                );
                 enc.set_buffer(1, Some(&q.buffer), q.offset as u64);
                 enc.set_buffer(2, Some(&k.buffer), k.offset as u64);
                 enc.set_buffer(3, Some(&v.buffer), v.offset as u64);
-                enc.set_buffer(4, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(
+                    4,
+                    Some(&mask16.as_ref().unwrap_or(dummy).buffer),
+                    mask16.as_ref().unwrap_or(dummy).offset as u64,
+                );
                 enc.set_buffer(5, Some(&q.buffer), q.offset as u64);
-                enc.set_buffer(6, Some(&pad.as_ref().unwrap_or(dummy).buffer), pad.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(
+                    6,
+                    Some(&pad.as_ref().unwrap_or(dummy).buffer),
+                    pad.as_ref().unwrap_or(dummy).offset as u64,
+                );
                 enc.set_buffer(7, Some(&tmp.buffer), tmp.offset as u64);
                 enc.set_threadgroup_memory_length(0, smem as u64);
             },
         )?;
 
         let nrows_i = nrows as i32;
-        let rname = if hd == 128 { "fa_vec_reduce_dv128" } else { "fa_vec_reduce_dv64" };
+        let rname = if hd == 128 {
+            "fa_vec_reduce_dv128"
+        } else {
+            "fa_vec_reduce_dv64"
+        };
         self.run(
             rname,
             MTLSize::new((nrows * 1024) as u64, 1, 1),
@@ -4757,7 +4902,10 @@ impl MetalCtx {
         let nb12 = (hd * 2) as u64;
         let nb31 = (tkv * 2) as u64;
         if std::env::var("INFER_FA_TILE_DEBUG").is_ok() {
-            eprintln!("fa_tile ENTER tq={tq} tkv={tkv} nh={n_heads} nkv={kv_heads} hd={hd} mask={}", mask.is_some());
+            eprintln!(
+                "fa_tile ENTER tq={tq} tkv={tkv} nh={n_heads} nkv={kv_heads} hd={hd} mask={}",
+                mask.is_some()
+            );
         }
         if let Ok(path) = std::env::var("INFER_FA_TILE_DUMP") {
             if !std::path::Path::new(&path).exists() {
@@ -4806,7 +4954,10 @@ impl MetalCtx {
         let has_kvpad = tkv % 64 != 0;
         let pad = if has_kvpad {
             let bytes = nb11 * 64 * kv_heads as u64 * 2 + 64 * tq as u64 * 2;
-            Some(GpuTensor::zeros(&self.device, vec![bytes.div_ceil(4) as usize])?)
+            Some(GpuTensor::zeros(
+                &self.device,
+                vec![bytes.div_ceil(4) as usize],
+            )?)
         } else {
             None
         };
@@ -4835,10 +4986,18 @@ impl MetalCtx {
                 MTLSize::new(64 * 32, kv_heads as u64, 1),
                 MTLSize::new(32, 1, 1),
                 |enc| {
-                    enc.set_bytes(0, std::mem::size_of::<FaPadArgs>() as u64, (&a as *const FaPadArgs).cast());
+                    enc.set_bytes(
+                        0,
+                        std::mem::size_of::<FaPadArgs>() as u64,
+                        (&a as *const FaPadArgs).cast(),
+                    );
                     enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
                     enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
-                    enc.set_buffer(3, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                    enc.set_buffer(
+                        3,
+                        Some(&mask16.as_ref().unwrap_or(dummy).buffer),
+                        mask16.as_ref().unwrap_or(dummy).offset as u64,
+                    );
                     enc.set_buffer(4, Some(&p.buffer), p.offset as u64);
                 },
             )?;
@@ -4863,8 +5022,16 @@ impl MetalCtx {
             MTLSize::new((nblk0 * 32) as u64, nblk1 as u64, 1),
             MTLSize::new(32, 1, 1),
             |enc| {
-                enc.set_bytes(0, std::mem::size_of::<FaBlkArgs>() as u64, (&ba as *const FaBlkArgs).cast());
-                enc.set_buffer(1, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_bytes(
+                    0,
+                    std::mem::size_of::<FaBlkArgs>() as u64,
+                    (&ba as *const FaBlkArgs).cast(),
+                );
+                enc.set_buffer(
+                    1,
+                    Some(&mask16.as_ref().unwrap_or(dummy).buffer),
+                    mask16.as_ref().unwrap_or(dummy).offset as u64,
+                );
                 enc.set_buffer(2, Some(&blk.buffer), blk.offset as u64);
             },
         )?;
@@ -4917,13 +5084,25 @@ impl MetalCtx {
             MTLSize::new((nblk1 * 128) as u64, n_heads as u64, 1),
             MTLSize::new(128, 1, 1),
             |enc| {
-                enc.set_bytes(0, std::mem::size_of::<FaTileArgs>() as u64, (&a as *const FaTileArgs).cast());
+                enc.set_bytes(
+                    0,
+                    std::mem::size_of::<FaTileArgs>() as u64,
+                    (&a as *const FaTileArgs).cast(),
+                );
                 enc.set_buffer(1, Some(&q.buffer), q.offset as u64);
                 enc.set_buffer(2, Some(&k.buffer), k.offset as u64);
                 enc.set_buffer(3, Some(&v.buffer), v.offset as u64);
-                enc.set_buffer(4, Some(&mask16.as_ref().unwrap_or(dummy).buffer), mask16.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(
+                    4,
+                    Some(&mask16.as_ref().unwrap_or(dummy).buffer),
+                    mask16.as_ref().unwrap_or(dummy).offset as u64,
+                );
                 enc.set_buffer(5, Some(&q.buffer), q.offset as u64);
-                enc.set_buffer(6, Some(&pad.as_ref().unwrap_or(dummy).buffer), pad.as_ref().unwrap_or(dummy).offset as u64);
+                enc.set_buffer(
+                    6,
+                    Some(&pad.as_ref().unwrap_or(dummy).buffer),
+                    pad.as_ref().unwrap_or(dummy).offset as u64,
+                );
                 enc.set_buffer(7, Some(&blk.buffer), blk.offset as u64);
                 enc.set_buffer(8, Some(&y.buffer), y.offset as u64);
                 enc.set_threadgroup_memory_length(0, smem as u64);
@@ -4997,8 +5176,13 @@ impl MetalCtx {
         // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел).
         // HD до 256 (Qwen3.5): фрагментов головы вдвое больше (nf = HD/8).
         if b == 1 && tq >= 16 && tkv >= 8 && hd.is_multiple_of(8) && hd <= 256 {
-            let (tq32, tkv32, h32, kvh32, hd32) =
-                (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            let (tq32, tkv32, h32, kvh32, hd32) = (
+                tq as u32,
+                tkv as u32,
+                n_heads as u32,
+                kv_heads as u32,
+                hd as u32,
+            );
             // S float 2×8×32 + P half 2×8×32 + диаг float 2×64 + 1/l 2×8
             // + Q half 16×HD (стейджинг с построчной защитой хвоста).
             let bytes: u64 =
@@ -5084,8 +5268,13 @@ impl MetalCtx {
             && hd <= 256
             && std::env::var("INFER_ATTN_MB_OFF").is_err()
         {
-            let (tkv32, h32, kvh32, hd32, tq32) =
-                (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32, tq as u32);
+            let (tkv32, h32, kvh32, hd32, tq32) = (
+                tkv as u32,
+                n_heads as u32,
+                kv_heads as u32,
+                hd as u32,
+                tq as u32,
+            );
             let has_mask = mask.is_some() as u32;
             let nsg = split_attn_groups(tkv, hd);
             let nsg32 = nsg as u32;
@@ -5250,11 +5439,19 @@ impl MetalCtx {
             && !attn_opt("legacy")
             && attn_opt("tiles")
         {
-            let (tq32, tkv32, h32, kvh32, hd32) =
-                (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            let (tq32, tkv32, h32, kvh32, hd32) = (
+                tq as u32,
+                tkv as u32,
+                n_heads as u32,
+                kv_heads as u32,
+                hd as u32,
+            );
             // Q half 32×HD + K/V half 16×HD + S float 4×8×16 + P half 4×8×16
             // + диагонали 1 КБ + 1/l ≈ 16.1 КБ при hd=128 — две группы на ядро.
-            let bytes = (32 * hd * 2 + 2 * 16 * hd * 2 + 4 * 8 * 16 * 4 + 4 * 8 * 16 * 2
+            let bytes = (32 * hd * 2
+                + 2 * 16 * hd * 2
+                + 4 * 8 * 16 * 4
+                + 4 * 8 * 16 * 2
                 + 4 * 64 * 4
                 + 32 * 4) as u64;
             let grid = MTLSize::new((tq.div_ceil(32) * 128) as u64, n_heads as u64, 1);
@@ -5288,8 +5485,13 @@ impl MetalCtx {
             && n_heads.is_multiple_of(kv_heads)
             && !attn_opt("legacy")
         {
-            let (tq32, tkv32, h32, kvh32, hd32) =
-                (tq as u32, tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            let (tq32, tkv32, h32, kvh32, hd32) = (
+                tq as u32,
+                tkv as u32,
+                n_heads as u32,
+                kv_heads as u32,
+                hd as u32,
+            );
             // [16][HD] Q (он же выход) + [16][32] S + [16][8] диаг + [16] 1/l
             let floats = 16 * hd + 16 * 32 + 16 * 8 + 16;
             let bytes = (floats * 4).div_ceil(16) * 16;
@@ -5323,7 +5525,8 @@ impl MetalCtx {
             && n_heads.is_multiple_of(kv_heads)
             && !attn_opt("legacy")
         {
-            let (tkv32, h32, kvh32, hd32) = (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
+            let (tkv32, h32, kvh32, hd32) =
+                (tkv as u32, n_heads as u32, kv_heads as u32, hd as u32);
             // Разбиение ключей: на длинном контексте 8 групп оставляли всего
             // 32 threadgroup'а — каждый лейн тянул цепочку из сотен ключей
             // последовательно (декод на 4k контекста падал до 1.3 ток/с).
@@ -5558,24 +5761,19 @@ impl MetalCtx {
                 MTLSize::new(s as u64, 1, 1),
             )
         };
-        self.run(
-            kernel,
-            grid,
-            group,
-            |enc| {
-                enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
-                enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
-                enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
-                enc.set_buffer(3, Some(&g.buffer), g.offset as u64);
-                enc.set_buffer(4, Some(&b.buffer), b.offset as u64);
-                enc.set_buffer(5, Some(&state.buffer), state.offset as u64);
-                enc.set_buffer(6, Some(&out.buffer), out.offset as u64);
-                enc.set_bytes(7, 4, (&t32 as *const u32).cast());
-                enc.set_bytes(8, 4, (&hk32 as *const u32).cast());
-                enc.set_bytes(9, 4, (&hv32 as *const u32).cast());
-                enc.set_bytes(10, 4, (&s32 as *const u32).cast());
-            },
-        )
+        self.run(kernel, grid, group, |enc| {
+            enc.set_buffer(0, Some(&q.buffer), q.offset as u64);
+            enc.set_buffer(1, Some(&k.buffer), k.offset as u64);
+            enc.set_buffer(2, Some(&v.buffer), v.offset as u64);
+            enc.set_buffer(3, Some(&g.buffer), g.offset as u64);
+            enc.set_buffer(4, Some(&b.buffer), b.offset as u64);
+            enc.set_buffer(5, Some(&state.buffer), state.offset as u64);
+            enc.set_buffer(6, Some(&out.buffer), out.offset as u64);
+            enc.set_bytes(7, 4, (&t32 as *const u32).cast());
+            enc.set_bytes(8, 4, (&hk32 as *const u32).cast());
+            enc.set_bytes(9, 4, (&hv32 as *const u32).cast());
+            enc.set_bytes(10, 4, (&s32 as *const u32).cast());
+        })
     }
 
     /// Гейтовая RMS-норма GDN: y = rmsnorm(x)·w · silu(z). x/z/y [rows, hd].
@@ -5776,13 +5974,14 @@ impl MetalCtx {
             grid,
             group,
             |enc| {
-            enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
-            enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
-            enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
-            enc.set_bytes(3, 4, (&nh as *const u32).cast());
-            enc.set_bytes(4, 4, (&hd32 as *const u32).cast());
-            enc.set_bytes(5, 4, (&eps as *const f32).cast());
-        })
+                enc.set_buffer(0, Some(&x.buffer), x.offset as u64);
+                enc.set_buffer(1, Some(&w.buffer), w.offset as u64);
+                enc.set_buffer(2, Some(&y.buffer), y.offset as u64);
+                enc.set_bytes(3, 4, (&nh as *const u32).cast());
+                enc.set_bytes(4, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&eps as *const f32).cast());
+            },
+        )
     }
 
     /// Per-row scalar multiply: X (rows, D), W (rows) → Y.
@@ -5971,17 +6170,18 @@ impl crate::backend::Backend for MetalBackend {
             grid,
             group,
             |enc| {
-            enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
-            enc.set_buffer(1, Some(&wg.buffer), wg.offset as u64);
-            enc.set_buffer(2, Some(&yg.buffer), yg.offset as u64);
-            enc.set_bytes(3, 4, (&h32 as *const u32).cast());
-            enc.set_bytes(4, 4, (&nh32 as *const u32).cast());
-            enc.set_bytes(5, 4, (&hd32 as *const u32).cast());
-            enc.set_bytes(6, 4, (&eps as *const f32).cast());
-            enc.set_bytes(7, 4, (&pos32 as *const u32).cast());
-            enc.set_bytes(8, 4, (&theta as *const f32).cast());
-            enc.set_bytes(9, 24, (&yarn as *const crate::rope::RopeYarn).cast());
-        })?;
+                enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+                enc.set_buffer(1, Some(&wg.buffer), wg.offset as u64);
+                enc.set_buffer(2, Some(&yg.buffer), yg.offset as u64);
+                enc.set_bytes(3, 4, (&h32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&nh32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&hd32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&eps as *const f32).cast());
+                enc.set_bytes(7, 4, (&pos32 as *const u32).cast());
+                enc.set_bytes(8, 4, (&theta as *const f32).cast());
+                enc.set_bytes(9, 24, (&yarn as *const crate::rope::RopeYarn).cast());
+            },
+        )?;
         Ok(y)
     }
 
@@ -6025,23 +6225,28 @@ impl crate::backend::Backend for MetalBackend {
                 pos_kv as u32,
             );
             let grid = MTLSize::new((t * (h + 2 * kvh) * 32) as u64, 1, 1);
-            self.ctx.run("qkv_norm_rope_kv_f16_f32", grid, MTLSize::new(64, 1, 1), |enc| {
-                enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
-                enc.set_buffer(1, Some(&wq.buffer), wq.offset as u64);
-                enc.set_buffer(2, Some(&wk.buffer), wk.offset as u64);
-                enc.set_buffer(3, Some(&qh.buffer), qh.offset as u64);
-                enc.set_buffer(4, Some(&kg.buffer), kg.offset as u64);
-                enc.set_buffer(5, Some(&vg.buffer), vg.offset as u64);
-                enc.set_bytes(6, 4, (&t32 as *const u32).cast());
-                enc.set_bytes(7, 4, (&h32 as *const u32).cast());
-                enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
-                enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
-                enc.set_bytes(10, 4, (&rp32 as *const u32).cast());
-                enc.set_bytes(11, 4, (&pk32 as *const u32).cast());
-                enc.set_bytes(12, 4, (&theta as *const f32).cast());
-                enc.set_bytes(13, 4, (&eps as *const f32).cast());
-                enc.set_bytes(14, 24, (&yarn as *const crate::rope::RopeYarn).cast());
-            })?;
+            self.ctx.run(
+                "qkv_norm_rope_kv_f16_f32",
+                grid,
+                MTLSize::new(64, 1, 1),
+                |enc| {
+                    enc.set_buffer(0, Some(&xg.buffer), xg.offset as u64);
+                    enc.set_buffer(1, Some(&wq.buffer), wq.offset as u64);
+                    enc.set_buffer(2, Some(&wk.buffer), wk.offset as u64);
+                    enc.set_buffer(3, Some(&qh.buffer), qh.offset as u64);
+                    enc.set_buffer(4, Some(&kg.buffer), kg.offset as u64);
+                    enc.set_buffer(5, Some(&vg.buffer), vg.offset as u64);
+                    enc.set_bytes(6, 4, (&t32 as *const u32).cast());
+                    enc.set_bytes(7, 4, (&h32 as *const u32).cast());
+                    enc.set_bytes(8, 4, (&kvh32 as *const u32).cast());
+                    enc.set_bytes(9, 4, (&hd32 as *const u32).cast());
+                    enc.set_bytes(10, 4, (&rp32 as *const u32).cast());
+                    enc.set_bytes(11, 4, (&pk32 as *const u32).cast());
+                    enc.set_bytes(12, 4, (&theta as *const f32).cast());
+                    enc.set_bytes(13, 4, (&eps as *const f32).cast());
+                    enc.set_bytes(14, 24, (&yarn as *const crate::rope::RopeYarn).cast());
+                },
+            )?;
             return Ok(crate::backend::Tensor::from_gpu(qh));
         }
         let (kg, vg) = (kbuf.as_gpu(), vbuf.as_gpu());
@@ -6056,8 +6261,14 @@ impl crate::backend::Backend for MetalBackend {
             )));
         }
         let q = self.zeros(vec![1, t, h * hd])?;
-        let (t32, h32, kvh32, hd32, rp32, pk32) =
-            (t as u32, h as u32, kvh as u32, hd as u32, rope_pos as u32, pos_kv as u32);
+        let (t32, h32, kvh32, hd32, rp32, pk32) = (
+            t as u32,
+            h as u32,
+            kvh as u32,
+            hd as u32,
+            rope_pos as u32,
+            pos_kv as u32,
+        );
         let grid = MTLSize::new((t * (h + 2 * kvh) * 32) as u64, 1, 1);
         let group = MTLSize::new(64, 1, 1);
         let (xg, wq, wk, qg) = (qkv.as_gpu(), q_norm.as_gpu(), k_norm.as_gpu(), q.as_gpu());
@@ -6205,8 +6416,7 @@ impl crate::backend::Backend for MetalBackend {
         x: &crate::backend::Tensor,
         w: &crate::backend::Tensor,
         state: &crate::backend::Tensor,
-    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
-    {
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError> {
         let (c, k) = (w.shape()[0], w.shape()[1]);
         let t = x.numel() / c;
         let y = self.zeros(x.shape().to_vec())?;
@@ -6241,8 +6451,7 @@ impl crate::backend::Backend for MetalBackend {
         hd: usize,
         qk: usize,
         eps: f32,
-    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
-    {
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError> {
         let y = self.zeros(vec![c])?;
         let ns = self.zeros(vec![c, k - 1])?;
         self.ctx.gdn_conv_silu_split_norm_f32(
@@ -6265,8 +6474,7 @@ impl crate::backend::Backend for MetalBackend {
         ba: &crate::backend::Tensor,
         dt_bias: &crate::backend::Tensor,
         a: &crate::backend::Tensor,
-    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
-    {
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError> {
         let h = dt_bias.numel();
         let n = ba.numel() / 2;
         let mut gs = ba.shape().to_vec();
@@ -6295,8 +6503,7 @@ impl crate::backend::Backend for MetalBackend {
         b: &crate::backend::Tensor,
         state: &crate::backend::Tensor,
         hk: usize,
-    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError>
-    {
+    ) -> Result<(crate::backend::Tensor, crate::backend::Tensor), crate::error::BackendError> {
         let (hv, s) = (state.shape()[0], state.shape()[1]);
         let t = v.numel() / (hv * s);
         let out = self.zeros(vec![t, hv, s])?;
@@ -6593,8 +6800,7 @@ impl crate::backend::Backend for MetalBackend {
                 );
                 let kmod = if bg.dtype == GpuDtype::Q5_0 { 32 } else { 256 };
                 if m >= mm_min && m > 1 && mm_capable && k.is_multiple_of(kmod) {
-                    self.ctx
-                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+                    self.ctx.gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
                 // Q8_0 (окно верификации Q8_0-моделей: MTP γ≤7, DFlash2-блок):
@@ -6616,8 +6822,7 @@ impl crate::backend::Backend for MetalBackend {
                     && a.as_gpu().offset.is_multiple_of(16)
                     && std::env::var("INFER_Q8_NO_MB").is_err()
                 {
-                    self.ctx
-                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+                    self.ctx.gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
                 // Q4_0 (saiga-Q4_0, MTP/mmproj-веса Q4_0): тот же класс окон, что
@@ -6643,10 +6848,18 @@ impl crate::backend::Backend for MetalBackend {
                 let new_fmt_blk = match bg.dtype {
                     GpuDtype::Iq4Nl | GpuDtype::Mxfp4 => Some(32usize),
                     GpuDtype::Nvfp4 => Some(64),
-                    GpuDtype::Q2_K | GpuDtype::Q3_K | GpuDtype::Q8_K
-                    | GpuDtype::TQ1_0 | GpuDtype::TQ2_0 | GpuDtype::Iq2Xxs
-                    | GpuDtype::Iq3Xxs | GpuDtype::Iq2Xs | GpuDtype::Iq2S
-                    | GpuDtype::Iq3S | GpuDtype::Iq1S | GpuDtype::Iq1M => Some(256),
+                    GpuDtype::Q2_K
+                    | GpuDtype::Q3_K
+                    | GpuDtype::Q8_K
+                    | GpuDtype::TQ1_0
+                    | GpuDtype::TQ2_0
+                    | GpuDtype::Iq2Xxs
+                    | GpuDtype::Iq3Xxs
+                    | GpuDtype::Iq2Xs
+                    | GpuDtype::Iq2S
+                    | GpuDtype::Iq3S
+                    | GpuDtype::Iq1S
+                    | GpuDtype::Iq1M => Some(256),
                     GpuDtype::Q4_1 | GpuDtype::Q5_1 | GpuDtype::Q8_1 => Some(32),
                     GpuDtype::Q1_0 => Some(128),
                     GpuDtype::Q2_0 => Some(64),
@@ -6657,8 +6870,7 @@ impl crate::backend::Backend for MetalBackend {
                     && (2..=8).contains(&m)
                     && a.as_gpu().offset.is_multiple_of(16)
                 {
-                    self.ctx
-                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+                    self.ctx.gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
                 // IQ4_XS, окна m 2..3 (γ=1,2): батчевый матvec уже выбран в
@@ -6675,8 +6887,7 @@ impl crate::backend::Backend for MetalBackend {
                     && k.is_multiple_of(256)
                     && std::env::var("INFER_IQ4XS_NO_MB").is_err()
                 {
-                    self.ctx
-                        .gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
+                    self.ctx.gemm_nt_quantized(a.as_gpu(), bg, c.as_gpu())?;
                     return Ok(());
                 }
                 // Внутри ext-окна эталон берёт НЕ classic mul_mv, а
@@ -7287,7 +7498,8 @@ impl crate::backend::Backend for MetalBackend {
         if table.as_gpu().dtype == GpuDtype::F32 {
             self.ctx.embedding_f32(idx, table.as_gpu(), y.as_gpu())?;
         } else {
-            self.ctx.embedding_quant_f32(idx, table.as_gpu(), y.as_gpu())?;
+            self.ctx
+                .embedding_quant_f32(idx, table.as_gpu(), y.as_gpu())?;
         }
         Ok(())
     }
@@ -7462,11 +7674,7 @@ impl crate::backend::Backend for MetalBackend {
         per_slot: bool,
     ) -> Result<(), crate::error::BackendError> {
         use crate::error::BackendError;
-        let (ag, bg, cg) = (
-            a.inner_metal(),
-            b.inner_metal(),
-            c.inner_metal(),
-        );
+        let (ag, bg, cg) = (a.inner_metal(), b.inner_metal(), c.inner_metal());
         let k = a.shape()[a.shape().len() - 1];
         let kslots = ids.numel();
         if kslots == 0 || weights.numel() != kslots {
@@ -7499,17 +7707,18 @@ impl crate::backend::Backend for MetalBackend {
         // строку — r2-раскладка), слоты — цикл.
         let grid = MTLSize::new((n_rows.div_ceil(8) * 128) as u64, 1, 1);
         let group = MTLSize::new(128, 1, 1);
-        self.ctx.run(name, grid, group, |enc| {
-            enc.set_buffer(0, Some(&ag.buffer), ag.offset as u64);
-            enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
-            enc.set_buffer(2, Some(&wg.buffer), wg.offset as u64);
-            enc.set_buffer(3, Some(&bg.buffer), bg.offset as u64);
-            enc.set_buffer(4, Some(&cg.buffer), cg.offset as u64);
-            enc.set_bytes(5, 4, (&k32 as *const u32).cast());
-            enc.set_bytes(6, 4, (&n32 as *const u32).cast());
-            enc.set_bytes(7, 4, (&ks32 as *const u32).cast());
-        })
-        .map_err(|e| BackendError::Shape(format!("moe_experts_mv: {e}")))
+        self.ctx
+            .run(name, grid, group, |enc| {
+                enc.set_buffer(0, Some(&ag.buffer), ag.offset as u64);
+                enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
+                enc.set_buffer(2, Some(&wg.buffer), wg.offset as u64);
+                enc.set_buffer(3, Some(&bg.buffer), bg.offset as u64);
+                enc.set_buffer(4, Some(&cg.buffer), cg.offset as u64);
+                enc.set_bytes(5, 4, (&k32 as *const u32).cast());
+                enc.set_bytes(6, 4, (&n32 as *const u32).cast());
+                enc.set_bytes(7, 4, (&ks32 as *const u32).cast());
+            })
+            .map_err(|e| BackendError::Shape(format!("moe_experts_mv: {e}")))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7599,13 +7808,22 @@ impl crate::backend::Backend for MetalBackend {
         };
         let smem0 = (((n_expert * k * 2) + 15) / 16 * 16) as u64;
         self.ctx
-            .run(map0_name, MTLSize::new(n_expert as u64, 1, 1), MTLSize::new(n_expert as u64, 1, 1), |enc| {
-                enc.set_bytes(0, std::mem::size_of::<MmIdMap0Args>() as u64, (&m0 as *const MmIdMap0Args).cast());
-                enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
-                enc.set_buffer(2, Some(&scratch), 0);
-                enc.set_buffer(3, Some(&scratch), (n_expert * 4) as u64);
-                enc.set_threadgroup_memory_length(0, smem0);
-            })
+            .run(
+                map0_name,
+                MTLSize::new(n_expert as u64, 1, 1),
+                MTLSize::new(n_expert as u64, 1, 1),
+                |enc| {
+                    enc.set_bytes(
+                        0,
+                        std::mem::size_of::<MmIdMap0Args>() as u64,
+                        (&m0 as *const MmIdMap0Args).cast(),
+                    );
+                    enc.set_buffer(1, Some(&ig.buffer), ig.offset as u64);
+                    enc.set_buffer(2, Some(&scratch), 0);
+                    enc.set_buffer(3, Some(&scratch), (n_expert * 4) as u64);
+                    enc.set_threadgroup_memory_length(0, smem0);
+                },
+            )
             .map_err(|e| BackendError::Shape(format!("moe_experts_mm map0: {e}")))?;
         let args = MmIdArgs {
             ne00: kk as i32,
@@ -7632,7 +7850,11 @@ impl crate::backend::Backend for MetalBackend {
         );
         self.ctx
             .run(name, grid, MTLSize::new(128, 1, 1), |enc| {
-                enc.set_bytes(0, std::mem::size_of::<MmIdArgs>() as u64, (&args as *const MmIdArgs).cast());
+                enc.set_bytes(
+                    0,
+                    std::mem::size_of::<MmIdArgs>() as u64,
+                    (&args as *const MmIdArgs).cast(),
+                );
                 enc.set_buffer(1, Some(&bg.buffer), bg.offset as u64);
                 enc.set_buffer(2, Some(&ag.buffer), ag.offset as u64);
                 enc.set_buffer(3, Some(&scratch), 0);
@@ -7730,7 +7952,11 @@ impl crate::backend::Backend for MetalBackend {
         scale: f32,
     ) -> Result<(), crate::error::BackendError> {
         use crate::error::BackendError;
-        let (lg, ig, wg) = (logits.inner_metal(), ids.inner_metal(), weights.inner_metal());
+        let (lg, ig, wg) = (
+            logits.inner_metal(),
+            ids.inner_metal(),
+            weights.inner_metal(),
+        );
         let shp = logits.shape();
         if shp.len() != 2 {
             return Err(BackendError::Shape(format!(
@@ -7895,7 +8121,11 @@ mod quant_gemm_tests {
         for row in 0..n {
             let bytes = &raw[row * (k / 256) * 136..(row + 1) * (k / 256) * 136];
             let y = crate::weights_map::dequant_iq4_xs(bytes);
-            let want: f64 = y.iter().zip(&a).map(|(w, x)| (*w as f64) * (*x as f64)).sum();
+            let want: f64 = y
+                .iter()
+                .zip(&a)
+                .map(|(w, x)| (*w as f64) * (*x as f64))
+                .sum();
             let d = (got[row] as f64 - want).abs();
             assert!(
                 d <= 1e-4 * (1.0 + want.abs()),
@@ -7923,7 +8153,7 @@ mod quant_gemm_tests {
         let mut raw = Vec::new();
         for _ in 0..n * k / 256 {
             raw.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
-            raw.extend_from_slice(&((next() as u16)).to_le_bytes());
+            raw.extend_from_slice(&(next() as u16).to_le_bytes());
             for _ in 0..4 {
                 raw.push((next() & 0xFF) as u8);
             }
@@ -8003,8 +8233,14 @@ mod quant_gemm_tests {
                 // кернелов эталона, не баг раскладки (грубый баг дал бы
                 // O(1)); побитовый паритет с оракулом — на совпадении путей
                 // (см. oracle-сверки A4).
-                assert!(relm < 5e-2, "mm row={r} n={ni}: {bm} vs host {h} (rel {relm})");
-                assert!(relv < 5e-2, "mv row={r} n={ni}: {bv} vs host {h} (rel {relv})");
+                assert!(
+                    relm < 5e-2,
+                    "mm row={r} n={ni}: {bm} vs host {h} (rel {relm})"
+                );
+                assert!(
+                    relv < 5e-2,
+                    "mv row={r} n={ni}: {bv} vs host {h} (rel {relv})"
+                );
             }
         }
     }
@@ -8019,7 +8255,13 @@ mod quant_gemm_tests {
     fn q5_k_mb_matches_host_dequant() {
         use crate::backend::Backend as _;
         let be = MetalBackend::new().unwrap();
-        for (n, k, m) in [(4usize, 512usize, 5usize), (4, 512, 2), (3, 768, 3), (4, 512, 7), (4, 768, 8)] {
+        for (n, k, m) in [
+            (4usize, 512usize, 5usize),
+            (4, 512, 2),
+            (3, 768, 3),
+            (4, 512, 7),
+            (4, 768, 8),
+        ] {
             let mut seed = 0x5EED_1A2Bu64 ^ ((k as u64) << 8) ^ (m as u64);
             let mut next = || {
                 seed ^= seed << 13;
@@ -8045,7 +8287,9 @@ mod quant_gemm_tests {
             let w = be
                 .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q5_K)
                 .unwrap();
-            let a: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.02)
+                .collect();
             let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
             let c = be.zeros(vec![m, n]).unwrap();
             be.ctx
@@ -8057,7 +8301,11 @@ mod quant_gemm_tests {
                 let y = crate::weights_map::dequant_q5_k(bytes);
                 for mi in 0..m {
                     let x = &a[mi * k..(mi + 1) * k];
-                    let want: f64 = y.iter().zip(x).map(|(w, x)| (*w as f64) * (*x as f64)).sum();
+                    let want: f64 = y
+                        .iter()
+                        .zip(x)
+                        .map(|(w, x)| (*w as f64) * (*x as f64))
+                        .sum();
                     let d = (got[mi * n + row] as f64 - want).abs() / (1.0 + want.abs());
                     assert!(
                         d < 1e-3,
@@ -8159,9 +8407,13 @@ mod quant_gemm_tests {
                 .unwrap();
             assert!(used, "{tag} m={m}: ext не применим — тест недействителен");
             let ext = be.to_cpu_f32(&c_ext).unwrap();
-            let same = got.iter().zip(ext.iter()).all(|(g, e)| g.to_bits() == e.to_bits());
+            let same = got
+                .iter()
+                .zip(ext.iter())
+                .all(|(g, e)| g.to_bits() == e.to_bits());
             assert_eq!(
-                same, want_ext,
+                same,
+                want_ext,
                 "{tag} m={m}: ожидался {}ext-путь",
                 if want_ext { "" } else { "НЕ " }
             );
@@ -8232,7 +8484,10 @@ mod quant_gemm_tests {
                 let qs = &b[16..144];
                 let just2 = |j: usize, kk: usize| -> (f32, f32) {
                     if j < 4 {
-                        ((scales[j + kk] & 63) as f32, (scales[j + 4 + kk] & 63) as f32)
+                        (
+                            (scales[j + kk] & 63) as f32,
+                            (scales[j + 4 + kk] & 63) as f32,
+                        )
                     } else {
                         (
                             ((scales[j + 4 + kk] & 0xF) | ((scales[j - 4 + kk] & 0xC0) >> 2))
@@ -8334,7 +8589,10 @@ mod quant_gemm_tests {
                 let qs = &b[48..176];
                 let just2 = |j: usize, kk: usize| -> (f32, f32) {
                     if j < 4 {
-                        ((scales[j + kk] & 63) as f32, (scales[j + 4 + kk] & 63) as f32)
+                        (
+                            (scales[j + kk] & 63) as f32,
+                            (scales[j + 4 + kk] & 63) as f32,
+                        )
                     } else {
                         (
                             ((scales[j + 4 + kk] & 0xF) | ((scales[j - 4 + kk] & 0xC0) >> 2))
@@ -8419,9 +8677,7 @@ mod quant_gemm_tests {
             .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
             .unwrap();
         let got = be.to_cpu_f32(&c).unwrap();
-        let rd_u16 = |b: &[u8], off: usize| -> u32 {
-            (b[off] as u32) | ((b[off + 1] as u32) << 8)
-        };
+        let rd_u16 = |b: &[u8], off: usize| -> u32 { (b[off] as u32) | ((b[off + 1] as u32) << 8) };
         let mut checked = 0usize;
         for r in 0..n {
             let sb0 = r * (k / 256) * 210;
@@ -8457,12 +8713,12 @@ mod quant_gemm_tests {
                     };
                     let shr_l: u32 = if i2 > 1 { 4 } else { 0 };
                     for i in 0..4usize {
-                        let low =
-                            (rd_u16(b, ql_off + 4 * i) | (rd_u16(b, ql_off + 4 * i + 2) << 16))
-                                & kmask2;
-                        let high =
-                            (rd_u16(b, qh_off + 4 * i) | (rd_u16(b, qh_off + 4 * i + 2) << 16))
-                                & kmask1;
+                        let low = (rd_u16(b, ql_off + 4 * i)
+                            | (rd_u16(b, ql_off + 4 * i + 2) << 16))
+                            & kmask2;
+                        let high = (rd_u16(b, qh_off + 4 * i)
+                            | (rd_u16(b, qh_off + 4 * i + 2) << 16))
+                            & kmask1;
                         let q = ((high << shl_h) >> shr_h) | (low >> shr_l);
                         let dl = [dl0, dl1, dl2, dl3];
                         for (j, dlj) in dl.iter().enumerate() {
@@ -8528,8 +8784,8 @@ mod quant_gemm_tests {
             .unwrap();
         let got = be.to_cpu_f32(&c).unwrap();
         const KV: [f32; 16] = [
-            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
-            53.0, 69.0, 89.0, 113.0,
+            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+            69.0, 89.0, 113.0,
         ];
         let mut checked = 0usize;
         for r in 0..n {
@@ -8624,9 +8880,13 @@ mod quant_gemm_tests {
                 .mv_iq4_xs_mb(a.inner_metal(), w.inner_metal(), c_mb.inner_metal(), k, n)
                 .unwrap();
             let mb = be.to_cpu_f32(&c_mb).unwrap();
-            let same = got.iter().zip(mb.iter()).all(|(g, m)| g.to_bits() == m.to_bits());
+            let same = got
+                .iter()
+                .zip(mb.iter())
+                .all(|(g, m)| g.to_bits() == m.to_bits());
             assert_eq!(
-                same, want_mb,
+                same,
+                want_mb,
                 "m={m}: ожидался {}путь окна IQ4_XS",
                 if want_mb { "mb-" } else { "НЕ mb (mm) " }
             );
@@ -8763,7 +9023,10 @@ mod quant_gemm_tests {
         let d = crate::weights_map::dequant_iq3_xxs(&b);
         assert_eq!(d.len(), 256);
         // db = d·(0.5 + 0)·0.5 = 0.25, grid[0] = 4 → 1.0
-        assert!(d.iter().all(|v| *v == 1.0), "нулевой блок IQ3_XXS должен быть 1.0");
+        assert!(
+            d.iter().all(|v| *v == 1.0),
+            "нулевой блок IQ3_XXS должен быть 1.0"
+        );
 
         let be = MetalBackend::new().expect("MetalBackend");
         let (n, k) = (77usize, 256usize);
@@ -8780,8 +9043,7 @@ mod quant_gemm_tests {
                 raw.push((next() & 0xFF) as u8);
             }
             let base = raw.len() - 98;
-            raw[base..base + 2]
-                .copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            raw[base..base + 2].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
         }
         let w = be
             .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq3Xxs)
@@ -8849,7 +9111,10 @@ mod quant_gemm_tests {
         assert_eq!(b.len(), 66);
         let d = crate::weights_map::dequant_iq2_xxs(&b);
         assert_eq!(d.len(), 256);
-        assert!(d.iter().all(|v| *v == 1.0), "нулевой блок IQ2_XXS должен быть 1.0");
+        assert!(
+            d.iter().all(|v| *v == 1.0),
+            "нулевой блок IQ2_XXS должен быть 1.0"
+        );
 
         let be = MetalBackend::new().expect("MetalBackend");
         let (n, k) = (77usize, 256usize);
@@ -8866,8 +9131,7 @@ mod quant_gemm_tests {
                 raw.push((next() & 0xFF) as u8);
             }
             let base = raw.len() - 66;
-            raw[base..base + 2]
-                .copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
+            raw[base..base + 2].copy_from_slice(&half::f16::from_f32(0.02).to_bits().to_le_bytes());
         }
         let w = be
             .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Iq2Xxs)
@@ -8941,7 +9205,9 @@ mod quant_gemm_tests {
             }
             let want = be.to_cpu_f32(&cd).unwrap();
             assert!(
-                got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                got.iter()
+                    .zip(want.iter())
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
                 "iq2_xxs m={m}: маршрут сломан"
             );
         }
@@ -9346,7 +9612,9 @@ mod quant_gemm_tests {
                 }
                 let want = be.to_cpu_f32(&cd).unwrap();
                 assert!(
-                    got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                    got.iter()
+                        .zip(want.iter())
+                        .all(|(g, w)| g.to_bits() == w.to_bits()),
                     "{fmt:?} m={m}: маршрут сломан"
                 );
             }
@@ -9460,7 +9728,9 @@ mod quant_gemm_tests {
             }
             let want = be.to_cpu_f32(&cd).unwrap();
             assert!(
-                got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                got.iter()
+                    .zip(want.iter())
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
                 "nvfp4 m={m}: маршрут сломан"
             );
         }
@@ -9501,7 +9771,10 @@ mod quant_gemm_tests {
             seed ^= seed << 17;
             seed
         };
-        for (fmt, bb) in [(crate::dtype::WeightFormat::Iq4Nl, 18usize), (crate::dtype::WeightFormat::Mxfp4, 17)] {
+        for (fmt, bb) in [
+            (crate::dtype::WeightFormat::Iq4Nl, 18usize),
+            (crate::dtype::WeightFormat::Mxfp4, 17),
+        ] {
             let mut raw = Vec::with_capacity(n * k / 32 * bb);
             for _ in 0..n * k / 32 {
                 if bb == 18 {
@@ -9526,7 +9799,9 @@ mod quant_gemm_tests {
                 let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 104729.0).sin()).collect();
                 let av = be.from_cpu_f32(&a, vec![m, k]).unwrap();
                 let c = be.zeros(vec![m, n]).unwrap();
-                be.ctx.mv_iq4_nl_mxfp4_mb(av.inner_metal(), w.inner_metal(), c.inner_metal()).unwrap();
+                be.ctx
+                    .mv_iq4_nl_mxfp4_mb(av.inner_metal(), w.inner_metal(), c.inner_metal())
+                    .unwrap();
                 let got = be.to_cpu_f32(&c).unwrap();
                 for r in 0..n {
                     for mi in 0..m {
@@ -9547,7 +9822,9 @@ mod quant_gemm_tests {
             }
             let av = be.from_cpu_f32(&a, vec![k, k]).unwrap();
             let c = be.zeros(vec![k, n]).unwrap();
-            be.ctx.gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal()).unwrap();
+            be.ctx
+                .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), c.inner_metal())
+                .unwrap();
             let got = be.to_cpu_f32(&c).unwrap();
             for r in 0..n {
                 for kk in 0..k {
@@ -9572,10 +9849,14 @@ mod quant_gemm_tests {
                 let got = be.to_cpu_f32(&c).unwrap();
                 let cm = be.zeros(vec![m, n]).unwrap();
                 if m <= 8 {
-                    be.ctx.mv_iq4_nl_mxfp4_mb(av.inner_metal(), w.inner_metal(), cm.inner_metal()).unwrap();
+                    be.ctx
+                        .mv_iq4_nl_mxfp4_mb(av.inner_metal(), w.inner_metal(), cm.inner_metal())
+                        .unwrap();
                     let want = be.to_cpu_f32(&cm).unwrap();
                     assert_eq!(
-                        got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                        got.iter()
+                            .zip(want.iter())
+                            .all(|(g, w)| g.to_bits() == w.to_bits()),
                         want_mb,
                         "{fmt:?} m={m}: маршрут mb сломан"
                     );
@@ -9584,10 +9865,14 @@ mod quant_gemm_tests {
                     let _ = am;
                     // mm: сравнение с прямым gemm_nt_quantized
                     let cd = be.zeros(vec![m, n]).unwrap();
-                    be.ctx.gemm_nt_quantized(av.inner_metal(), w.inner_metal(), cd.inner_metal()).unwrap();
+                    be.ctx
+                        .gemm_nt_quantized(av.inner_metal(), w.inner_metal(), cd.inner_metal())
+                        .unwrap();
                     let want = be.to_cpu_f32(&cd).unwrap();
                     assert!(
-                        got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                        got.iter()
+                            .zip(want.iter())
+                            .all(|(g, w)| g.to_bits() == w.to_bits()),
                         "{fmt:?} m={m}: трейт не совпал с quantized-путём"
                     );
                 }
@@ -9612,7 +9897,7 @@ mod quant_gemm_tests {
         let mut raw = Vec::with_capacity(n * k / 256 * 136);
         for _ in 0..n * k / 256 {
             raw.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
-            raw.extend_from_slice(&((next() as u16)).to_le_bytes());
+            raw.extend_from_slice(&(next() as u16).to_le_bytes());
             for _ in 0..4 {
                 raw.push((next() & 0xFF) as u8);
             }
@@ -9663,7 +9948,11 @@ mod quant_gemm_tests {
                 if rel > worst {
                     worst = rel;
                 }
-                assert!(rel <= 2e-4, "m={mi} n={ni}: {} vs {want} (Δ {d})", got[mi * n + ni]);
+                assert!(
+                    rel <= 2e-4,
+                    "m={mi} n={ni}: {} vs {want} (Δ {d})",
+                    got[mi * n + ni]
+                );
             }
         }
         eprintln!("iq4_xs_mm worst rel {worst:e}");
@@ -9700,10 +9989,12 @@ mod quant_gemm_tests {
         let got = be.to_cpu_f32(&c).unwrap();
         let rows: Vec<Vec<f32>> = (0..n)
             .map(|r| {
-                crate::weights_map::dequant_q6_k(&raw[r * (k / 256) * 210..(r + 1) * (k / 256) * 210])
-                    .into_iter()
-                    .map(|x| half::f16::to_f32(half::f16::from_f32(x)))
-                    .collect()
+                crate::weights_map::dequant_q6_k(
+                    &raw[r * (k / 256) * 210..(r + 1) * (k / 256) * 210],
+                )
+                .into_iter()
+                .map(|x| half::f16::to_f32(half::f16::from_f32(x)))
+                .collect()
             })
             .collect();
         let mut worst = 0f64;
@@ -9719,7 +10010,11 @@ mod quant_gemm_tests {
                 if rel > worst {
                     worst = rel;
                 }
-                assert!(rel <= 2e-4, "m={mi} n={ni}: {} vs {want} (Δ {d})", got[mi * n + ni]);
+                assert!(
+                    rel <= 2e-4,
+                    "m={mi} n={ni}: {} vs {want} (Δ {d})",
+                    got[mi * n + ni]
+                );
             }
         }
         eprintln!("q6_k_mm worst rel {worst:e}");
@@ -9731,7 +10026,6 @@ mod quant_gemm_tests {
             .join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {name}: {e}"))
     }
-
 
     // Тестовые энкодеры Q4_K/Q6_K (K=256-синтетика; логика как в fixture-gen).
     /// Канонический Q4_K (ggml block_q4_K, 144 Б/256): d (f16), dmin (f16),
@@ -9790,7 +10084,11 @@ mod quant_gemm_tests {
         for sb in w.chunks_exact(256) {
             let smax = sb.iter().fold(0.0f32, |m, x| m.max(x.abs()));
             // q − 32 ∈ [−32, 31]: d·s ≈ bmax/31 даёт полный диапазон.
-            let d = if smax > 0.0 { smax / (31.0 * 127.0) } else { 0.0 };
+            let d = if smax > 0.0 {
+                smax / (31.0 * 127.0)
+            } else {
+                0.0
+            };
             let mut ql = [0u8; 128];
             let mut qh = [0u8; 64];
             let mut scales = [0u8; 16];
@@ -9980,7 +10278,10 @@ mod quant_gemm_tests {
             for tkv in [1usize, 63, 64, 1984, 2048, 4096, 100_000] {
                 let n = split_attn_groups(tkv, hd);
                 assert!(n >= 1);
-                assert!(n * (2 + hd) * 4 <= 32 * 1024, "hd={hd} tkv={tkv}: {n} групп");
+                assert!(
+                    n * (2 + hd) * 4 <= 32 * 1024,
+                    "hd={hd} tkv={tkv}: {n} групп"
+                );
             }
         }
         assert_eq!(split_attn_groups(4096, 128), 32, "hd=128 не урезается");
@@ -10024,9 +10325,14 @@ mod quant_gemm_tests {
                         .filter(|x| x.is_finite())
                         .map(|x| (x - mx).exp())
                         .sum();
-                    let want_lse = if mx > f32::NEG_INFINITY { sum.ln() } else { f32::NEG_INFINITY };
+                    let want_lse = if mx > f32::NEG_INFINITY {
+                        sum.ln()
+                    } else {
+                        f32::NEG_INFINITY
+                    };
                     assert!(
-                        (lse[r] - want_lse).abs() < 1e-3 || (lse[r].is_infinite() && want_lse.is_infinite()),
+                        (lse[r] - want_lse).abs() < 1e-3
+                            || (lse[r].is_infinite() && want_lse.is_infinite()),
                         "lse p={penalty} r={r}: {} vs {want_lse}",
                         lse[r]
                     );
@@ -10135,7 +10441,10 @@ mod quant_gemm_tests {
                     break;
                 }
             }
-            assert!(same, "M={m}: трейтовый gemm_nt не равен mb-пути (маршрут сломан)");
+            assert!(
+                same,
+                "M={m}: трейтовый gemm_nt не равен mb-пути (маршрут сломан)"
+            );
             // Контроль вырожденности: паритет-порог 9 (окна идут mv_ext,
             // как до правки) обязан дать ДРУГИЕ числа.
             be.ctx.set_quant_mm_min(9);
@@ -10235,7 +10544,9 @@ mod quant_gemm_tests {
                 .unwrap();
             let want = be.to_cpu_f32(&c_mb).unwrap();
             assert!(
-                got.iter().zip(want.iter()).all(|(g, w)| g.to_bits() == w.to_bits()),
+                got.iter()
+                    .zip(want.iter())
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
                 "M={m}: трейтовый gemm_nt не равен mv_q4_0_mb (маршрут сломан)"
             );
             be.ctx.set_quant_mm_min(9);
@@ -10244,7 +10555,9 @@ mod quant_gemm_tests {
             let old = be.to_cpu_f32(&c_old).unwrap();
             be.ctx.set_quant_mm_min(4);
             assert!(
-                got.iter().zip(old.iter()).any(|(g, o)| g.to_bits() != o.to_bits()),
+                got.iter()
+                    .zip(old.iter())
+                    .any(|(g, o)| g.to_bits() != o.to_bits()),
                 "M={m}: mb и mv_ext совпали побитово — пин маршрута недействителен"
             );
         }
@@ -10265,7 +10578,9 @@ mod quant_gemm_tests {
         let w = be
             .from_quantized(&raw, vec![n, k], crate::dtype::WeightFormat::Q4_0)
             .unwrap();
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 29) as f32 - 14.0) * 0.03).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+            .collect();
         let ah: Vec<f32> = a
             .iter()
             .map(|&x| half::f16::to_f32(half::f16::from_f32(x)))
@@ -10297,7 +10612,11 @@ mod quant_gemm_tests {
                 if rel > worst {
                     worst = rel;
                 }
-                assert!(rel <= 2e-4, "m={mi} n={ni}: {} vs {want} (Δ {d})", got[mi * n + ni]);
+                assert!(
+                    rel <= 2e-4,
+                    "m={mi} n={ni}: {} vs {want} (Δ {d})",
+                    got[mi * n + ni]
+                );
             }
         }
         eprintln!("q4_0_mm worst rel {worst:e}");
@@ -10498,18 +10817,12 @@ mod batch_debug {
             let q9 =
                 GpuTensor::from_cpu_f32(&ctx.device, &vec![0.1f32; 9 * 4096], vec![1, 9, 4096])
                     .unwrap();
-            let k36 = GpuTensor::from_cpu_f32(
-                &ctx.device,
-                &vec![0.2f32; 36 * 1024],
-                vec![1, 36, 1024],
-            )
-            .unwrap();
-            let v36 = GpuTensor::from_cpu_f32(
-                &ctx.device,
-                &vec![0.3f32; 36 * 1024],
-                vec![1, 36, 1024],
-            )
-            .unwrap();
+            let k36 =
+                GpuTensor::from_cpu_f32(&ctx.device, &vec![0.2f32; 36 * 1024], vec![1, 36, 1024])
+                    .unwrap();
+            let v36 =
+                GpuTensor::from_cpu_f32(&ctx.device, &vec![0.3f32; 36 * 1024], vec![1, 36, 1024])
+                    .unwrap();
             let y9 = GpuTensor::zeros(&ctx.device, vec![1, 9, 4096]).unwrap();
             let t0 = std::time::Instant::now();
             for _ in 0..10 {
@@ -10682,14 +10995,17 @@ mod glm_attention_tests {
             let v = metal.from_cpu_f32(&vd_v, vec![1, tkv, kvd]).unwrap();
             let m = metal.from_cpu_f32(&mask_v, vec![1, tq, tkv]).unwrap();
             let y = metal.zeros(vec![1, tq, qd]).unwrap();
-            metal.attn_ar(&q, &k, &v, Some(&m), &y, nh, nkv, hd).unwrap();
+            metal
+                .attn_ar(&q, &k, &v, Some(&m), &y, nh, nkv, hd)
+                .unwrap();
             let got = metal.to_cpu_f32(&y).unwrap();
             let qc = cpu.from_cpu_f32(&qd_v, vec![1, tq, qd]).unwrap();
             let kc = cpu.from_cpu_f32(&kd_v, vec![1, tkv, kvd]).unwrap();
             let vc = cpu.from_cpu_f32(&vd_v, vec![1, tkv, kvd]).unwrap();
             let mc = cpu.from_cpu_f32(&mask_v, vec![1, tq, tkv]).unwrap();
             let yc = cpu.zeros(vec![1, tq, qd]).unwrap();
-            cpu.attn_ar(&qc, &kc, &vc, Some(&mc), &yc, nh, nkv, hd).unwrap();
+            cpu.attn_ar(&qc, &kc, &vc, Some(&mc), &yc, nh, nkv, hd)
+                .unwrap();
             let want = cpu.to_cpu_f32(&yc).unwrap();
             let nf = got.iter().filter(|x| !x.is_finite()).count();
             assert_eq!(nf, 0, "tq={tq}: NaN/Inf в выходе Metal ({nf})");
@@ -10705,7 +11021,9 @@ mod glm_attention_tests {
             let kf = metal.from_cpu_f16(&k16, vec![1, tkv, kvd]).unwrap();
             let vf = metal.from_cpu_f16(&v16, vec![1, tkv, kvd]).unwrap();
             let yf = metal.zeros(vec![1, tq, qd]).unwrap();
-            metal.attn_ar(&q, &kf, &vf, Some(&m), &yf, nh, nkv, hd).unwrap();
+            metal
+                .attn_ar(&q, &kf, &vf, Some(&m), &yf, nh, nkv, hd)
+                .unwrap();
             let got16 = metal.to_cpu_f32(&yf).unwrap();
             let nf16 = got16.iter().filter(|x| !x.is_finite()).count();
             assert_eq!(nf16, 0, "tq={tq}: NaN/Inf в f16-KV выходе ({nf16})");
@@ -10715,7 +11033,6 @@ mod glm_attention_tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(diff16 <= 2e-2, "tq={tq}: f16-KV |Δ| max {diff16}");
-
         }
     }
 }

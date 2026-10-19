@@ -29,9 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gf = rust_inference::gguf::parse(&bytes)?;
     let wm = WeightsMap::from_gguf(&gf)?;
     let tok = Tokenizer::from_gguf(&gf)?;
-    let u = |k: &str| -> usize {
-        gf.get(k).and_then(|v| v.as_u32()).unwrap_or(0) as usize
-    };
+    let u = |k: &str| -> usize { gf.get(k).and_then(|v| v.as_u32()).unwrap_or(0) as usize };
     let f = |k: &str, d: f32| -> f32 {
         gf.get(k)
             .and_then(|v| match v {
@@ -71,9 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("ids: {ids:?}");
 
     let get = |name: &str| -> Vec<f32> {
-        let t = wm
-            .get(name)
-            .unwrap_or_else(|| panic!("нет тензора {name}"));
+        let t = wm.get(name).unwrap_or_else(|| panic!("нет тензора {name}"));
         dequant_f32(t)
     };
     let rmsnorm = |x: &[f32], w: &[f32], eps: f32| -> Vec<f32> {

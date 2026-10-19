@@ -37,7 +37,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let qk = hk * s; // 2048
 
     let h2 = be.from_cpu_f32(
-        &(0..dim).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect::<Vec<_>>(),
+        &(0..dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+            .collect::<Vec<_>>(),
         vec![1, dim],
     )?;
 
@@ -187,7 +189,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         ywant[ch] = acc / (1.0 + (-acc).exp());
         for j in 0..3 {
-            nswant[ch * 3 + j] = if j + 1 < 3 { sf[ch * 3 + j + 1] } else { xf[ch] };
+            nswant[ch * 3 + j] = if j + 1 < 3 {
+                sf[ch * 3 + j + 1]
+            } else {
+                xf[ch]
+            };
         }
     }
     for hbase in (0..2 * qk).step_by(s) {
@@ -210,11 +216,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(maxd < 1e-5, "fused-хвост неверен");
     let xq = be.from_cpu_f32(&xf, vec![1, 1, cq])?;
     bench(&be, "fused tail", cq * 4 * 3, reps, || {
-        be.gdn_conv_silu_split_norm(&xq, &wt, &stt, cq, 4, s, qk, 1e-6).unwrap();
+        be.gdn_conv_silu_split_norm(&xq, &wt, &stt, cq, 4, s, qk, 1e-6)
+            .unwrap();
     });
     // Корректность norm_gated: x,z,w с известными значениями.
-    let xv: Vec<f32> = (0..ssm_inner).map(|i| ((i % 37) as f32 - 18.0) * 0.05).collect();
-    let zv: Vec<f32> = (0..ssm_inner).map(|i| ((i % 23) as f32 - 11.0) * 0.2).collect();
+    let xv: Vec<f32> = (0..ssm_inner)
+        .map(|i| ((i % 37) as f32 - 18.0) * 0.05)
+        .collect();
+    let zv: Vec<f32> = (0..ssm_inner)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.2)
+        .collect();
     let wv: Vec<f32> = (0..ssm_inner).map(|i| 1.0 + (i % 7) as f32 * 0.1).collect();
     let xt = be.from_cpu_f32(&xv, vec![1, 1, ssm_inner])?;
     let zt = be.from_cpu_f32(&zv, vec![1, 1, ssm_inner])?;
@@ -233,12 +244,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  got[0..4]: {:?} got[32]: {}", &ygv[0..4], ygv[32]);
     let ss2: f32 = xv.iter().map(|v| v * v).sum();
     let inv2 = 1.0 / (ss2 / ssm_inner as f32 + 1e-6).sqrt();
-    println!("  want[0..4]: {:?}", (0..4).map(|i| { let zz = zv[i]; xv[i] * inv2 * wv[i] * (zz / (1.0 + (-zz).exp())) }).collect::<Vec<f32>>());
+    println!(
+        "  want[0..4]: {:?}",
+        (0..4)
+            .map(|i| {
+                let zz = zv[i];
+                xv[i] * inv2 * wv[i] * (zz / (1.0 + (-zz).exp()))
+            })
+            .collect::<Vec<f32>>()
+    );
     assert!(maxd < 1e-4, "norm_gated неверен");
     // Корректность v4-gemm: F32 [8,512] против хоста.
     let kk = 512usize;
     let a8: Vec<f32> = (0..kk).map(|i| ((i % 31) as f32 - 15.0) * 0.02).collect();
-    let b8: Vec<f32> = (0..8 * kk).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+    let b8: Vec<f32> = (0..8 * kk)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+        .collect();
     let at = be.from_cpu_f32(&a8, vec![1, kk])?;
     let bt = be.from_cpu_f32(&b8, vec![8, kk])?;
     let ct = be.zeros(vec![1, 8])?;

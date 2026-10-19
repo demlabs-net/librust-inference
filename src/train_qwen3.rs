@@ -427,12 +427,12 @@ fn attention_fwd(
     let mut kr = vec![0.0f32; t * kd];
     for h in 0..n_heads {
         // GQA: голова запроса h смотрит в kv-голову h / (n_heads/n_kv) —
-    // ГРУППИРОВАННО, как в движке (attn_ar: `kvh = h / n_rep`) и llama.cpp.
-    // Было `h % n_kv_heads` (чередование) — форвард читал ЧУЖИЕ k/v, лосс
-    // стоял около 19, а LoRA училась на сломанном распределении
-    // (ppl 4e9 против 231 у llama.cpp на том же тексте).
-    let rep = n_heads / n_kv_heads;
-    let kh = h / rep;
+        // ГРУППИРОВАННО, как в движке (attn_ar: `kvh = h / n_rep`) и llama.cpp.
+        // Было `h % n_kv_heads` (чередование) — форвард читал ЧУЖИЕ k/v, лосс
+        // стоял около 19, а LoRA училась на сломанном распределении
+        // (ppl 4e9 против 231 у llama.cpp на том же тексте).
+        let rep = n_heads / n_kv_heads;
+        let kh = h / rep;
         let mut qh_ = vec![0.0f32; t * hd];
         for kk in 0..t {
             let off = (kk * n_heads + h) * hd;
@@ -532,12 +532,12 @@ fn attention_bwd(
     let mut d_v = vec![0.0f32; v.len()];
     for h in 0..n_heads {
         // GQA: голова запроса h смотрит в kv-голову h / (n_heads/n_kv) —
-    // ГРУППИРОВАННО, как в движке (attn_ar: `kvh = h / n_rep`) и llama.cpp.
-    // Было `h % n_kv_heads` (чередование) — форвард читал ЧУЖИЕ k/v, лосс
-    // стоял около 19, а LoRA училась на сломанном распределении
-    // (ppl 4e9 против 231 у llama.cpp на том же тексте).
-    let rep = n_heads / n_kv_heads;
-    let kh = h / rep;
+        // ГРУППИРОВАННО, как в движке (attn_ar: `kvh = h / n_rep`) и llama.cpp.
+        // Было `h % n_kv_heads` (чередование) — форвард читал ЧУЖИЕ k/v, лосс
+        // стоял около 19, а LoRA училась на сломанном распределении
+        // (ppl 4e9 против 231 у llama.cpp на том же тексте).
+        let rep = n_heads / n_kv_heads;
+        let kh = h / rep;
         // dP[i][j] = Σ_d dO[i,h,d]·V[j,kh,d], затем dS = P·(dP − rowsum(dP·P))
         let mut ds = vec![0.0f32; t * t];
         for i in 0..t {
@@ -1799,15 +1799,14 @@ mod tests {
         }
         // Слитый GGUF (база+адаптер): путь из env (INFER_TRAIN_MERGED), иначе
         // дефолт каталога джоб; тест «до/после» имеет смысл только с ним.
-        let merged_path = std::path::PathBuf::from(
-            std::env::var("INFER_TRAIN_MERGED").unwrap_or_else(|_| {
+        let merged_path =
+            std::path::PathBuf::from(std::env::var("INFER_TRAIN_MERGED").unwrap_or_else(|_| {
                 let home = home();
                 format!(
                     "{home}/.inferd/train-jobs/out/\
                      metal-e2e-Qwen3-0.6B-Instruct-Q8_0-f16.gguf"
                 )
-            }),
-        );
+            }));
         if !merged_path.is_file() {
             eprintln!("skip: нет merged-файла");
             return;
@@ -1873,14 +1872,13 @@ mod tests {
         // Адаптер — из env (INFER_TRAIN_ADAPTER), иначе дефолтный каталог
         // e2e-прогона (metal_train_0_6b пишет туда же); жёсткий
         // /var/folders/... путь на чужой машине не существует.
-        let adapter_path = std::path::PathBuf::from(
-            std::env::var("INFER_TRAIN_ADAPTER").unwrap_or_else(|_| {
+        let adapter_path =
+            std::path::PathBuf::from(std::env::var("INFER_TRAIN_ADAPTER").unwrap_or_else(|_| {
                 std::env::temp_dir()
                     .join("qwen3-lora-e2e/adapter.json")
                     .to_string_lossy()
                     .into_owned()
-            }),
-        );
+            }));
         if !adapter_path.is_file() {
             eprintln!("skip: нет адаптера {}", adapter_path.display());
             return;
@@ -1895,7 +1893,9 @@ mod tests {
                     .unwrap_or_else(|e| panic!("INFER_PPL_TEXT {p}: {e}"));
                 &held_owned
             }
-            Err(_) => "Обучение языковой модели — это процесс минимизации потерь на большом корпусе текста:         каждая последовательность токенов становится примером, а обратное распространение ошибки         подстраивает параметры так, чтобы следующее слово угадывалось всё лучше. Ключевой момент —         качество данных: мусор в корпусе означает мусор в знаниях модели, поэтому фильтрация и         балансировка длин — обязательная часть пайплайна.",
+            Err(_) => {
+                "Обучение языковой модели — это процесс минимизации потерь на большом корпусе текста:         каждая последовательность токенов становится примером, а обратное распространение ошибки         подстраивает параметры так, чтобы следующее слово угадывалось всё лучше. Ключевой момент —         качество данных: мусор в корпусе означает мусор в знаниях модели, поэтому фильтрация и         балансировка длин — обязательная часть пайплайна."
+            }
         };
         let bk = crate::train::default_backend().unwrap();
         let bytes = std::fs::read(&model).unwrap();
@@ -1949,7 +1949,10 @@ mod tests {
         // Порог «разумного» — только для штатного текста; при INFER_PPL_TEXT
         // (сверка с llama-perplexity на произвольном корпусе) он не применяется.
         if std::env::var("INFER_PPL_TEXT").is_err() {
-            assert!(ppl0 < 1000.0 && ppl1 < 1000.0, "ppl вне разумного: {ppl0} / {ppl1}");
+            assert!(
+                ppl0 < 1000.0 && ppl1 < 1000.0,
+                "ppl вне разумного: {ppl0} / {ppl1}"
+            );
         }
         if std::env::var("INFER_PPL_TEXT").is_err() {
             // Строгий порог «не хуже» имеет смысл только на штатном тексте и

@@ -60,7 +60,11 @@ impl Timings {
     }
 
     pub fn prompt_per_second(&self) -> f64 {
-        if self.prompt_ms > 0.0 { self.prompt_n as f64 * 1e3 / self.prompt_ms } else { 0.0 }
+        if self.prompt_ms > 0.0 {
+            self.prompt_n as f64 * 1e3 / self.prompt_ms
+        } else {
+            0.0
+        }
     }
 
     pub fn predicted_per_second(&self) -> f64 {
@@ -199,10 +203,18 @@ pub trait CausalLm {
     /// Новая последовательность: пустой контекст.
     fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError>;
     /// Prefill ids → логиты [1, T, V].
-    fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError>;
+    fn prefill(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError>;
     /// Prefill → логиты ТОЛЬКО последней позиции [1, 1, V] (генерации нужны
     /// лишь они; lm_head по одной строке вместо T).
-    fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn prefill_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         self.prefill(backend, ids)
     }
     /// Prefill + выходы слоёв `layers` (DFlash-инжект).
@@ -224,7 +236,11 @@ pub trait CausalLm {
         self.prefill_extract(backend, ids, layers)
     }
     /// Один токен → логиты [1, 1, V].
-    fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError>;
+    fn decode(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+    ) -> Result<crate::backend::Tensor, BackendError>;
     /// Спек-шаг: верификация [id, draft…] одним forward'ом + откат хвоста.
     /// `sp` — тот же каскад сэмплирования, что у `sample_next`: верификация
     /// обязана брать p из модифицированного распределения цели (лосслессность).
@@ -259,7 +275,11 @@ pub trait CausalLm {
         )))
     }
     /// PP-стадия: эмбеддинги координатора.
-    fn embed_ids(&self, _backend: &dyn Backend, _ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn embed_ids(
+        &self,
+        _backend: &dyn Backend,
+        _ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Err(self.pp_unsupported())
     }
     /// PP-стадия: слои [from..upto) на присланных скрытых.
@@ -276,7 +296,11 @@ pub trait CausalLm {
         Err(self.pp_unsupported())
     }
     /// PP-стадия: lm_head по нормированным скрытым.
-    fn lm_head(&self, _backend: &dyn Backend, _h: &crate::backend::Tensor) -> Result<crate::backend::Tensor, BackendError> {
+    fn lm_head(
+        &self,
+        _backend: &dyn Backend,
+        _h: &crate::backend::Tensor,
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Err(self.pp_unsupported())
     }
     /// PP-стадия: позиция кэша первого слоя диапазона.
@@ -315,10 +339,18 @@ impl CausalLm for crate::qwen3::Qwen3Model {
     fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
         Qwen3Model::reset_cache(self, backend)
     }
-    fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn prefill(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::prefill(self, backend, ids)
     }
-    fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn prefill_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::prefill_last(self, backend, ids)
     }
     fn prefill_extract(
@@ -337,7 +369,11 @@ impl CausalLm for crate::qwen3::Qwen3Model {
     ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
         Qwen3Model::prefill_extract_last(self, backend, ids, layers)
     }
-    fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError> {
+    fn decode(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::decode(self, backend, id)
     }
     fn decode_spec(
@@ -386,7 +422,11 @@ impl CausalLm for crate::qwen3::Qwen3Model {
             pos_after,
         )
     }
-    fn embed_ids(&self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn embed_ids(
+        &self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::embed_ids(self, backend, ids)
     }
     fn forward_layers_range(
@@ -400,7 +440,11 @@ impl CausalLm for crate::qwen3::Qwen3Model {
     ) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::forward_layers_range(self, backend, x, t, None, upto, from, None, norm_out)
     }
-    fn lm_head(&self, backend: &dyn Backend, h: &crate::backend::Tensor) -> Result<crate::backend::Tensor, BackendError> {
+    fn lm_head(
+        &self,
+        backend: &dyn Backend,
+        h: &crate::backend::Tensor,
+    ) -> Result<crate::backend::Tensor, BackendError> {
         Qwen3Model::lm_head(self, backend, h)
     }
     fn stage_pos(&self, from: usize) -> usize {
@@ -433,10 +477,18 @@ impl CausalLm for crate::qwen35::Qwen35Model {
     fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
         crate::qwen35::Qwen35Model::reset_cache(self, backend)
     }
-    fn prefill(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn prefill(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         crate::qwen35::Qwen35Model::prefill(self, backend, ids)
     }
-    fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<crate::backend::Tensor, BackendError> {
+    fn prefill_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<crate::backend::Tensor, BackendError> {
         crate::qwen35::Qwen35Model::prefill_last(self, backend, ids)
     }
     fn prefill_extract(
@@ -455,7 +507,11 @@ impl CausalLm for crate::qwen35::Qwen35Model {
     ) -> Result<(crate::backend::Tensor, Vec<crate::backend::Tensor>), BackendError> {
         crate::qwen35::Qwen35Model::prefill_extract_last(self, backend, ids, layers)
     }
-    fn decode(&mut self, backend: &dyn Backend, id: u32) -> Result<crate::backend::Tensor, BackendError> {
+    fn decode(
+        &mut self,
+        backend: &dyn Backend,
+        id: u32,
+    ) -> Result<crate::backend::Tensor, BackendError> {
         crate::qwen35::Qwen35Model::decode(self, backend, id)
     }
     fn decode_spec(
@@ -519,14 +575,15 @@ fn pp_forward<M: CausalLm + ?Sized>(
     // иначе стороны разъезжаются на токен и все следующие вызовы падают на
     // проверке позиции (наблюдалось в кросс-машинном прогоне).
     let start_pos = model.stage_pos(0);
-    let reset = pp
-        .first
-        .swap(false, std::sync::atomic::Ordering::Relaxed);
+    let reset = pp.first.swap(false, std::sync::atomic::Ordering::Relaxed);
     let x = model.embed_ids(backend, ids)?;
     let dim = x.shape()[2];
     let mid = model.forward_layers_range(backend, x, t, Some(pp.from), 0, false)?;
     let hidden = backend.to_cpu_f32(&mid)?;
-    let out = match pp.transport.forward_stage(pp.from, None, true, reset, start_pos, t, hidden) {
+    let out = match pp
+        .transport
+        .forward_stage(pp.from, None, true, reset, start_pos, t, hidden)
+    {
         Ok(v) => v,
         Err(e) => {
             // Транзакционный откат: строки, которые стадия не приняла,
@@ -765,9 +822,7 @@ pub fn generate<M: CausalLm + ?Sized>(
     let mut generated: Vec<u32> = Vec::new();
     // Сид запроса материализуется в состояние один раз на генерацию: и
     // спекулятивный, и обычный путь сэмплят из этого одного потока.
-    let mut rng_state: Option<u64> = params
-        .seed
-        .map(crate::inference::sampling::state_from_seed);
+    let mut rng_state: Option<u64> = params.seed.map(crate::inference::sampling::state_from_seed);
     let mut decoder = IncrementalDecoder::new();
     let mut acc = String::new(); // накопленный текст (для stop-строк)
     // Черновики выбираются так же, как их проверяет таргет: жадная проверка
@@ -1036,8 +1091,14 @@ pub fn generate<M: CausalLm + ?Sized>(
     if spec_prof {
         eprintln!(
             "SPEC_PROF черновик {:.0} мс/{} · верификация {:.0} мс/{} · фичи {:.0} мс/{} · декод {:.0} мс/{}",
-            prof[0] * 1e3, prof_n[0], prof[1] * 1e3, prof_n[1], prof[2] * 1e3, prof_n[2],
-            prof[3] * 1e3, prof_n[3]
+            prof[0] * 1e3,
+            prof_n[0],
+            prof[1] * 1e3,
+            prof_n[1],
+            prof[2] * 1e3,
+            prof_n[2],
+            prof[3] * 1e3,
+            prof_n[3]
         );
     }
     if finish.is_none() {
@@ -1214,7 +1275,8 @@ mod tests {
         let mut tok = crate::tokenizer::Tokenizer::from_parts(vocab, vec![], None, None, None);
         tok.add_special(b"<think>".to_vec(), 5);
         tok.add_special(b"</think>".to_vec(), 6);
-        let mut budget = ReasoningBudget::for_tokenizer(&tok, "<think>", &["</think>"], "\n", 3).unwrap();
+        let mut budget =
+            ReasoningBudget::for_tokenizer(&tok, "<think>", &["</think>"], "\n", 3).unwrap();
         budget.prefill(&tok, &tok.encode("<think>\n"));
         let params = GenerateParams {
             max_tokens: 12,
@@ -1229,7 +1291,11 @@ mod tests {
         // снова генерация модели
         assert_eq!(&out[2..4], &[7, 6], "вставка после 2 токенов: {out:?}");
         assert!(!out[..2].contains(&6), "{out:?}");
-        assert_eq!(out.len(), 12, "после вставки генерация продолжается: {out:?}");
+        assert_eq!(
+            out.len(),
+            12,
+            "после вставки генерация продолжается: {out:?}"
+        );
     }
 
     #[test]
@@ -1250,18 +1316,41 @@ mod tests {
     fn timings_split_prefill_and_decode() {
         let (backend, mut model) = mini_model();
         let mut events = Vec::new();
-        let params = GenerateParams { max_tokens: 5, temperature: 0.0, ..Default::default() };
-        let out = generate(&mut model, &backend, &tiny_tokenizer(), &[1, 2, 3], &params, |ev| {
-            events.push(ev);
-            true
-        })
+        let params = GenerateParams {
+            max_tokens: 5,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let out = generate(
+            &mut model,
+            &backend,
+            &tiny_tokenizer(),
+            &[1, 2, 3],
+            &params,
+            |ev| {
+                events.push(ev);
+                true
+            },
+        )
         .unwrap();
-        let pos_t = events.iter().position(|e| matches!(e, GenerateEvent::Timings(_))).expect("Timings");
-        let pos_d = events.iter().position(|e| matches!(e, GenerateEvent::Done(_))).expect("Done");
+        let pos_t = events
+            .iter()
+            .position(|e| matches!(e, GenerateEvent::Timings(_)))
+            .expect("Timings");
+        let pos_d = events
+            .iter()
+            .position(|e| matches!(e, GenerateEvent::Done(_)))
+            .expect("Done");
         assert!(pos_t < pos_d, "Timings до Done");
-        let GenerateEvent::Timings(t) = events[pos_t] else { unreachable!() };
+        let GenerateEvent::Timings(t) = events[pos_t] else {
+            unreachable!()
+        };
         assert_eq!(t.prompt_n, 3);
-        assert_eq!(t.predicted_n, out.len(), "без EOG: predicted_n = выданные токены");
+        assert_eq!(
+            t.predicted_n,
+            out.len(),
+            "без EOG: predicted_n = выданные токены"
+        );
         assert!(t.prompt_ms > 0.0 && t.predicted_ms > 0.0, "{t:?}");
         assert_eq!(t.decode_steps(), out.len() - 1);
 

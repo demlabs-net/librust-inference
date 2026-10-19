@@ -15,7 +15,9 @@ use rust_inference::weights_map::WeightsMap;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: verify_cost <model.gguf>")?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: verify_cost <model.gguf>")?;
     let file = std::fs::File::open(&path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let gf = rust_inference::gguf::parse(&mmap)?;
@@ -25,7 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Qwen3Config::from_gguf(&gf, tok.vocab_size())?;
     let n_layers = cfg.n_layers;
     let mut m = Qwen3Model::load(&be, &wm, cfg)?;
-    let ctx: usize = std::env::var("VERIFY_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let ctx: usize = std::env::var("VERIFY_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
     let prompt: Vec<u32> = (0..ctx as u32).map(|i| 100 + (i * 7) % 5000).collect();
     let extract: Vec<usize> = (0..5).map(|i| 1 + i * (n_layers - 2) / 4).collect();
     let reps = 12;
@@ -56,7 +61,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // VERIFY_BREAKDOWN=T: разложение forward'а 2 и T строк (LLM_BENCH-профиль
     // слоёв: attn/ffn с синхронизацией; LLM_PROF_ATTN=1 — шаги внимания).
-    if let Some(t) = std::env::var("VERIFY_BREAKDOWN").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(t) = std::env::var("VERIFY_BREAKDOWN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         for tt in [2usize, t] {
             m.reset_cache(&be)?;
             let lg = m.prefill_last(&be, &prompt)?;
@@ -68,7 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let lg = m.prefill_extract(&be, &ids, &[])?.0;
             be.to_cpu_f32(&lg)?;
             unsafe { std::env::remove_var("LLM_BENCH") };
-            eprintln!("T={tt}: forward с синхронизацией по слоям {:.1} мс", t0.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "T={tt}: forward с синхронизацией по слоям {:.1} мс",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
         }
         return Ok(());
     }

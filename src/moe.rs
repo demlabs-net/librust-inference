@@ -165,10 +165,7 @@ impl MoeConfig {
             })?,
             None => Gating::Softmax,
         };
-        let expert_weights_scale = file
-            .get(&p(KEYS[4].1))
-            .and_then(as_f32)
-            .unwrap_or(0.0);
+        let expert_weights_scale = file.get(&p(KEYS[4].1)).and_then(as_f32).unwrap_or(0.0);
         let norm_topk_prob = file
             .get(&p(KEYS[5].1))
             .and_then(as_f32)
@@ -293,12 +290,7 @@ impl ExpertTensor {
                 wt.shape
             )));
         }
-        let w = crate::qwen3::Qwen3Model::upload_q(
-            backend,
-            wm,
-            name,
-            vec![n_expert * rows, cols],
-        )?;
+        let w = crate::qwen3::Qwen3Model::upload_q(backend, wm, name, vec![n_expert * rows, cols])?;
         // Блочный срез — только если бэкенд РЕАЛЬНО держит тензор в packed
         // виде: CPU грузит f32, и байтовое смещение там было бы в 4 раза
         // меньше нужного.
@@ -322,10 +314,9 @@ impl ExpertTensor {
     /// сверкам/будущим путям (смена резидентности экспертов в Части B).
     pub fn expert(&self, e: usize) -> Tensor {
         match self.row_bytes {
-            Some(rb) => self.w.view_offset_bytes(
-                vec![self.rows, self.cols],
-                e * self.rows * rb,
-            ),
+            Some(rb) => self
+                .w
+                .view_offset_bytes(vec![self.rows, self.cols], e * self.rows * rb),
             None => self
                 .w
                 .view_offset(vec![self.rows, self.cols], e * self.rows * self.cols),
@@ -384,8 +375,15 @@ impl MoeLayer {
                 cfg.n_expert_groups, cfg.n_group_used
             )));
         }
-        let ffn = if cfg.ffn_dim == 0 { dense_ffn } else { cfg.ffn_dim };
-        let cfg = MoeConfig { ffn_dim: ffn, ..cfg };
+        let ffn = if cfg.ffn_dim == 0 {
+            dense_ffn
+        } else {
+            cfg.ffn_dim
+        };
+        let cfg = MoeConfig {
+            ffn_dim: ffn,
+            ..cfg
+        };
         let n = cfg.n_expert;
         let t = |s: &str| format!("{prefix}{s}");
         Ok(Self {
@@ -414,11 +412,7 @@ impl MoeLayer {
     /// произведений, что у `mul_mat_id` llama.cpp (группировка токенов по
     /// эксперту меняет только порядок вызовов, не математику); группировка —
     /// оптимизация префилла, шаг A3.4.
-    pub fn forward(
-        &self,
-        backend: &dyn Backend,
-        x: &Tensor,
-    ) -> Result<Tensor, BackendError> {
+    pub fn forward(&self, backend: &dyn Backend, x: &Tensor) -> Result<Tensor, BackendError> {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         if b != 1 || d != self.dim {
             return Err(BackendError::Shape(format!(
@@ -440,11 +434,10 @@ impl MoeLayer {
         let mut ws = Vec::with_capacity(self.cfg.n_expert_used);
         let dbg = std::env::var("MOE_DEBUG").is_ok();
         for ti in 0..t {
-            self.cfg.route_row(&host[ti * e..(ti + 1) * e], &mut ids, &mut ws);
+            self.cfg
+                .route_row(&host[ti * e..(ti + 1) * e], &mut ids, &mut ws);
             if dbg {
-                eprintln!(
-                    "ENG router[t={ti}] ids={ids:?} w={ws:?}",
-                );
+                eprintln!("ENG router[t={ti}] ids={ids:?} w={ws:?}",);
             }
             routed.push((ids.clone(), ws.clone()));
         }
@@ -465,7 +458,12 @@ impl MoeLayer {
                 let mut dump = |name: &str, ne: &str, vals: &[f32]| {
                     let _ = writeln!(f, "STEP {call} TENSOR {name} ne=[{ne}]");
                     for (i, v) in vals.iter().enumerate() {
-                        let _ = write!(f, "{:08x}{}", v.to_bits(), if i % 8 == 7 { "\n" } else { " " });
+                        let _ = write!(
+                            f,
+                            "{:08x}{}",
+                            v.to_bits(),
+                            if i % 8 == 7 { "\n" } else { " " }
+                        );
                     }
                     let _ = writeln!(f);
                 };
@@ -481,8 +479,16 @@ impl MoeLayer {
                     idv.push(*eid as f32);
                     wt.push(*w);
                 }
-                dump("eng_topk_ids", &format!("{},1,1,1", t * self.cfg.n_expert_used), &idv);
-                dump("eng_weights", &format!("1,{},1,1", self.cfg.n_expert_used), &wt);
+                dump(
+                    "eng_topk_ids",
+                    &format!("{},1,1,1", t * self.cfg.n_expert_used),
+                    &idv,
+                );
+                dump(
+                    "eng_weights",
+                    &format!("1,{},1,1", self.cfg.n_expert_used),
+                    &wt,
+                );
             }
         }
 
@@ -584,7 +590,19 @@ impl MoeLayer {
         // суммирования — без него префилл MoE не битуется. Пакетный путь на
         // весь чанк; UnsupportedFormat (чужой квант/бэкенд) → по-слотовый цикл.
         if t >= 32 && std::env::var("INFER_MOE_NO_MM").is_err() {
-            match self.ffn_id_mm(backend, x2, routed, t, d, ffn, e, k, device_route, device_ids.as_ref(), device_wts.as_ref()) {
+            match self.ffn_id_mm(
+                backend,
+                x2,
+                routed,
+                t,
+                d,
+                ffn,
+                e,
+                k,
+                device_route,
+                device_ids.as_ref(),
+                device_wts.as_ref(),
+            ) {
                 Err(BackendError::UnsupportedFormat(_)) => {}
                 r => return r,
             }
@@ -666,9 +684,33 @@ impl MoeLayer {
         };
         // gate/up: src1 = строка токена, ne11=1 (вещание по слотам).
         let up = backend.zeros(vec![t, k, ffn])?;
-        backend.moe_experts_mm(&x2.view(vec![t, d]), &ids_t, &self.up.w, &up, ffn, e, t, k, 1, 0, (d * 4) as u64)?;
+        backend.moe_experts_mm(
+            &x2.view(vec![t, d]),
+            &ids_t,
+            &self.up.w,
+            &up,
+            ffn,
+            e,
+            t,
+            k,
+            1,
+            0,
+            (d * 4) as u64,
+        )?;
         let gate = backend.zeros(vec![t, k, ffn])?;
-        backend.moe_experts_mm(&x2.view(vec![t, d]), &ids_t, &self.gate.w, &gate, ffn, e, t, k, 1, 0, (d * 4) as u64)?;
+        backend.moe_experts_mm(
+            &x2.view(vec![t, d]),
+            &ids_t,
+            &self.gate.w,
+            &gate,
+            ffn,
+            e,
+            t,
+            k,
+            1,
+            0,
+            (d * 4) as u64,
+        )?;
         let prod = backend.zeros(vec![t, k, ffn])?;
         backend.swiglu(&gate, &up, &prod)?;
         // down: src1 [ffn, k, t] (слот-за-слотом, ne11=k), выход [t, k, d].
@@ -708,7 +750,12 @@ impl MoeLayer {
                         let v = backend.to_cpu_f32(tt)?;
                         writeln!(f, "STEP {call} TENSOR {name} ne=[{ne}]")?;
                         for (i, x) in v.iter().enumerate() {
-                            write!(f, "{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " })?;
+                            write!(
+                                f,
+                                "{:08x}{}",
+                                x.to_bits(),
+                                if i % 8 == 7 { "\n" } else { " " }
+                            )?;
                         }
                         writeln!(f)?;
                     }
@@ -725,13 +772,18 @@ impl MoeLayer {
                 return Ok(acc.view(vec![1, t, d]));
             }
             let v = backend.to_cpu_f32(&acc)?;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(std::env::var("INFER_MOE_DUMP").unwrap_or_else(|_| "/tmp/llama_ref/olm_acc.txt".into()))?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(
+                std::env::var("INFER_MOE_DUMP")
+                    .unwrap_or_else(|_| "/tmp/llama_ref/olm_acc.txt".into()),
+            )?;
             writeln!(f, "STEP {call} TENSOR acc ne=[{d},{t},1,1]")?;
             for (i, x) in v.iter().enumerate() {
-                write!(f, "{:08x}{}", x.to_bits(), if i % 8 == 7 { "\n" } else { " " })?;
+                write!(
+                    f,
+                    "{:08x}{}",
+                    x.to_bits(),
+                    if i % 8 == 7 { "\n" } else { " " }
+                )?;
             }
             writeln!(f)?;
         }
@@ -790,7 +842,11 @@ mod tests {
         let mut ids = Vec::new();
         let mut w = Vec::new();
         c.route_row(&[2.0, 2.0, 2.0, 2.0], &mut ids, &mut w);
-        assert_eq!(ids, vec![0, 1, 2, 3], "все четыре равны — порядок по индексу");
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3],
+            "все четыре равны — порядок по индексу"
+        );
         assert_eq!(w.len(), 4);
         // k = 0 не должен вернуть пустой список (иначе токен выпадет из FFN)
         c.n_expert_used = 0;
@@ -854,7 +910,9 @@ mod tests {
         let ws: Vec<f32> = vec![0.4, 0.3, 0.2, 0.1];
         let x = be
             .from_cpu_f32(
-                &(0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect::<Vec<_>>(),
+                &(0..k)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+                    .collect::<Vec<_>>(),
                 vec![1, k],
             )
             .unwrap();
@@ -863,7 +921,8 @@ mod tests {
         let y_id = be.zeros(vec![4, ffn]).unwrap();
         let ids_t = be.from_cpu_u32(&ids, vec![ids.len()]).unwrap();
         let ws_t = be.from_cpu_f32(&ws, vec![ws.len()]).unwrap();
-        be.moe_experts_mv(&x, &ids_t, &ws_t, &up_w, &y_id, ffn, false).unwrap();
+        be.moe_experts_mv(&x, &ids_t, &ws_t, &up_w, &y_id, ffn, false)
+            .unwrap();
         let id_host = be.to_cpu_f32(&y_id).unwrap();
         for (j, &eid) in ids.iter().enumerate() {
             let slice = ExpertTensor {
@@ -900,7 +959,8 @@ mod tests {
             )
             .unwrap();
         let y_ids = be.zeros(vec![n]).unwrap();
-        be.moe_experts_mv(&prod, &ids_t, &ws_t, &down_w, &y_ids, n, true).unwrap();
+        be.moe_experts_mv(&prod, &ids_t, &ws_t, &down_w, &y_ids, n, true)
+            .unwrap();
         let sum_id = be.to_cpu_f32(&y_ids).unwrap();
         let mut want = vec![0f32; n];
         for (j, &eid) in ids.iter().enumerate() {

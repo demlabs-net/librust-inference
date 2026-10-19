@@ -65,11 +65,19 @@ fn encode_matches_llama_cpp_golden() {
                 );
             }
             // decode — обратная операция (спец-токены декодируются в свой текст)
-            assert_eq!(tok.decode(&got), text, "{model}/{case}: decode(encode(x)) != x");
+            assert_eq!(
+                tok.decode(&got),
+                text,
+                "{model}/{case}: decode(encode(x)) != x"
+            );
             checked += 1;
         }
     }
-    assert!(checked > 0, "ни одной модели в {:?}: проверка не выполнена", models_dir());
+    assert!(
+        checked > 0,
+        "ни одной модели в {:?}: проверка не выполнена",
+        models_dir()
+    );
     eprintln!("совпало с llama.cpp: {checked} текстов");
 }
 
@@ -89,12 +97,21 @@ fn encode_is_fast_on_long_text() {
     let t0 = Instant::now();
     let ids = tok.encode(&text);
     let dt = t0.elapsed();
-    eprintln!("{} байт → {} токенов за {:.0} мс", text.len(), ids.len(), dt.as_secs_f64() * 1e3);
+    eprintln!(
+        "{} байт → {} токенов за {:.0} мс",
+        text.len(),
+        ids.len(),
+        dt.as_secs_f64() * 1e3
+    );
     assert!(dt.as_secs_f64() < 2.0, "1 МБ кодировался {dt:?}");
     let short = &text[..text.char_indices().nth(30_000).unwrap().0];
     let t1 = Instant::now();
     tok.encode(short);
-    assert!(t1.elapsed().as_secs_f64() < 0.1, "30 тыс. символов: {:?}", t1.elapsed());
+    assert!(
+        t1.elapsed().as_secs_f64() < 0.1,
+        "30 тыс. символов: {:?}",
+        t1.elapsed()
+    );
 }
 
 /// Набор EOG — как `special_eog_ids` llama.cpp: у Qwen3 eos = `<|im_end|>`,
@@ -103,7 +120,8 @@ fn encode_is_fast_on_long_text() {
 /// модель после `<|endoftext|>` продолжала писать мусор.
 #[test]
 fn eog_set_matches_llama_cpp_rules() {
-    let Some((mmap, _)) = load("Qwen3-8B-Base-Q8_0.gguf").or_else(|| load("Qwen3-0.6B-Instruct-Q8_0.gguf"))
+    let Some((mmap, _)) =
+        load("Qwen3-8B-Base-Q8_0.gguf").or_else(|| load("Qwen3-0.6B-Instruct-Q8_0.gguf"))
     else {
         eprintln!("нет Qwen3 GGUF — пропуск");
         return;
@@ -115,7 +133,13 @@ fn eog_set_matches_llama_cpp_rules() {
         assert_eq!(ids.len(), 1, "{s} обязан быть одним спец-токеном: {ids:?}");
         ids[0]
     };
-    for s in ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"] {
+    for s in [
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|fim_pad|>",
+        "<|repo_name|>",
+        "<|file_sep|>",
+    ] {
         assert!(tok.is_eog(id(s)), "{s} обязан завершать генерацию");
     }
     for s in ["<|im_start|>", "<think>", "<|vision_start|>"] {
@@ -126,14 +150,15 @@ fn eog_set_matches_llama_cpp_rules() {
     }
 }
 
-
 /// Стриминг по токенам (piece_bytes → IncrementalDecoder) собирает ровно
 /// исходный текст, даже когда символ разбит на несколько токенов (эмодзи,
 /// редкие иероглифы): раньше кусок токена проходил через from_utf8_lossy
 /// ДО декодера, и клиент получал «���» вместо 🦀.
 #[test]
 fn streaming_decode_keeps_split_characters() {
-    let Some((mmap, _)) = load("Qwen3-0.6B-Instruct-Q8_0.gguf").or_else(|| load("Qwen3-8B-Q8_0.gguf")) else {
+    let Some((mmap, _)) =
+        load("Qwen3-0.6B-Instruct-Q8_0.gguf").or_else(|| load("Qwen3-8B-Q8_0.gguf"))
+    else {
         eprintln!("нет Qwen3 GGUF — пропуск");
         return;
     };
@@ -142,7 +167,8 @@ fn streaming_decode_keeps_split_characters() {
     let text = "Краб 🦀 и 𝔘 и 龘, эмодзи-флаг 🇷🇺 и 👩‍💻.";
     let ids = tok.encode(text);
     assert!(
-        ids.iter().any(|&i| std::str::from_utf8(&tok.piece_bytes(i)).is_err()),
+        ids.iter()
+            .any(|&i| std::str::from_utf8(&tok.piece_bytes(i)).is_err()),
         "в тексте должен быть символ, разбитый на токены"
     );
     let mut dec = rust_inference::tokenizer::IncrementalDecoder::new();

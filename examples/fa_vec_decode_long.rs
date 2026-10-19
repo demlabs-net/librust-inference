@@ -39,7 +39,10 @@ fn main() {
     let ywant = rd(&format!("{dir}/dec_y.bin"));
     let (nh, nkv, hd) = (32usize, 2usize, 128usize);
     let tq = 1usize;
-    let tkv_cap: usize = std::env::var("FA_TKV_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    let tkv_cap: usize = std::env::var("FA_TKV_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
     let tkv = (k.len() / (nkv * hd)).min(tkv_cap);
     eprintln!("tkv={tkv} q={} k={} v={}", q.len(), k.len(), v.len());
     let kh: Vec<half::f16> = k.iter().map(|x| half::f16::from_f32(*x)).collect();
@@ -53,14 +56,24 @@ fn main() {
         ("nomask", None),
         (
             "zeromask",
-            Some(be.from_cpu_f32(&vec![0.0f32; tq * tkv], vec![1, tq, tkv]).unwrap()),
+            Some(
+                be.from_cpu_f32(&vec![0.0f32; tq * tkv], vec![1, tq, tkv])
+                    .unwrap(),
+            ),
         ),
     ] {
-        if std::env::var("FA_BATCH").is_ok() { be.begin_batch().unwrap(); }
-        be.attn_ar(&qt, &kt, &vt, mask.as_ref(), &y, nh, nkv, hd).unwrap();
-        if std::env::var("FA_BATCH").is_ok() { be.end_batch().unwrap(); }
+        if std::env::var("FA_BATCH").is_ok() {
+            be.begin_batch().unwrap();
+        }
+        be.attn_ar(&qt, &kt, &vt, mask.as_ref(), &y, nh, nkv, hd)
+            .unwrap();
+        if std::env::var("FA_BATCH").is_ok() {
+            be.end_batch().unwrap();
+        }
         let got = be.to_cpu_f32(&y).unwrap();
-        let bad = (0..ywant.len()).filter(|i| got[*i].to_bits() != ywant[*i].to_bits()).count();
+        let bad = (0..ywant.len())
+            .filter(|i| got[*i].to_bits() != ywant[*i].to_bits())
+            .count();
         let worst = (0..ywant.len())
             .map(|i| (got[i] - ywant[i]).abs())
             .fold(0f32, f32::max);
@@ -69,14 +82,27 @@ fn main() {
             let bytes: Vec<u8> = got.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write("/tmp/llama_ref/iso_y.bin", bytes).unwrap();
         }
-        if std::env::var("FA_ULP").is_ok() { ulp_hist(&got, &ywant); }
-        if std::env::var("FA_POS").is_ok() { bad_positions(&got, &ywant); }
+        if std::env::var("FA_ULP").is_ok() {
+            ulp_hist(&got, &ywant);
+        }
+        if std::env::var("FA_POS").is_ok() {
+            bad_positions(&got, &ywant);
+        }
         if std::env::var("FA_DIAG").is_ok() {
             let mut byh = vec![0usize; nh];
             for i in 0..ywant.len() {
-                if got[i].to_bits() != ywant[i].to_bits() { byh[i / hd] += 1; }
+                if got[i].to_bits() != ywant[i].to_bits() {
+                    byh[i / hd] += 1;
+                }
             }
-            println!("by head: {:?}", byh.iter().enumerate().filter(|(_,c)| **c>0).map(|(h,c)| (h,c)).collect::<Vec<_>>());
+            println!(
+                "by head: {:?}",
+                byh.iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c > 0)
+                    .map(|(h, c)| (h, c))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }

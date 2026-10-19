@@ -25,7 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t.offset,
         t.data.len()
     );
-    let w = dequant_gguf(t.ggml_type, &t.data[..t.ggml_type.bytes_per_element(32) as usize])?;
+    let w = dequant_gguf(
+        t.ggml_type,
+        &t.data[..t.ggml_type.bytes_per_element(32) as usize],
+    )?;
     println!("первые {n} f32 из источника: {:?}", &w[..n]);
     let q4 = quant_q4_0(&w);
     println!("наш Q4_0 блок: {}", hex(&q4));
@@ -37,4 +40,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-

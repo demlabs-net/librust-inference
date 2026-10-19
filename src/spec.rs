@@ -267,11 +267,7 @@ impl Drafter for NGramDrafter {
 /// N-грамный lookup БЕЗ бэкенда (7.9): та же логика, что у
 /// [`NGramDrafter`], но вызываемая там, где графа нет вовсе — например на
 /// ноде-драфтере, обслуживающей черновики соседей по сети.
-pub fn ngram_lookup(
-    history: &[u32],
-    gamma: usize,
-    max_order: usize,
-) -> (Vec<u32>, Vec<f32>) {
+pub fn ngram_lookup(history: &[u32], gamma: usize, max_order: usize) -> (Vec<u32>, Vec<f32>) {
     let max_order = max_order.max(1);
     {
         let mut drafts: Vec<u32> = Vec::new();

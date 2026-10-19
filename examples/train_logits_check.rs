@@ -18,9 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .ok_or("usage: train_logits_check <model.gguf>")?;
-    let text = std::env::var("CHECK_TEXT").unwrap_or_else(|_| {
-        "Столица Франции — это".to_string()
-    });
+    let text = std::env::var("CHECK_TEXT").unwrap_or_else(|_| "Столица Франции — это".to_string());
     let bytes = std::fs::read(&path)?;
     let gf = rust_inference::gguf::parse(&bytes)?;
     let wm = WeightsMap::from_gguf(&gf)?;
@@ -58,12 +56,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "n={n:2}: инференс {:>8?} | обучение {:>8?} | |Δ|max {diff:8.4} {}",
             tok.decode_piece(t1_inf as u32),
             tok.decode_piece(t1_tr as u32),
-            if t1_inf == t1_tr { "OK" } else { "РАСХОЖДЕНИЕ" }
+            if t1_inf == t1_tr {
+                "OK"
+            } else {
+                "РАСХОЖДЕНИЕ"
+            }
         );
     }
     Ok(())
 }
-
 
 // ── Постадийная сверка обучающего форварда с независимым host-эталоном ──────
 // (t=1: внимание тривиально, rope в pos=0 — тождество; любой расхождение на

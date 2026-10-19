@@ -209,7 +209,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
             Some(std::sync::Arc::new(std::sync::Mutex::new(d)))
         } else if std::env::var("LLM_SPEC").is_ok() {
-            Some(std::sync::Arc::new(std::sync::Mutex::new(NGramDrafter::new(4))))
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                NGramDrafter::new(4),
+            )))
         } else {
             None
         };
@@ -238,7 +240,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(d) = &drafter {
             d.lock().unwrap().reset();
         }
-        eprintln!("прогрев (пайплайны, буферы): {:.2}s", t0.elapsed().as_secs_f32());
+        eprintln!(
+            "прогрев (пайплайны, буферы): {:.2}s",
+            t0.elapsed().as_secs_f32()
+        );
     }
     // Потокенный префилл (отладка): кэш заполняется декодом по одному
     // токену, generate получает только последний токен промпта.

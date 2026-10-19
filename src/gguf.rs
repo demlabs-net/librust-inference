@@ -248,9 +248,16 @@ impl GgmlType {
             Self::Q1_0 => 128,
             Self::Q2_0 => 64,
             Self::Tq1_0 | Self::Tq2_0 => 256,
-            Self::Iq2Xxs | Self::Iq2Xs | Self::Iq3Xxs | Self::Iq1S | Self::Iq3S
-            | Self::Iq2S | Self::Iq1M => 256,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => 256,
+            Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq3Xxs
+            | Self::Iq1S
+            | Self::Iq3S
+            | Self::Iq2S
+            | Self::Iq1M => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => {
+                256
+            }
         }
     }
 

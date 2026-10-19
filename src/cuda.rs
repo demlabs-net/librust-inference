@@ -2328,7 +2328,8 @@ impl Backend for CudaBackend {
         if let Some(y) = yarn {
             if !y.is_identity() {
                 return Err(BackendError::Shape(
-                    "rope_standard: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)".into(),
+                    "rope_standard: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)"
+                        .into(),
                 ));
             }
         }
@@ -2370,7 +2371,8 @@ impl Backend for CudaBackend {
         if let Some(y) = yarn {
             if !y.is_identity() {
                 return Err(BackendError::Shape(
-                    "rmsnorm_head_rope: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)".into(),
+                    "rmsnorm_head_rope: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)"
+                        .into(),
                 ));
             }
         }

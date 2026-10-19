@@ -12,18 +12,18 @@ fn main() {
     let mut w = Vec::new();
     for row in 0..n {
         w.extend_from_slice(&[0x00u8, 0x3c]); // d = 1.0f16
-        let qh: u32 = if row % 2 == 0 { 0x0000_FFFF } else { 0xFFFF_0000 };
+        let qh: u32 = if row % 2 == 0 {
+            0x0000_FFFF
+        } else {
+            0xFFFF_0000
+        };
         w.extend_from_slice(&qh.to_le_bytes());
         for _ in 0..16 {
             w.push(0x10);
         }
     }
     let wt = be
-        .from_quantized(
-            &w,
-            vec![n, k],
-            rust_inference::dtype::WeightFormat::Q5_0,
-        )
+        .from_quantized(&w, vec![n, k], rust_inference::dtype::WeightFormat::Q5_0)
         .unwrap();
     for e in [0usize, 1, 15, 16, 17, 31] {
         let mut x = vec![0f32; k];

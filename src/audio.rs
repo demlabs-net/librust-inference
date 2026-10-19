@@ -170,8 +170,7 @@ pub fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Vec<f32>
 /// RIFF-заголовок разбирается вручную (без внешних зависимостей).
 pub fn read_wav_pcm16(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
     let bytes = std::fs::read(path)?;
-    parse_wav_pcm16_bytes(&bytes)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    parse_wav_pcm16_bytes(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
 /// Парсинг WAV (PCM16, mono) ИЗ ПАМЯТИ — HTTP/IPC-путь (input_audio):

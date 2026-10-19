@@ -18,10 +18,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Qwen3Config::from_gguf(&gf, tok.vocab_size())?;
     let dim = cfg.dim;
     let mut model = Qwen3Model::load(&be, &wm, cfg.clone())?;
-    for text in ["<|im_start|>user\nмассив<|im_end|>\n<|im_start|>assistant\n", "<|im_start|>user\nСкажи<|im_end|>\n<|im_start|>assistant\n"] {
+    for text in [
+        "<|im_start|>user\nмассив<|im_end|>\n<|im_start|>assistant\n",
+        "<|im_start|>user\nСкажи<|im_end|>\n<|im_start|>assistant\n",
+    ] {
         let ids = tok.encode(text);
         model.reset_cache(&be)?;
-
 
         let lg = model.prefill(&be, &ids)?;
         let lv = be.to_cpu_f32(&lg)?;

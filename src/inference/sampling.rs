@@ -271,12 +271,7 @@ pub fn modified_probs(logits: &[f32], params: &SamplingParams, history: &[u32]) 
 /// модифицированного p — вычесть массу драфтера с draft-позиции, обнулить
 /// отрицательное, ренормировать, сэмплить (индексный порядок — как у
 /// прежнего sample_modified).
-pub fn sample_residual(
-    probs: &[f32],
-    draft_tok: u32,
-    q: f32,
-    rng_state: &mut Option<u64>,
-) -> u32 {
+pub fn sample_residual(probs: &[f32], draft_tok: u32, q: f32, rng_state: &mut Option<u64>) -> u32 {
     let mut w: Vec<f32> = probs.to_vec();
     if let Some(t) = w.get_mut(draft_tok as usize) {
         *t = (*t - q).max(0.0);
@@ -412,7 +407,9 @@ mod tests {
     fn seeded_stream_is_deterministic() {
         let draws = |seed: u64| {
             let mut rng = Some(state_from_seed(seed));
-            (0..6).map(|_| next_unit_f32(&mut rng)).collect::<Vec<f32>>()
+            (0..6)
+                .map(|_| next_unit_f32(&mut rng))
+                .collect::<Vec<f32>>()
         };
         assert_eq!(draws(42), draws(42));
         assert_ne!(draws(42), draws(43));
@@ -437,12 +434,20 @@ mod tests {
                 min_p,
             };
             let mut rng = Some(state_from_seed(11));
-            (0..400).map(|_| top_p_sample_vec(&logits, &params, &mut rng)).collect()
+            (0..400)
+                .map(|_| top_p_sample_vec(&logits, &params, &mut rng))
+                .collect()
         };
         let cut = run(0.25);
-        assert!(cut.iter().all(|&t| t <= 1), "min_p=0.25 пропустил хвост: {cut:?}");
+        assert!(
+            cut.iter().all(|&t| t <= 1),
+            "min_p=0.25 пропустил хвост: {cut:?}"
+        );
         let all = run(0.0);
-        assert!(all.iter().any(|&t| t >= 2), "без min_p хвост обязан встречаться: {all:?}");
+        assert!(
+            all.iter().any(|&t| t >= 2),
+            "без min_p хвост обязан встречаться: {all:?}"
+        );
     }
 
     #[test]

@@ -30,14 +30,21 @@ fn main() {
         *x = half::f16::from_f32(rnd());
     }
     let mut mask = vec![0.0f32; tq * tkv];
-    for i in 0..tq { for j in 0..tkv { if j > i { mask[i * tkv + j] = f32::NEG_INFINITY; } } }
+    for i in 0..tq {
+        for j in 0..tkv {
+            if j > i {
+                mask[i * tkv + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
     let qt = be.from_cpu_f32(&q, vec![1, tq, nh * hd]).unwrap();
     let kt = be.from_cpu_f16(&k, vec![1, tkv, nkv * hd]).unwrap();
     let vt = be.from_cpu_f16(&v, vec![1, tkv, nkv * hd]).unwrap();
     let mt = be.from_cpu_f32(&mask, vec![1, tq, tkv]).unwrap();
     let y = be.zeros(vec![1, tq, nh * hd]).unwrap();
     use rust_inference::backend::Backend;
-    be.attn_ar(&qt, &kt, &vt, Some(&mt), &y, nh, nkv, hd).unwrap();
+    be.attn_ar(&qt, &kt, &vt, Some(&mt), &y, nh, nkv, hd)
+        .unwrap();
     let got = be.to_cpu_f32(&y).unwrap();
     // эталон: для каждого токена и головы — softmax по разрешённым ключам
     let scale = 1.0f32 / (hd as f32).sqrt();
@@ -50,12 +57,17 @@ fn main() {
             for j in 0..tkv {
                 if mask[t * tkv + j] == 0.0 {
                     let s: f32 = (0..hd)
-                        .map(|d| q[t * nh * hd + h * hd + d] * f32::from(k[j * nkv * hd + kvh * hd + d]))
+                        .map(|d| {
+                            q[t * nh * hd + h * hd + d] * f32::from(k[j * nkv * hd + kvh * hd + d])
+                        })
                         .sum();
                     scores.push((j, s * scale));
                 }
             }
-            let m = scores.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+            let m = scores
+                .iter()
+                .map(|(_, s)| *s)
+                .fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = scores.iter().map(|(_, s)| (s - m).exp()).sum();
             for d in 0..hd {
                 let e: f32 = scores

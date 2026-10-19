@@ -753,7 +753,6 @@ impl KvCache {
         self.pos = 0;
     }
 
-
     /// Откат к позиции `pos` (спекулятивный decode: непринятые draft-токены).
     /// Данные остаются — следующий kv_update перезапишет хвост.
     pub fn truncate(&mut self, pos: usize) {

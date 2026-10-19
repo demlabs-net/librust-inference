@@ -111,11 +111,13 @@ impl Qwen3Config {
             .and_then(GgufValue::as_u32)
             .unwrap_or(0);
         let rope_yarn = crate::rope::RopeYarn::from_meta(
-            &|k| file.get(k).and_then(|v| match v {
-                GgufValue::F32(f) => Some(*f),
-                GgufValue::F64(f) => Some(*f as f32),
-                _ => None,
-            }),
+            &|k| {
+                file.get(k).and_then(|v| match v {
+                    GgufValue::F32(f) => Some(*f),
+                    GgufValue::F64(f) => Some(*f as f32),
+                    _ => None,
+                })
+            },
             &|k| file.get(k).and_then(|v| v.as_str().map(|s| s.to_string())),
             &|k| file.get(k).and_then(GgufValue::as_u32),
             &arch,
@@ -304,7 +306,6 @@ impl ModelKvState {
         }
         Ok(Self { pos_rope, layers })
     }
-
 }
 
 pub struct Qwen3Model {
@@ -787,7 +788,11 @@ impl Qwen3Model {
     /// генерация читает лишь их. lm_head (самая большая матрица: V×D) идёт
     /// по одной строке вместо T: на промпте 128 токенов у Qwen3-8B это
     /// ~1/4 всей prefill-работы. Кэш и позиции — как у [`Self::prefill`].
-    pub fn prefill_last(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+    pub fn prefill_last(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
         self.prefill_last_chunked(backend, ids, Self::prefill_chunk())
     }
 
@@ -854,7 +859,11 @@ impl Qwen3Model {
         })()
     }
 
-    fn prefill_last_one(&mut self, backend: &dyn Backend, ids: &[u32]) -> Result<Tensor, BackendError> {
+    fn prefill_last_one(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
         backend.begin_batch()?;
         let r = (|| {
             let t = ids.len();
@@ -959,8 +968,7 @@ impl Qwen3Model {
             t_fwd += tf.elapsed().as_secs_f64();
             for (li, e) in ex.iter().enumerate() {
                 let tc = std::time::Instant::now();
-                extract[li] =
-                    backend.copy_rows_into(e, t, d, extract[li].clone(), done, 0, d)?;
+                extract[li] = backend.copy_rows_into(e, t, d, extract[li].clone(), done, 0, d)?;
                 t_copy += tc.elapsed().as_secs_f64();
             }
             if end == t_all {
@@ -1147,7 +1155,17 @@ impl Qwen3Model {
         let mut extract = Vec::new();
         let mut split = None;
         self.forward_layers_inner(
-            backend, x, t, mrope, upto, from, deepstack, norm_out, &[], &mut extract, None,
+            backend,
+            x,
+            t,
+            mrope,
+            upto,
+            from,
+            deepstack,
+            norm_out,
+            &[],
+            &mut extract,
+            None,
             &mut split,
         )
     }
@@ -1260,7 +1278,9 @@ impl Qwen3Model {
         // Постадийная сверка MoE/A3-пути с host-эталоном (examples/olmoe_probe):
         // MOE_DEBUG_L=<слой> печатает те же теги (последний токен, первые 8
         // значений), что печатает HOST у зонда.
-        let dbg_layer = std::env::var("MOE_DEBUG_L").ok().and_then(|v| v.parse::<usize>().ok());
+        let dbg_layer = std::env::var("MOE_DEBUG_L")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
         let dump = |tag: &str, t: &Tensor| -> Result<(), BackendError> {
             let v = backend.to_cpu_f32(t)?;
             let d = self.cfg.dim;
@@ -1610,9 +1630,8 @@ impl Qwen3Model {
         // Жадная проверка без штрафа за повторы (обычный режим сервиса):
         // argmax строк считается на GPU, строка [1+γ, V] на хост не едет.
         // INFER_SPEC_CPU=1 — прежний путь через хост (сверка/замеры).
-        let gpu_greedy = greedy
-            && sp.repetition_penalty == 1.0
-            && std::env::var("INFER_SPEC_CPU").is_err();
+        let gpu_greedy =
+            greedy && sp.repetition_penalty == 1.0 && std::env::var("INFER_SPEC_CPU").is_err();
         let mut ld = Vec::new();
         let (accepted, accepted_len, n_verified) = if gpu_greedy {
             let (am, _lse) = backend.argmax_rows(&logits, None)?;
@@ -1806,160 +1825,180 @@ impl Qwen3Model {
             && qkv_parts.is_none()
             && (cache.is_f32() || cache.is_f16())
             && std::env::var("INFER_QKV_UNFUSED").is_err();
-        let (q, t_norm, t_upd_d) = if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
-            let t_upd = std::time::Instant::now();
-            let (pos_kv, kb, vb) = cache.begin_append(backend, tq)?;
-            let q = backend.qkv_norm_rope_kv(
-                qkv.as_ref().expect("fused ⇒ qkv есть"),
-                qn,
-                kn,
-                &kb,
-                &vb,
-                attn.n_heads,
-                attn.n_kv_heads,
-                attn.head_dim,
-                pos,
-                pos_kv,
-                cfg.rope_theta,
-                1e-6,
-                cfg.rope_yarn.as_ref(),
-            )?;
-            cache.advance(tq);
-            sync(&q)?;
-            (q, tp0.elapsed().as_secs_f64(), t_upd.elapsed().as_secs_f64())
-        } else {
-            let (q, k, v) = match qkv_parts {
-                Some(parts) => parts,
-                None => (
-                    crate::nn::slice_last(backend, qkv.as_ref().expect("qkv или parts"), q_size, 0)?,
-                    crate::nn::slice_last(backend, qkv.as_ref().expect("qkv или parts"), kv_size, q_size)?,
-                    crate::nn::slice_last(backend, qkv.as_ref().expect("qkv или parts"), kv_size, q_size + kv_size)?,
-                ),
-            };
-            if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
-                for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
-                    let tv = backend.to_cpu_f32(t)?;
-                    eprintln!("INFER_DEBUG {tag}_slice[:8]={:?}", &tv[..8.min(tv.len())]);
-                }
-            }
-            if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
-                let qv = backend.to_cpu_f32(&q)?;
-                let kvv = backend.to_cpu_f32(&k)?;
-                let hv = backend.to_cpu_f32(h)?;
-                let t = tq;
-                eprintln!(
-                    "OMNI_REF our_ln[-1,:8]={:?}",
-                    &hv[(t - 1) * q_size..(t - 1) * q_size + 8]
-                );
-                eprintln!(
-                    "OMNI_REF our_q0[-1,:8]={:?}",
-                    &qv[(t - 1) * q_size..(t - 1) * q_size + 8]
-                );
-                eprintln!(
-                    "OMNI_REF our_k0[-1,:8]={:?}",
-                    &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]
-                );
-            }
-            // НОРМАЛИЗАЦИЯ — ТОЛЬКО ОДНА, В ВЕТКАХ НИЖЕ. Раньше здесь стоял
-            // пред-норм qk_norm, а затем fused rmsnorm_head_rope / qk_norm_pub
-            // нормировали q/k ВТОРОЙ раз: 2× норм на реальном GGUF (Qwen3
-            // 0.6B/8B) давал вырожденный вывод (повтор «|وووو…»). Ветки
-            // сами нормируют: else — rmsnorm_head_rope, mrope — qk_norm_pub.
-            let (q, k) = if let Some(mrope) = mrope {
-                let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
-                let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
-                let sects = cfg.mrope_sections.expect("mrope без sections");
+        let (q, t_norm, t_upd_d) =
+            if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
+                let t_upd = std::time::Instant::now();
+                let (pos_kv, kb, vb) = cache.begin_append(backend, tq)?;
+                let q = backend.qkv_norm_rope_kv(
+                    qkv.as_ref().expect("fused ⇒ qkv есть"),
+                    qn,
+                    kn,
+                    &kb,
+                    &vb,
+                    attn.n_heads,
+                    attn.n_kv_heads,
+                    attn.head_dim,
+                    pos,
+                    pos_kv,
+                    cfg.rope_theta,
+                    1e-6,
+                    cfg.rope_yarn.as_ref(),
+                )?;
+                cache.advance(tq);
+                sync(&q)?;
                 (
-                    backend.rope_mrope(&q, mrope, attn.head_dim, cfg.rope_theta, sects)?,
-                    backend.rope_mrope(&k, mrope, attn.head_dim, cfg.rope_theta, sects)?,
-                )
-            } else if let Some(sects) = cfg.mrope_sections {
-                let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
-                let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
-                (
-                    backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?,
-                    backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?,
+                    q,
+                    tp0.elapsed().as_secs_f64(),
+                    t_upd.elapsed().as_secs_f64(),
                 )
             } else {
-                // OLMoE: QK-норма по ВСЕЙ проекции (вес длиной n_embd) —
-                // пер-головный fused-кернел тут неприменим: нормируем строку
-                // целиком (как llama.cpp olmoe.cpp build_norm ДО reshape в
-                // головы), затем стандартный RoPE.
-                let norm_rope =
-                    |x: &Tensor, w: &Tensor, heads: usize| -> Result<Tensor, BackendError> {
-                        match attn.qk_norm_whole_eps {
-                            Some(eps) => {
-                                let y = backend.zeros(x.shape().to_vec())?;
-                                backend.rmsnorm(x, w, &y, eps)?;
-                                rope_standard(
-                                    backend,
-                                    &y,
+                let (q, k, v) = match qkv_parts {
+                    Some(parts) => parts,
+                    None => (
+                        crate::nn::slice_last(
+                            backend,
+                            qkv.as_ref().expect("qkv или parts"),
+                            q_size,
+                            0,
+                        )?,
+                        crate::nn::slice_last(
+                            backend,
+                            qkv.as_ref().expect("qkv или parts"),
+                            kv_size,
+                            q_size,
+                        )?,
+                        crate::nn::slice_last(
+                            backend,
+                            qkv.as_ref().expect("qkv или parts"),
+                            kv_size,
+                            q_size + kv_size,
+                        )?,
+                    ),
+                };
+                if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
+                    for (tag, t) in [("q", &q), ("k", &k), ("v", &v)] {
+                        let tv = backend.to_cpu_f32(t)?;
+                        eprintln!("INFER_DEBUG {tag}_slice[:8]={:?}", &tv[..8.min(tv.len())]);
+                    }
+                }
+                if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
+                    let qv = backend.to_cpu_f32(&q)?;
+                    let kvv = backend.to_cpu_f32(&k)?;
+                    let hv = backend.to_cpu_f32(h)?;
+                    let t = tq;
+                    eprintln!(
+                        "OMNI_REF our_ln[-1,:8]={:?}",
+                        &hv[(t - 1) * q_size..(t - 1) * q_size + 8]
+                    );
+                    eprintln!(
+                        "OMNI_REF our_q0[-1,:8]={:?}",
+                        &qv[(t - 1) * q_size..(t - 1) * q_size + 8]
+                    );
+                    eprintln!(
+                        "OMNI_REF our_k0[-1,:8]={:?}",
+                        &kvv[(t - 1) * kv_size..(t - 1) * kv_size + 8]
+                    );
+                }
+                // НОРМАЛИЗАЦИЯ — ТОЛЬКО ОДНА, В ВЕТКАХ НИЖЕ. Раньше здесь стоял
+                // пред-норм qk_norm, а затем fused rmsnorm_head_rope / qk_norm_pub
+                // нормировали q/k ВТОРОЙ раз: 2× норм на реальном GGUF (Qwen3
+                // 0.6B/8B) давал вырожденный вывод (повтор «|وووو…»). Ветки
+                // сами нормируют: else — rmsnorm_head_rope, mrope — qk_norm_pub.
+                let (q, k) = if let Some(mrope) = mrope {
+                    let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
+                    let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
+                    let sects = cfg.mrope_sections.expect("mrope без sections");
+                    (
+                        backend.rope_mrope(&q, mrope, attn.head_dim, cfg.rope_theta, sects)?,
+                        backend.rope_mrope(&k, mrope, attn.head_dim, cfg.rope_theta, sects)?,
+                    )
+                } else if let Some(sects) = cfg.mrope_sections {
+                    let q = qk_norm_pub(backend, &q, attn.q_norm.as_ref(), attn.n_heads, 1e-6)?;
+                    let k = qk_norm_pub(backend, &k, attn.k_norm.as_ref(), attn.n_kv_heads, 1e-6)?;
+                    (
+                        backend.rope_mrope_text(&q, pos, attn.head_dim, cfg.rope_theta, sects)?,
+                        backend.rope_mrope_text(&k, pos, attn.head_dim, cfg.rope_theta, sects)?,
+                    )
+                } else {
+                    // OLMoE: QK-норма по ВСЕЙ проекции (вес длиной n_embd) —
+                    // пер-головный fused-кернел тут неприменим: нормируем строку
+                    // целиком (как llama.cpp olmoe.cpp build_norm ДО reshape в
+                    // головы), затем стандартный RoPE.
+                    let norm_rope =
+                        |x: &Tensor, w: &Tensor, heads: usize| -> Result<Tensor, BackendError> {
+                            match attn.qk_norm_whole_eps {
+                                Some(eps) => {
+                                    let y = backend.zeros(x.shape().to_vec())?;
+                                    backend.rmsnorm(x, w, &y, eps)?;
+                                    rope_standard(
+                                        backend,
+                                        &y,
+                                        pos,
+                                        t,
+                                        attn.head_dim,
+                                        cfg.rope_theta,
+                                        cfg.rope_yarn.as_ref(),
+                                    )
+                                }
+                                // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4;
+                                // дефолт (CPU/CUDA) — два шага
+                                None => backend.rmsnorm_head_rope(
+                                    x,
+                                    w,
                                     pos,
-                                    t,
                                     attn.head_dim,
                                     cfg.rope_theta,
+                                    heads,
+                                    1e-6,
                                     cfg.rope_yarn.as_ref(),
-                                )
+                                ),
                             }
-                            // fused qk_norm+rope (Ф8): 2 кернела на слой вместо 4;
-                            // дефолт (CPU/CUDA) — два шага
-                            None => backend.rmsnorm_head_rope(
-                                x,
-                                w,
-                                pos,
-                                attn.head_dim,
-                                cfg.rope_theta,
-                                heads,
-                                1e-6,
-                                cfg.rope_yarn.as_ref(),
-                            ),
+                        };
+                    let q = match &attn.q_norm {
+                        Some(w) => {
+                            let q = norm_rope(&q, w, attn.n_heads)?;
+                            if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
+                                let qv = backend.to_cpu_f32(&q)?;
+                                eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
+                            }
+                            q
                         }
+                        None => rope_standard(
+                            backend,
+                            &q,
+                            pos,
+                            t,
+                            attn.head_dim,
+                            cfg.rope_theta,
+                            cfg.rope_yarn.as_ref(),
+                        )?,
                     };
-                let q = match &attn.q_norm {
-                    Some(w) => {
-                        let q = norm_rope(&q, w, attn.n_heads)?;
-                        if cfg!(debug_assertions) && std::env::var("INFER_LLM_DEBUG").is_ok() {
-                            let qv = backend.to_cpu_f32(&q)?;
-                            eprintln!("INFER_DEBUG q0_normed[:8]={:?}", &qv[..8.min(qv.len())]);
-                        }
-                        q
-                    }
-                    None => rope_standard(
-                        backend,
-                        &q,
-                        pos,
-                        t,
-                        attn.head_dim,
-                        cfg.rope_theta,
-                        cfg.rope_yarn.as_ref(),
-                    )?,
+                    let k = match &attn.k_norm {
+                        Some(w) => norm_rope(&k, w, attn.n_kv_heads)?,
+                        None => rope_standard(
+                            backend,
+                            &k,
+                            pos,
+                            t,
+                            attn.head_dim,
+                            cfg.rope_theta,
+                            cfg.rope_yarn.as_ref(),
+                        )?,
+                    };
+                    (q, k)
                 };
-                let k = match &attn.k_norm {
-                    Some(w) => norm_rope(&k, w, attn.n_kv_heads)?,
-                    None => rope_standard(
-                        backend,
-                        &k,
-                        pos,
-                        t,
-                        attn.head_dim,
-                        cfg.rope_theta,
-                        cfg.rope_yarn.as_ref(),
-                    )?,
-                };
-                (q, k)
+                sync(&k)?;
+                let t_norm = tp0.elapsed().as_secs_f64();
+                // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
+                // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
+                let t_upd = std::time::Instant::now();
+                match cache_at {
+                    Some(at) => cache.update_at(backend, &k, &v, at)?,
+                    None => cache.update(backend, &k, &v)?,
+                }
+                let t_upd_d = t_upd.elapsed().as_secs_f64();
+                (q, t_norm, t_upd_d)
             };
-            sync(&k)?;
-            let t_norm = tp0.elapsed().as_secs_f64();
-            // attention напрямую через attn_ar (q/k уже повёрнуты стандартным RoPE)
-            // q/k/v 3D [1, T, D]; attn_ar сам разложит по головам
-            let t_upd = std::time::Instant::now();
-            match cache_at {
-                Some(at) => cache.update_at(backend, &k, &v, at)?,
-                None => cache.update(backend, &k, &v)?,
-            }
-            let t_upd_d = t_upd.elapsed().as_secs_f64();
-            (q, t_norm, t_upd_d)
-        };
         // N (iter-10): mask passed in from the caller (built once per
         // forward); the `causal`/`mrope` arguments are kept for the call
         // sites' None-vs-Some decision, but the build itself moved out.
@@ -2074,12 +2113,7 @@ pub(crate) fn verify_draft(
                 // нужен — распределение вырождено).
                 crate::inference::sampling::greedy_next(row, &h, sp.repetition_penalty)
             } else {
-                crate::inference::sampling::sample_residual(
-                    &probs,
-                    draft[i],
-                    draft_probs[i],
-                    rng,
-                )
+                crate::inference::sampling::sample_residual(&probs, draft[i], draft_probs[i], rng)
             });
             break;
         }
@@ -2323,7 +2357,11 @@ mod test_util {
             ] {
                 let numel = shape.iter().product::<usize>();
                 let data = rand_vec(numel, &mut rng);
-                if !qk_norm && n.contains("_norm.weight") && n.starts_with("attn_") && n != "attn_norm.weight" {
+                if !qk_norm
+                    && n.contains("_norm.weight")
+                    && n.starts_with("attn_")
+                    && n != "attn_norm.weight"
+                {
                     continue; // тот же поток rng — прочие веса совпадают
                 }
                 storage.push((p(n), data, shape));
@@ -2450,10 +2488,14 @@ mod roll_tests {
             .prefill(backend.as_ref(), window)
             .expect("prefill window");
 
-        let rk = crate::backend::download_in_dtype(backend.as_ref(), &rolled.caches[0].view()).unwrap();
-        let fk = crate::backend::download_in_dtype(backend.as_ref(), &fresh.caches[0].view()).unwrap();
-        let rv = crate::backend::download_in_dtype(backend.as_ref(), &rolled.caches[0].view_v()).unwrap();
-        let fv = crate::backend::download_in_dtype(backend.as_ref(), &fresh.caches[0].view_v()).unwrap();
+        let rk =
+            crate::backend::download_in_dtype(backend.as_ref(), &rolled.caches[0].view()).unwrap();
+        let fk =
+            crate::backend::download_in_dtype(backend.as_ref(), &fresh.caches[0].view()).unwrap();
+        let rv = crate::backend::download_in_dtype(backend.as_ref(), &rolled.caches[0].view_v())
+            .unwrap();
+        let fv =
+            crate::backend::download_in_dtype(backend.as_ref(), &fresh.caches[0].view_v()).unwrap();
         let dev = |a: &[f32], b: &[f32]| {
             a.iter()
                 .zip(b)
@@ -2525,7 +2567,9 @@ mod tests {
                 super::test_util::FORCE_KV_F32.with(|f| f.set(false));
                 let fmt = m.caches[0].stored_formats().0;
                 let ids: Vec<u32> = (0..19u32).map(|i| (i * 3) % 8).collect();
-                let mut out = backend.to_cpu_f32(&m.prefill(&backend, &ids).unwrap()).unwrap();
+                let mut out = backend
+                    .to_cpu_f32(&m.prefill(&backend, &ids).unwrap())
+                    .unwrap();
                 for t in [1u32, 5, 2] {
                     out.extend(backend.to_cpu_f32(&m.decode(&backend, t).unwrap()).unwrap());
                 }
@@ -2533,9 +2577,21 @@ mod tests {
             };
             let (a, fa) = run(false);
             let (b, fb) = run(true);
-            assert_eq!(fa, crate::dtype::KvFormat::F16, "{name}: KV обязан быть f16");
-            assert_eq!(fb, crate::dtype::KvFormat::F32, "{name}: рычаг INFER_KV_F32");
-            let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs() / (1.0 + y.abs())).fold(0.0f32, f32::max);
+            assert_eq!(
+                fa,
+                crate::dtype::KvFormat::F16,
+                "{name}: KV обязан быть f16"
+            );
+            assert_eq!(
+                fb,
+                crate::dtype::KvFormat::F32,
+                "{name}: рычаг INFER_KV_F32"
+            );
+            let worst = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
+                .fold(0.0f32, f32::max);
             assert!(a.iter().all(|x| x.is_finite()), "{name}: NaN в логитах f16");
             assert!(worst < 2e-2, "{name}: f16 против f32 — {worst}");
         }
@@ -2559,7 +2615,11 @@ mod tests {
         // Эталон: источник продолжает 8 и 9.
         let mut l_src = Vec::new();
         for &t in &[8u32, 9] {
-            l_src.push(backend.to_cpu_f32(&src.decode(&backend, t).unwrap()).unwrap());
+            l_src.push(
+                backend
+                    .to_cpu_f32(&src.decode(&backend, t).unwrap())
+                    .unwrap(),
+            );
         }
 
         // Приёмник: тот же KV импортирован в другой экземпляр тех же весов.
@@ -2567,8 +2627,13 @@ mod tests {
         dst.import_kv(&backend2, &st).unwrap();
         assert_eq!(dst.pos_rope, 7, "rope-позиция после импорта");
         for (i, &t) in [8u32, 9].iter().enumerate() {
-            let l = backend2.to_cpu_f32(&dst.decode(&backend2, t).unwrap()).unwrap();
-            assert_eq!(l, l_src[i], "продолжение после импорта KV расходится (шаг {i})");
+            let l = backend2
+                .to_cpu_f32(&dst.decode(&backend2, t).unwrap())
+                .unwrap();
+            assert_eq!(
+                l, l_src[i],
+                "продолжение после импорта KV расходится (шаг {i})"
+            );
         }
 
         // Кодек передачи (7.8): блоб кодируется и разбирается без потерь.
@@ -2576,7 +2641,10 @@ mod tests {
         let back = ModelKvState::decode(&blob).unwrap();
         assert_eq!(back, st, "KV-объект не пережил кодек");
         // Обрезанный блоб отвергается, а не превращается в пустой контекст.
-        assert!(ModelKvState::decode(&blob[..blob.len() - 8]).is_err(), "обрыв не отвергнут");
+        assert!(
+            ModelKvState::decode(&blob[..blob.len() - 8]).is_err(),
+            "обрыв не отвергнут"
+        );
         assert!(ModelKvState::decode(b"XXXX").is_err(), "чужой блоб принят");
 
         // Несовместимый объект — громкая ошибка, а не молчаливый мусор.
@@ -2632,7 +2700,10 @@ mod tests {
                     .zip(&bv)
                     .map(|(x, y)| (x - y).abs())
                     .fold(0.0f32, f32::max);
-                assert!(worst < 1e-4, "chunk={chunk}: extract слоя {li}: max |Δ| {worst}");
+                assert!(
+                    worst < 1e-4,
+                    "chunk={chunk}: extract слоя {li}: max |Δ| {worst}"
+                );
             }
 
             model.reset_cache(&backend).unwrap();
@@ -2643,7 +2714,10 @@ mod tests {
                 .zip(&lv2)
                 .map(|(x, y)| (x - y).abs())
                 .fold(0.0f32, f32::max);
-            assert!(worst < 1e-4, "chunk={chunk}: против prefill_last max |Δ| {worst}");
+            assert!(
+                worst < 1e-4,
+                "chunk={chunk}: против prefill_last max |Δ| {worst}"
+            );
         }
     }
 
@@ -2654,9 +2728,9 @@ mod tests {
         let id = 7u32;
         for (draft, argmax) in [
             (vec![], vec![]),
-            (vec![1, 2, 3], vec![1, 2, 3]),      // все приняты
-            (vec![1, 2, 3], vec![1, 9, 3]),      // отказ на 2-м
-            (vec![1, 2, 3], vec![8, 2, 3]),      // отказ сразу
+            (vec![1, 2, 3], vec![1, 2, 3]), // все приняты
+            (vec![1, 2, 3], vec![1, 9, 3]), // отказ на 2-м
+            (vec![1, 2, 3], vec![8, 2, 3]), // отказ сразу
         ] {
             let (acc_g, len_g, nv_g) = verify_greedy_by_argmax(id, &draft, &argmax);
             // CPU-путь (penalty 1.0): ld — строки с максимумом в argmax[r]
@@ -2677,7 +2751,11 @@ mod tests {
                 &sp_softmax_unit(),
             );
 
-            assert_eq!((len_g, nv_g), (len_c, nv_c), "draft={draft:?} argmax={argmax:?}");
+            assert_eq!(
+                (len_g, nv_g),
+                (len_c, nv_c),
+                "draft={draft:?} argmax={argmax:?}"
+            );
             assert_eq!(acc_g, acc_c, "draft={draft:?} argmax={argmax:?}");
         }
     }
@@ -2721,7 +2799,17 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let out = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], &sp_softmax_unit())
+            .decode_spec(
+                &backend,
+                5,
+                &[],
+                &[],
+                &mut rng,
+                &[],
+                false,
+                &[],
+                &sp_softmax_unit(),
+            )
             .unwrap();
         // Контракт SpecOutcome: accepted[0] — ЯКОРЬ (гарантированный токен);
         // при γ=0 черновиков нет, значит список ровно из якоря.
@@ -2745,7 +2833,17 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], &sp_softmax_unit())
+            .decode_spec(
+                &backend,
+                5,
+                &[],
+                &[],
+                &mut rng,
+                &[],
+                false,
+                &[],
+                &sp_softmax_unit(),
+            )
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let p3 = Qwen3Model::softmax_prob(&pv, 3);
@@ -2767,7 +2865,17 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(crate::inference::sampling::state_from_seed(seed));
         let out = model
-            .decode_spec(&backend, 5, &[3], &[1.0], &mut rng, &[], false, &[], &sp_softmax_unit())
+            .decode_spec(
+                &backend,
+                5,
+                &[3],
+                &[1.0],
+                &mut rng,
+                &[],
+                false,
+                &[],
+                &sp_softmax_unit(),
+            )
             .unwrap();
         assert_eq!(out.accepted.len(), 2, "якорь + пересэмпл: draft отклонён");
         assert_eq!(out.accepted[0], 5, "accepted[0] — якорь");
@@ -2784,8 +2892,15 @@ mod tests {
         let l2s = model.decode(&backend, 6).unwrap();
         let a = backend.to_cpu_f32(&l2).unwrap();
         let b = backend.to_cpu_f32(&l2s).unwrap();
-        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(worst < 1e-4, "после отката decode расходится с обычным: max |Δ| {worst}");
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "после отката decode расходится с обычным: max |Δ| {worst}"
+        );
         let _ = l1;
     }
 
@@ -2798,7 +2913,17 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = None;
         let probe = model
-            .decode_spec(&backend, 5, &[], &[], &mut rng, &[], false, &[], &sp_softmax_unit())
+            .decode_spec(
+                &backend,
+                5,
+                &[],
+                &[],
+                &mut rng,
+                &[],
+                false,
+                &[],
+                &sp_softmax_unit(),
+            )
             .unwrap();
         let pv = backend.to_cpu_f32(&probe.logits).unwrap();
         let a = pv
@@ -2814,7 +2939,17 @@ mod tests {
         model.prefill(&backend, &ids).unwrap();
         let mut rng = Some(0xDEAD_BEEF);
         let out = model
-            .decode_spec(&backend, 5, &[a], &[q], &mut rng, &[], false, &[], &sp_softmax_unit())
+            .decode_spec(
+                &backend,
+                5,
+                &[a],
+                &[q],
+                &mut rng,
+                &[],
+                false,
+                &[],
+                &sp_softmax_unit(),
+            )
             .unwrap();
         assert_eq!(
             out.accepted,
@@ -2868,15 +3003,24 @@ mod tests {
         let (backend, mut a) = mini_model();
         let (_, mut b) = mini_model();
         let ids: Vec<u32> = (0..23u32).map(|i| i % 8).collect();
-        let one = backend.to_cpu_f32(&a.prefill_last(&backend, &ids).unwrap()).unwrap();
+        let one = backend
+            .to_cpu_f32(&a.prefill_last(&backend, &ids).unwrap())
+            .unwrap();
         for chunk in [1usize, 2, 5, 7, 11] {
             b.reset_cache(&backend).unwrap();
             let many = backend
                 .to_cpu_f32(&b.prefill_last_chunked(&backend, &ids, chunk).unwrap())
                 .unwrap();
-            let worst = one.iter().zip(&many).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let worst = one
+                .iter()
+                .zip(&many)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             assert!(worst < 1e-4, "chunk={chunk}: max |Δ| {worst}");
-            assert_eq!(a.caches[0].pos, b.caches[0].pos, "chunk={chunk}: позиция кэша");
+            assert_eq!(
+                a.caches[0].pos, b.caches[0].pos,
+                "chunk={chunk}: позиция кэша"
+            );
         }
     }
 
@@ -2885,11 +3029,19 @@ mod tests {
         let (backend, mut a) = mini_model();
         let (_, mut b) = mini_model();
         let ids = [1u32, 2, 3, 4, 5];
-        let full = backend.to_cpu_f32(&a.prefill(&backend, &ids).unwrap()).unwrap();
-        let last = backend.to_cpu_f32(&b.prefill_last(&backend, &ids).unwrap()).unwrap();
+        let full = backend
+            .to_cpu_f32(&a.prefill(&backend, &ids).unwrap())
+            .unwrap();
+        let last = backend
+            .to_cpu_f32(&b.prefill_last(&backend, &ids).unwrap())
+            .unwrap();
         let v = a.cfg.vocab_size;
         assert_eq!(last.len(), v, "prefill_last: одна строка логитов");
-        assert_eq!(&full[full.len() - v..], &last[..], "последняя строка расходится");
+        assert_eq!(
+            &full[full.len() - v..],
+            &last[..],
+            "последняя строка расходится"
+        );
         assert_eq!(a.caches[0].pos, b.caches[0].pos, "кэш после prefill_last");
     }
 
@@ -3216,11 +3368,15 @@ mod pp_range_tests {
                 (v, vec![dim, c.n_heads * c.head_dim])
             });
             t.insert(format!("{p}attn_q_norm.weight"), {
-                let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
+                let v: Vec<f32> = (0..c.head_dim)
+                    .map(|_| 0.9 + rng.next_f32() * 0.2)
+                    .collect();
                 (v, vec![c.head_dim])
             });
             t.insert(format!("{p}attn_k_norm.weight"), {
-                let v: Vec<f32> = (0..c.head_dim).map(|_| 0.9 + rng.next_f32() * 0.2).collect();
+                let v: Vec<f32> = (0..c.head_dim)
+                    .map(|_| 0.9 + rng.next_f32() * 0.2)
+                    .collect();
                 (v, vec![c.head_dim])
             });
             t.insert(format!("{p}ffn_norm.weight"), {

@@ -12,8 +12,12 @@ use rust_inference::tokenizer::Tokenizer;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).ok_or("usage: tokenize <model.gguf> <text-file>")?;
-    let text_path = args.get(2).ok_or("usage: tokenize <model.gguf> <text-file>")?;
+    let path = args
+        .get(1)
+        .ok_or("usage: tokenize <model.gguf> <text-file>")?;
+    let text_path = args
+        .get(2)
+        .ok_or("usage: tokenize <model.gguf> <text-file>")?;
     let text = std::fs::read_to_string(text_path)?;
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };

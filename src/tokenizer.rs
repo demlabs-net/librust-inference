@@ -42,7 +42,10 @@ impl std::fmt::Display for TokenizerError {
             Self::BadMerge(m) => write!(f, "bad merge entry `{m}`"),
             Self::MissingTokenId(k) => write!(f, "{k} missing"),
             Self::UnsupportedPreTokenizer(p) => {
-                write!(f, "tokenizer.ggml.pre = `{p}`: пред-токенизатор не поддержан")
+                write!(
+                    f,
+                    "tokenizer.ggml.pre = `{p}`: пред-токенизатор не поддержан"
+                )
             }
         }
     }
@@ -441,7 +444,10 @@ impl Tokenizer {
         // Куча: (ранг, левый индекс, id левого, id правого, merged).
         let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, usize, u32, u32, u32)>> =
             std::collections::BinaryHeap::new();
-        let push = |heap: &mut std::collections::BinaryHeap<_>, l: usize, r: usize, ids: &[Option<u32>]| {
+        let push = |heap: &mut std::collections::BinaryHeap<_>,
+                    l: usize,
+                    r: usize,
+                    ids: &[Option<u32>]| {
             if let (Some(a), Some(b)) = (ids[l], ids[r])
                 && let Some(&(rank, m)) = self.merge_rank.get(&(a, b))
             {
@@ -694,7 +700,11 @@ fn pre_split(text: &str, pre: PreTokenizer) -> Vec<&str> {
         }
 
         // <space>?[^\s\p{L}\p{N}]+[\r\n]*   (qwen35: и без \p{M})
-        let mut f2 = if cpt == ' ' as u32 { get_flags(pos + 1) } else { f };
+        let mut f2 = if cpt == ' ' as u32 {
+            get_flags(pos + 1)
+        } else {
+            f
+        };
         let is_other = |g: CptFlags| {
             !(g.is_whitespace() || g.is_letter() || g.is_number() || (marks && g.is_accent_mark()))
         };
@@ -992,7 +1002,6 @@ fn utf8_char_len(b: u8) -> usize {
         0
     }
 }
-
 
 #[cfg(test)]
 mod tests {

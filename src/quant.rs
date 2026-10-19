@@ -826,7 +826,7 @@ pub fn quant_iq4_xs(weights: &[f32]) -> Vec<u8> {
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         for ib in 0..8usize {
             let mut li = nearest_int(id * scales[ib]);
-            li = li.max(-32).min(31);
+            li = li.clamp(-32, 31);
             let dl = d * li as f32;
             let idl = if dl != 0.0 { 1.0 / dl } else { 0.0 };
             let lb = &mut l[32 * ib..32 * ib + 32];

@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 //! Host-эталон OLMoE (все слои, f32) — независимая реализация того же графа,
 //! что и в движке (qwen3.rs с MoE-ветвью). Нужен для постадийной сверки:
 //! HOST-теги должны совпасть с MOE_DEBUG-тегами движка.
@@ -265,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &i in idx.iter().take(topk) {
         eprintln!(
             "HOST top: {i} {:?} {:.4}",
-            String::from_utf8_lossy(&tok.piece(i)),
+            String::from_utf8_lossy(tok.piece(i)),
             logits[i as usize]
         );
     }

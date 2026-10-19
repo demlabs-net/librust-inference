@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 //! Host-эталон слоя 0 GLM-4 (независимая реализация тех же формул) — для
 //! постадийной сверки с обучающим/инференс-путём через `GLM4_DEBUG=1`.
 //!

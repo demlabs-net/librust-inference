@@ -67,9 +67,9 @@ fn main() {
     let vb = mb(bytemuck_f16(&v16));
     // pad buffer: nb11*C*nkv*2 + 32*tq*2 bytes (mask absent)
     let nb11 = 2 * 128 * 2u64;
-    let pad_bytes = nb11 * 32 * 2 + 32 * 1 * 2;
+    let pad_bytes = nb11 * 32 * 2 + 32 * 2;
     let pad = device.new_buffer(pad_bytes, MTLResourceOptions::StorageModeShared);
-    let nrows = 1usize * nh;
+    let nrows = nh;
     let tmp = device.new_buffer(
         (nrows * (hd * 32 + 64) * 4) as u64,
         MTLResourceOptions::StorageModeShared,
@@ -182,7 +182,7 @@ fn main() {
     let cmdb2 = q.new_command_buffer().to_owned();
     let enc2 = cmdb2.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&rpipe);
-    let nrows_i = (nh * 1) as i32;
+    let nrows_i = nh as i32;
     enc2.set_bytes(0, 4, &nrows_i as *const i32 as *const _);
     enc2.set_buffer(1, Some(&tmp), 0);
     enc2.set_buffer(2, Some(&yb), 0);

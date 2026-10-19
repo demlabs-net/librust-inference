@@ -100,7 +100,6 @@ fn main() {
                 byh.iter()
                     .enumerate()
                     .filter(|(_, c)| **c > 0)
-                    .map(|(h, c)| (h, c))
                     .collect::<Vec<_>>()
             );
         }

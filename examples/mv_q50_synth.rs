@@ -18,9 +18,7 @@ fn main() {
             0xFFFF_0000
         };
         w.extend_from_slice(&qh.to_le_bytes());
-        for _ in 0..16 {
-            w.push(0x10);
-        }
+        w.extend(std::iter::repeat_n(0x10u8, 16));
     }
     let wt = be
         .from_quantized(&w, vec![n, k], rust_inference::dtype::WeightFormat::Q5_0)
@@ -34,7 +32,7 @@ fn main() {
         let got = be.to_cpu_f32(&c).unwrap();
         println!(
             "e={e:2}: {:?}",
-            got.iter().take(4).map(|v| *v).collect::<Vec<_>>()
+            got.iter().take(4).copied().collect::<Vec<_>>()
         );
     }
     // Ожидаем для e<16 row0: (0|16 bit? lo nibble=0, qh bit e=1 → 16)-16 = 0;

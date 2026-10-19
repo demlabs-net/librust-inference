@@ -351,11 +351,10 @@ impl Glm4Model {
         let step = DUMP_STEP.load(std::sync::atomic::Ordering::Relaxed);
         // GLM4_DUMP_WATCH — фильтр подстрок (через запятую): на длинном m
         // полный дамп 321 чекпоинта это гигабайты; бисект пишет только нужное.
-        if let Ok(w) = std::env::var("GLM4_DUMP_WATCH") {
-            if !w.split(',').any(|s| !s.is_empty() && name.contains(s)) {
+        if let Ok(w) = std::env::var("GLM4_DUMP_WATCH")
+            && !w.split(',').any(|s| !s.is_empty() && name.contains(s)) {
                 return Ok(());
             }
-        }
         let v = backend.to_cpu_f32(&x.view_restricted(vec![x.numel()]))?;
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -809,6 +808,6 @@ impl Glm4Model {
             let top: Vec<(usize, f32)> = idx[..5].iter().map(|&i| (i, last[i])).collect();
             eprintln!("GLM4 top5 логитов: {top:?}");
         }
-        Ok(backend.from_cpu_f32(last, vec![1, 1, v])?)
+        backend.from_cpu_f32(last, vec![1, 1, v])
     }
 }

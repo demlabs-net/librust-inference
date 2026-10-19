@@ -197,6 +197,9 @@ impl Qwen3Config {
 /// olmoe). Смешанных «плотный + MoE в одном слое» схем (общие эксперты) в
 /// qwen3-семействе нет — они придут своей веткой (A3+).
 #[derive(Debug, Clone)]
+// MoE-слой крупнее Dense (~504 против ~176 байт); Box сломал бы чтение
+// forward'а, а вариант ровно один на слой — разница не влияет на память.
+#[allow(clippy::large_enum_variant)]
 pub enum Ffn {
     Dense(SwiGLU),
     Moe(crate::moe::MoeLayer),

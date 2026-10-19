@@ -107,9 +107,6 @@ impl<'a> WeightsMap<'a> {
                 GgmlType::Iq3S => WeightFormat::Iq3S,
                 GgmlType::Iq1S => WeightFormat::Iq1S,
                 GgmlType::Iq1M => WeightFormat::Iq1M,
-                other => {
-                    return Err(GgufError::InvalidTensorType(other as u32));
-                }
             };
             // логический shape: реверс ne-dims
             let shape: Vec<u64> = t.dims.iter().rev().copied().collect();
@@ -4925,7 +4922,7 @@ pub fn dequant_gguf(
     ggml_type: crate::gguf::GgmlType,
     data: &[u8],
 ) -> Result<Vec<f32>, crate::error::BackendError> {
-    use crate::error::BackendError;
+    
     use crate::gguf::GgmlType as T;
     Ok(match ggml_type {
         T::F32 => data

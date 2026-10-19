@@ -598,7 +598,7 @@ mod tests {
     /// переигрывает их по history.
     #[test]
     fn mtp_replay_rebuilds_chain_kv() {
-        let be = CpuBackend::default();
+        let be = CpuBackend;
         let f = fixture(0xBEEF);
         let d = f.cfg.dim;
         // seed-строка последовательности: pending_h до первого префилла —
@@ -625,7 +625,7 @@ mod tests {
         let mut rep = drafter(&be, &f);
         rep.pending_h = Some(be.from_cpu_f32(&h0, vec![1, 1, d]).unwrap());
         let extract = be.from_cpu_f32(&h_rows, vec![toks.len(), d]).unwrap();
-        rep.after_extract(&be, &[extract.clone()], toks.len(), toks.len())
+        rep.after_extract(&be, std::slice::from_ref(&extract), toks.len(), toks.len())
             .unwrap();
         assert!(rep.pending_rows.is_some(), "префилл отложен до draft()");
         // history = промпт + anchor; anchor — любой (черновиков gamma=0).
@@ -642,7 +642,7 @@ mod tests {
         // 3) повторный префилл (повторная попытка сервиса) при непустом
         //    окне прошлой последовательности — обязан сбросить границу.
         rep.window = vec![9, 9];
-        rep.after_extract(&be, &[extract.clone()], toks.len(), toks.len())
+        rep.after_extract(&be, std::slice::from_ref(&extract), toks.len(), toks.len())
             .unwrap();
         assert_eq!(rep.committed(), 0);
         assert!(rep.pending_rows.is_some());

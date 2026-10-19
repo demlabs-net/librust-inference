@@ -229,7 +229,7 @@ impl MoeConfig {
             softmax_into(&w, weights);
         }
         if self.norm_topk_prob {
-            let sum = weights.iter().sum::<f32>().max(6.103515625e-5);
+            let sum = weights.iter().sum::<f32>().max(6.103_515_6e-5);
             for w in weights.iter_mut() {
                 *w /= sum;
             }
@@ -734,8 +734,8 @@ impl MoeLayer {
             use std::io::Write as _;
             static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if call < 16 {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
+            if call < 16
+                && let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&path)
@@ -760,7 +760,6 @@ impl MoeLayer {
                         writeln!(f)?;
                     }
                 }
-            }
         }
         let acc = backend.zeros(vec![t, d])?;
         backend.moe_acc_slots(&dn, &wts_t, &acc, t, k)?;

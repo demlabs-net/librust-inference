@@ -1794,9 +1794,9 @@ impl MetalCtx {
         // Фоллбэк INFER_F32_NO_MV=1.
         if b.dtype == GpuDtype::F32
             && m == 1
-            && k % 4 == 0
-            && a.offset % 16 == 0
-            && b.offset % 16 == 0
+            && k.is_multiple_of(4)
+            && a.offset.is_multiple_of(16)
+            && b.offset.is_multiple_of(16)
             && std::env::var("INFER_F32_NO_MV").is_err()
         {
             return self.run(
@@ -1820,7 +1820,7 @@ impl MetalCtx {
         if b.dtype == GpuDtype::F32
             && k >= 64
             && m > 8
-            && k % 32 == 0
+            && k.is_multiple_of(32)
             && std::env::var("INFER_NO_F32_MM").is_err()
         {
             let grid = MTLSize::new((m.div_ceil(32) * 128) as u64, n.div_ceil(64) as u64, 1);
@@ -1840,7 +1840,7 @@ impl MetalCtx {
             // float4-загрузки при том же порядке накопления (побитово равен
             // скалярному), ~4× меньше латентности загрузок на поток.
             GpuDtype::F32 => {
-                if k % 4 == 0 && a.offset % 16 == 0 && b.offset % 16 == 0 {
+                if k.is_multiple_of(4) && a.offset.is_multiple_of(16) && b.offset.is_multiple_of(16) {
                     "gemm_nt_f32_v4"
                 } else {
                     "gemm_nt_f32"
@@ -1970,7 +1970,7 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q4K_NO_MM").is_err()
+                if m >= mm_min && m > 1 && k.is_multiple_of(256) && std::env::var("INFER_Q4K_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid =
@@ -1999,7 +1999,7 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q6K_NO_MM").is_err()
+                if m >= mm_min && m > 1 && k.is_multiple_of(256) && std::env::var("INFER_Q6K_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid =
@@ -2027,7 +2027,7 @@ impl MetalCtx {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(2);
-                if m >= mm_min && m > 1 && k % 256 == 0 && std::env::var("INFER_Q5K_NO_MM").is_err()
+                if m >= mm_min && m > 1 && k.is_multiple_of(256) && std::env::var("INFER_Q5K_NO_MM").is_err()
                 {
                     let (m32, k32, n32) = (m as u32, k as u32, n as u32);
                     let grid =
@@ -2593,7 +2593,7 @@ impl MetalCtx {
             GpuDtype::F16 => 8,
             _ => 4,
         };
-        if a.offset % 16 != 0 || b.offset % b_align != 0 {
+        if !a.offset.is_multiple_of(16) || !b.offset.is_multiple_of(b_align) {
             return Ok(false);
         }
         let nb01: u64 = match b.dtype {
@@ -3337,7 +3337,7 @@ impl MetalCtx {
         // пара строк на simdgroup, y один раз на пару). uint16-чтение scales
         // требует чётного смещения; фоллбэк INFER_Q5K_NO_R2.
         if b.dtype == GpuDtype::Q5_K
-            && b.offset % 2 == 0
+            && b.offset.is_multiple_of(2)
             && std::env::var("INFER_Q5K_NO_R2").is_err()
         {
             let (k32, n32) = (k as u32, n as u32);
@@ -3415,8 +3415,8 @@ impl MetalCtx {
         // тогда как путь «поток на строку» даёт байт-в-байт. Паритет первичен,
         // скорость — рычагом (решение зафиксировано в плане A3.4).
         let ks_ok = n <= 4096 && std::env::var("INFER_MV_KS").is_ok();
-        if ks_ok {
-            if let Some(kname) = match b.dtype {
+        if ks_ok
+            && let Some(kname) = match b.dtype {
                 GpuDtype::Q4_K => Some("mv_ks_q4_k"),
                 GpuDtype::Q6_K => Some("mv_ks_q6_k"),
                 _ => None,
@@ -3432,7 +3432,6 @@ impl MetalCtx {
                     enc.set_bytes(4, 4, (&n32 as *const u32).cast());
                 });
             }
-        }
         let grid = MTLSize::new(n as u64, 1, 1);
         let group = MTLSize::new(64, 1, 1);
         self.run(name, grid, group, |enc| {
@@ -3524,8 +3523,8 @@ impl MetalCtx {
         // требует 16-байтового сдвига A и 4-байтового B. INFER_IQ4XS_NO_R2=1
         // — прежний путь (сверка).
         if m == 1
-            && a.offset % 16 == 0
-            && b.offset % 4 == 0
+            && a.offset.is_multiple_of(16)
+            && b.offset.is_multiple_of(4)
             && std::env::var("INFER_IQ4XS_NO_R2").is_err()
         {
             let grid = MTLSize::new(32, n.div_ceil(2) as u64, 1);
@@ -3678,7 +3677,7 @@ impl MetalCtx {
         // Побитовый порт оркального launch (ggml_metal_op_norm): ne00_t = d/4
         // (float4) либо d; nth = 32, удваивать пока nth < ne00_t и < 1024,
         // затем min(1024), min(ceil(ne00_t/32)*32).
-        let vec = d % 4 == 0 && x.offset % 16 == 0 && w.offset % 16 == 0 && y.offset % 16 == 0;
+        let vec = d.is_multiple_of(4) && x.offset.is_multiple_of(16) && w.offset.is_multiple_of(16) && y.offset.is_multiple_of(16);
         let nt = if vec { d / 4 } else { d };
         let mut nth = 32usize;
         while nth < nt && nth < 1024 {
@@ -4387,7 +4386,7 @@ impl MetalCtx {
         let m = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
         let mut g = m.lock().unwrap();
         if let Some(s) = g.get(&name) {
-            return *s;
+            return s;
         }
         let s: &'static str = Box::leak(name.clone().into_boxed_str());
         g.insert(name, s);
@@ -4554,7 +4553,7 @@ impl MetalCtx {
                  nb01={} nb02={} nb11={nb11} nb12={nb12} nb31={nb31} kvpad={}",
                 qd * 4,
                 hd * 4,
-                tkv % 32 != 0
+                !tkv.is_multiple_of(32)
             );
             if let Some(m16) = &mask16 {
                 let mv = m16.to_cpu_f16(self)?;
@@ -4617,7 +4616,7 @@ impl MetalCtx {
         }
 
         // pad-буфер хвостового чанка (K, V, маска) — при ne11 % 32 != 0
-        let has_kvpad = tkv % 32 != 0;
+        let has_kvpad = !tkv.is_multiple_of(32);
         let pad = if has_kvpad {
             let bytes =
                 nb11 * 32 * kv_heads as u64 + nb11 * 32 * kv_heads as u64 + 32 * tq as u64 * 2;
@@ -4749,12 +4748,12 @@ impl MetalCtx {
             if mask.is_some() { "_mask" } else { "" },
             if has_kvpad { "_pad" } else { "" }
         ));
-        let smem = (((hd.max(128) + 4 * 32 + 2 * hd.max(128)) * nsg * q_q * 2) + 15) / 16 * 16;
+        let smem = ((hd.max(128) + 4 * 32 + 2 * hd.max(128)) * nsg * q_q * 2).div_ceil(16) * 16;
         if std::env::var("INFER_FA_VEC_ARGS").is_ok() {
             eprintln!(
                 "fa_vec ARGS name={name} smem={smem} grid=({},{},{}) q.off={} k.off={} v.off={} \
                 nb01={} nb02={} nb11={} nb12={} ns10={} nb31={} ne31={} scale={:08x}",
-                ((tq + q_q - 1) / q_q * 32 * nsg),
+                (tq.div_ceil(q_q) * 32 * nsg),
                 n_heads,
                 32,
                 q.offset,
@@ -4772,7 +4771,7 @@ impl MetalCtx {
         }
         self.run(
             name,
-            MTLSize::new(((tq + q_q - 1) / q_q * 32 * nsg) as u64, n_heads as u64, 32),
+            MTLSize::new((tq.div_ceil(q_q) * 32 * nsg) as u64, n_heads as u64, 32),
             MTLSize::new((32 * nsg) as u64, 1, 1),
             |enc| {
                 enc.set_bytes(
@@ -4818,8 +4817,8 @@ impl MetalCtx {
         Ok(())
     }
 
-    /// Ф8.1f: побитов путь эталонного FA TILE (kernel_flash_attn_ext_{blk,pad}
-    /// + kernel_flash_attn_ext, Q=8, C=64, NSG=4, f16 KV, dense-маска).
+    /// Ф8.1f: побитов путь эталонного FA TILE (kernel_flash_attn_ext_blk/pad
+    /// и kernel_flash_attn_ext, Q=8, C=64, NSG=4, f16 KV, dense-маска).
     /// Оркал берёт его при ne01 >= 20. Требует маску (наши префиллы её имеют).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_fa_tile_f16(
@@ -4907,8 +4906,8 @@ impl MetalCtx {
                 mask.is_some()
             );
         }
-        if let Ok(path) = std::env::var("INFER_FA_TILE_DUMP") {
-            if !std::path::Path::new(&path).exists() {
+        if let Ok(path) = std::env::var("INFER_FA_TILE_DUMP")
+            && !std::path::Path::new(&path).exists() {
                 use std::io::Write;
                 let qv = q.to_cpu_f32(self)?;
                 let kv = k.to_cpu_f16(self)?;
@@ -4927,7 +4926,6 @@ impl MetalCtx {
                 }
                 eprintln!("fa_tile dumped to {path}");
             }
-        }
 
         let mask16 = match mask {
             Some(m) => {
@@ -4951,7 +4949,7 @@ impl MetalCtx {
         let dummy = q;
 
         // pad хвостового чанка C=64
-        let has_kvpad = tkv % 64 != 0;
+        let has_kvpad = !tkv.is_multiple_of(64);
         let pad = if has_kvpad {
             let bytes = nb11 * 64 * kv_heads as u64 * 2 + 64 * tq as u64 * 2;
             Some(GpuTensor::zeros(
@@ -5065,7 +5063,7 @@ impl MetalCtx {
             ne3: 1,
             scale,
         };
-        let bcm = tq % 8 != 0;
+        let bcm = !tq.is_multiple_of(8);
         let name = match (hd, has_kvpad, bcm) {
             (128, true, true) => "fa_tile_dk128_mask_pad_bcm",
             (128, true, false) => "fa_tile_dk128_mask_pad",
@@ -5077,8 +5075,8 @@ impl MetalCtx {
             _ => "fa_tile_dk64_mask",
         };
         // FATTN_SMEM: PAD2(Q*(DK + 2*PAD2(DV,64) + 4*C) * 2, 16)
-        let pv = (hd.max(64) + 63) / 64 * 64;
-        let smem = ((8 * (hd + 2 * pv + 4 * 64) * 2) + 15) / 16 * 16;
+        let pv = hd.max(64).div_ceil(64) * 64;
+        let smem = (8 * (hd + 2 * pv + 4 * 64) * 2).div_ceil(16) * 16;
         self.run(
             name,
             MTLSize::new((nblk1 * 128) as u64, n_heads as u64, 1),
@@ -5141,7 +5139,6 @@ impl MetalCtx {
                 q.dtype
             )));
         }
-        let q = q;
         if !n_heads.is_multiple_of(kv_heads) || !hd.is_multiple_of(4) {
             return Err(MetalError::Shape(format!(
                 "attn_ar f16: H={n_heads} не делится на KVH={kv_heads} или HD={hd} не кратен 4"
@@ -5793,9 +5790,9 @@ impl MetalCtx {
         // одним: на декоде 27B (rows=1, HD=6144) 0.16 мс/слой → ~0.01.
         // HD%128==0 — 4 simdgroup на строку (одной мало при rows=1).
         // Фоллбэк на прежний порядок — INFER_NG_SERIAL=1.
-        let (kernel, nth) = if hd % 128 == 0 && std::env::var("INFER_NG_SERIAL").is_err() {
+        let (kernel, nth) = if hd.is_multiple_of(128) && std::env::var("INFER_NG_SERIAL").is_err() {
             ("gdn_norm_gated_par4_f32", 128u64)
-        } else if hd % 32 == 0 && std::env::var("INFER_NG_SERIAL").is_err() {
+        } else if hd.is_multiple_of(32) && std::env::var("INFER_NG_SERIAL").is_err() {
             ("gdn_norm_gated_par_f32", 32u64)
         } else {
             ("gdn_norm_gated_f32", 32u64)
@@ -5964,7 +5961,7 @@ impl MetalCtx {
         let hd32 = hd as u32;
         let grid = MTLSize::new(rows as u64 * h as u64 * 32, 1, 1);
         let group = MTLSize::new(64, 1, 1);
-        let vec = hd % 4 == 0 && x.offset % 16 == 0 && w.offset % 16 == 0 && y.offset % 16 == 0;
+        let vec = hd.is_multiple_of(4) && x.offset.is_multiple_of(16) && w.offset.is_multiple_of(16) && y.offset.is_multiple_of(16);
         self.run(
             if vec {
                 "rmsnorm_head_sg_f32"
@@ -6160,7 +6157,7 @@ impl crate::backend::Backend for MetalBackend {
         let (h32, nh32, hd32, pos32) = (h as u32, (tq * h) as u32, hd as u32, pos as u32);
         let grid = metal::MTLSize::new((tq * h * 32) as u64, 1, 1);
         let group = metal::MTLSize::new(64, 1, 1);
-        let vec = hd % 4 == 0 && xg.offset % 16 == 0;
+        let vec = hd.is_multiple_of(4) && xg.offset.is_multiple_of(16);
         self.ctx.run(
             if vec {
                 "rmsnorm_head_rope_sg_f32"
@@ -7784,7 +7781,7 @@ impl crate::backend::Backend for MetalBackend {
             }
         };
         let blk = bg.dtype.block_bytes().unwrap_or(0) as u64;
-        if blk == 0 || kk % 256 != 0 || n_expert == 0 || t == 0 || k == 0 {
+        if blk == 0 || !kk.is_multiple_of(256) || n_expert == 0 || t == 0 || k == 0 {
             return Err(BackendError::Shape(format!(
                 "moe_experts_mm: K={kk} E={n_expert} t={t} k={k}"
             )));
@@ -7806,7 +7803,7 @@ impl crate::backend::Backend for MetalBackend {
             ne20: k as i32,
             nb21: (k * 4) as u64,
         };
-        let smem0 = (((n_expert * k * 2) + 15) / 16 * 16) as u64;
+        let smem0 = ((n_expert * k * 2).div_ceil(16) * 16) as u64;
         self.ctx
             .run(
                 map0_name,
@@ -8900,20 +8897,20 @@ mod quant_gemm_tests {
         use crate::backend::Backend as _;
         // Канонические: нулевые блоки с d=1 (кроме IQ1_M — там d в scales).
         let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
-        b.extend(std::iter::repeat(0u8).take(72));
+        b.extend(std::iter::repeat_n(0u8, 72));
         let d = crate::weights_map::dequant_iq2_xs(&b);
         assert!(d.iter().all(|v| *v == 1.0), "IQ2_XS: нулевой блок");
         let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
-        b.extend(std::iter::repeat(0u8).take(80));
+        b.extend(std::iter::repeat_n(0u8, 80));
         let d = crate::weights_map::dequant_iq2_s(&b);
         assert!(d.iter().all(|v| *v == 1.0), "IQ2_S: нулевой блок");
         let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
-        b.extend(std::iter::repeat(0u8).take(108));
+        b.extend(std::iter::repeat_n(0u8, 108));
         let d = crate::weights_map::dequant_iq3_s(&b);
         assert!(d.iter().all(|v| *v == 1.0), "IQ3_S: нулевой блок");
         // IQ1_S: q=0 → dl=1, delta=+0.125, grid[0] байт 0xFF = int8 −1 → −0.875
         let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
-        b.extend(std::iter::repeat(0u8).take(48));
+        b.extend(std::iter::repeat_n(0u8, 48));
         let d = crate::weights_map::dequant_iq1_s(&b);
         assert!(d.iter().all(|v| *v == -0.875), "IQ1_S: −1 + 0.125 = −0.875");
         // IQ1_M: scale_u16 = 0 → d = 0 → все нули
@@ -9018,7 +9015,7 @@ mod quant_gemm_tests {
     fn iq3_xxs_paths_match_host() {
         use crate::backend::Backend as _;
         let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
-        b.extend(std::iter::repeat(0u8).take(96));
+        b.extend(std::iter::repeat_n(0u8, 96));
         assert_eq!(b.len(), 98);
         let d = crate::weights_map::dequant_iq3_xxs(&b);
         assert_eq!(d.len(), 256);
@@ -9107,7 +9104,7 @@ mod quant_gemm_tests {
     fn iq2_xxs_paths_match_host() {
         use crate::backend::Backend as _;
         let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
-        b.extend(std::iter::repeat(0u8).take(64));
+        b.extend(std::iter::repeat_n(0u8, 64));
         assert_eq!(b.len(), 66);
         let d = crate::weights_map::dequant_iq2_xxs(&b);
         assert_eq!(d.len(), 256);
@@ -9491,7 +9488,7 @@ mod quant_gemm_tests {
         // y[0] = 0·3 − 0.5 = −0.5; подблок 1 (scales[1]=0) → −0.0.
         let mut b2 = vec![0u8; 16];
         b2[0] = 0x10;
-        b2.extend(std::iter::repeat(0u8).take(64));
+        b2.extend(std::iter::repeat_n(0u8, 64));
         b2.extend_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
         b2.extend_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
         b2[16] = 3; // qs[0]

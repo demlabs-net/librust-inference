@@ -739,27 +739,27 @@ impl MoeLayer {
                     .create(true)
                     .append(true)
                     .open(&path)
-                {
-                    let _ = writeln!(&mut f, "# call {call}");
-                    for (name, tt, ne) in [
-                        ("up", &up, format!("{ffn},{k},{t},1")),
-                        ("gate", &gate, format!("{ffn},{k},{t},1")),
-                        ("prod", &prod, format!("{ffn},{k},{t},1")),
-                        ("dn", &dn, format!("{d},{k},{t},1")),
-                    ] {
-                        let v = backend.to_cpu_f32(tt)?;
-                        writeln!(f, "STEP {call} TENSOR {name} ne=[{ne}]")?;
-                        for (i, x) in v.iter().enumerate() {
-                            write!(
-                                f,
-                                "{:08x}{}",
-                                x.to_bits(),
-                                if i % 8 == 7 { "\n" } else { " " }
-                            )?;
-                        }
-                        writeln!(f)?;
+            {
+                let _ = writeln!(&mut f, "# call {call}");
+                for (name, tt, ne) in [
+                    ("up", &up, format!("{ffn},{k},{t},1")),
+                    ("gate", &gate, format!("{ffn},{k},{t},1")),
+                    ("prod", &prod, format!("{ffn},{k},{t},1")),
+                    ("dn", &dn, format!("{d},{k},{t},1")),
+                ] {
+                    let v = backend.to_cpu_f32(tt)?;
+                    writeln!(f, "STEP {call} TENSOR {name} ne=[{ne}]")?;
+                    for (i, x) in v.iter().enumerate() {
+                        write!(
+                            f,
+                            "{:08x}{}",
+                            x.to_bits(),
+                            if i % 8 == 7 { "\n" } else { " " }
+                        )?;
                     }
+                    writeln!(f)?;
                 }
+            }
         }
         let acc = backend.zeros(vec![t, d])?;
         backend.moe_acc_slots(&dn, &wts_t, &acc, t, k)?;

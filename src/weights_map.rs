@@ -4922,7 +4922,6 @@ pub fn dequant_gguf(
     ggml_type: crate::gguf::GgmlType,
     data: &[u8],
 ) -> Result<Vec<f32>, crate::error::BackendError> {
-    
     use crate::gguf::GgmlType as T;
     Ok(match ggml_type {
         T::F32 => data

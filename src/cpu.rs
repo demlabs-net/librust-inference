@@ -105,7 +105,21 @@ impl Backend for CpuBackend {
     }
 
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
-        Ok(data(t).to_vec())
+        // Ограниченный view (view_restricted: логическая форма меньше
+        // родительского буфера) — отдаём РОВНО numel элементов, как GPU-
+        // to_cpu (он копирует numel от offset). Прежнее `.to_vec()` отдавало
+        // весь родительский буфер, и первый же оператор над view падал на
+        // несоответствии данных и формы (zipformer_smoke: [11,96] из
+        // буфера 11×128).
+        let d = data(t);
+        let n = t.numel();
+        if d.len() < n {
+            return Err(BackendError::Shape(format!(
+                "to_cpu_f32: {} элементов в буфере, логическая форма {n}",
+                d.len()
+            )));
+        }
+        Ok(d[..n].to_vec())
     }
 
     fn gemm(&self, a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), BackendError> {

@@ -89,6 +89,8 @@ pub mod omni;
 pub mod quant;
 pub mod qwen3;
 pub mod qwen35;
+/// Qwen3.8-Flash-Next (`qwen4exp`): конфиг + схема файла (forward — A5).
+pub mod qwen4exp;
 pub mod rope;
 pub mod spec;
 pub mod tokenizer;

@@ -108,6 +108,13 @@ pub const SUPPORTED: &[ArchInfo] = &[
         "Qwen3-MoE: MoE-FFN (128 экспертов, top-8, нормировка top-k)",
     ),
     a(
+        "qwen4exp",
+        Family::Moe,
+        Support::Planned,
+        "Qwen3.8-Flash-Next: гипер-связи (4 потока), MoE 512/top-10 + shared, \
+         QSA-индексер, PLE n-граммы; конфиг и схема сверены с GGUF, forward — A5",
+    ),
+    a(
         "dflash",
         Family::Other,
         Support::Supported,

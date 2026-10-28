@@ -854,6 +854,13 @@ impl Qwen35Model {
         let prof = std::env::var("LLM_SPEC_PROF").is_ok();
         let tp = std::time::Instant::now();
         let base = self.pos;
+        // Захват входов GDN окна (Ф8.2g): при отказе стейты восстанавливаются
+        // перепрогоном лёгких стадий по захвату, БЕЗ полного реплея.
+        // INFER_SPEC_REPLAY=1 — прежний путь (сверка/замеры).
+        let use_capture = std::env::var("INFER_SPEC_REPLAY").is_err();
+        // Снимок стейтов — БАЗА отката: restore_spec_states() пересчитывает
+        // принятый префикс, НАЧИНАЯ с состояния на старте окна, поэтому
+        // снимок нужен и при захвате (проверено: без него SPEC != AR).
         let snap = self.snapshot_states(backend)?;
         if prof {
             // синхронизация: время снимка отдельно от forward
@@ -865,10 +872,6 @@ impl Qwen35Model {
         let mut ids = Vec::with_capacity(1 + draft.len());
         ids.push(id);
         ids.extend_from_slice(draft);
-        // Захват входов GDN окна (Ф8.2g): при отказе стейты восстанавливаются
-        // перепрогоном лёгких стадий по захвату, БЕЗ полного реплея.
-        // INFER_SPEC_REPLAY=1 — прежний путь (сверка/замеры).
-        let use_capture = std::env::var("INFER_SPEC_REPLAY").is_err();
         if use_capture && !draft.is_empty() {
             // Пустой черновик (окно из одного якоря) откатить не может —
             // захват был бы чистым оверхедом на каждый вырожденный токен.

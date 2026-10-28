@@ -917,7 +917,15 @@ pub fn generate<M: CausalLm + ?Sized>(
             let (mut draft_tokens, mut draft_probs) = {
                 let mut dr = drafter.lock().unwrap();
                 dr.set_sampling(draft_sampling);
-                dr.draft(backend, &history, params.spec_gamma)
+                // Батч на черновик: БЕЗ него каждый кернел драфтера — свой
+                // command buffer с wait_until_completed (у MTP 30+ кернелов
+                // на шаг → ~14 мс вместо ~2, замер 27B). pick() внутри
+                // читает логиты — это flush батча, дальше кодирование
+                // продолжается в новый CB того же батча.
+                backend.begin_batch()?;
+                let r = dr.draft(backend, &history, params.spec_gamma);
+                backend.end_batch()?;
+                r
             };
             prof[0] += tp.elapsed().as_secs_f64();
             prof_n[0] += 1;
@@ -966,7 +974,13 @@ pub fn generate<M: CausalLm + ?Sized>(
                     let tp = std::time::Instant::now();
                     let pos = model.context_len();
                     let mut dr = drafter.lock().unwrap();
-                    if let Err(e) = dr.after_extract(backend, &out.extract, pos, n_ok) {
+                    // Батч и здесь: после пересборки KV принятыми строками
+                    // дравер гоняет n_accepted шагов — вне батча это по
+                    // command buffer'у на кернел (см. draft()).
+                    backend.begin_batch()?;
+                    let r = dr.after_extract(backend, &out.extract, pos, n_ok);
+                    backend.end_batch()?;
+                    if let Err(e) = r {
                         eprintln!("after_extract (окно) не удался: {e}");
                     }
                     prof[2] += tp.elapsed().as_secs_f64();

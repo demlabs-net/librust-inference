@@ -119,7 +119,7 @@ fn main() {
         let w = be.from_quantized(&raw, vec![n, k], fmt).unwrap();
         let wbytes = raw.len();
         let mut line = format!("{name:9} [{n}x{k}] {:5.1} МБ", wbytes as f64 / 1e6);
-        for m in [1usize, 5, 8, 128] {
+        for m in [1usize, 2, 3, 4, 5, 6, 7, 8] {
             let a = be
                 .from_cpu_f32(
                     &(0..m * k)

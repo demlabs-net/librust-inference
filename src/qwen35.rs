@@ -1525,6 +1525,17 @@ impl Qwen35Model {
         self.with_slot(slot, |m| m.prefill(backend, ids))
     }
 
+    /// Prefill В СЛОТ с логитами только последней позиции ([1, 1, V]) —
+    /// так принимает новую беседу пакетный драйвер (lm_head по одной строке).
+    pub fn prefill_slot_last(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        self.with_slot(slot, |m| m.prefill_last(backend, ids))
+    }
+
     /// Одиночный декод В СЛОТ (переключением состояния).
     pub fn decode_slot(
         &mut self,
@@ -1552,7 +1563,22 @@ impl Qwen35Model {
         slots: &mut [Qwen35Slot],
         ids: &[u32],
     ) -> Result<Tensor, BackendError> {
-        let b = slots.len();
+        let all: Vec<usize> = (0..slots.len()).collect();
+        self.decode_batch_active(backend, slots, &all, ids)
+    }
+
+    /// Пакетный шаг по ПОДМНОЖЕСТВУ слотов: `active[j]` — индекс слота для
+    /// строки j пакета (порядок строк = порядок `active`). Неактивные слоты
+    /// не трогаются вовсе — так работает очередь бесед: шагают только те,
+    /// кому сейчас нужен токен.
+    pub fn decode_batch_active(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen35Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        let b = active.len();
         if b == 0 || ids.len() != b {
             return Err(BackendError::Shape(format!(
                 "decode_batch: {} слотов против {} токенов",
@@ -1560,11 +1586,17 @@ impl Qwen35Model {
                 ids.len()
             )));
         }
-        for (j, s) in slots.iter().enumerate() {
-            if s.pos + 1 > self.cfg.max_seq {
+        for (row, &j) in active.iter().enumerate() {
+            if j >= slots.len() {
+                return Err(BackendError::Shape(format!(
+                    "decode_batch: строка {row} — нет слота {j} (слотов {})",
+                    slots.len()
+                )));
+            }
+            if slots[j].pos + 1 > self.cfg.max_seq {
                 return Err(BackendError::Shape(format!(
                     "decode_batch: слот {j} pos {} + 1 > окна {}",
-                    s.pos, self.cfg.max_seq
+                    slots[j].pos, self.cfg.max_seq
                 )));
             }
         }
@@ -1580,7 +1612,7 @@ impl Qwen35Model {
         // получает свой command buffer с commit+wait, и хост съедает больше,
         // чем GPU (замер: B=1 165 мс/шаг против 38 у одиночного decode).
         backend.begin_batch()?;
-        let r = self.decode_batch_inner(backend, slots, ids, d);
+        let r = self.decode_batch_inner(backend, slots, active, ids, d);
         backend.end_batch()?;
         r
     }
@@ -1589,6 +1621,7 @@ impl Qwen35Model {
         &mut self,
         backend: &dyn Backend,
         slots: &mut [Qwen35Slot],
+        active: &[usize],
         ids: &[u32],
         d: usize,
     ) -> Result<Tensor, BackendError> {
@@ -1610,12 +1643,26 @@ impl Qwen35Model {
             let h = layer.attn_norm.forward(backend, &x)?;
             let mut p3 = [0.0f64; 4];
             let m = match &layer.mixer {
-                Mixer::Attn(a) => {
-                    Self::attn_forward_batch(&self.cfg, backend, &h, a, slots, i, Some(&mut p3))?
-                }
-                Mixer::Gdn(g) => {
-                    Self::gdn_forward_batch(&self.cfg, backend, &h, g, slots, i, Some(&mut p3))?
-                }
+                Mixer::Attn(a) => Self::attn_forward_batch(
+                    &self.cfg,
+                    backend,
+                    &h,
+                    a,
+                    slots,
+                    active,
+                    i,
+                    Some(&mut p3),
+                )?,
+                Mixer::Gdn(g) => Self::gdn_forward_batch(
+                    &self.cfg,
+                    backend,
+                    &h,
+                    g,
+                    slots,
+                    active,
+                    i,
+                    Some(&mut p3),
+                )?,
             };
             sync(&m)?;
             t_shared += p3[0] + (t0.elapsed().as_secs_f64() - p3[0] - p3[1] - p3[2]);
@@ -1633,8 +1680,8 @@ impl Qwen35Model {
             t_ffn += t1.elapsed().as_secs_f64();
             x = x2;
         }
-        for s in slots.iter_mut() {
-            s.pos += 1;
+        for &j in active {
+            slots[j].pos += 1;
         }
         let h = self.out_norm.forward(backend, &x)?;
         let logits = self.head_rows(backend, &h, b)?;
@@ -1660,6 +1707,7 @@ impl Qwen35Model {
         h: &Tensor,
         a: &FullAttn,
         slots: &mut [Qwen35Slot],
+        active: &[usize],
         layer: usize,
         mut prof: Option<&mut [f64; 4]>,
     ) -> Result<Tensor, BackendError> {
@@ -1690,16 +1738,17 @@ impl Qwen35Model {
         let qg_rows = qg.view(vec![b, 2 * nh * hd]);
         let k_rows = k.view(vec![b, kv_size]);
         let v_rows = v.view(vec![b, kv_size]);
-        for (j, slot) in slots.iter_mut().enumerate() {
+        for (row, &j) in active.iter().enumerate() {
+            let slot = &mut slots[j];
             let pos = slot.pos;
             let cache = slot.caches[layer].as_mut().ok_or_else(|| {
                 BackendError::Shape(format!("слот {j}, слой {layer}: нет KV (не attn-слой?)"))
             })?;
-            let qg_j = qg_rows.view_offset(vec![1, nh, 2 * hd], j * 2 * nh * hd);
+            let qg_j = qg_rows.view_offset(vec![1, nh, 2 * hd], row * 2 * nh * hd);
             let q = crate::nn::slice_last(backend, &qg_j, hd, 0)?.view(vec![1, 1, nh * hd]);
             let gate = crate::nn::slice_last(backend, &qg_j, hd, hd)?.view(vec![1, 1, nh * hd]);
-            let k_j = k_rows.view_offset(vec![1, 1, kv_size], j * kv_size);
-            let v_j = v_rows.view_offset(vec![1, 1, kv_size], j * kv_size);
+            let k_j = k_rows.view_offset(vec![1, 1, kv_size], row * kv_size);
+            let v_j = v_rows.view_offset(vec![1, 1, kv_size], row * kv_size);
             let qn = backend.zeros(vec![1, 1, nh * hd])?;
             backend.rmsnorm_head(&q, &a.q_norm, &qn, nh, cfg.norm_eps)?;
             let kn = backend.zeros(vec![1, 1, kv_size])?;
@@ -1725,9 +1774,9 @@ impl Qwen35Model {
             backend.attn_ar(&qr, &cache.view(), &cache.view_v(), None, &out, nh, nkv, hd)?;
             let sg = backend.zeros(vec![1, 1, nh * hd])?;
             backend.sigmoid(&gate, &sg)?;
-            let row = backend.zeros(vec![1, 1, nh * hd])?;
-            backend.mul(&out, &sg, &row)?;
-            backend.row_write(&gated, &row, j)?;
+            let row_out = backend.zeros(vec![1, 1, nh * hd])?;
+            backend.mul(&out, &sg, &row_out)?;
+            backend.row_write(&gated, &row_out, row)?;
         }
         if let Some(p) = prof.as_deref_mut() {
             p[1] += t_slot.elapsed().as_secs_f64();
@@ -1753,6 +1802,7 @@ impl Qwen35Model {
         h: &Tensor,
         g: &Gdn,
         slots: &mut [Qwen35Slot],
+        active: &[usize],
         layer: usize,
         mut prof: Option<&mut [f64; 4]>,
     ) -> Result<Tensor, BackendError> {
@@ -1791,13 +1841,14 @@ impl Qwen35Model {
         let gate_rows = gate.view(vec![b, gdim]);
         let b_rows = bvec.view(vec![b, gdim]);
         let fused = s <= 1024 && cq.is_multiple_of(s);
-        for (j, slot) in slots.iter_mut().enumerate() {
+        for (row, &j) in active.iter().enumerate() {
+            let slot = &mut slots[j];
             let st = slot.states[layer].as_mut().ok_or_else(|| {
                 BackendError::Shape(format!("слот {j}, слой {layer}: нет GDN-стейта"))
             })?;
-            let qkv_j = qkv_rows.view_offset(vec![1, 1, cq], j * cq);
-            let gate_j = gate_rows.view_offset(vec![1, 1, gdim], j * gdim);
-            let b_j = b_rows.view_offset(vec![1, 1, gdim], j * gdim);
+            let qkv_j = qkv_rows.view_offset(vec![1, 1, cq], row * cq);
+            let gate_j = gate_rows.view_offset(vec![1, 1, gdim], row * gdim);
+            let b_j = b_rows.view_offset(vec![1, 1, gdim], row * gdim);
             let o = if fused {
                 let (y, new_conv) = backend.gdn_conv_silu_split_norm(
                     &qkv_j,
@@ -1822,7 +1873,7 @@ impl Qwen35Model {
                     .3
                     .view(vec![1, 1, inner])
             };
-            backend.row_write(&o_all, &o, j)?;
+            backend.row_write(&o_all, &o, row)?;
         }
         if let Some(p) = prof.as_deref_mut() {
             p[1] += t_slot.elapsed().as_secs_f64();

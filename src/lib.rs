@@ -63,6 +63,7 @@ pub fn models_dir() -> std::path::PathBuf {
 pub mod arch;
 pub mod audio;
 pub mod backend;
+pub mod batch;
 pub mod bert;
 pub mod chat_template;
 pub mod concurrency;

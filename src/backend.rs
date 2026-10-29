@@ -2374,6 +2374,37 @@ pub trait Backend: Send + Sync {
     /// dequantizes inline on read (per-component KV config).
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError>;
 
+    /// Пакетный шаг (слоты): строка `row` приёмника DST (1, cap, D) ← SRC
+    /// (1, 1, D). Сборка строк разных слотов в один батч-тензор.
+    ///
+    /// Отдельный оп, а не `scale` по `view_offset`: на CPU `view_offset`
+    /// КОПИРУЕТ (запись через него теряется), поэтому CPU-ветка пишет в
+    /// хранилище напрямую. f32-only: строки пакета — активации.
+    fn row_write(&self, dst: &Tensor, src: &Tensor, row: usize) -> Result<(), BackendError> {
+        let d = dst.shape()[2];
+        if src.shape() != [1, 1, d] {
+            return Err(BackendError::Shape(format!(
+                "row_write: src {:?} не (1,1,{d})",
+                src.shape()
+            )));
+        }
+        if row * d + d > dst.shape()[1] * d {
+            return Err(BackendError::Shape(format!(
+                "row_write: строка {row} за пределами (1,{},{d})",
+                dst.shape()[1]
+            )));
+        }
+        #[cfg(feature = "cpu")]
+        if matches!(dst.inner, TensorInner::Cpu(_)) {
+            let s = self.to_cpu_f32(src)?;
+            dst.cpu_write()[row * d..row * d + d].copy_from_slice(&s);
+            return Ok(());
+        }
+        // Metal: view_offset — реальный вид на буфер, запись попадает по
+        // смещению. CUDA упадёт громко в view_offset (нужен свой оп — Ф9).
+        self.scale(src, &dst.view_offset(vec![1, 1, d], row * d), 1.0)
+    }
+
     /// KV compaction shift (plan 1.6): rows [shift..pos) of the (B, cap, D)
     /// buffer → a NEW tensor with them at [0..pos−shift) (the rest zeroed),
     /// storage-dtype-preserving (f32 / f16 / q8_0 with the per-32-block

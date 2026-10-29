@@ -1088,6 +1088,9 @@ impl Qwen35Model {
         extract_out: &mut Vec<Tensor>,
     ) -> Result<Tensor, BackendError> {
         let t = ids.len();
+        if std::env::var("INFER_METAL_NAMES").is_ok() {
+            eprintln!("=== SINGLE STEP t={t}");
+        }
         if self.pos + t > self.cfg.max_seq {
             return Err(BackendError::Shape(format!(
                 "qwen35: контекст {} + {t} > окна {}",
@@ -1466,6 +1469,375 @@ impl Qwen35Model {
             p[2] += t0.elapsed().as_secs_f64();
         }
         Ok((qn, kn, v, o))
+    }
+
+    // ── батч-слоты (шаг 2): пакетный шаг, по токену на слот ──────────────
+
+    /// Пустой слот: свои кэши/стейты, позиция 0. Веса не копируются.
+    pub fn new_slot(&self, backend: &dyn Backend) -> Result<Qwen35Slot, BackendError> {
+        Ok(Qwen35Slot {
+            caches: Self::fresh_caches(backend, &self.cfg)?,
+            states: Self::fresh_states(backend, &self.cfg)?,
+            pos: 0,
+        })
+    }
+
+    /// Выполнить `f` НА СОСТОЯНИИ СЛОТА: состояние слота встаёт в модель,
+    /// прежнее активное переезжает в слот, после вызова — обратно. Копий
+    /// нет, поэтому одиночные пути (prefill/decode/спек) работают со слотом
+    /// без единой строки дублирования.
+    pub fn with_slot<R>(
+        &mut self,
+        slot: &mut Qwen35Slot,
+        f: impl FnOnce(&mut Self) -> Result<R, BackendError>,
+    ) -> Result<R, BackendError> {
+        let current = Qwen35Slot {
+            caches: std::mem::take(&mut self.caches),
+            states: std::mem::take(&mut self.states),
+            pos: self.pos,
+        };
+        let taken = std::mem::replace(slot, current);
+        self.caches = taken.caches;
+        self.states = taken.states;
+        self.pos = taken.pos;
+        let r = f(self);
+        let moved = std::mem::replace(
+            slot,
+            Qwen35Slot {
+                caches: std::mem::take(&mut self.caches),
+                states: std::mem::take(&mut self.states),
+                pos: self.pos,
+            },
+        );
+        self.caches = moved.caches;
+        self.states = moved.states;
+        self.pos = moved.pos;
+        r
+    }
+
+    /// Prefill В СЛОТ (переключением состояния).
+    pub fn prefill_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        self.with_slot(slot, |m| m.prefill(backend, ids))
+    }
+
+    /// Одиночный декод В СЛОТ (переключением состояния).
+    pub fn decode_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        id: u32,
+    ) -> Result<Tensor, BackendError> {
+        self.with_slot(slot, |m| m.decode(backend, id))
+    }
+
+    /// Пакетный шаг декода: по одному токену на слот, строки всех слотов
+    /// идут ОДНИМИ matmul'ами (веса читаются раз на пакет — выигрыш батча).
+    /// Логиты (1, B, V) — строка на слот в порядке `slots`.
+    ///
+    /// Состояние активного контекста модели здесь НЕ используется и НЕ
+    /// меняется: вся последовательность живёт в слотах (см. [`Self::new_slot`],
+    /// [`Self::prefill_slot`]).
+    ///
+    /// Побитового равенства с одиночным декодом нет и быть не может: m=1 и
+    /// m=B идут разными кернелами (mv против mb/mm) — принятая норма батча
+    /// (llama.cpp `-np` точно так же расходится построчно).
+    pub fn decode_batch(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen35Slot],
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        let b = slots.len();
+        if b == 0 || ids.len() != b {
+            return Err(BackendError::Shape(format!(
+                "decode_batch: {} слотов против {} токенов",
+                b,
+                ids.len()
+            )));
+        }
+        for (j, s) in slots.iter().enumerate() {
+            if s.pos + 1 > self.cfg.max_seq {
+                return Err(BackendError::Shape(format!(
+                    "decode_batch: слот {j} pos {} + 1 > окна {}",
+                    s.pos, self.cfg.max_seq
+                )));
+            }
+        }
+        // Пакет из одного слота — это ровно одиночный декод: идём им (биты
+        // совпадают с одиночным прогоном по построению, и спек-путь сломать
+        // нельзя). Ветка пакета нужна только при b ≥ 2.
+        if b == 1 {
+            let id = ids[0];
+            return self.with_slot(&mut slots[0], |m| m.decode(backend, id));
+        }
+        let d = self.cfg.dim;
+        // Весь шаг — ОДИН батч (как в decode): иначе каждый из ~300 кернелов
+        // получает свой command buffer с commit+wait, и хост съедает больше,
+        // чем GPU (замер: B=1 165 мс/шаг против 38 у одиночного decode).
+        backend.begin_batch()?;
+        let r = self.decode_batch_inner(backend, slots, ids, d);
+        backend.end_batch()?;
+        r
+    }
+
+    fn decode_batch_inner(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen35Slot],
+        ids: &[u32],
+        d: usize,
+    ) -> Result<Tensor, BackendError> {
+        let b = ids.len();
+        if std::env::var("INFER_METAL_NAMES").is_ok() {
+            eprintln!("=== BATCH STEP B={b}");
+        }
+        // QWEN35_BATCH_PROF=1 — время по секциям (синхронизация после каждой).
+        let prof = std::env::var("QWEN35_BATCH_PROF").is_ok();
+        // Профиль — ХОСТ-время секций (без синхронизаций: шаг CPU-bound, а
+        // каждый sync добавлял ожидание GPU и искажал картину).
+        let sync = |_t: &Tensor| -> Result<(), BackendError> { Ok(()) };
+        let (mut t_shared, mut t_slot, mut t_ffn, mut t_gates) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut x = backend.zeros(vec![1, b, d])?;
+        backend.embedding_quant(ids, &self.embed, &x)?;
+        for i in 0..self.layers.len() {
+            let layer = &self.layers[i];
+            let t0 = std::time::Instant::now();
+            let h = layer.attn_norm.forward(backend, &x)?;
+            let mut p3 = [0.0f64; 4];
+            let m = match &layer.mixer {
+                Mixer::Attn(a) => {
+                    Self::attn_forward_batch(&self.cfg, backend, &h, a, slots, i, Some(&mut p3))?
+                }
+                Mixer::Gdn(g) => {
+                    Self::gdn_forward_batch(&self.cfg, backend, &h, g, slots, i, Some(&mut p3))?
+                }
+            };
+            sync(&m)?;
+            t_shared += p3[0] + (t0.elapsed().as_secs_f64() - p3[0] - p3[1] - p3[2]);
+            t_shared += p3[2];
+            t_slot += p3[1];
+            t_gates += p3[3];
+            let x1 = backend.zeros(x.shape().to_vec())?;
+            backend.add(&x, &m, &x1)?;
+            let t1 = std::time::Instant::now();
+            let h2 = layer.post_norm.forward(backend, &x1)?;
+            let f = ffn_forward(backend, &h2, &layer.ffn)?;
+            let x2 = backend.zeros(vec![1, b, d])?;
+            backend.add(&x1, &f, &x2)?;
+            sync(&x2)?;
+            t_ffn += t1.elapsed().as_secs_f64();
+            x = x2;
+        }
+        for s in slots.iter_mut() {
+            s.pos += 1;
+        }
+        let h = self.out_norm.forward(backend, &x)?;
+        let logits = self.head_rows(backend, &h, b)?;
+        if prof {
+            sync(&logits)?;
+            eprintln!(
+                "BATCH_PROF B={b}: проекции+нормы {:.1}ms, по-слоту {:.1}ms, ffn+norm {:.1}ms, gates {:.1}ms",
+                t_shared * 1e3,
+                t_slot * 1e3,
+                t_ffn * 1e3,
+                t_gates * 1e3
+            );
+        }
+        Ok(logits)
+    }
+
+    /// Пакетное gated-внимание: q/k/v — ОДИН matmul на все слоты, дальше
+    /// per-slot только норма, rope (своя позиция), запись в СВОЙ кэш и
+    /// attention по своему префиксу; выходная проекция — снова общая.
+    fn attn_forward_batch(
+        cfg: &Qwen35Config,
+        backend: &dyn Backend,
+        h: &Tensor,
+        a: &FullAttn,
+        slots: &mut [Qwen35Slot],
+        layer: usize,
+        mut prof: Option<&mut [f64; 4]>,
+    ) -> Result<Tensor, BackendError> {
+        let t_proj = std::time::Instant::now();
+        let b = h.shape()[1];
+        let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+        let kv_size = nkv * hd;
+        let qg = Linear {
+            w: a.wq.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let k = Linear {
+            w: a.wk.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let v = Linear {
+            w: a.wv.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let gated = backend.zeros(vec![1, b, nh * hd])?;
+        if let Some(p) = prof.as_deref_mut() {
+            p[0] += t_proj.elapsed().as_secs_f64();
+        }
+        let t_slot = std::time::Instant::now();
+        let qg_rows = qg.view(vec![b, 2 * nh * hd]);
+        let k_rows = k.view(vec![b, kv_size]);
+        let v_rows = v.view(vec![b, kv_size]);
+        for (j, slot) in slots.iter_mut().enumerate() {
+            let pos = slot.pos;
+            let cache = slot.caches[layer].as_mut().ok_or_else(|| {
+                BackendError::Shape(format!("слот {j}, слой {layer}: нет KV (не attn-слой?)"))
+            })?;
+            let qg_j = qg_rows.view_offset(vec![1, nh, 2 * hd], j * 2 * nh * hd);
+            let q = crate::nn::slice_last(backend, &qg_j, hd, 0)?.view(vec![1, 1, nh * hd]);
+            let gate = crate::nn::slice_last(backend, &qg_j, hd, hd)?.view(vec![1, 1, nh * hd]);
+            let k_j = k_rows.view_offset(vec![1, 1, kv_size], j * kv_size);
+            let v_j = v_rows.view_offset(vec![1, 1, kv_size], j * kv_size);
+            let qn = backend.zeros(vec![1, 1, nh * hd])?;
+            backend.rmsnorm_head(&q, &a.q_norm, &qn, nh, cfg.norm_eps)?;
+            let kn = backend.zeros(vec![1, 1, kv_size])?;
+            backend.rmsnorm_head(&k_j, &a.k_norm, &kn, nkv, cfg.norm_eps)?;
+            let qr = backend.rope_imrope_text(
+                &qn,
+                pos,
+                hd,
+                cfg.rope_theta,
+                cfg.rope_sections,
+                cfg.n_rot,
+            )?;
+            let kr = backend.rope_imrope_text(
+                &kn,
+                pos,
+                hd,
+                cfg.rope_theta,
+                cfg.rope_sections,
+                cfg.n_rot,
+            )?;
+            cache.update(backend, &kr, &v_j)?;
+            let out = backend.zeros(vec![1, 1, nh * hd])?;
+            backend.attn_ar(&qr, &cache.view(), &cache.view_v(), None, &out, nh, nkv, hd)?;
+            let sg = backend.zeros(vec![1, 1, nh * hd])?;
+            backend.sigmoid(&gate, &sg)?;
+            let row = backend.zeros(vec![1, 1, nh * hd])?;
+            backend.mul(&out, &sg, &row)?;
+            backend.row_write(&gated, &row, j)?;
+        }
+        if let Some(p) = prof.as_deref_mut() {
+            p[1] += t_slot.elapsed().as_secs_f64();
+        }
+        let t_out = std::time::Instant::now();
+        let y = Linear {
+            w: a.wo.clone(),
+            b: None,
+        }
+        .forward(backend, &gated)?;
+        if let Some(p) = prof.as_deref_mut() {
+            p[2] += t_out.elapsed().as_secs_f64();
+        }
+        Ok(y)
+    }
+
+    /// Пакетный GDN: проекции qkv/gate/ba — один matmul на все слоты;
+    /// свёртка, delta-rule и норм-гейт — по слоту со СВОИМ рекуррентным
+    /// стейтом (он и есть состояние беседы); выходная проекция — общая.
+    fn gdn_forward_batch(
+        cfg: &Qwen35Config,
+        backend: &dyn Backend,
+        h: &Tensor,
+        g: &Gdn,
+        slots: &mut [Qwen35Slot],
+        layer: usize,
+        mut prof: Option<&mut [f64; 4]>,
+    ) -> Result<Tensor, BackendError> {
+        let t_proj = std::time::Instant::now();
+        let b = h.shape()[1];
+        let (s, hk) = (cfg.ssm_state, cfg.ssm_k_heads);
+        let inner = cfg.ssm_inner;
+        let qk_size = hk * s;
+        let cq = 2 * qk_size + inner;
+        let qkv = Linear {
+            w: g.w_qkv.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let z = Linear {
+            w: g.w_gate.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let ba = Linear {
+            w: g.w_ba.clone(),
+            b: None,
+        }
+        .forward(backend, h)?;
+        let t_gates = std::time::Instant::now();
+        let (gate, bvec) = backend.gdn_gates(&ba, &g.dt_bias, &g.a)?;
+        let o_all = backend.zeros(vec![1, b, inner])?;
+        if let Some(p) = prof.as_deref_mut() {
+            p[0] += t_proj.elapsed().as_secs_f64();
+            p[3] += t_gates.elapsed().as_secs_f64();
+        }
+        let t_slot = std::time::Instant::now();
+        // gate/b — по времени шага на v-голову (time_step_rank), НЕ inner.
+        let gdim = g.dt_bias.numel();
+        let qkv_rows = qkv.view(vec![b, cq]);
+        let gate_rows = gate.view(vec![b, gdim]);
+        let b_rows = bvec.view(vec![b, gdim]);
+        let fused = s <= 1024 && cq.is_multiple_of(s);
+        for (j, slot) in slots.iter_mut().enumerate() {
+            let st = slot.states[layer].as_mut().ok_or_else(|| {
+                BackendError::Shape(format!("слот {j}, слой {layer}: нет GDN-стейта"))
+            })?;
+            let qkv_j = qkv_rows.view_offset(vec![1, 1, cq], j * cq);
+            let gate_j = gate_rows.view_offset(vec![1, 1, gdim], j * gdim);
+            let b_j = b_rows.view_offset(vec![1, 1, gdim], j * gdim);
+            let o = if fused {
+                let (y, new_conv) = backend.gdn_conv_silu_split_norm(
+                    &qkv_j,
+                    &g.conv_w,
+                    &st.conv,
+                    cq,
+                    cfg.conv_kernel,
+                    s,
+                    qk_size,
+                    cfg.norm_eps,
+                )?;
+                st.conv = new_conv;
+                let qn = y.view_offset(vec![1, 1, qk_size], 0);
+                let kn = y.view_offset(vec![1, 1, qk_size], qk_size);
+                let vv = y.view_offset(vec![1, 1, inner], 2 * qk_size);
+                let (o, new_ssm) =
+                    backend.gdn_delta_rule(&qn, &kn, &vv, &gate_j, &b_j, &st.ssm, hk)?;
+                st.ssm = new_ssm;
+                o.view(vec![1, 1, inner])
+            } else {
+                Self::gdn_state_update(cfg, backend, &qkv_j, &gate_j, &b_j, g, st, None)?
+                    .3
+                    .view(vec![1, 1, inner])
+            };
+            backend.row_write(&o_all, &o, j)?;
+        }
+        if let Some(p) = prof.as_deref_mut() {
+            p[1] += t_slot.elapsed().as_secs_f64();
+        }
+        let t_out = std::time::Instant::now();
+        let normed = backend.gdn_norm_gated(&o_all, &z, &g.norm, cfg.norm_eps)?;
+        let y = Linear {
+            w: g.w_out.clone(),
+            b: None,
+        }
+        .forward(backend, &normed)?;
+        if let Some(p) = prof.as_deref_mut() {
+            p[2] += t_out.elapsed().as_secs_f64();
+        }
+        Ok(y)
     }
 }
 

@@ -246,6 +246,16 @@ fn cb_chunk() -> usize {
 /// (кодирование энкодера, без GPU-ожидания). Выключено по умолчанию:
 /// два атомика на dispatch — заметная доля стоимости мелкого оверхеда,
 /// который эти счётчики и измеряют.
+/// Предел трассировки имён кернелов (INFER_METAL_NAMES); None — выключено.
+fn names_limit() -> Option<u64> {
+    static N: OnceLock<Option<u64>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("INFER_METAL_NAMES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+    })
+}
+
 fn ops_prof() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("INFER_METAL_OPS").is_ok())
@@ -1013,6 +1023,19 @@ impl MetalCtx {
         setup: impl FnOnce(&ComputeCommandEncoderRef),
     ) -> Result<(), MetalError> {
         if !ops_prof() {
+            // INFER_METAL_NAMES=N — трассировка имён кернелов (диагностика
+            // структуры шага: лишние/повторные dispatch'и). Счётчик общий,
+            // печатается первые N.
+            if let Some(limit) = names_limit() {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let i = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i < limit {
+                    eprintln!(
+                        "KN {i} {kernel} {}x{}x{} g{}x{}x{}",
+                        grid.width, grid.height, grid.depth, group.width, group.height, group.depth
+                    );
+                }
+            }
             return self.run_inner(kernel, grid, group, setup);
         }
         let t = std::time::Instant::now();

@@ -268,6 +268,23 @@ struct GdnState {
     ssm: Tensor,
 }
 
+/// Состояние ОДНОЙ беседы (слота батча): KV полных слоёв, GDN-состояния
+/// рекуррентных и позиция следующего токена. Веса модели общие — слот их не
+/// копирует; [`Qwen35Model::activate_slot`] меняет слот с активным состоянием
+/// местами (переезд тензоров, без копирования данных).
+pub struct Qwen35Slot {
+    caches: Vec<Option<KvCache>>,
+    states: Vec<Option<GdnState>>,
+    pos: usize,
+}
+
+impl Qwen35Slot {
+    /// Позиция следующего токена в этой беседе (= длина контекста слота).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
     /// Таблица эмбеддингов в родном формате GGUF (деквант строки на лету);
@@ -283,6 +300,9 @@ pub struct Qwen35Model {
     states: Vec<Option<GdnState>>,
     /// Позиция следующего токена (число токенов в контексте).
     pos: usize,
+    /// Запаркованные беседы (слоты): их состояние ждёт активации,
+    /// активное живёт в полях выше.
+    parked: Vec<Qwen35Slot>,
     /// forward считает логиты только последней позиции (prefill_last).
     last_only: bool,
     /// Логиты вообще не нужны (промежуточные блоки префилла): head не
@@ -492,6 +512,7 @@ impl Qwen35Model {
             caches,
             states,
             pos: 0,
+            parked: Vec::new(),
             last_only: false,
             no_logits: false,
             spec_capture: None,
@@ -545,6 +566,56 @@ impl Qwen35Model {
         Ok((embed, self.output.clone()))
     }
 
+    /// Сброс активного контекста: KV пусты, рекуррентные стейты обнулены.
+    ///
+    /// Пустые кэши/стейты по конфигу — для сброса и для будущих слотов батча
+    /// (см. [`Self::park_slot`]). Строятся ТЕМ ЖЕ кодом, что в [`Self::load`]:
+    /// формат KV от env INFER_KV_F32, у рекуррентных слоёв кэша нет.
+    fn fresh_caches(
+        backend: &dyn Backend,
+        cfg: &Qwen35Config,
+    ) -> Result<Vec<Option<KvCache>>, BackendError> {
+        let fmt = if std::env::var("INFER_KV_F32").is_ok() {
+            crate::dtype::KvFormat::F32
+        } else {
+            crate::dtype::KvFormat::F16
+        };
+        let mut out = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            if cfg.recurrent[i] {
+                out.push(None);
+                continue;
+            }
+            let mut kv = KvCache::new(
+                backend,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                fmt,
+                fmt,
+                cfg.rope_theta,
+                Some(cfg.rope_sections),
+            )?;
+            kv.set_max_cap(Some(cfg.max_seq));
+            out.push(Some(kv));
+        }
+        Ok(out)
+    }
+
+    fn fresh_states(
+        backend: &dyn Backend,
+        cfg: &Qwen35Config,
+    ) -> Result<Vec<Option<GdnState>>, BackendError> {
+        let mut out = Vec::with_capacity(cfg.n_layers);
+        for i in 0..cfg.n_layers {
+            out.push(if cfg.recurrent[i] {
+                Some(Self::fresh_state(backend, cfg)?)
+            } else {
+                None
+            });
+        }
+        Ok(out)
+    }
+
     /// Новая последовательность: KV пусты, рекуррентные стейты обнулены.
     pub fn reset_cache(&mut self, backend: &dyn Backend) -> Result<(), BackendError> {
         for c in self.caches.iter_mut().flatten() {
@@ -555,6 +626,50 @@ impl Qwen35Model {
             *st = Self::fresh_state(backend, &self.cfg)?;
         }
         self.pos = 0;
+        Ok(())
+    }
+
+    /// Число ЗАПАРКОВАННЫХ контекстов (слотов). Активный контекст живёт в
+    /// полях модели и сюда не входит.
+    pub fn parked_slots(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// Запарковать текущий контекст (беседа) и подготовить модель к
+    /// следующей: тензоры состояния ПЕРЕЕЗЖАЮТ в слот (копий весов/кэшей
+    /// нет — веса общие), активный контекст сбрасывается.
+    pub fn park_slot(&mut self, backend: &dyn Backend) -> Result<usize, BackendError> {
+        let slot = Qwen35Slot {
+            caches: std::mem::take(&mut self.caches),
+            states: std::mem::take(&mut self.states),
+            pos: self.pos,
+        };
+        // Активному нужны СВОИ кэши/стейты: пересобираем с нуля.
+        self.caches = Self::fresh_caches(backend, &self.cfg)?;
+        self.states = Self::fresh_states(backend, &self.cfg)?;
+        self.pos = 0;
+        self.parked.push(slot);
+        Ok(self.parked.len() - 1)
+    }
+
+    /// Активировать слот `i`: его состояние встаёт в модель, а прежнее
+    /// активное уезжает на его место (обмен без копирования).
+    pub fn activate_slot(&mut self, i: usize) -> Result<(), BackendError> {
+        if i >= self.parked.len() {
+            return Err(BackendError::Shape(format!(
+                "activate_slot: нет слота {i} (запарковано {})",
+                self.parked.len()
+            )));
+        }
+        let current = Qwen35Slot {
+            caches: std::mem::take(&mut self.caches),
+            states: std::mem::take(&mut self.states),
+            pos: self.pos,
+        };
+        let slot = std::mem::replace(&mut self.parked[i], current);
+        self.caches = slot.caches;
+        self.states = slot.states;
+        self.pos = slot.pos;
         Ok(())
     }
 

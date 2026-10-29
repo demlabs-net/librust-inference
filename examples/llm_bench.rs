@@ -91,6 +91,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             let _ = be.to_cpu_f32(&lg)?;
         }
 
+        // LLM_PAUSE_MS: пауза между префиллом контекста и замером декода.
+        // Нужна, чтобы отделить «длинный контекст» от «троттлинг после
+        // префилла»: префилл 1440 греет GPU, и без паузы декод меряет уже
+        // прогретый чип.
+        if let Ok(ms) = std::env::var("LLM_PAUSE_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         let t0 = Instant::now();
         let mut id = next_id();
         for _ in 0..tg {

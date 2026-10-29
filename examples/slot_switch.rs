@@ -9,7 +9,7 @@ use std::error::Error;
 use rust_inference::backend::Backend as _;
 use rust_inference::inference::generate::CausalLm;
 use rust_inference::metal::MetalBackend;
-use rust_inference::{gguf, qwen35, tokenizer::Tokenizer, weights_map::WeightsMap, Tensor};
+use rust_inference::{Tensor, gguf, qwen35, tokenizer::Tokenizer, weights_map::WeightsMap};
 
 fn pick(be: &MetalBackend, vocab: usize, logits: &Tensor) -> u32 {
     let v = be.to_cpu_f32(logits).unwrap();
@@ -22,7 +22,9 @@ fn pick(be: &MetalBackend, vocab: usize, logits: &Tensor) -> u32 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: slot_switch <model.gguf>")?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: slot_switch <model.gguf>")?;
     let file = std::fs::File::open(&path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let gf = gguf::parse(&mmap)?;
@@ -89,8 +91,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let step2 = same(&logits_solo2, &logits_inter2);
     println!(
         "слот A: pos={pos_a}, токен {next_inter} (эталон {next_solo}); логиты шагов: {} / {}",
-        if step1 { "равны" } else { "РАЗОШЛИСЬ" },
-        if step2 { "равны" } else { "РАЗОШЛИСЬ" },
+        if step1 {
+            "равны"
+        } else {
+            "РАЗОШЛИСЬ"
+        },
+        if step2 {
+            "равны"
+        } else {
+            "РАЗОШЛИСЬ"
+        },
     );
     assert!(step1 && step2, "логиты слота после переключения разошлись");
     println!("OK: слоты переключаются без потери состояния (побитово)");

@@ -29,7 +29,11 @@ fn argmax(row: &[f32]) -> u32 {
 }
 
 /// Жадный токен из логитов [.., V] (берём последнюю строку).
-fn pick(be: &MetalBackend, vocab: usize, logits: &rust_inference::Tensor) -> Result<u32, Box<dyn Error>> {
+fn pick(
+    be: &MetalBackend,
+    vocab: usize,
+    logits: &rust_inference::Tensor,
+) -> Result<u32, Box<dyn Error>> {
     let v = be.to_cpu_f32(logits)?;
     let last = &v[v.len() - vocab..];
     Ok(argmax(last))
@@ -193,12 +197,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 None => format!("все {n} шагов совпали"),
                 Some(s) => format!("РАСХОЖДЕНИЕ на шаге {s}"),
             },
-            if same_argmax { "совпал" } else { "разошёлся" },
-            if drift.is_finite() {
-                ""
+            if same_argmax {
+                "совпал"
             } else {
-                " (nan!)"
+                "разошёлся"
             },
+            if drift.is_finite() { "" } else { " (nan!)" },
         );
         ok &= first_diff.is_none();
     }
@@ -206,7 +210,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Второй проход: время (первый прогрел буферы/mmap). ORDER=batch_first —
     // обратный порядок (проверка зависимости от прогрева/троттлинга).
     be.ctx.ops_snapshot(true);
-    let batch_first = std::env::var("ORDER").map(|v| v == "batch_first").unwrap_or(false);
+    let batch_first = std::env::var("ORDER")
+        .map(|v| v == "batch_first")
+        .unwrap_or(false);
     let (solo2, batch2, solo_ops, solo_ns, batch_ops, batch_ns) = if batch_first {
         let b2 = run_batch(&mut m, &be, &tok, prompts, n)?;
         let (bops, bns) = be.ctx.ops_snapshot(true);

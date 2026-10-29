@@ -103,13 +103,14 @@ impl<'m> BatchEngine<'m> {
         ids: &[u32],
     ) -> Result<(usize, Vec<f32>), BackendError> {
         if ids.is_empty() {
-            return Err(BackendError::Shape("BatchEngine::submit: пустой промпт".into()));
+            return Err(BackendError::Shape(
+                "BatchEngine::submit: пустой промпт".into(),
+            ));
         }
-        let slot = self
-            .meta
-            .iter()
-            .position(|m| m.is_none())
-            .ok_or_else(|| BackendError::Shape("BatchEngine::submit: все слоты заняты".into()))?;
+        let slot =
+            self.meta.iter().position(|m| m.is_none()).ok_or_else(|| {
+                BackendError::Shape("BatchEngine::submit: все слоты заняты".into())
+            })?;
         let logits = self
             .model
             .prefill_slot_last(backend, &mut self.slots[slot], ids)?;
@@ -130,7 +131,9 @@ impl<'m> BatchEngine<'m> {
         next: &[(usize, u32)],
     ) -> Result<Vec<(usize, Vec<f32>)>, BackendError> {
         if next.is_empty() {
-            return Err(BackendError::Shape("BatchEngine::step: пустой пакет".into()));
+            return Err(BackendError::Shape(
+                "BatchEngine::step: пустой пакет".into(),
+            ));
         }
         if next.len() != self.active() {
             return Err(BackendError::Shape(format!(

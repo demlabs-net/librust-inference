@@ -69,6 +69,22 @@ impl<'m> BatchEngine<'m> {
         })
     }
 
+    /// Движок на ГОТОВЫХ слотах: сервис держит их между пакетами — состояние
+    /// последовательностей выделяется один раз, а не на каждый пакет.
+    pub fn with_slots(model: &'m mut Qwen35Model, slots: Vec<Qwen35Slot>) -> Self {
+        let meta = vec![None; slots.len()];
+        Self {
+            model,
+            slots,
+            meta,
+        }
+    }
+
+    /// Забрать слоты обратно (состояние бесед уже закрыто/освобождено).
+    pub fn into_slots(self) -> Vec<Qwen35Slot> {
+        self.slots
+    }
+
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }

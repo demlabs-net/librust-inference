@@ -73,11 +73,7 @@ impl<'m> BatchEngine<'m> {
     /// последовательностей выделяется один раз, а не на каждый пакет.
     pub fn with_slots(model: &'m mut Qwen35Model, slots: Vec<Qwen35Slot>) -> Self {
         let meta = vec![None; slots.len()];
-        Self {
-            model,
-            slots,
-            meta,
-        }
+        Self { model, slots, meta }
     }
 
     /// Забрать слоты обратно (состояние бесед уже закрыто/освобождено).
@@ -102,6 +98,11 @@ impl<'m> BatchEngine<'m> {
             .enumerate()
             .filter_map(|(i, m)| m.map(|_| i))
             .collect()
+    }
+
+    /// Предел контекста модели (окно, из метаданных GGUF).
+    pub fn max_seq(&self) -> usize {
+        self.model.cfg.max_seq
     }
 
     pub fn meta(&self, slot: usize) -> Option<SlotMeta> {
@@ -327,6 +328,26 @@ pub fn generate_batch(
         }
         if queue.is_empty() {
             break;
+        }
+        // Контекст беседы кончился — закрываем ЕЁ (как llama.cpp на переполнении
+        // окна), а не роняем весь пакет: остальные беседы продолжают идти.
+        let max_seq = engine.max_seq();
+        let mut ready: Vec<(usize, u32)> = Vec::with_capacity(queue.len());
+        for &(slot, tok_) in queue.iter() {
+            let full = engine.pos(slot).map(|p| p + 1 > max_seq).unwrap_or(true);
+            if full {
+                if let Some(st) = streams[slot].as_mut() {
+                    close_stream(st, FinishReason::MaxTokens, on_event);
+                }
+                engine.finish(slot, backend)?;
+                streams[slot] = None;
+            } else {
+                ready.push((slot, tok_));
+            }
+        }
+        queue = ready;
+        if queue.is_empty() {
+            continue;
         }
         let rows = engine.step(backend, &queue)?;
         queue.clear();

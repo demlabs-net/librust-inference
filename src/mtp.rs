@@ -65,6 +65,9 @@ pub struct MtpDrafter {
     pending_rows: Option<Tensor>,
     sampling: DraftSampling,
     rng: u64,
+    /// Промпт-lookup (Strata/HyperQwen): порядок n-грамм для продолжения
+    /// вербатимного совпадения из истории. None — только MTP.
+    ngram_order: Option<usize>,
 }
 
 /// Есть ли у файла nextn-веса (blk.{n_layers}.nextn.eh_proj.weight).
@@ -74,6 +77,16 @@ pub fn has_mtp(w: &WeightsMap<'_>, cfg: &Qwen35Config) -> bool {
 }
 
 impl MtpDrafter {
+    /// Включить продолжение вербатимных совпадений из истории (q=1.0,
+    /// дельта-предложение): на цитатах, правках кода и RAG длинный повтор даёт
+    /// больше принятых токенов на окно, чем MTP-цепочка. Окно при этом
+    /// состоит из lookup-токенов и попадает в `self.window`, поэтому
+    /// after_extract переигрывает принятые строки как обычно.
+    pub fn with_ngram(mut self, order: usize) -> Self {
+        self.ngram_order = Some(order.max(1));
+        self
+    }
+
     /// Загрузка nextn-блока из тех же весов, что и таргет. `embed`/`output`
     /// — тензоры таргета ([`Qwen35Model::head_tables`]) — драфтер делит их
     /// с моделью, как эталон (nextn.embed_tokens/shared_head_head в этих
@@ -173,6 +186,7 @@ impl MtpDrafter {
             pending_rows: None,
             sampling: DraftSampling::Greedy,
             rng: 0x85ebca6b,
+            ngram_order: None,
         })
     }
 
@@ -472,6 +486,7 @@ mod tests {
             window: Vec::new(),
             sampling: DraftSampling::Greedy,
             rng: 1,
+            ngram_order: None,
         }
     }
 
@@ -664,6 +679,27 @@ mod tests {
             "history != committed+1"
         );
     }
+
+    /// Prompt-lookup: вербатимное продолжение из истории берётся ДО MTP-шагов
+    /// (q=1.0 — дельта), окно уходит в self.window для after_extract.
+    /// Проверяем, что драфт — именно повтор (2,3,4 после …1) и q=1.0.
+    #[test]
+    fn ngram_extension_drafts_verbatim_continuation() {
+        let be = CpuBackend;
+        let f = fixture(11);
+        let mut dr = drafter(&be, &f).with_ngram(4);
+        // История: 1..8 и снова 1,2,3,4 — суффикс [1,2,3,4] встречался ранее
+        // (полный 4-грамматический контекст, как требует min_order), поэтому
+        // продолжение вербатимно: 5,6,7 (gamma=3). committed = len-1.
+        let history = [1u32, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4];
+        dr.committed = history.len() - 1;
+        dr.pending_h = Some(be.zeros(vec![1, 1, f.cfg.dim]).unwrap());
+        let (tokens, probs) = dr.draft(&be, &history, 3);
+        assert_eq!(tokens, vec![5, 6, 7], "вербатимное продолжение");
+        assert!(probs.iter().all(|q| *q == 1.0), "lookup — дельта q=1.0");
+        assert_eq!(dr.window.first(), Some(&4), "окно начинается с якоря");
+        assert_eq!(&dr.window[1..], &tokens[..], "окно = lookup-токены");
+    }
 }
 
 impl Drafter for MtpDrafter {
@@ -750,10 +786,41 @@ impl Drafter for MtpDrafter {
         // Хвост черновой цепочки прошлого окна (если after_extract не
         // добрался до него) — дописывать будем с границы committed.
         self.kv.truncate(self.committed);
-        let mut tokens = Vec::with_capacity(gamma);
-        let mut probs = Vec::with_capacity(gamma);
+        // Prompt-lookup ПЕРВЫМ (Strata/HyperQwen): если продолжение уже есть в
+        // истории (цитата, правка, RAG), оно вербатимно и q = 1.0, и MTP-шаги
+        // не нужны вовсе — окно целиком из lookup-токенов. Порог — 3 токена:
+        // совпадения из 1-2 на обычном тексте случайны, их проверка съедает
+        // окно (замер: обычный текст 12.7 против 14.7 у чистого MTP).
+        // after_extract переигрывает принятые строки по `self.window` — ему
+        // всё равно, из какого источника взяты токены.
+        if let Some(order) = self.ngram_order {
+            // Контекст совпадения — не короче order: короткие n-граммы на
+            // обычном тексте совпадают случайно (см. ngram_lookup_min).
+            let (lookup, lq) = crate::spec::ngram_lookup_min(history, gamma, order, order);
+            if lookup.len() >= 3 {
+                self.window = Vec::with_capacity(lookup.len() + 1);
+                self.window.push(anchor);
+                self.window.extend_from_slice(&lookup);
+                if std::env::var("LLM_DBG_MTP").is_ok() {
+                    eprintln!("MTP draft: {} токенов prompt-lookup", lookup.len());
+                }
+                return (lookup, lq);
+            }
+        }
+        // MTP-цепочка капнута: γ задаёт размер ОКНА (его использует lookup),
+        // а последовательные MTP-шаги дороги — больше 4 почти никогда не
+        // окупаются (замер 27B: γ=4 13.2 при AR 12.3 и γ=6 10.8).
+        let chain = gamma.min(
+            std::env::var("INFER_MTP_CHAIN")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4)
+                .max(1),
+        );
+        let mut tokens = Vec::with_capacity(chain);
+        let mut probs = Vec::with_capacity(chain);
         let mut tok = anchor;
-        for i in 0..gamma {
+        for i in 0..chain {
             let step = self.step(backend, &h, tok, self.committed + i, true);
             let (lg, h_out) = match step {
                 Ok(v) => v,

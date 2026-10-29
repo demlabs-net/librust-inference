@@ -260,7 +260,15 @@ impl Drafter for NGramDrafter {
         history: &[u32],
         gamma: usize,
     ) -> (Vec<u32>, Vec<f32>) {
-        ngram_lookup(history, gamma, self.max_order)
+        // Строгий контекст: 1-2-грамматические совпадения на обычном тексте
+        // случайны и только тратят окно (замер 27B: 12.7 против 14.6 tok/s).
+        // Для цитат/правок/кода контекст повторяется целиком, порог не мешает.
+        ngram_lookup_min(
+            history,
+            gamma,
+            self.max_order,
+            self.max_order.saturating_sub(1).max(2),
+        )
     }
 }
 
@@ -268,7 +276,21 @@ impl Drafter for NGramDrafter {
 /// [`NGramDrafter`], но вызываемая там, где графа нет вовсе — например на
 /// ноде-драфтере, обслуживающей черновики соседей по сети.
 pub fn ngram_lookup(history: &[u32], gamma: usize, max_order: usize) -> (Vec<u32>, Vec<f32>) {
+    ngram_lookup_min(history, gamma, max_order, 1)
+}
+
+/// То же, но совпадение засчитывается только с контекста длины `min_order`:
+/// на обычном тексте короткие n-граммы повторяются случайно, и черновик
+/// тратит окно впустую (замер 27B: 12.7 против 14.6 tok/s у чистого MTP);
+/// для цитат/правок нужен длинный вербатимный контекст.
+pub fn ngram_lookup_min(
+    history: &[u32],
+    gamma: usize,
+    max_order: usize,
+    min_order: usize,
+) -> (Vec<u32>, Vec<f32>) {
     let max_order = max_order.max(1);
+    let min_order = min_order.clamp(1, max_order);
     {
         let mut drafts: Vec<u32> = Vec::new();
         let mut probs: Vec<f32> = Vec::new();
@@ -276,7 +298,7 @@ pub fn ngram_lookup(history: &[u32], gamma: usize, max_order: usize) -> (Vec<u32
         for _ in 0..gamma {
             let mut next: Option<(u32, f32)> = None;
             let mut order = hist.len().min(max_order);
-            while order >= 1 && next.is_none() {
+            while order >= min_order && next.is_none() {
                 if hist.len() > order {
                     let suffix = &hist[hist.len() - order..];
                     // N (plan 1.5): count ALL suffix occurrences and the
@@ -334,6 +356,21 @@ mod tests {
         let (drafts, probs) = d.draft(&crate::cpu::CpuBackend, &history, 3);
         assert_eq!(drafts[0], 4, "продолжение [7,8,9] → 4");
         assert_eq!(probs.len(), drafts.len());
+    }
+
+    /// Строгий контекст (min_order): повтор короткого суффикса не даёт
+    /// черновика — иначе на обычном тексте lookup тратит окно впустую
+    /// (замер 27B: 12.7 против 14.6 tok/s).
+    #[test]
+    fn ngram_min_order_requires_long_context() {
+        // Повтор только 2-граммы [7,8] → при min_order=4 черновиков нет.
+        let history: Vec<u32> = vec![7, 8, 1, 2, 3, 7, 8];
+        let (short, _) = ngram_lookup_min(&history, 4, 4, 4);
+        assert!(short.is_empty(), "2-грамма при min_order=4: {short:?}");
+        // Полный 4-грамматический повтор: [5,6,7,8] → продолжение 9,10.
+        let history: Vec<u32> = vec![5, 6, 7, 8, 9, 10, 1, 2, 3, 5, 6, 7, 8];
+        let (long, _) = ngram_lookup_min(&history, 2, 4, 4);
+        assert_eq!(&long[..2], &[9, 10], "4-грамма → вербатимное продолжение");
     }
 
     #[test]

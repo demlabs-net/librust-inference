@@ -74,9 +74,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             // с таргетом (как в эталоне: nextn.embed_tokens/shared_head_head
             // в этих чекпойнтах нет).
             let (embed, output) = model.head_tables();
-            std::sync::Arc::new(std::sync::Mutex::new(
-                rust_inference::mtp::MtpDrafter::load(&backend, &wm, &model.cfg, embed, output)?,
-            ))
+            let dr =
+                rust_inference::mtp::MtpDrafter::load(&backend, &wm, &model.cfg, embed, output)?;
+            // QWEN35_NGRAM=1: prompt-lookup рядом с MTP (как в сервисе).
+            let dr = if std::env::var("QWEN35_NGRAM").is_ok() {
+                dr.with_ngram(4)
+            } else {
+                dr
+            };
+            std::sync::Arc::new(std::sync::Mutex::new(dr))
         } else {
             let (embed, lm_head) = model.shared_tables(&backend, &wm)?;
             std::sync::Arc::new(std::sync::Mutex::new(

@@ -19,9 +19,17 @@
 //! Пакет из одной беседы идёт одиночным путём (см.
 //! [`Qwen35Model::decode_batch`]) — биты совпадают с обычным декодом.
 
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use crate::backend::Backend;
 use crate::error::BackendError;
+use crate::inference::generate::{
+    Emit, FinishReason, GenerateEvent, GenerateParams, Timings, check_stop, emit,
+};
+use crate::inference::sampling::state_from_seed;
 use crate::qwen35::{Qwen35Model, Qwen35Slot};
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 /// Учёт беседы в слоте (позиция живёт в самом слоте).
 #[derive(Debug, Clone, Copy)]
@@ -195,4 +203,193 @@ impl<'m> BatchEngine<'m> {
         self.slots[slot] = self.model.new_slot(backend)?;
         Ok(())
     }
+}
+
+/// Запрос пакетной генерации: промпт + параметры.
+///
+/// Пакетный путь — обычный AR-декод по одному токену на беседу. Спекулятивный
+/// драфтер, распределённый PP и vision-префилл в пакете не поддержаны
+/// (у каждого — своё состояние/транспорт на последовательность) и дают явную
+/// ошибку, а не тихую подмену.
+pub struct BatchRequest {
+    pub ids: Vec<u32>,
+    pub params: GenerateParams,
+}
+
+/// Состояние одной беседы в пакете (сэмплинг, стоп, декодер UTF-8).
+struct Stream {
+    req: usize,
+    decoder: IncrementalDecoder,
+    acc: String,
+    history: Vec<u32>,
+    rng: Option<u64>,
+    generated: Vec<u32>,
+    budget: Option<crate::inference::reasoning_budget::ReasoningBudget>,
+    /// Токен, который надо подать следующим шагом.
+    next: u32,
+    t_prompt: f64,
+    t_start: Instant,
+    predicted_n: usize,
+}
+
+/// Сгенерировать продолжения для нескольких промптов ПАКЕТОМ: по токену на
+/// беседу за шаг, веса читаются один раз на пакет, `capacity` бесед идут
+/// одновременно (остальные ждут в очереди и занимают место по мере
+/// завершения). Сэмплинг/стоп-условия/EOG/штрафы — на КАЖДУЮ беседу свои,
+/// ровно тот же каскад, что у [`crate::inference::generate::generate`].
+///
+/// События стримятся с индексом запроса: `on_event(req_index, event)`;
+/// `false` из колбэка — отмена ЭТОЙ беседы (остальные продолжают).
+///
+/// Возвращает токены каждого запроса (в порядке `reqs`).
+pub fn generate_batch(
+    engine: &mut BatchEngine<'_>,
+    backend: &dyn Backend,
+    tok: &Tokenizer,
+    reqs: &[BatchRequest],
+    on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
+) -> Result<Vec<Vec<u32>>, BackendError> {
+    if reqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (i, r) in reqs.iter().enumerate() {
+        if r.ids.is_empty() {
+            return Err(BackendError::Shape(format!(
+                "generate_batch: запрос {i}: пустой промпт"
+            )));
+        }
+        if r.params.drafter.is_some() || r.params.pp.is_some() || r.params.vision.is_some() {
+            return Err(BackendError::Shape(format!(
+                "generate_batch: запрос {i}: спек/PP/vision в пакетном пути не поддержаны"
+            )));
+        }
+    }
+    let mut pending: VecDeque<usize> = (0..reqs.len()).collect();
+    let mut streams: Vec<Option<Stream>> = (0..engine.capacity()).map(|_| None).collect();
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); reqs.len()];
+    let mut queue: Vec<(usize, u32)> = Vec::new();
+
+    // Принять беседы в свободные места: prefill + первый токен.
+    loop {
+        while let Some(&q) = pending.front() {
+            if !streams.iter().any(|s| s.is_none()) {
+                break;
+            }
+            pending.pop_front();
+            let t_prompt = Instant::now();
+            let (slot, logits) = engine.submit(backend, &reqs[q].ids)?;
+            let st = Stream {
+                req: q,
+                decoder: IncrementalDecoder::new(),
+                acc: String::new(),
+                history: reqs[q].ids.clone(),
+                rng: reqs[q].params.seed.map(state_from_seed),
+                generated: Vec::new(),
+                budget: reqs[q].params.reasoning_budget.clone(),
+                next: 0,
+                t_prompt: t_prompt.elapsed().as_secs_f64() * 1e3,
+                t_start: Instant::now(),
+                predicted_n: 0,
+            };
+            streams[slot] = Some(st);
+            let done = advance(
+                streams[slot].as_mut().expect("слот только что занят"),
+                &logits,
+                &reqs[q].params,
+                tok,
+                &mut out[q],
+                on_event,
+            );
+            match done {
+                None => queue.push((slot, streams[slot].as_ref().unwrap().next)),
+                Some(reason) => {
+                    close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
+                    engine.finish(slot, backend)?;
+                    streams[slot] = None;
+                }
+            }
+        }
+        if queue.is_empty() {
+            break;
+        }
+        let rows = engine.step(backend, &queue)?;
+        queue.clear();
+        for (slot, row) in rows {
+            let st = streams[slot].as_mut().expect("шаг по занятому слоту");
+            let q = st.req;
+            let done = advance(st, &row, &reqs[q].params, tok, &mut out[q], on_event);
+            match done {
+                None => queue.push((slot, streams[slot].as_ref().unwrap().next)),
+                Some(reason) => {
+                    close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
+                    engine.finish(slot, backend)?;
+                    streams[slot] = None;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Один шаг беседы по строке логитов: сэмплинг → стоп → эмиссия → учёт.
+/// `None` — продолжаем (`st.next` обновлён), `Some(reason)` — беседа
+/// завершена (выход и последний токен уже учтены).
+fn advance(
+    st: &mut Stream,
+    row: &[f32],
+    params: &GenerateParams,
+    tok: &Tokenizer,
+    out: &mut Vec<u32>,
+    on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
+) -> Option<FinishReason> {
+    let next = match st.budget.as_ref().and_then(|b| b.forced_token()) {
+        Some(f) => f,
+        None => crate::inference::generate::sample_row(row, params, &st.history, &mut st.rng),
+    };
+    if let Some(b) = st.budget.as_mut() {
+        b.accept_piece(next, &tok.piece_bytes(next));
+    }
+    if let Some(r) = check_stop(next, |t| tok.is_eog(t), &st.acc, &params.stop_strings) {
+        return Some(r);
+    }
+    let q = st.req;
+    match emit(next, tok, &mut st.decoder, &mut st.acc, &mut |ev| {
+        on_event(q, ev)
+    }) {
+        Emit::Stop => return Some(FinishReason::Cancelled),
+        Emit::Ok => {}
+    }
+    st.generated.push(next);
+    out.push(next);
+    st.history.push(next);
+    st.predicted_n += 1;
+    if st.generated.len() >= params.max_tokens {
+        return Some(FinishReason::MaxTokens);
+    }
+    st.next = next;
+    None
+}
+
+/// Хвост завершённой беседы: невыданный остаток UTF-8, времена, Done.
+fn close_stream(
+    st: &mut Stream,
+    reason: FinishReason,
+    on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
+) {
+    let q = st.req;
+    let tail = st.decoder.finish();
+    if !tail.is_empty() {
+        on_event(q, GenerateEvent::Delta(tail));
+    }
+    let prompt_n = st.history.len() - st.generated.len();
+    on_event(
+        q,
+        GenerateEvent::Timings(Timings {
+            prompt_n,
+            prompt_ms: st.t_prompt,
+            predicted_n: st.predicted_n,
+            predicted_ms: st.t_start.elapsed().as_secs_f64() * 1e3,
+        }),
+    );
+    on_event(q, GenerateEvent::Done(reason));
 }

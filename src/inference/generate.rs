@@ -645,6 +645,32 @@ fn local_fallback<M: CausalLm + ?Sized>(
 /// Выбор следующего токена по строке логитов: жадный (со штрафом за
 /// повторы — единая реализация `sampling::greedy_next`, её же использует
 /// жадная верификация спека) или сэмплинг top-p/top-k.
+/// Сэмплинг по ГОТОВОЙ строке логитов (на хосте) — тот же каскад, что у
+/// одиночного пути. Пакетный путь ([`crate::batch::generate_batch`]) читает
+/// строки пакета одним дампом и зовёт это; одиночный — [`sample_next`].
+pub fn sample_row(
+    row: &[f32],
+    params: &GenerateParams,
+    history: &[u32],
+    rng_state: &mut Option<u64>,
+) -> u32 {
+    if params.temperature <= 0.0 {
+        crate::inference::sampling::greedy_next(row, history, params.repeat_penalty)
+    } else {
+        let sp = SamplingParams {
+            temperature: params.temperature,
+            top_p: params.top_p,
+            top_k: params.top_k,
+            repetition_penalty: params.repeat_penalty,
+            // Поток несёт `rng_state` (сид уже материализован) — второй
+            // источник сида дал бы двойной шаг LCG.
+            seed: None,
+            min_p: params.min_p,
+        };
+        top_p_sample_vec_history(row, &sp, history, rng_state)
+    }
+}
+
 fn sample_next(
     backend: &dyn Backend,
     logits: &crate::backend::Tensor,
@@ -657,32 +683,22 @@ fn sample_next(
     if v.len() < vocab || vocab == 0 {
         return Err(BackendError::Shape("sample: empty logits row".into()));
     }
-    let last = &v[v.len() - vocab..];
-    Ok(if params.temperature <= 0.0 {
-        crate::inference::sampling::greedy_next(last, history, params.repeat_penalty)
-    } else {
-        let sp = SamplingParams {
-            temperature: params.temperature,
-            top_p: params.top_p,
-            top_k: params.top_k,
-            repetition_penalty: params.repeat_penalty,
-            // Поток несёт `rng_state` (сид уже материализован) — второй
-            // источник сида дал бы двойной шаг LCG.
-            seed: None,
-            min_p: params.min_p,
-        };
-        top_p_sample_vec_history(last, &sp, history, rng_state)
-    })
+    Ok(sample_row(
+        &v[v.len() - vocab..],
+        params,
+        history,
+        rng_state,
+    ))
 }
 
-enum Emit {
+pub(crate) enum Emit {
     Ok,
     Stop,
 }
 
 /// Отдать токен наружу: дельта текста (склейка UTF-8) + сырой токен.
 /// Stop — потребитель попросил остановиться.
-fn emit(
+pub(crate) fn emit(
     t: u32,
     tok: &Tokenizer,
     decoder: &mut IncrementalDecoder,

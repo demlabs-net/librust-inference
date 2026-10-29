@@ -5252,7 +5252,17 @@ impl MetalCtx {
         // Предфилл: half×half матричные блоки (16 запросов/threadgroup).
         // tkv ≥ 8: хвостовой фрагмент ключей сдвигается к Tkv-8 (см. кернел).
         // HD до 256 (Qwen3.5): фрагментов головы вдвое больше (nf = HD/8).
-        if b == 1 && tq >= 16 && tkv >= 8 && hd.is_multiple_of(8) && hd <= 256 {
+        // INFER_ATTN_NO_MMA=1 — общий путь вместо матричных блоков: на
+        // длинном Tkv у hd=256 у mma-кернела 32 фрагмента головы и всего
+        // 11.8 КБ threadgroup при 64 потоках (2 группы на ядро, 4 warps) —
+        // occupancy низкая; сверка/замеры альтернативы.
+        if b == 1
+            && tq >= 16
+            && tkv >= 8
+            && hd.is_multiple_of(8)
+            && hd <= 256
+            && std::env::var("INFER_ATTN_NO_MMA").is_err()
+        {
             let (tq32, tkv32, h32, kvh32, hd32) = (
                 tq as u32,
                 tkv as u32,

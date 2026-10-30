@@ -279,6 +279,20 @@ pub struct Qwen35Slot {
 }
 
 impl Qwen35Slot {
+    /// Байты памяти слота: KV-кэши (по ёмкости, не по pos) + рекуррентные
+    /// стейты (conv/ssm, f32). Нужно статусу: иначе занятая слотами память
+    /// не видна нигде.
+    pub fn bytes(&self) -> u64 {
+        let mut n: u64 = 0;
+        for c in self.caches.iter().flatten() {
+            n += c.storage_bytes() as u64;
+        }
+        for st in self.states.iter().flatten() {
+            n += (st.conv.numel() + st.ssm.numel()) as u64 * 4;
+        }
+        n
+    }
+
     /// Позиция следующего токена в этой беседе (= длина контекста слота).
     pub fn pos(&self) -> usize {
         self.pos

@@ -151,6 +151,13 @@ impl<'m> BatchEngine<'m> {
             .collect()
     }
 
+    /// Память слотов (KV + рекуррентные стейты), включая сохранённые
+    /// под кэш префикса: статус обязан показывать её, иначе «модель занимает
+    /// N ГБ» расходится с реальностью.
+    pub fn slots_bytes(&self) -> u64 {
+        self.slots.iter().map(|s| s.bytes()).sum()
+    }
+
     /// Размерность скрытого (для примирения драфтера).
     pub fn dim(&self) -> usize {
         self.model.cfg.dim
@@ -777,6 +784,24 @@ pub fn generate_batch_full(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
+    // ПРЕДЕЛ РАЗМЕРА КЭША: слот с сохранённым KV не освобождает память, пока
+    // его не займёт другая беседа. Длинная беседа оставила бы KV на десятки
+    // тысяч токенов (и снимок стейтов) навсегда. Сверх лимита слот
+    // ОСВОБОЖДАЕТСЯ полностью — префикс пересчитается при следующем ходе.
+    let prefix_cache_max: usize = std::env::var("INFER_PREFIX_CACHE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    // Закрытие беседы: кэш префикса — только если история в пределах лимита
+    // (иначе слот освобождается целиком, иначе KV/снимок висели бы вечно).
+    let keep_or_finish =
+        |eng: &mut BatchEngine<'_>, slot: usize, hist: &[u32]| -> Result<(), BackendError> {
+            if hist.len() <= prefix_cache_max {
+                eng.finish_keep(slot, hist)
+            } else {
+                eng.finish(slot, backend)
+            }
+        };
     let pchunk: usize = std::env::var("INFER_BATCH_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -940,7 +965,7 @@ pub fn generate_batch_full(
                     Some(reason) => {
                         let hist = streams[slot].as_ref().unwrap().history.clone();
                         close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
-                        engine.finish_keep(slot, &hist)?;
+                        keep_or_finish(engine, slot, &hist)?;
                         streams[slot] = None;
                     }
                 }
@@ -966,7 +991,7 @@ pub fn generate_batch_full(
                 if let Some(st) = streams[slot].as_mut() {
                     close_stream(st, FinishReason::MaxTokens, on_event);
                 }
-                engine.finish_keep(slot, &hist)?;
+                keep_or_finish(engine, slot, &hist)?;
                 streams[slot] = None;
             } else {
                 ready.push((slot, tok_));
@@ -1116,7 +1141,7 @@ pub fn generate_batch_full(
                     Some(r) => {
                         let hist = st.history.clone();
                         close_stream(st, r, on_event);
-                        engine.finish_keep(slot, &hist)?;
+                        keep_or_finish(engine, slot, &hist)?;
                         streams[slot] = None;
                     }
                     None => {
@@ -1158,7 +1183,7 @@ pub fn generate_batch_full(
                             if let Some(r) = stop_now {
                                 let hist = st.history.clone();
                                 close_stream(st, r, on_event);
-                                engine.finish_keep(slot, &hist)?;
+                                keep_or_finish(engine, slot, &hist)?;
                                 streams[slot] = None;
                                 continue;
                             }
@@ -1173,7 +1198,7 @@ pub fn generate_batch_full(
                                     Some(r) => {
                                         let hist = st.history.clone();
                                         close_stream(st, r, on_event);
-                                        engine.finish_keep(slot, &hist)?;
+                                        keep_or_finish(engine, slot, &hist)?;
                                         streams[slot] = None;
                                     }
                                 }
@@ -1216,7 +1241,7 @@ pub fn generate_batch_full(
                     let hist = st.history.clone();
                     close_stream(st, reason, on_event);
                     // Кэш префикса: KV и история остаются для следующего хода.
-                    engine.finish_keep(slot, &hist)?;
+                    keep_or_finish(engine, slot, &hist)?;
                     streams[slot] = None;
                 }
             }

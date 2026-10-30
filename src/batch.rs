@@ -456,6 +456,18 @@ pub fn generate_batch(
                 //   accepted[0] — ЯКОРЬ (уже выдан), наружу идут [1..n_ok];
                 //   accepted[n_ok] при отказе — пересэмпл, В KV ЕГО НЕТ.
                 let n_ok = o.n_draft_accepted + 1;
+                // Диагностика приёмки: без неё «спек не дал выигрыша»
+                // неотличим от «черновики не предлагались».
+                on_event(
+                    q,
+                    crate::inference::generate::GenerateEvent::SpecStats(
+                        crate::inference::generate::SpecStats {
+                            drafts: drafts.len() as u64,
+                            accepted: o.n_draft_accepted as u64,
+                            rejected: (drafts.len() - o.n_draft_accepted) as u64,
+                        },
+                    ),
+                );
                 let all = n_ok == o.accepted.len();
                 let row = if all {
                     Some(backend.to_cpu_f32(&o.logits)?)

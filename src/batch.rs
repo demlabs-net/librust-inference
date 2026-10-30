@@ -809,6 +809,10 @@ pub fn generate_batch_full(
                 }
             }
             let log = std::env::var("INFER_BATCH_LOG").is_ok();
+            // Хвост должен быть НЕПУСТЫМ: при полностью совпавшем промпте
+            // (клиент повторил тот же запрос) префиллить нечего, а пустой
+            // кусок префилла — ошибка. Такой случай идёт полным префиллом.
+            let reuse = reuse.filter(|(_, k)| *k < ids.len());
             let picked = match reuse {
                 Some((slot, k)) => match engine.resume_from_seal(slot, ids) {
                     Ok(_) => Some((slot, k, "снимок")),

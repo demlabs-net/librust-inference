@@ -94,8 +94,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             hist.push(t);
         }
         if n_ok < o.accepted.len() {
-            // Пересэмпл НЕ в KV — якорь следующего шага.
+            // Пересэмпл НЕ в KV (якорь следующего шага) — и он ПЕРВЫЙ токен
+            // продолжения: как `pending` в одиночном пути, он выдаётся сразу.
             next = *o.accepted.last().unwrap();
+            out.push(next);
+            hist.push(next);
         } else {
             // Полная приёмка: логиты продолжения на руках.
             let row = be.to_cpu_f32(&o.logits)?;

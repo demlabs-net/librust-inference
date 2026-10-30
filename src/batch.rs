@@ -221,6 +221,7 @@ impl<'m> BatchEngine<'m> {
         draft_probs: &[f32],
         greedy: bool,
         hist: &[u32],
+        sp: &crate::inference::sampling::SamplingParams,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         if slot >= self.slots.len() {
             return Err(BackendError::Shape(format!(
@@ -230,12 +231,8 @@ impl<'m> BatchEngine<'m> {
         }
         let m = &mut *self.model;
         let s = &mut self.slots[slot];
-        let sp = crate::inference::sampling::SamplingParams {
-            temperature: 0.0,
-            ..Default::default()
-        };
         m.with_slot(s, |m| {
-            m.decode_spec(backend, anchor, draft, draft_probs, &mut None, &[], greedy, hist, &sp)
+            m.decode_spec(backend, anchor, draft, draft_probs, &mut None, &[], greedy, hist, sp)
         })
     }
 
@@ -404,19 +401,13 @@ pub fn generate_batch(
         // вербатимное продолжение в истории — окно верификации через
         // decode_spec, остальные идут пакетом. Путь аддитивный: без черновиков
         // всё как раньше.
-        // ЭКСПЕРИМЕНТАЛЬНО и НЕ ПРИНЯТО: при INFER_BATCH_SPEC=1 токены
-        // расходятся с одиночным прогоном (приёмка batch_generate падает) —
-        // разбор конвенции SpecOutcome не закончен (см. docs/batch_spec.md).
-        // Флаг существует, чтобы доводить ветвь, а НЕ включать в сервисе.
+        // Спец по беседам (INFER_BATCH_SPEC=1): окно верификации через
+        // decode_spec на состоянии ОДНОГО слота, черновики — prompt-lookup.
+        // Лосслессно для жадных бесед: приёмка сверяет токены с одиночным AR
+        // (cap 3 и 6, γ=2/4/8). Остальные беседы в том же такте идут пакетом.
+        // ВАЖНО: параметры сэмплинга для окна берутся из запроса — дефолтный
+        // SamplingParams (repeat 1.1) выключал быструю GPU-проверку argmax.
         let spec_on = std::env::var("INFER_BATCH_SPEC").is_ok();
-        if spec_on {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!(
-                    "batch-spec: ЭКСПЕРИМЕНТАЛЬНО (приёмка не пройдена — токены расходятся с AR)"
-                )
-            });
-        }
         let gamma: usize = std::env::var("INFER_BATCH_SPEC_GAMMA")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -438,7 +429,20 @@ pub fn generate_batch(
                     continue;
                 }
                 let hist = st.history.clone();
-                let o = match engine.decode_spec_slot(backend, slot, tok_, &drafts, &probs, true, &hist)
+                // Параметры — РОВНО те же, что у одиночного пути: иначе
+                // SamplingParams::default() (repeat 1.1) выключает быструю
+                // GPU-проверку argmax и подменяет приёмку.
+                let p = &reqs[q].params;
+                let sp = crate::inference::sampling::SamplingParams {
+                    temperature: p.temperature,
+                    top_p: p.top_p,
+                    top_k: p.top_k,
+                    repetition_penalty: p.repeat_penalty,
+                    seed: None,
+                    min_p: p.min_p,
+                };
+                let o = match engine
+                    .decode_spec_slot(backend, slot, tok_, &drafts, &probs, true, &hist, &sp)
                 {
                     Ok(o) => o,
                     // Окно не удалось — беседа честно идёт AR-шагом.
@@ -492,7 +496,46 @@ pub fn generate_batch(
                     None => {
                         // Полная приёмка: логиты продолжения уже есть; иначе
                         // последний принятый — пересэмпл, НЕ в KV, его кормим.
+                        // ВАЖНО: пересэмпл — обычный следующий токен беседы,
+                        // его надо ВЫДАТЬ (в одиночном пути он приходит из
+                        // `pending` и печатается на следующей итерации), а не
+                        // только запомнить как якорь — иначе выход короче и
+                        // история/выдача разъезжаются с AR.
                         st.next = *o.accepted.last().expect("окно вернуло токены");
+                        if n_ok < o.accepted.len() {
+                            let rs = st.next;
+                            let mut stop_now = None;
+                            if let Some(r) = check_stop(
+                                rs,
+                                |x| tok.is_eog(x),
+                                &st.acc,
+                                &reqs[q].params.stop_strings,
+                            ) {
+                                stop_now = Some(r);
+                            } else {
+                                match emit(rs, tok, &mut st.decoder, &mut st.acc, &mut |ev| {
+                                    on_event(q, ev)
+                                }) {
+                                    Emit::Stop => stop_now = Some(FinishReason::Cancelled),
+                                    Emit::Ok => {}
+                                }
+                                if stop_now.is_none() {
+                                    st.generated.push(rs);
+                                    out[q].push(rs);
+                                    st.history.push(rs);
+                                    st.predicted_n += 1;
+                                    if st.generated.len() >= reqs[q].params.max_tokens {
+                                        stop_now = Some(FinishReason::MaxTokens);
+                                    }
+                                }
+                            }
+                            if let Some(r) = stop_now {
+                                close_stream(st, r, on_event);
+                                engine.finish(slot, backend)?;
+                                streams[slot] = None;
+                                continue;
+                            }
+                        }
                         st.pending = row;
                         match st.pending.take() {
                             // Готовые логиты: сэмплим из них, forward не нужен.

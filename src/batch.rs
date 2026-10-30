@@ -239,6 +239,24 @@ impl<'m> BatchEngine<'m> {
         })
     }
 
+    /// Один AR-шаг ОДНОЙ беседы на её состоянии (диагностика/сверка окон).
+    pub fn decode_step_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        id: u32,
+    ) -> Result<crate::backend::Tensor, BackendError> {
+        if slot >= self.slots.len() {
+            return Err(BackendError::Shape(format!(
+                "decode_step_slot: нет слота {slot} (мест {})",
+                self.slots.len()
+            )));
+        }
+        let m = &mut *self.model;
+        let s = &mut self.slots[slot];
+        m.with_slot(s, |m| m.decode(backend, id))
+    }
+
     /// Освободить слот: состояние беседы выбрасывается, слот готов принять
     /// следующую (тензоры состояния уходят в пул бэкенда).
     pub fn finish(&mut self, slot: usize, backend: &dyn Backend) -> Result<(), BackendError> {
@@ -429,14 +447,19 @@ pub fn generate_batch(
                         continue;
                     }
                 };
-                let all = o.n_draft_accepted == drafts.len();
+                // Конвенция SpecOutcome (как в одиночном generate):
+                //   n_ok = n_draft_accepted + 1  — якорь + принятые черновики;
+                //   accepted[0] — ЯКОРЬ (уже выдан), наружу идут [1..n_ok];
+                //   accepted[n_ok] при отказе — пересэмпл, В KV ЕГО НЕТ.
+                let n_ok = o.n_draft_accepted + 1;
+                let all = n_ok == o.accepted.len();
                 let row = if all {
                     Some(backend.to_cpu_f32(&o.logits)?)
                 } else {
                     None
                 };
                 let mut closed = None;
-                for t in o.accepted.iter().copied() {
+                for t in o.accepted[1..n_ok].iter().copied() {
                     match check_stop(t, |x| tok.is_eog(x), &st.acc, &reqs[q].params.stop_strings) {
                         Some(r) => {
                             closed = Some(r);

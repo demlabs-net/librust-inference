@@ -1578,6 +1578,25 @@ impl Qwen35Model {
         active: &[usize],
         ids: &[u32],
     ) -> Result<Tensor, BackendError> {
+        // Пакет из одной беседы — ровно одиночный декод (биты совпадают по
+        // построению, спек-путь не ломается).
+        if active.len() == 1 {
+            let id = ids[0];
+            return self.with_slot(&mut slots[active[0]], |m| m.decode(backend, id));
+        }
+        Ok(self.decode_batch_hidden(backend, slots, active, ids)?.0)
+    }
+
+    /// Пакетный шаг + СКРЫТОЕ последней позиции каждой беседы (out_norm,
+    /// строка на слот) — вход MTP-черновиков на слот. Считается всё равно
+    /// для логитов, поэтому отдать его наружу бесплатно.
+    pub fn decode_batch_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen35Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<(Tensor, Tensor), BackendError> {
         let b = active.len();
         if b == 0 || ids.len() != b {
             return Err(BackendError::Shape(format!(
@@ -1600,13 +1619,6 @@ impl Qwen35Model {
                 )));
             }
         }
-        // Пакет из одного слота — это ровно одиночный декод: идём им (биты
-        // совпадают с одиночным прогоном по построению, и спек-путь сломать
-        // нельзя). Ветка пакета нужна только при b ≥ 2.
-        if b == 1 {
-            let id = ids[0];
-            return self.with_slot(&mut slots[0], |m| m.decode(backend, id));
-        }
         let d = self.cfg.dim;
         // Весь шаг — ОДИН батч (как в decode): иначе каждый из ~300 кернелов
         // получает свой command buffer с commit+wait, и хост съедает больше,
@@ -1624,7 +1636,7 @@ impl Qwen35Model {
         active: &[usize],
         ids: &[u32],
         d: usize,
-    ) -> Result<Tensor, BackendError> {
+    ) -> Result<(Tensor, Tensor), BackendError> {
         let b = ids.len();
         if std::env::var("INFER_METAL_NAMES").is_ok() {
             eprintln!("=== BATCH STEP B={b}");
@@ -1685,6 +1697,7 @@ impl Qwen35Model {
         }
         let h = self.out_norm.forward(backend, &x)?;
         let logits = self.head_rows(backend, &h, b)?;
+        let hidden = h.clone();
         if prof {
             sync(&logits)?;
             eprintln!(
@@ -1695,7 +1708,7 @@ impl Qwen35Model {
                 t_gates * 1e3
             );
         }
-        Ok(logits)
+        Ok((logits, hidden))
     }
 
     /// Пакетное gated-внимание: q/k/v — ОДИН matmul на все слоты, дальше

@@ -147,6 +147,49 @@ impl<'m> BatchEngine<'m> {
         Ok((slot, host))
     }
 
+    /// Пакетный шаг + СКРЫТОЕ последней позиции каждой беседы (строка [d] на
+    /// слот) — вход MTP-черновиков на слот. Скрытое всё равно считается для
+    /// логитов, лишней работы нет.
+    pub fn step_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        next: &[(usize, u32)],
+    ) -> Result<Vec<(usize, Vec<f32>, Vec<f32>)>, BackendError> {
+        if next.is_empty() {
+            return Err(BackendError::Shape("step_hidden: пустой пакет".into()));
+        }
+        let mut active = Vec::with_capacity(next.len());
+        let mut ids = Vec::with_capacity(next.len());
+        for &(slot, id) in next {
+            if slot >= self.slots.len() || self.meta[slot].is_none() {
+                return Err(BackendError::Shape(format!(
+                    "step_hidden: слот {slot} вне или свободен"
+                )));
+            }
+            active.push(slot);
+            ids.push(id);
+        }
+        let (logits, hidden) =
+            self.model
+                .decode_batch_hidden(backend, &mut self.slots, &active, &ids)?;
+        let host = backend.to_cpu_f32(&logits)?;
+        let hhost = backend.to_cpu_f32(&hidden)?;
+        let v = self.model.cfg.vocab_size;
+        let d = self.model.cfg.dim;
+        let mut out = Vec::with_capacity(active.len());
+        for (row, &slot) in active.iter().enumerate() {
+            out.push((
+                slot,
+                host[row * v..(row + 1) * v].to_vec(),
+                hhost[row * d..(row + 1) * d].to_vec(),
+            ));
+            if let Some(m) = self.meta[slot].as_mut() {
+                m.tokens_out += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// Пакетный шаг: по токену на активную беседу. `next` покрывает РОВНО
     /// активные слоты (пары (слот, токен)); порядок пар задаёт порядок строк
     /// результата. Логиты возвращаются на хосте, по строке [V] на беседу.
@@ -232,7 +275,17 @@ impl<'m> BatchEngine<'m> {
         let m = &mut *self.model;
         let s = &mut self.slots[slot];
         m.with_slot(s, |m| {
-            m.decode_spec(backend, anchor, draft, draft_probs, &mut None, &[], greedy, hist, sp)
+            m.decode_spec(
+                backend,
+                anchor,
+                draft,
+                draft_probs,
+                &mut None,
+                &[],
+                greedy,
+                hist,
+                sp,
+            )
         })
     }
 
@@ -291,6 +344,9 @@ struct Stream {
     budget: Option<crate::inference::reasoning_budget::ReasoningBudget>,
     /// Токен, который надо подать следующим шагом.
     next: u32,
+    /// Скрытое последней позиции (out_norm) — вход MTP-черновиков на слот.
+    /// Пусто, пока шаг не вернул его (после окна — устарело).
+    hidden: Vec<f32>,
     /// Логиты, УЖЕ полученные окном верификации (все черновики приняты):
     /// следующий токен сэмплится прямо из них, forward не нужен.
     pending: Option<Vec<f32>>,
@@ -314,6 +370,24 @@ pub fn generate_batch(
     backend: &dyn Backend,
     tok: &Tokenizer,
     reqs: &[BatchRequest],
+    on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
+) -> Result<Vec<Vec<u32>>, BackendError> {
+    generate_batch_with(engine, backend, tok, reqs, None, on_event)
+}
+
+/// Источник черновиков на беседу: (слот, история, скрытое последней позиции)
+/// → (черновики, вероятности). Возвращает None — беседа идёт AR-шагом.
+pub type BatchDraftFn<'a> = dyn FnMut(usize, &[u32], &[f32]) -> Option<(Vec<u32>, Vec<f32>)> + 'a;
+
+/// Как [`generate_batch`], но черновики даёт ВНЕШНИЙ драфтер на слот (MTP,
+/// обученный nextn-модуль таргета). Без него черновики берутся из
+/// prompt-lookup, как в [`generate_batch`].
+pub fn generate_batch_with(
+    engine: &mut BatchEngine<'_>,
+    backend: &dyn Backend,
+    tok: &Tokenizer,
+    reqs: &[BatchRequest],
+    mut draft_fn: Option<&mut BatchDraftFn<'_>>,
     on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
 ) -> Result<Vec<Vec<u32>>, BackendError> {
     if reqs.is_empty() {
@@ -354,6 +428,7 @@ pub fn generate_batch(
                 generated: Vec::new(),
                 budget: reqs[q].params.reasoning_budget.clone(),
                 next: 0,
+                hidden: Vec::new(),
                 pending: None,
                 t_prompt: t_prompt.elapsed().as_secs_f64() * 1e3,
                 t_start: Instant::now(),
@@ -423,7 +498,15 @@ pub fn generate_batch(
                     still_ar.push((slot, tok_));
                     continue;
                 }
-                let (drafts, probs) = crate::spec::ngram_lookup_min(&st.history, gamma, 4, 4);
+                // Черновики: внешний драфтер (MTP на слот) — только если
+                // скрытое СВЕЖЕЕ (шаг, а не окно); иначе prompt-lookup.
+                let (drafts, probs) = match draft_fn.as_deref_mut() {
+                    Some(f) if !st.hidden.is_empty() => match f(slot, &st.history, &st.hidden) {
+                        Some(d) => d,
+                        None => (Vec::new(), Vec::new()),
+                    },
+                    _ => crate::spec::ngram_lookup_min(&st.history, gamma, 4, 4),
+                };
                 if drafts.len() < 2 {
                     still_ar.push((slot, tok_));
                     continue;
@@ -483,7 +566,9 @@ pub fn generate_batch(
                         }
                         None => {}
                     }
-                    match emit(t, tok, &mut st.decoder, &mut st.acc, &mut |ev| on_event(q, ev)) {
+                    match emit(t, tok, &mut st.decoder, &mut st.acc, &mut |ev| {
+                        on_event(q, ev)
+                    }) {
                         Emit::Stop => {
                             closed = Some(FinishReason::Cancelled);
                             break;
@@ -551,21 +636,17 @@ pub fn generate_batch(
                         st.pending = row;
                         match st.pending.take() {
                             // Готовые логиты: сэмплим из них, forward не нужен.
-                            Some(row) => match advance(
-                                st,
-                                &row,
-                                &reqs[q].params,
-                                tok,
-                                &mut out[q],
-                                on_event,
-                            ) {
-                                None => still_ar.push((slot, st.next)),
-                                Some(r) => {
-                                    close_stream(st, r, on_event);
-                                    engine.finish(slot, backend)?;
-                                    streams[slot] = None;
+                            Some(row) => {
+                                match advance(st, &row, &reqs[q].params, tok, &mut out[q], on_event)
+                                {
+                                    None => still_ar.push((slot, st.next)),
+                                    Some(r) => {
+                                        close_stream(st, r, on_event);
+                                        engine.finish(slot, backend)?;
+                                        streams[slot] = None;
+                                    }
                                 }
-                            },
+                            }
                             None => still_ar.push((slot, st.next)),
                         }
                     }
@@ -578,21 +659,25 @@ pub fn generate_batch(
         if queue.is_empty() {
             continue;
         }
-        let rows = engine.step(backend, &queue)?;
-        queue.clear();
-        for (slot, row) in rows {
+        let rows = engine.step_hidden(backend, &queue)?;
+        let mut queue_next: Vec<(usize, u32)> = Vec::with_capacity(rows.len());
+        for (slot, row, hid) in rows {
             let st = streams[slot].as_mut().expect("шаг по занятому слоту");
+            // Скрытое последней позиции — только что посчитано этим шагом:
+            // годный вход MTP-черновиков для СЛЕДУЮЩЕГО окна.
+            st.hidden = hid;
             let q = st.req;
             let done = advance(st, &row, &reqs[q].params, tok, &mut out[q], on_event);
             match done {
-                None => queue.push((slot, streams[slot].as_ref().unwrap().next)),
+                None => queue_next.push((slot, streams[slot].as_ref().unwrap().next)),
                 Some(reason) => {
-                    close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
+                    close_stream(st, reason, on_event);
                     engine.finish(slot, backend)?;
                     streams[slot] = None;
                 }
             }
         }
+        queue = queue_next;
     }
     Ok(out)
 }

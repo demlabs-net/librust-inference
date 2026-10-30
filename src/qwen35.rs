@@ -1448,7 +1448,7 @@ impl Qwen35Model {
         b: &Tensor,
         g: &Gdn,
         st: &mut GdnState,
-        prof: Option<&mut [f64; 3]>,
+        mut prof: Option<&mut [f64; 3]>,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor), BackendError> {
         let (s, hk) = (cfg.ssm_state, cfg.ssm_k_heads);
         let inner = cfg.ssm_inner;
@@ -1469,7 +1469,7 @@ impl Qwen35Model {
         t0 = std::time::Instant::now();
         let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, gate, b, &st.ssm, hk)?;
         st.ssm = new_ssm;
-        if let Some(p) = prof {
+        if let Some(p) = prof.as_mut() {
             p[0] += t_conv;
             p[1] += t_norm;
             p[2] += t0.elapsed().as_secs_f64();
@@ -1836,7 +1836,7 @@ impl Qwen35Model {
         }
         .forward(backend, h)?;
         let gated = backend.zeros(vec![1, b, nh * hd])?;
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof.as_mut() {
             p[0] += t_proj.elapsed().as_secs_f64();
         }
         let t_slot = std::time::Instant::now();
@@ -1883,7 +1883,7 @@ impl Qwen35Model {
             backend.mul(&out, &sg, &row_out)?;
             backend.row_write(&gated, &row_out, row)?;
         }
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof.as_mut() {
             p[1] += t_slot.elapsed().as_secs_f64();
         }
         let t_out = std::time::Instant::now();
@@ -1892,7 +1892,7 @@ impl Qwen35Model {
             b: None,
         }
         .forward(backend, &gated)?;
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof.as_mut() {
             p[2] += t_out.elapsed().as_secs_f64();
         }
         Ok(y)
@@ -1935,7 +1935,7 @@ impl Qwen35Model {
         let t_gates = std::time::Instant::now();
         let (gate, bvec) = backend.gdn_gates(&ba, &g.dt_bias, &g.a)?;
         let o_all = backend.zeros(vec![1, b, inner])?;
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof.as_mut() {
             p[0] += t_proj.elapsed().as_secs_f64();
             p[3] += t_gates.elapsed().as_secs_f64();
         }
@@ -1980,7 +1980,7 @@ impl Qwen35Model {
             };
             backend.row_write(&o_all, &o, row)?;
         }
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof.as_mut() {
             p[1] += t_slot.elapsed().as_secs_f64();
         }
         let t_out = std::time::Instant::now();
@@ -1990,7 +1990,7 @@ impl Qwen35Model {
             b: None,
         }
         .forward(backend, &normed)?;
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof.as_mut() {
             p[2] += t_out.elapsed().as_secs_f64();
         }
         Ok(y)

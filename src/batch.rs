@@ -899,10 +899,10 @@ pub fn generate_batch_full(
             if seal_here || (st.seal_at == Some(base + b) && !st.sealed) {
                 let upto = st.seal_at.expect("seal_here");
                 let cut = &reqs[q].ids[..upto];
-                if let Err(e) = engine.seal_prefix(backend, slot, cut) {
-                    if std::env::var("INFER_BATCH_LOG").is_ok() {
-                        eprintln!("prefix-cache: снимок не снят ({e})");
-                    }
+                if let Err(e) = engine.seal_prefix(backend, slot, cut)
+                    && std::env::var("INFER_BATCH_LOG").is_ok()
+                {
+                    eprintln!("prefix-cache: снимок не снят ({e})");
                 }
                 st.sealed = true;
             }
@@ -1084,12 +1084,11 @@ pub fn generate_batch_full(
                 };
                 let mut closed = None;
                 for t in o.accepted[1..n_ok].iter().copied() {
-                    match check_stop(t, |x| tok.is_eog(x), &st.acc, &reqs[q].params.stop_strings) {
-                        Some(r) => {
-                            closed = Some(r);
-                            break;
-                        }
-                        None => {}
+                    if let Some(r) =
+                        check_stop(t, |x| tok.is_eog(x), &st.acc, &reqs[q].params.stop_strings)
+                    {
+                        closed = Some(r);
+                        break;
                     }
                     match emit(t, tok, &mut st.decoder, &mut st.acc, &mut |ev| {
                         on_event(q, ev)

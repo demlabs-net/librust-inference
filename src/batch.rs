@@ -45,6 +45,11 @@ pub struct BatchEngine<'m> {
     model: &'m mut Qwen35Model,
     slots: Vec<Qwen35Slot>,
     meta: Vec<Option<SlotMeta>>,
+    /// КЭШ ПРЕФИКСА: история, лежащая в KV слота после `finish_keep`. Следующий
+    /// ход той же беседы префиллит ТОЛЬКО хвост, если новый промпт начинается
+    /// с этой истории (чат-шаблон перерисовывает всю переписку — префикс
+    /// совпадает).
+    cached: Vec<Vec<u32>>,
 }
 
 impl<'m> BatchEngine<'m> {
@@ -66,6 +71,7 @@ impl<'m> BatchEngine<'m> {
             model,
             slots,
             meta: vec![None; capacity],
+            cached: vec![Vec::new(); capacity],
         })
     }
 
@@ -73,7 +79,13 @@ impl<'m> BatchEngine<'m> {
     /// последовательностей выделяется один раз, а не на каждый пакет.
     pub fn with_slots(model: &'m mut Qwen35Model, slots: Vec<Qwen35Slot>) -> Self {
         let meta = vec![None; slots.len()];
-        Self { model, slots, meta }
+        let cached = vec![Vec::new(); slots.len()];
+        Self {
+            model,
+            slots,
+            meta,
+            cached,
+        }
     }
 
     /// Забрать слоты обратно (состояние бесед уже закрыто/освобождено).
@@ -122,7 +134,11 @@ impl<'m> BatchEngine<'m> {
     /// Начать приём беседы БЕЗ префилла: слот резервируется под промпт, сам
     /// префилл идёт кусками через [`Self::prefill_chunk`] — так длинный
     /// промпт не замораживает остальные беседы пакета.
-    pub fn begin_prefill(&mut self, ids: &[u32]) -> Result<usize, BackendError> {
+    pub fn begin_prefill(
+        &mut self,
+        backend: &dyn Backend,
+        ids: &[u32],
+    ) -> Result<usize, BackendError> {
         if ids.is_empty() {
             return Err(BackendError::Shape("begin_prefill: пустой промпт".into()));
         }
@@ -131,6 +147,12 @@ impl<'m> BatchEngine<'m> {
             .iter()
             .position(|m| m.is_none())
             .ok_or_else(|| BackendError::Shape("begin_prefill: все слоты заняты".into()))?;
+        // НОВАЯ последовательность: слот мог остаться с кэшем префикса от
+        // прошлой беседы — стираем состояние, иначе префилл дописался бы
+        // поверх чужого KV (позиция не с нуля). Подхват кэша — только через
+        // resume_begin, который сюда не попадает.
+        self.slots[slot] = self.model.new_slot(backend)?;
+        self.cached[slot].clear();
         self.meta[slot] = Some(SlotMeta {
             prompt_len: ids.len(),
             tokens_out: 0,
@@ -351,6 +373,111 @@ impl<'m> BatchEngine<'m> {
         m.with_slot(s, |m| m.decode(backend, id))
     }
 
+    /// Освободить слот, СОХРАНИВ KV и историю — кэш префикса для следующего
+    /// хода той же беседы. Слот считается свободным, но если новый промпт
+    /// начинается с сохранённой истории, префилл пойдёт только с хвоста.
+    pub fn finish_keep(&mut self, slot: usize, history: &[u32]) -> Result<(), BackendError> {
+        if slot >= self.slots.len() || self.meta[slot].is_none() {
+            return Err(BackendError::Shape(format!(
+                "finish_keep: слот {slot} вне или свободен"
+            )));
+        }
+        self.meta[slot] = None;
+        // В KV лежит ровно `pos` токенов: последний сэмплированный токен в
+        // кэш ещё НЕ подан (он станет первым токеном следующего шага).
+        let pos = self.slots[slot].pos();
+        self.cached[slot] = history[..history.len().min(pos)].to_vec();
+        Ok(())
+    }
+
+    /// Сколько токенов из `ids` уже лежит в KV слота (общий префикс с кэшем).
+    pub fn cached_prefix(&self, slot: usize, ids: &[u32]) -> usize {
+        let Some(c) = self.cached.get(slot) else {
+            return 0;
+        };
+        let n = c.len().min(ids.len());
+        c.iter()
+            .zip(ids.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(n)
+    }
+
+    /// Свободный слот с самым длинным общим префиксом (0 — кэша нет).
+    pub fn best_cached_slot(&self, ids: &[u32]) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for slot in 0..self.slots.len() {
+            if self.meta[slot].is_some() {
+                continue;
+            }
+            let k = self.cached_prefix(slot, ids);
+            if k > 0 && best.map(|(_, bk)| k > bk).unwrap_or(true) {
+                best = Some((slot, k));
+            }
+        }
+        best
+    }
+
+    /// Подхватить кэш префикса без префилла: слот занимается, возвращается
+    /// длина уже лежащего префикса. Хвост `ids[common..]` вызывающий подаёт
+    /// кусками через [`Self::prefill_chunk`] — как обычный префилл.
+    pub fn resume_begin(&mut self, slot: usize, ids: &[u32]) -> Result<usize, BackendError> {
+        if slot >= self.slots.len() || self.meta[slot].is_some() {
+            return Err(BackendError::Shape(format!(
+                "resume_begin: слот {slot} вне или занят"
+            )));
+        }
+        let common = self.cached_prefix(slot, ids);
+        if common == 0 || common != self.slots[slot].pos() {
+            return Err(BackendError::Shape(format!(
+                "resume_begin: кэш {common} токенов, в KV {} — нельзя подхватить",
+                self.slots[slot].pos()
+            )));
+        }
+        self.meta[slot] = Some(SlotMeta {
+            prompt_len: ids.len(),
+            tokens_out: 0,
+        });
+        Ok(common)
+    }
+
+    /// Продолжить беседу в слоте с кэшем: подать только `ids[common..]`.
+    /// Возвращает (сколько токенов уже было, логиты последней позиции).
+    pub fn resume_prefix(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        ids: &[u32],
+    ) -> Result<(usize, Option<Vec<f32>>), BackendError> {
+        if slot >= self.slots.len() || self.meta[slot].is_some() {
+            return Err(BackendError::Shape(format!(
+                "resume_prefix: слот {slot} вне или занят"
+            )));
+        }
+        let common = self.cached_prefix(slot, ids);
+        if common == 0 {
+            return Err(BackendError::Shape(
+                "resume_prefix: общего префикса нет — нужен полный префилл".into(),
+            ));
+        }
+        let pos = self.slots[slot].pos();
+        if common != pos {
+            return Err(BackendError::Shape(format!(
+                "resume_prefix: кэш {common} токенов, в KV {pos} — рассинхрон"
+            )));
+        }
+        self.meta[slot] = Some(SlotMeta {
+            prompt_len: ids.len(),
+            tokens_out: 0,
+        });
+        let tail = &ids[common..];
+        if tail.is_empty() {
+            return Ok((common, None));
+        }
+        let lg = self.prefill_chunk(backend, slot, tail, true)?;
+        Ok((common, lg))
+    }
+
     /// Освободить слот: состояние беседы выбрасывается, слот готов принять
     /// следующую (тензоры состояния уходят в пул бэкенда).
     pub fn finish(&mut self, slot: usize, backend: &dyn Backend) -> Result<(), BackendError> {
@@ -361,6 +488,7 @@ impl<'m> BatchEngine<'m> {
             )));
         }
         self.meta[slot] = None;
+        self.cached[slot].clear();
         self.slots[slot] = self.model.new_slot(backend)?;
         Ok(())
     }
@@ -460,6 +588,12 @@ pub fn generate_batch_with(
 
     // Кусок префилла за такт: длинный промпт не замораживает остальные
     // беседы — между кусками они получают свои токены.
+    // Кэш префикса имеет смысл от заметного куска: мельче — только трата
+    // проверки. INFER_PREFIX_CACHE_MIN=0 выключает подхват (A/B).
+    let prefix_cache_min: usize = std::env::var("INFER_PREFIX_CACHE_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     let pchunk: usize = std::env::var("INFER_BATCH_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -473,7 +607,25 @@ pub fn generate_batch_with(
                 break;
             }
             pending.pop_front();
-            let slot = engine.begin_prefill(&reqs[q].ids)?;
+            // КЭШ ПРЕФИКСА: если чья-то история (в свободном слоте) — префикс
+            // нового промпта, подаём только хвост. Порог отсекает мелочь.
+            let ids = &reqs[q].ids;
+            let reuse = engine
+                .best_cached_slot(ids)
+                .filter(|(_, k)| *k >= prefix_cache_min && prefix_cache_min > 0);
+            let (slot, tail_from) = match reuse {
+                Some((slot, k)) if engine.resume_begin(slot, ids).is_ok() => {
+                    if std::env::var("INFER_BATCH_LOG").is_ok() {
+                        eprintln!(
+                            "prefix-cache: слот {slot} отдал {k} токенов из {} (префилл {})",
+                            ids.len(),
+                            ids.len() - k
+                        );
+                    }
+                    (slot, k)
+                }
+                _ => (engine.begin_prefill(backend, ids)?, 0),
+            };
             streams[slot] = Some(Stream {
                 req: q,
                 decoder: IncrementalDecoder::new(),
@@ -483,7 +635,7 @@ pub fn generate_batch_with(
                 generated: Vec::new(),
                 budget: reqs[q].params.reasoning_budget.clone(),
                 next: 0,
-                prefill: Some(reqs[q].ids.clone()),
+                prefill: Some(reqs[q].ids[tail_from..].to_vec()),
                 prefill_done: 0,
                 hidden: Vec::new(),
                 pending: None,
@@ -523,8 +675,9 @@ pub fn generate_batch_with(
                         queue.push((slot, nx));
                     }
                     Some(reason) => {
+                        let hist = streams[slot].as_ref().unwrap().history.clone();
                         close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
-                        engine.finish(slot, backend)?;
+                        engine.finish_keep(slot, &hist)?;
                         streams[slot] = None;
                     }
                 }
@@ -543,10 +696,14 @@ pub fn generate_batch_with(
         for &(slot, tok_) in queue.iter() {
             let full = engine.pos(slot).map(|p| p + 1 > max_seq).unwrap_or(true);
             if full {
+                let hist = streams[slot]
+                    .as_ref()
+                    .map(|st| st.history.clone())
+                    .unwrap_or_default();
                 if let Some(st) = streams[slot].as_mut() {
                     close_stream(st, FinishReason::MaxTokens, on_event);
                 }
-                engine.finish(slot, backend)?;
+                engine.finish_keep(slot, &hist)?;
                 streams[slot] = None;
             } else {
                 ready.push((slot, tok_));
@@ -683,8 +840,9 @@ pub fn generate_batch_with(
                 }
                 match closed {
                     Some(r) => {
+                        let hist = st.history.clone();
                         close_stream(st, r, on_event);
-                        engine.finish(slot, backend)?;
+                        engine.finish_keep(slot, &hist)?;
                         streams[slot] = None;
                     }
                     None => {
@@ -724,8 +882,9 @@ pub fn generate_batch_with(
                                 }
                             }
                             if let Some(r) = stop_now {
+                                let hist = st.history.clone();
                                 close_stream(st, r, on_event);
-                                engine.finish(slot, backend)?;
+                                engine.finish_keep(slot, &hist)?;
                                 streams[slot] = None;
                                 continue;
                             }
@@ -738,8 +897,9 @@ pub fn generate_batch_with(
                                 {
                                     None => still_ar.push((slot, st.next)),
                                     Some(r) => {
+                                        let hist = st.history.clone();
                                         close_stream(st, r, on_event);
-                                        engine.finish(slot, backend)?;
+                                        engine.finish_keep(slot, &hist)?;
                                         streams[slot] = None;
                                     }
                                 }
@@ -768,8 +928,10 @@ pub fn generate_batch_with(
             match done {
                 None => queue_next.push((slot, streams[slot].as_ref().unwrap().next)),
                 Some(reason) => {
+                    let hist = st.history.clone();
                     close_stream(st, reason, on_event);
-                    engine.finish(slot, backend)?;
+                    // Кэш префикса: KV и история остаются для следующего хода.
+                    engine.finish_keep(slot, &hist)?;
                     streams[slot] = None;
                 }
             }

@@ -16,7 +16,9 @@ use rust_inference::tokenizer::Tokenizer;
 use rust_inference::weights_map::WeightsMap;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: mtp_check <model.gguf>")?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: mtp_check <model.gguf>")?;
     let file = std::fs::File::open(&path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let gf = gguf::parse(&mmap)?;

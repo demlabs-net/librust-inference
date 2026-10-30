@@ -22,7 +22,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Tensor};
 use crate::error::BackendError;
 use crate::inference::generate::{
     Emit, FinishReason, GenerateEvent, GenerateParams, Timings, check_stop, emit,
@@ -283,7 +283,7 @@ impl<'m> BatchEngine<'m> {
         &mut self,
         backend: &dyn Backend,
         next: &[(usize, u32)],
-    ) -> Result<Vec<(usize, Vec<f32>, Vec<f32>)>, BackendError> {
+    ) -> Result<(Vec<(usize, Vec<f32>, Vec<f32>)>, Tensor), BackendError> {
         if next.is_empty() {
             return Err(BackendError::Shape("step_hidden: пустой пакет".into()));
         }
@@ -316,7 +316,7 @@ impl<'m> BatchEngine<'m> {
                 m.tokens_out += 1;
             }
         }
-        Ok(out)
+        Ok((out, hidden))
     }
 
     /// Пакетный шаг: по токену на активную беседу. `next` покрывает РОВНО
@@ -395,6 +395,7 @@ impl<'m> BatchEngine<'m> {
         hist: &[u32],
         sp: &crate::inference::sampling::SamplingParams,
         rng: &mut Option<u64>,
+        layers: &[usize],
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         if slot >= self.slots.len() {
             return Err(BackendError::Shape(format!(
@@ -411,7 +412,7 @@ impl<'m> BatchEngine<'m> {
                 draft,
                 draft_probs,
                 rng,
-                &[],
+                layers,
                 greedy,
                 hist,
                 sp,
@@ -702,7 +703,20 @@ pub fn generate_batch(
 
 /// Источник черновиков на беседу: (слот, история, скрытое последней позиции)
 /// → (черновики, вероятности). Возвращает None — беседа идёт AR-шагом.
-pub type BatchDraftFn<'a> = dyn FnMut(usize, &[u32], &[f32]) -> Option<(Vec<u32>, Vec<f32>)> + 'a;
+pub type BatchDraftFn<'a> = dyn FnMut(usize, &[u32], &[f32]) -> Option<BatchDraft> + 'a;
+
+/// Черновики беседы: токены, вероятности и СЛОИ, скрытое которых нужно
+/// захватить при верификации (для примирения драфтера после окна).
+pub struct BatchDraft {
+    pub tokens: Vec<u32>,
+    pub probs: Vec<f32>,
+    pub layers: Vec<usize>,
+}
+
+/// После окна верификации: (слот, скрытое строк окна [rows, d], позиция
+/// ПОСЛЕ окна, принято токенов). Драфтер по этому вызову пересобирает KV —
+/// без него он рассинхронизируется после первого же окна.
+pub type BatchAfterWindowFn<'a> = dyn FnMut(usize, &crate::backend::Tensor, usize, usize) + 'a;
 
 /// Примирение внешнего драфтера с промптом беседы: (слот, скрытое по ВСЕМ
 /// строкам промпта [T, d], длина промпта). По этому вызову драфтер выстраивает
@@ -720,7 +734,7 @@ pub fn generate_batch_with(
     draft_fn: Option<&mut BatchDraftFn<'_>>,
     on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
 ) -> Result<Vec<Vec<u32>>, BackendError> {
-    generate_batch_full(engine, backend, tok, reqs, draft_fn, None, on_event)
+    generate_batch_full(engine, backend, tok, reqs, draft_fn, None, None, on_event)
 }
 
 /// То же, но с ПРИМИРЕНИЕМ драфтера: `prime_fn` получает скрытое по всем
@@ -732,6 +746,7 @@ pub fn generate_batch_full(
     reqs: &[BatchRequest],
     mut draft_fn: Option<&mut BatchDraftFn<'_>>,
     mut prime_fn: Option<&mut BatchPrimeFn<'_>>,
+    mut after_fn: Option<&mut BatchAfterWindowFn<'_>>,
     on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
 ) -> Result<Vec<Vec<u32>>, BackendError> {
     if reqs.is_empty() {
@@ -902,6 +917,11 @@ pub fn generate_batch_full(
                         if !pf(slot, &ht, rows) && std::env::var("INFER_BATCH_LOG").is_ok() {
                             eprintln!("mtp: примирение слота {slot} не удалось");
                         }
+                        // Скрытое последней строки промпта — вход ПЕРВОГО
+                        // черновика: драфтер ждёт вызов ровно при
+                        // history = committed + 1 (сразу после префилла).
+                        let n = st.prime_h.len();
+                        st.hidden = st.prime_h[n - d..].to_vec();
                     }
                     st.prime_h = Vec::new();
                 }
@@ -985,12 +1005,15 @@ pub fn generate_batch_full(
                 }
                 // Черновики: внешний драфтер (MTP на слот) — только если
                 // скрытое СВЕЖЕЕ (шаг, а не окно); иначе prompt-lookup.
-                let (drafts, probs) = match draft_fn.as_deref_mut() {
+                let (drafts, probs, layers) = match draft_fn.as_deref_mut() {
                     Some(f) if !st.hidden.is_empty() => match f(slot, &st.history, &st.hidden) {
-                        Some(d) => d,
-                        None => (Vec::new(), Vec::new()),
+                        Some(d) => (d.tokens, d.probs, d.layers),
+                        None => (Vec::new(), Vec::new(), Vec::new()),
                     },
-                    _ => crate::spec::ngram_lookup_min(&st.history, gamma, 4, 4),
+                    _ => {
+                        let (t, p) = crate::spec::ngram_lookup_min(&st.history, gamma, 4, 4);
+                        (t, p, Vec::new())
+                    }
                 };
                 if drafts.len() < 2 {
                     still_ar.push((slot, tok_));
@@ -1019,6 +1042,7 @@ pub fn generate_batch_full(
                     &hist,
                     &sp,
                     &mut st.rng,
+                    &layers,
                 ) {
                     Ok(o) => o,
                     // Окно не удалось — беседа честно идёт AR-шагом.
@@ -1027,6 +1051,14 @@ pub fn generate_batch_full(
                         continue;
                     }
                 };
+                if !layers.is_empty()
+                    && let Some(af) = after_fn.as_deref_mut()
+                    && let Some(ext) = o.extract.first()
+                {
+                    let n_ok_now = o.n_draft_accepted + 1;
+                    let pos_now = engine.pos(slot).unwrap_or(0);
+                    af(slot, ext, pos_now, n_ok_now);
+                }
                 // Конвенция SpecOutcome (как в одиночном generate):
                 //   n_ok = n_draft_accepted + 1  — якорь + принятые черновики;
                 //   accepted[0] — ЯКОРЬ (уже выдан), наружу идут [1..n_ok];
@@ -1155,9 +1187,20 @@ pub fn generate_batch_full(
         if queue.is_empty() {
             continue;
         }
-        let rows = engine.step_hidden(backend, &queue)?;
-        let mut queue_next: Vec<(usize, u32)> = Vec::with_capacity(rows.len());
-        for (slot, row, hid) in rows {
+        let (rows, h_all) = engine.step_hidden(backend, &queue)?;
+        let b_rows = rows.len();
+        let mut queue_next: Vec<(usize, u32)> = Vec::with_capacity(b_rows);
+        for (r, (slot, row, hid)) in rows.into_iter().enumerate() {
+            // Каждый поданный токен — в драфтер (контракт MTP: history =
+            // committed + 1; иначе драфтер отстаёт на токен и молчит).
+            if let Some(af) = after_fn.as_deref_mut() {
+                let d = engine.dim();
+                let hv = h_all
+                    .view(vec![b_rows, d])
+                    .view_offset(vec![1, 1, d], r * d);
+                let pos = engine.pos(slot).unwrap_or(0);
+                af(slot, &hv, pos, 1);
+            }
             let st = streams[slot].as_mut().expect("шаг по занятому слоту");
             // Скрытое последней позиции — только что посчитано этим шагом:
             // годный вход MTP-черновиков для СЛЕДУЮЩЕГО окна.

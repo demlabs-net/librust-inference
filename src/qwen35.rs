@@ -1536,6 +1536,25 @@ impl Qwen35Model {
         self.with_slot(slot, |m| m.prefill_last(backend, ids))
     }
 
+    /// КУСОК префилла в слот (длинный промпт режется вызывающим): состояние
+    /// слота продолжается, логиты нужны только на ПОСЛЕДНЕМ куске — на
+    /// промежуточных head пропускается (`no_logits`). Так префилл длинной
+    /// беседы можно вплести в пакетный цикл и не замораживать остальные.
+    pub fn prefill_slot_chunk(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        ids: &[u32],
+        want_logits: bool,
+    ) -> Result<Option<Tensor>, BackendError> {
+        self.with_slot(slot, |m| {
+            m.no_logits = !want_logits;
+            let r = m.prefill_extract_last(backend, ids, &[]);
+            m.no_logits = false;
+            r.map(|(lg, _)| want_logits.then_some(lg))
+        })
+    }
+
     /// Одиночный декод В СЛОТ (переключением состояния).
     pub fn decode_slot(
         &mut self,

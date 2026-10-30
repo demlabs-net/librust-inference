@@ -119,6 +119,49 @@ impl<'m> BatchEngine<'m> {
         })
     }
 
+    /// Начать приём беседы БЕЗ префилла: слот резервируется под промпт, сам
+    /// префилл идёт кусками через [`Self::prefill_chunk`] — так длинный
+    /// промпт не замораживает остальные беседы пакета.
+    pub fn begin_prefill(&mut self, ids: &[u32]) -> Result<usize, BackendError> {
+        if ids.is_empty() {
+            return Err(BackendError::Shape("begin_prefill: пустой промпт".into()));
+        }
+        let slot = self
+            .meta
+            .iter()
+            .position(|m| m.is_none())
+            .ok_or_else(|| BackendError::Shape("begin_prefill: все слоты заняты".into()))?;
+        self.meta[slot] = Some(SlotMeta {
+            prompt_len: ids.len(),
+            tokens_out: 0,
+        });
+        Ok(slot)
+    }
+
+    /// Кусок префилла в слот. `None` — кусок промежуточный (head не считался);
+    /// `Some(логиты [V])` — промпт подан целиком, это логиты последней
+    /// позиции (из них сэмплится первый токен).
+    pub fn prefill_chunk(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        ids: &[u32],
+        last: bool,
+    ) -> Result<Option<Vec<f32>>, BackendError> {
+        if slot >= self.slots.len() || self.meta[slot].is_none() {
+            return Err(BackendError::Shape(format!(
+                "prefill_chunk: слот {slot} вне или свободен"
+            )));
+        }
+        // Копий состояния нет: поля модели и слота заимствуются раздельно.
+        let m = &mut *self.model;
+        let s = &mut self.slots[slot];
+        match m.prefill_slot_chunk(backend, s, ids, last)? {
+            Some(lg) => Ok(Some(backend.to_cpu_f32(&lg)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Принять беседу: prefill в свободный слот, отдать логиты последней
     /// позиции ([V], на хосте). Свободных слотов нет — внятная ошибка
     /// (очередь держит вызывающий).
@@ -345,6 +388,10 @@ struct Stream {
     budget: Option<crate::inference::reasoning_budget::ReasoningBudget>,
     /// Токен, который надо подать следующим шагом.
     next: u32,
+    /// Остаток промпта, который ещё не подан (префилл кусками), и сколько
+    /// уже подано. None — префилл завершён.
+    prefill: Option<Vec<u32>>,
+    prefill_done: usize,
     /// Скрытое последней позиции (out_norm) — вход MTP-черновиков на слот.
     /// Пусто, пока шаг не вернул его (после окна — устарело).
     hidden: Vec<f32>,
@@ -411,16 +458,23 @@ pub fn generate_batch_with(
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); reqs.len()];
     let mut queue: Vec<(usize, u32)> = Vec::new();
 
-    // Принять беседы в свободные места: prefill + первый токен.
+    // Кусок префилла за такт: длинный промпт не замораживает остальные
+    // беседы — между кусками они получают свои токены.
+    let pchunk: usize = std::env::var("INFER_BATCH_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .unwrap_or(256);
+
     loop {
+        // Принять новые беседы в свободные СЛОТЫ (префилл — ниже, кусками).
         while let Some(&q) = pending.front() {
             if !streams.iter().any(|s| s.is_none()) {
                 break;
             }
             pending.pop_front();
-            let t_prompt = Instant::now();
-            let (slot, logits) = engine.submit(backend, &reqs[q].ids)?;
-            let st = Stream {
+            let slot = engine.begin_prefill(&reqs[q].ids)?;
+            streams[slot] = Some(Stream {
                 req: q,
                 decoder: IncrementalDecoder::new(),
                 acc: String::new(),
@@ -429,32 +483,58 @@ pub fn generate_batch_with(
                 generated: Vec::new(),
                 budget: reqs[q].params.reasoning_budget.clone(),
                 next: 0,
+                prefill: Some(reqs[q].ids.clone()),
+                prefill_done: 0,
                 hidden: Vec::new(),
                 pending: None,
-                t_prompt: t_prompt.elapsed().as_secs_f64() * 1e3,
+                t_prompt: 0.0,
                 t_start: Instant::now(),
                 predicted_n: 0,
+            });
+        }
+        // Один кусок префилла на беседу; последний даёт первый токен.
+        let mut prefilling = false;
+        for slot in 0..streams.len() {
+            let Some(st) = streams[slot].as_mut() else {
+                continue;
             };
-            streams[slot] = Some(st);
-            let done = advance(
-                streams[slot].as_mut().expect("слот только что занят"),
-                &logits,
-                &reqs[q].params,
-                tok,
-                &mut out[q],
-                on_event,
-            );
-            match done {
-                None => queue.push((slot, streams[slot].as_ref().unwrap().next)),
-                Some(reason) => {
-                    close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
-                    engine.finish(slot, backend)?;
-                    streams[slot] = None;
+            let Some(p) = st.prefill.as_ref() else {
+                continue;
+            };
+            prefilling = true;
+            let a = st.prefill_done;
+            let b = (a + pchunk).min(p.len());
+            let last = b == p.len();
+            let piece: Vec<u32> = p[a..b].to_vec();
+            st.prefill_done = b;
+            let q = st.req;
+            let t0 = Instant::now();
+            let lg = engine.prefill_chunk(backend, slot, &piece, last)?;
+            st.t_prompt += t0.elapsed().as_secs_f64() * 1e3;
+            if last {
+                st.prefill = None;
+                st.t_start = Instant::now();
+            }
+            if let Some(row) = lg {
+                let done = advance(st, &row, &reqs[q].params, tok, &mut out[q], on_event);
+                match done {
+                    None => {
+                        let nx = streams[slot].as_ref().unwrap().next;
+                        queue.push((slot, nx));
+                    }
+                    Some(reason) => {
+                        close_stream(streams[slot].as_mut().unwrap(), reason, on_event);
+                        engine.finish(slot, backend)?;
+                        streams[slot] = None;
+                    }
                 }
             }
         }
         if queue.is_empty() {
-            break;
+            if !prefilling && pending.is_empty() {
+                break;
+            }
+            continue;
         }
         // Контекст беседы кончился — закрываем ЕЁ (как llama.cpp на переполнении
         // окна), а не роняем весь пакет: остальные беседы продолжают идти.

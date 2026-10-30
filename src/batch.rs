@@ -265,6 +265,7 @@ impl<'m> BatchEngine<'m> {
         greedy: bool,
         hist: &[u32],
         sp: &crate::inference::sampling::SamplingParams,
+        rng: &mut Option<u64>,
     ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
         if slot >= self.slots.len() {
             return Err(BackendError::Shape(format!(
@@ -280,7 +281,7 @@ impl<'m> BatchEngine<'m> {
                 anchor,
                 draft,
                 draft_probs,
-                &mut None,
+                rng,
                 &[],
                 greedy,
                 hist,
@@ -482,7 +483,12 @@ pub fn generate_batch_with(
         // (cap 3 и 6, γ=2/4/8). Остальные беседы в том же такте идут пакетом.
         // ВАЖНО: параметры сэмплинга для окна берутся из запроса — дефолтный
         // SamplingParams (repeat 1.1) выключал быструю GPU-проверку argmax.
-        let spec_on = std::env::var("INFER_BATCH_SPEC").is_ok();
+        // Спец ВКЛЮЧЁН по умолчанию (лосслессно: жадные — биты как AR,
+        // сэмплирующие — тот же каскад, что одиночный спек). Отключение:
+        // INFER_BATCH_SPEC=0.
+        let spec_on = std::env::var("INFER_BATCH_SPEC")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let gamma: usize = std::env::var("INFER_BATCH_SPEC_GAMMA")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -494,7 +500,10 @@ pub fn generate_batch_with(
                 let q = st.req;
                 let greedy = reqs[q].params.temperature <= 0.0;
                 let forced = st.budget.as_ref().and_then(|b| b.forced_token()).is_some();
-                if !greedy || forced {
+                // Бюджет рассуждений вставляет свои токены — окно его обошло
+                // бы, поэтому такие беседы идут AR-шагом. Сэмплирующие беседы
+                // идут окном через лосслесс-каскад (q — дельта, как в MTP).
+                if forced {
                     still_ar.push((slot, tok_));
                     continue;
                 }
@@ -524,9 +533,17 @@ pub fn generate_batch_with(
                     seed: None,
                     min_p: p.min_p,
                 };
-                let o = match engine
-                    .decode_spec_slot(backend, slot, tok_, &drafts, &probs, true, &hist, &sp)
-                {
+                let o = match engine.decode_spec_slot(
+                    backend,
+                    slot,
+                    tok_,
+                    &drafts,
+                    &probs,
+                    greedy,
+                    &hist,
+                    &sp,
+                    &mut st.rng,
+                ) {
                     Ok(o) => o,
                     // Окно не удалось — беседа честно идёт AR-шагом.
                     Err(_) => {

@@ -161,6 +161,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let all_done = dones.iter().all(|d| *d == Some(FinishReason::MaxTokens));
     assert!(all_done, "не все беседы закрылись Done(MaxTokens)");
+
+    // Сэмплирующие беседы на ЦИТАТАХ: пакетный спек обязан совпасть с
+    // ОДИНОЧНЫМ спеком (тот же лосслесс-каскад и сид), а не с чистым AR:
+    // при температуре окно меняет поток, оставаясь лосслессным.
+    let qprompts = [
+        "Repeat exactly: the quick brown fox jumps over the lazy dog. Again: the quick brown fox jumps over the",
+        "Copy this: one two three four five one two three four five one two three four",
+    ];
+    let sparam = || GenerateParams {
+        max_tokens: 10,
+        temperature: 0.8,
+        top_p: 0.95,
+        top_k: 40,
+        seed: Some(7),
+        spec_gamma: 8,
+        ..Default::default()
+    };
+    let mut qsolo = Vec::new();
+    for p in qprompts {
+        m.reset_cache(&be)?;
+        let mut pr = sparam();
+        pr.drafter = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            rust_inference::spec::NGramDrafter::new(4),
+        )));
+        qsolo.push(generate(&mut m, &be, &tok, &tok.encode(p), &pr, |_| true)?);
+    }
+    let qreqs: Vec<BatchRequest> = qprompts
+        .iter()
+        .map(|p| BatchRequest {
+            ids: tok.encode(p),
+            params: GenerateParams {
+                drafter: None,
+                ..sparam()
+            },
+        })
+        .collect();
+    let qout = {
+        let mut eng = BatchEngine::new(&mut m, &be, 2)?;
+        generate_batch(&mut eng, &be, &tok, &qreqs, &mut |_, _| true)?
+    };
+    for (i, got) in qout.iter().enumerate() {
+        println!(
+            "сэмплинг-цитата {i}: {} ток., с одиночным спеком {}",
+            got.len(),
+            if *got == qsolo[i] {
+                "совпал"
+            } else {
+                "разошёлся"
+            }
+        );
+        assert_eq!(
+            *got, qsolo[i],
+            "сэмплирующий спек в пакете должен совпадать с одиночным спеком"
+        );
+    }
     println!(
         "OK: {cap} слота обслужили {} бесед, токены = одиночным прогонам",
         reqs.len()

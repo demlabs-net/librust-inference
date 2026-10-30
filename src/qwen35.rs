@@ -1594,11 +1594,37 @@ impl Qwen35Model {
         ids: &[u32],
         want_logits: bool,
     ) -> Result<Option<Tensor>, BackendError> {
+        Ok(self
+            .prefill_slot_chunk_ext(backend, slot, ids, want_logits, false)?
+            .0)
+    }
+
+    /// Кусок префилла с ОПЦИОНАЛЬНЫМ скрытым по ВСЕМ строкам куска (out_norm,
+    /// [t, d]) — вход MTP-черновика: контракт драфтера требует строки h всего
+    /// промпта (prefill-вызов `after_extract` с pos = n = длина промпта).
+    pub fn prefill_slot_chunk_ext(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        ids: &[u32],
+        want_logits: bool,
+        want_hidden: bool,
+    ) -> Result<(Option<Tensor>, Option<Tensor>), BackendError> {
         self.with_slot(slot, |m| {
             m.no_logits = !want_logits;
-            let r = m.prefill_extract_last(backend, ids, &[]);
+            let layers: Vec<usize> = if want_hidden {
+                vec![HIDDEN_LAYER]
+            } else {
+                Vec::new()
+            };
+            let r = m.prefill_extract_last(backend, ids, &layers);
             m.no_logits = false;
-            r.map(|(lg, _)| want_logits.then_some(lg))
+            r.map(|(lg, ex)| {
+                (
+                    want_logits.then_some(lg),
+                    ex.into_iter().next().filter(|_| want_hidden),
+                )
+            })
         })
     }
 

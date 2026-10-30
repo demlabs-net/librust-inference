@@ -151,6 +151,11 @@ impl<'m> BatchEngine<'m> {
             .collect()
     }
 
+    /// Размерность скрытого (для примирения драфтера).
+    pub fn dim(&self) -> usize {
+        self.model.cfg.dim
+    }
+
     /// Предел контекста модели (окно, из метаданных GGUF).
     pub fn max_seq(&self) -> usize {
         self.model.cfg.max_seq
@@ -210,6 +215,21 @@ impl<'m> BatchEngine<'m> {
         ids: &[u32],
         last: bool,
     ) -> Result<Option<Vec<f32>>, BackendError> {
+        Ok(self
+            .prefill_chunk_hidden(backend, slot, ids, last, false)?
+            .0)
+    }
+
+    /// Кусок префилла + скрытое по всем строкам куска (для примирения MTP:
+    /// драфтеру нужны строки h всего промпта).
+    pub fn prefill_chunk_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        ids: &[u32],
+        last: bool,
+        want_hidden: bool,
+    ) -> Result<(Option<Vec<f32>>, Option<crate::backend::Tensor>), BackendError> {
         if slot >= self.slots.len() || self.meta[slot].is_none() {
             return Err(BackendError::Shape(format!(
                 "prefill_chunk: слот {slot} вне или свободен"
@@ -218,10 +238,14 @@ impl<'m> BatchEngine<'m> {
         // Копий состояния нет: поля модели и слота заимствуются раздельно.
         let m = &mut *self.model;
         let s = &mut self.slots[slot];
-        match m.prefill_slot_chunk(backend, s, ids, last)? {
-            Some(lg) => Ok(Some(backend.to_cpu_f32(&lg)?)),
-            None => Ok(None),
-        }
+        let (lg, h) = m.prefill_slot_chunk_ext(backend, s, ids, last, want_hidden)?;
+        Ok((
+            match lg {
+                Some(lg) => Some(backend.to_cpu_f32(&lg)?),
+                None => None,
+            },
+            h,
+        ))
     }
 
     /// Принять беседу: prefill в свободный слот, отдать логиты последней
@@ -640,6 +664,8 @@ struct Stream {
     /// уже подано. None — префилл завершён.
     prefill: Option<Vec<u32>>,
     prefill_done: usize,
+    /// Скрытое по строкам промпта (хост, [rows, d]) — для примирения MTP.
+    prime_h: Vec<f32>,
     /// Абсолютная позиция снимка префикса (в токенах промпта) и снят ли он.
     seal_at: Option<usize>,
     sealed: bool,
@@ -678,6 +704,11 @@ pub fn generate_batch(
 /// → (черновики, вероятности). Возвращает None — беседа идёт AR-шагом.
 pub type BatchDraftFn<'a> = dyn FnMut(usize, &[u32], &[f32]) -> Option<(Vec<u32>, Vec<f32>)> + 'a;
 
+/// Примирение внешнего драфтера с промптом беседы: (слот, скрытое по ВСЕМ
+/// строкам промпта [T, d], длина промпта). По этому вызову драфтер выстраивает
+/// свой KV на промпт (контракт MTP: pos = n = длина промпта).
+pub type BatchPrimeFn<'a> = dyn FnMut(usize, &crate::backend::Tensor, usize) -> bool + 'a;
+
 /// Как [`generate_batch`], но черновики даёт ВНЕШНИЙ драфтер на слот (MTP,
 /// обученный nextn-модуль таргета). Без него черновики берутся из
 /// prompt-lookup, как в [`generate_batch`].
@@ -686,7 +717,21 @@ pub fn generate_batch_with(
     backend: &dyn Backend,
     tok: &Tokenizer,
     reqs: &[BatchRequest],
+    draft_fn: Option<&mut BatchDraftFn<'_>>,
+    on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
+) -> Result<Vec<Vec<u32>>, BackendError> {
+    generate_batch_full(engine, backend, tok, reqs, draft_fn, None, on_event)
+}
+
+/// То же, но с ПРИМИРЕНИЕМ драфтера: `prime_fn` получает скрытое по всем
+/// строкам промпта сразу после префилла (MTP без этого «слеп»).
+pub fn generate_batch_full(
+    engine: &mut BatchEngine<'_>,
+    backend: &dyn Backend,
+    tok: &Tokenizer,
+    reqs: &[BatchRequest],
     mut draft_fn: Option<&mut BatchDraftFn<'_>>,
+    mut prime_fn: Option<&mut BatchPrimeFn<'_>>,
     on_event: &mut impl FnMut(usize, GenerateEvent) -> bool,
 ) -> Result<Vec<Vec<u32>>, BackendError> {
     if reqs.is_empty() {
@@ -793,6 +838,7 @@ pub fn generate_batch_with(
                     .prefix_seal_at
                     .filter(|sa| *sa > 0 && *sa <= reqs[q].ids.len()),
                 sealed: false,
+                prime_h: Vec::new(),
                 hidden: Vec::new(),
                 pending: None,
                 t_prompt: 0.0,
@@ -828,7 +874,12 @@ pub fn generate_batch_with(
             st.prefill_done = b;
             let q = st.req;
             let t0 = Instant::now();
-            let lg = engine.prefill_chunk(backend, slot, &piece, last)?;
+            let (lg, hchunk) =
+                engine.prefill_chunk_hidden(backend, slot, &piece, last, prime_fn.is_some())?;
+            if let Some(h) = hchunk {
+                let host = backend.to_cpu_f32(&h)?;
+                st.prime_h.extend_from_slice(&host);
+            }
             st.t_prompt += t0.elapsed().as_secs_f64() * 1e3;
             if seal_here || (st.seal_at == Some(base + b) && !st.sealed) {
                 let upto = st.seal_at.expect("seal_here");
@@ -843,6 +894,17 @@ pub fn generate_batch_with(
             if last {
                 st.prefill = None;
                 st.t_start = Instant::now();
+                if let Some(pf) = prime_fn.as_deref_mut() {
+                    let d = engine.dim();
+                    let rows = st.prime_h.len() / d.max(1);
+                    if rows > 0 {
+                        let ht = backend.from_cpu_f32(&st.prime_h, vec![rows, d])?;
+                        if !pf(slot, &ht, rows) && std::env::var("INFER_BATCH_LOG").is_ok() {
+                            eprintln!("mtp: примирение слота {slot} не удалось");
+                        }
+                    }
+                    st.prime_h = Vec::new();
+                }
             }
             if let Some(row) = lg {
                 let done = advance(st, &row, &reqs[q].params, tok, &mut out[q], on_event);

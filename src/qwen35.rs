@@ -285,6 +285,12 @@ impl Qwen35Slot {
     }
 }
 
+/// Снимок состояния слота на конце префилла: позиция + копии conv/ssm.
+pub struct SlotSnap {
+    pub pos: usize,
+    states: Vec<Option<(Tensor, Tensor)>>,
+}
+
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
     /// Таблица эмбеддингов в родном формате GGUF (деквант строки на лету);
@@ -1472,6 +1478,47 @@ impl Qwen35Model {
     }
 
     // ── батч-слоты (шаг 2): пакетный шаг, по токену на слот ──────────────
+
+    /// Снимок рекуррентных стейтов слота (копии на устройстве) — база для
+    /// кэша префикса: GDN-стейт не обрезается, поэтому откатиться к концу
+    /// промпта можно только через снимок.
+    pub fn slot_snapshot(
+        &self,
+        backend: &dyn Backend,
+        slot: &Qwen35Slot,
+    ) -> Result<SlotSnap, BackendError> {
+        let mut states = Vec::with_capacity(slot.states.len());
+        for st in slot.states.iter() {
+            match st {
+                Some(s) => {
+                    let conv = backend.zeros(s.conv.shape().to_vec())?;
+                    backend.scale(&s.conv, &conv, 1.0)?;
+                    let ssm = backend.zeros(s.ssm.shape().to_vec())?;
+                    backend.scale(&s.ssm, &ssm, 1.0)?;
+                    states.push(Some((conv, ssm)));
+                }
+                None => states.push(None),
+            }
+        }
+        Ok(SlotSnap {
+            pos: slot.pos,
+            states,
+        })
+    }
+
+    /// Вернуть слот к снимку: KV обрезается до pos, стейты — из копий.
+    pub fn slot_restore(&mut self, slot: &mut Qwen35Slot, snap: &SlotSnap) {
+        for c in slot.caches.iter_mut().flatten() {
+            c.truncate(snap.pos);
+        }
+        for (st, sn) in slot.states.iter_mut().zip(snap.states.iter()) {
+            if let (Some(st), Some((conv, ssm))) = (st, sn) {
+                st.conv = conv.clone();
+                st.ssm = ssm.clone();
+            }
+        }
+        slot.pos = snap.pos;
+    }
 
     /// Пустой слот: свои кэши/стейты, позиция 0. Веса не копируются.
     pub fn new_slot(&self, backend: &dyn Backend) -> Result<Qwen35Slot, BackendError> {

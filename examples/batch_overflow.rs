@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 temperature: 0.0,
                 ..Default::default()
             },
+            prefix_seal_at: None,
         })
         .collect();
 

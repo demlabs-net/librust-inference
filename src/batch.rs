@@ -50,6 +50,10 @@ pub struct BatchEngine<'m> {
     /// с этой истории (чат-шаблон перерисовывает всю переписку — префикс
     /// совпадает).
     cached: Vec<Vec<u32>>,
+    /// Снимок состояния на КОНЦЕ ПРЕФИЛЛА: промпт + стейты. По нему идёт
+    /// подхват префикса (в отличие от `cached`, не требует, чтобы клиент
+    /// вернул сгенерированные токены — достаточно того же промпта).
+    prefixed: Vec<Option<(Vec<u32>, crate::qwen35::SlotSnap)>>,
 }
 
 impl<'m> BatchEngine<'m> {
@@ -72,6 +76,7 @@ impl<'m> BatchEngine<'m> {
             slots,
             meta: vec![None; capacity],
             cached: vec![Vec::new(); capacity],
+            prefixed: (0..capacity).map(|_| None).collect(),
         })
     }
 
@@ -80,17 +85,51 @@ impl<'m> BatchEngine<'m> {
     pub fn with_slots(model: &'m mut Qwen35Model, slots: Vec<Qwen35Slot>) -> Self {
         let meta = vec![None; slots.len()];
         let cached = vec![Vec::new(); slots.len()];
+        let prefixed = (0..slots.len()).map(|_| None).collect();
         Self {
             model,
             slots,
             meta,
             cached,
+            prefixed,
         }
     }
 
     /// Забрать слоты обратно (состояние бесед уже закрыто/освобождено).
     pub fn into_slots(self) -> Vec<Qwen35Slot> {
         self.slots
+    }
+
+    /// Забрать слоты ВМЕСТЕ С КЭШЕМ префикса: движок создаёт `BatchEngine` на
+    /// каждый пакет, поэтому `cached`/`prefixed` обязаны переезжать вместе со
+    /// слотами — иначе кэш теряется между вызовами.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Qwen35Slot>,
+        Vec<Vec<u32>>,
+        Vec<Option<(Vec<u32>, crate::qwen35::SlotSnap)>>,
+    ) {
+        (self.slots, self.cached, self.prefixed)
+    }
+
+    /// Движок на готовых слотах + сохранённом кэше префикса (см.
+    /// [`Self::into_parts`]).
+    pub fn with_cache(
+        model: &'m mut Qwen35Model,
+        slots: Vec<Qwen35Slot>,
+        cached: Vec<Vec<u32>>,
+        prefixed: Vec<Option<(Vec<u32>, crate::qwen35::SlotSnap)>>,
+    ) -> Self {
+        let n = slots.len();
+        let meta = vec![None; n];
+        Self {
+            model,
+            slots,
+            meta,
+            cached,
+            prefixed,
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -153,6 +192,7 @@ impl<'m> BatchEngine<'m> {
         // resume_begin, который сюда не попадает.
         self.slots[slot] = self.model.new_slot(backend)?;
         self.cached[slot].clear();
+        self.prefixed[slot] = None;
         self.meta[slot] = Some(SlotMeta {
             prompt_len: ids.len(),
             tokens_out: 0,
@@ -390,6 +430,82 @@ impl<'m> BatchEngine<'m> {
         Ok(())
     }
 
+    /// Запечатать префикс: снять снимок состояния СЕЙЧАС (вызывается сразу
+    /// после последнего куска префилла) и запомнить сами токены промпта.
+    /// Дальше по этому снимку можно откатиться и подать только хвост.
+    pub fn seal_prefix(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        prompt: &[u32],
+    ) -> Result<(), BackendError> {
+        if slot >= self.slots.len() || self.meta[slot].is_none() {
+            return Err(BackendError::Shape(format!(
+                "seal_prefix: слот {slot} вне или свободен"
+            )));
+        }
+        let snap = self.model.slot_snapshot(backend, &self.slots[slot])?;
+        self.prefixed[slot] = Some((prompt.to_vec(), snap));
+        Ok(())
+    }
+
+    /// Сколько токенов запечатанного промпта совпадает с `ids` (диагностика;
+    /// Some(0) — снимок есть, но промпты разошлись с первого токена).
+    pub fn prefix_match_len(&self, slot: usize, ids: &[u32]) -> Option<usize> {
+        let (p, _) = self.prefixed.get(slot)?.as_ref()?;
+        Some(p.iter().zip(ids.iter()).take_while(|(a, b)| a == b).count())
+    }
+
+    /// Свободный слот, чей ЗАПЕЧАТАННЫЙ промпт — префикс `ids` (длина ≥ min).
+    pub fn best_prefix_slot(&self, ids: &[u32], min: usize) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for slot in 0..self.slots.len() {
+            if self.meta[slot].is_some() {
+                continue;
+            }
+            let Some((p, _)) = self.prefixed[slot].as_ref() else {
+                continue;
+            };
+            if p.len() < min.max(1) || p.len() > ids.len() {
+                continue;
+            }
+            if p.iter().zip(ids.iter()).all(|(a, b)| a == b)
+                && best.map(|(_, bk)| p.len() > bk).unwrap_or(true)
+            {
+                best = Some((slot, p.len()));
+            }
+        }
+        best
+    }
+
+    /// Подхватить префикс по СНИМКУ: откатить слот к концу промпта и отметить
+    /// занятым. Хвост `ids[k..]` подаёт вызывающий кусками префилла.
+    pub fn resume_from_seal(&mut self, slot: usize, ids: &[u32]) -> Result<usize, BackendError> {
+        if slot >= self.slots.len() || self.meta[slot].is_some() {
+            return Err(BackendError::Shape(format!(
+                "resume_from_seal: слот {slot} вне или занят"
+            )));
+        }
+        let Some((p, snap)) = self.prefixed[slot].take() else {
+            return Err(BackendError::Shape(format!(
+                "resume_from_seal: слот {slot} без снимка префикса"
+            )));
+        };
+        if p.len() > ids.len() || p.iter().zip(ids.iter()).any(|(a, b)| a != b) {
+            self.prefixed[slot] = Some((p, snap));
+            return Err(BackendError::Shape(
+                "resume_from_seal: промпт не является префиксом".into(),
+            ));
+        }
+        let k = p.len();
+        self.model.slot_restore(&mut self.slots[slot], &snap);
+        self.meta[slot] = Some(SlotMeta {
+            prompt_len: ids.len(),
+            tokens_out: 0,
+        });
+        Ok(k)
+    }
+
     /// Сколько токенов из `ids` уже лежит в KV слота (общий префикс с кэшем).
     pub fn cached_prefix(&self, slot: usize, ids: &[u32]) -> usize {
         let Some(c) = self.cached.get(slot) else {
@@ -503,6 +619,10 @@ impl<'m> BatchEngine<'m> {
 pub struct BatchRequest {
     pub ids: Vec<u32>,
     pub params: GenerateParams,
+    /// Где снять снимок префикса (конец ПЕРЕПИСКИ, без генерационного
+    /// префикса шаблона). Следующий ход с тем же началом подхватит его и
+    /// префиллит только хвост. None — не сохранять.
+    pub prefix_seal_at: Option<usize>,
 }
 
 /// Состояние одной беседы в пакете (сэмплинг, стоп, декодер UTF-8).
@@ -520,6 +640,9 @@ struct Stream {
     /// уже подано. None — префилл завершён.
     prefill: Option<Vec<u32>>,
     prefill_done: usize,
+    /// Абсолютная позиция снимка префикса (в токенах промпта) и снят ли он.
+    seal_at: Option<usize>,
+    sealed: bool,
     /// Скрытое последней позиции (out_norm) — вход MTP-черновиков на слот.
     /// Пусто, пока шаг не вернул его (после окна — устарело).
     hidden: Vec<f32>,
@@ -610,21 +733,50 @@ pub fn generate_batch_with(
             // КЭШ ПРЕФИКСА: если чья-то история (в свободном слоте) — префикс
             // нового промпта, подаём только хвост. Порог отсекает мелочь.
             let ids = &reqs[q].ids;
-            let reuse = engine
-                .best_cached_slot(ids)
-                .filter(|(_, k)| *k >= prefix_cache_min && prefix_cache_min > 0);
-            let (slot, tail_from) = match reuse {
-                Some((slot, k)) if engine.resume_begin(slot, ids).is_ok() => {
-                    if std::env::var("INFER_BATCH_LOG").is_ok() {
+            let reuse = engine.best_prefix_slot(ids, prefix_cache_min).or_else(|| {
+                engine
+                    .best_cached_slot(ids)
+                    .filter(|(_, k)| *k >= prefix_cache_min && prefix_cache_min > 0)
+            });
+            if reuse.is_none() && std::env::var("INFER_BATCH_LOG").is_ok() {
+                for slot in 0..engine.capacity() {
+                    if let Some(k) = engine.prefix_match_len(slot, ids) {
                         eprintln!(
-                            "prefix-cache: слот {slot} отдал {k} токенов из {} (префилл {})",
-                            ids.len(),
-                            ids.len() - k
+                            "prefix-cache: слот {slot} совпал на {k} из {} (порог {prefix_cache_min})",
+                            ids.len()
+                        );
+                    }
+                }
+            }
+            let log = std::env::var("INFER_BATCH_LOG").is_ok();
+            let picked = match reuse {
+                Some((slot, k)) => match engine.resume_from_seal(slot, ids) {
+                    Ok(_) => Some((slot, k, "снимок")),
+                    Err(e1) => match engine.resume_begin(slot, ids) {
+                        Ok(_) => Some((slot, k, "точный")),
+                        Err(e2) => {
+                            if log {
+                                eprintln!(
+                                    "prefix-cache: слот {slot} k={k} не подхвачен: снимок: {e1}; точный: {e2}"
+                                );
+                            }
+                            None
+                        }
+                    },
+                },
+                None => None,
+            };
+            let (slot, tail_from) = match picked {
+                Some((slot, k, how)) => {
+                    if log {
+                        eprintln!(
+                            "prefix-cache: слот {slot} отдал {k} из {} по «{how}»",
+                            ids.len()
                         );
                     }
                     (slot, k)
                 }
-                _ => (engine.begin_prefill(backend, ids)?, 0),
+                None => (engine.begin_prefill(backend, ids)?, 0),
             };
             streams[slot] = Some(Stream {
                 req: q,
@@ -637,6 +789,10 @@ pub fn generate_batch_with(
                 next: 0,
                 prefill: Some(reqs[q].ids[tail_from..].to_vec()),
                 prefill_done: 0,
+                seal_at: reqs[q]
+                    .prefix_seal_at
+                    .filter(|sa| *sa > 0 && *sa <= reqs[q].ids.len()),
+                sealed: false,
                 hidden: Vec::new(),
                 pending: None,
                 t_prompt: 0.0,
@@ -654,8 +810,19 @@ pub fn generate_batch_with(
                 continue;
             };
             prefilling = true;
+            let base = reqs[st.req].ids.len() - p.len();
             let a = st.prefill_done;
-            let b = (a + pchunk).min(p.len());
+            let mut b = (a + pchunk).min(p.len());
+            // Не перескакиваем точку снимка: иначе снимок пришлось бы снимать
+            // не на границе переписки (а GDN-стейт назад не откатить).
+            let mut seal_here = false;
+            if let (Some(sa), false) = (st.seal_at, st.sealed)
+                && base + b > sa
+                && base + a < sa
+            {
+                b = sa - base;
+                seal_here = true;
+            }
             let last = b == p.len();
             let piece: Vec<u32> = p[a..b].to_vec();
             st.prefill_done = b;
@@ -663,6 +830,16 @@ pub fn generate_batch_with(
             let t0 = Instant::now();
             let lg = engine.prefill_chunk(backend, slot, &piece, last)?;
             st.t_prompt += t0.elapsed().as_secs_f64() * 1e3;
+            if seal_here || (st.seal_at == Some(base + b) && !st.sealed) {
+                let upto = st.seal_at.expect("seal_here");
+                let cut = &reqs[q].ids[..upto];
+                if let Err(e) = engine.seal_prefix(backend, slot, cut) {
+                    if std::env::var("INFER_BATCH_LOG").is_ok() {
+                        eprintln!("prefix-cache: снимок не снят ({e})");
+                    }
+                }
+                st.sealed = true;
+            }
             if last {
                 st.prefill = None;
                 st.t_start = Instant::now();

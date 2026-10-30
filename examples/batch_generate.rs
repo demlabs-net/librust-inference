@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|p| BatchRequest {
             ids: tok.encode(p),
             params: params(),
+            prefix_seal_at: None,
         })
         .collect();
     let mut deltas = vec![0usize; reqs.len()];
@@ -141,6 +142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|p| BatchRequest {
             ids: tok.encode(p),
             params: samp(),
+            prefix_seal_at: None,
         })
         .collect();
     let t_out = {
@@ -195,6 +197,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 drafter: None,
                 ..sparam()
             },
+            prefix_seal_at: None,
         })
         .collect();
     let qout = {

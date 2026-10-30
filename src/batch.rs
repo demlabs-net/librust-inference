@@ -207,6 +207,38 @@ impl<'m> BatchEngine<'m> {
         Ok(out)
     }
 
+    /// Окно верификации ОДНОЙ беседы: `decode_spec` на её состоянии
+    /// (`with_slot`, копий нет). Откат KV, переигрыш GDN-стейта принятыми
+    /// рядами и проверка черновиков — внутри движка; здесь только подстановка
+    /// состояния нужного слота.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_spec_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        anchor: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        greedy: bool,
+        hist: &[u32],
+    ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
+        if slot >= self.slots.len() {
+            return Err(BackendError::Shape(format!(
+                "decode_spec_slot: нет слота {slot} (мест {})",
+                self.slots.len()
+            )));
+        }
+        let m = &mut *self.model;
+        let s = &mut self.slots[slot];
+        let sp = crate::inference::sampling::SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        m.with_slot(s, |m| {
+            m.decode_spec(backend, anchor, draft, draft_probs, &mut None, &[], greedy, hist, &sp)
+        })
+    }
+
     /// Освободить слот: состояние беседы выбрасывается, слот готов принять
     /// следующую (тензоры состояния уходят в пул бэкенда).
     pub fn finish(&mut self, slot: usize, backend: &dyn Backend) -> Result<(), BackendError> {
@@ -244,6 +276,9 @@ struct Stream {
     budget: Option<crate::inference::reasoning_budget::ReasoningBudget>,
     /// Токен, который надо подать следующим шагом.
     next: u32,
+    /// Логиты, УЖЕ полученные окном верификации (все черновики приняты):
+    /// следующий токен сэмплится прямо из них, forward не нужен.
+    pending: Option<Vec<f32>>,
     t_prompt: f64,
     t_start: Instant,
     predicted_n: usize,
@@ -304,6 +339,7 @@ pub fn generate_batch(
                 generated: Vec::new(),
                 budget: reqs[q].params.reasoning_budget.clone(),
                 next: 0,
+                pending: None,
                 t_prompt: t_prompt.elapsed().as_secs_f64() * 1e3,
                 t_start: Instant::now(),
                 predicted_n: 0,
@@ -346,6 +382,121 @@ pub fn generate_batch(
             }
         }
         queue = ready;
+        // Спец (INFER_BATCH_SPEC=1, только жадные беседы): у кого есть
+        // вербатимное продолжение в истории — окно верификации через
+        // decode_spec, остальные идут пакетом. Путь аддитивный: без черновиков
+        // всё как раньше.
+        // ЭКСПЕРИМЕНТАЛЬНО и НЕ ПРИНЯТО: при INFER_BATCH_SPEC=1 токены
+        // расходятся с одиночным прогоном (приёмка batch_generate падает) —
+        // разбор конвенции SpecOutcome не закончен (см. docs/batch_spec.md).
+        // Флаг существует, чтобы доводить ветвь, а НЕ включать в сервисе.
+        let spec_on = std::env::var("INFER_BATCH_SPEC").is_ok();
+        if spec_on {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "batch-spec: ЭКСПЕРИМЕНТАЛЬНО (приёмка не пройдена — токены расходятся с AR)"
+                )
+            });
+        }
+        let gamma: usize = std::env::var("INFER_BATCH_SPEC_GAMMA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let mut still_ar: Vec<(usize, u32)> = Vec::with_capacity(queue.len());
+        if spec_on {
+            for &(slot, tok_) in queue.iter() {
+                let st = streams[slot].as_mut().expect("шаг по занятому слоту");
+                let q = st.req;
+                let greedy = reqs[q].params.temperature <= 0.0;
+                let forced = st.budget.as_ref().and_then(|b| b.forced_token()).is_some();
+                if !greedy || forced {
+                    still_ar.push((slot, tok_));
+                    continue;
+                }
+                let (drafts, probs) = crate::spec::ngram_lookup_min(&st.history, gamma, 4, 4);
+                if drafts.len() < 2 {
+                    still_ar.push((slot, tok_));
+                    continue;
+                }
+                let hist = st.history.clone();
+                let o = match engine.decode_spec_slot(backend, slot, tok_, &drafts, &probs, true, &hist)
+                {
+                    Ok(o) => o,
+                    // Окно не удалось — беседа честно идёт AR-шагом.
+                    Err(_) => {
+                        still_ar.push((slot, tok_));
+                        continue;
+                    }
+                };
+                let all = o.n_draft_accepted == drafts.len();
+                let row = if all {
+                    Some(backend.to_cpu_f32(&o.logits)?)
+                } else {
+                    None
+                };
+                let mut closed = None;
+                for t in o.accepted.iter().copied() {
+                    match check_stop(t, |x| tok.is_eog(x), &st.acc, &reqs[q].params.stop_strings) {
+                        Some(r) => {
+                            closed = Some(r);
+                            break;
+                        }
+                        None => {}
+                    }
+                    match emit(t, tok, &mut st.decoder, &mut st.acc, &mut |ev| on_event(q, ev)) {
+                        Emit::Stop => {
+                            closed = Some(FinishReason::Cancelled);
+                            break;
+                        }
+                        Emit::Ok => {}
+                    }
+                    st.generated.push(t);
+                    out[q].push(t);
+                    st.history.push(t);
+                    st.predicted_n += 1;
+                    if st.generated.len() >= reqs[q].params.max_tokens {
+                        closed = Some(FinishReason::MaxTokens);
+                        break;
+                    }
+                }
+                match closed {
+                    Some(r) => {
+                        close_stream(st, r, on_event);
+                        engine.finish(slot, backend)?;
+                        streams[slot] = None;
+                    }
+                    None => {
+                        // Полная приёмка: логиты продолжения уже есть; иначе
+                        // последний принятый — пересэмпл, НЕ в KV, его кормим.
+                        st.next = *o.accepted.last().expect("окно вернуло токены");
+                        st.pending = row;
+                        match st.pending.take() {
+                            // Готовые логиты: сэмплим из них, forward не нужен.
+                            Some(row) => match advance(
+                                st,
+                                &row,
+                                &reqs[q].params,
+                                tok,
+                                &mut out[q],
+                                on_event,
+                            ) {
+                                None => still_ar.push((slot, st.next)),
+                                Some(r) => {
+                                    close_stream(st, r, on_event);
+                                    engine.finish(slot, backend)?;
+                                    streams[slot] = None;
+                                }
+                            },
+                            None => still_ar.push((slot, st.next)),
+                        }
+                    }
+                }
+            }
+        } else {
+            still_ar = std::mem::take(&mut queue);
+        }
+        queue = still_ar;
         if queue.is_empty() {
             continue;
         }

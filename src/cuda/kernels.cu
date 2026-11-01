@@ -2870,3 +2870,20 @@ extern "C" __global__ void tts_topk_merge_f32(
         __syncthreads();
     }
 }
+
+// ── Row copy without an offset view (CUDA has no nonzero elem_offset views) ──
+// copy_tail_f32: dst[0..d) = src[off..off+d) — the read-only row_view.
+extern "C" __global__ void copy_tail_f32(const float* __restrict__ src,
+                                         float* __restrict__ dst,
+                                         int off, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < d) dst[i] = src[off + i];
+}
+
+// copy_into_f32: dst[off..off+d) = src[0..d) — row_write into a batch tensor.
+extern "C" __global__ void copy_into_f32(const float* __restrict__ src,
+                                         float* __restrict__ dst,
+                                         int off, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < d) dst[off + i] = src[i];
+}

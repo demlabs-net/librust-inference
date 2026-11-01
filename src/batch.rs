@@ -1223,9 +1223,7 @@ pub fn generate_batch_full(
             // committed + 1; иначе драфтер отстаёт на токен и молчит).
             if let Some(af) = after_fn.as_deref_mut() {
                 let d = engine.dim();
-                let hv = h_all
-                    .view(vec![b_rows, d])
-                    .view_offset(vec![1, 1, d], r * d);
+                let hv = backend.row_view(&h_all, b_rows, d, r)?;
                 let pos = engine.pos(slot).unwrap_or(0);
                 af(slot, &hv, pos, 1);
             }

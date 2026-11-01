@@ -839,7 +839,7 @@ impl Qwen3Model {
                 let h = self.forward_layers_range(backend, x, t, None, None, 0, None, true)?;
                 if end == ids.len() {
                     let d = self.cfg.dim;
-                    let last = h.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d);
+                    let last = backend.row_view(&h, t, d, t - 1)?;
                     logits = Some(self.lm_head(backend, &last)?);
                 }
                 if trace {
@@ -874,7 +874,7 @@ impl Qwen3Model {
             let h = self.forward_layers_hidden(backend, x, t, None, None, None)?;
             self.pos_rope = self.caches[0].pos;
             let d = self.cfg.dim;
-            let last = h.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d);
+            let last = backend.row_view(&h, t, d, t - 1)?;
             self.lm_head(backend, &last)
         })();
         backend.end_batch()?;
@@ -975,7 +975,7 @@ impl Qwen3Model {
                 t_copy += tc.elapsed().as_secs_f64();
             }
             if end == t_all {
-                let last = h.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d);
+                let last = backend.row_view(&h, t, d, t - 1)?;
                 logits = Some(self.lm_head(backend, &last)?);
             }
             // Позиция следующего блока — от кэша (rope/маска).
@@ -1658,7 +1658,8 @@ impl Qwen3Model {
         // При жадном пути — срез окна на GPU (без обмена с хостом).
         let row_idx = accepted_len - 1;
         let logits = if gpu_greedy {
-            logits.view_offset(vec![1, 1, v], row_idx * v)
+            let rows = logits.numel() / v;
+            backend.row_view(&logits, rows, v, row_idx)?
         } else {
             let row = &ld[row_idx * v..(row_idx + 1) * v];
             backend.from_cpu_f32(row, vec![1, 1, v])?

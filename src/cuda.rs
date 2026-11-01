@@ -3325,6 +3325,69 @@ impl Backend for CudaBackend {
         }
     }
 
+    /// CUDA has no nonzero-offset views (`view_offset` panics by design), so
+    /// the row read/write pair copies device-side instead. Both are tiny
+    /// (one head row per call) and only the offset differs from Metal.
+    fn row_view(&self, x: &Tensor, rows: usize, d: usize, row: usize) -> Result<Tensor, BackendError> {
+        let n: usize = x.shape().iter().product();
+        if n != rows * d || row >= rows {
+            return Err(BackendError::Shape(format!(
+                "row_view: {:?} is not ({rows}, {d}) or row {row} out of range",
+                x.shape()
+            )));
+        }
+        let crate::backend::TensorInner::Cuda(_) = &x.inner else {
+            return Err(BackendError::UnsupportedFormat(
+                "row_view: non-CUDA tensor on the CUDA backend".into(),
+            ));
+        };
+        let mut dst = self.take_pooled(d)?;
+        let f = self.function("copy_tail_f32")?;
+        let cfg = LaunchConfig::for_num_elems(d as u32);
+        let off = (row * d) as i32;
+        let d32 = d as i32;
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(&dst);
+        la.arg(&off);
+        la.arg(&d32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(Tensor::from_cuda(self.wrap_pooled(dst), vec![1, 1, d]))
+    }
+
+    fn row_write(&self, dst: &Tensor, src: &Tensor, row: usize) -> Result<(), BackendError> {
+        let d = dst.shape()[2];
+        if src.shape() != [1, 1, d] {
+            return Err(BackendError::Shape(format!(
+                "row_write: src {:?} is not (1, 1, {d})",
+                src.shape()
+            )));
+        }
+        let cap = dst.shape()[1];
+        if row >= cap {
+            return Err(BackendError::Shape(format!(
+                "row_write: row {row} outside (1, {cap}, {d})"
+            )));
+        }
+        if let (crate::backend::TensorInner::Cuda(_), crate::backend::TensorInner::Cuda(_)) =
+            (&dst.inner, &src.inner)
+        {
+            let f = self.function("copy_into_f32")?;
+            let cfg = LaunchConfig::for_num_elems(d as u32);
+            let off = (row * d) as i32;
+            let d32 = d as i32;
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(src.as_cuda());
+            la.arg(dst.as_cuda());
+            la.arg(&off);
+            la.arg(&d32);
+            return unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err);
+        }
+        Err(BackendError::UnsupportedFormat(
+            "row_write: non-CUDA tensor on the CUDA backend".into(),
+        ))
+    }
+
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError> {
         let (b, tq, d) = (src.shape()[0], src.shape()[1], src.shape()[2]);
         // K44: the q8_0 KV format stores one f32 scale per 32-element

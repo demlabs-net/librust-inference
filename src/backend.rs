@@ -2405,6 +2405,25 @@ pub trait Backend: Send + Sync {
         self.scale(src, &dst.view_offset(vec![1, 1, d], row * d), 1.0)
     }
 
+    /// Read row `row` of a (rows, d) activation tensor as (1, 1, d).
+    ///
+    /// Read-only counterpart of `row_write`: CPU/Metal take a `view_offset`,
+    /// while CUDA has no offset views (a nonzero `elem_offset` panics), so its
+    /// impl copies the row device-side. Used by the chunked prefill's last-row
+    /// logits and by the batch MTP hidden-row feed.
+    fn row_view(&self, x: &Tensor, rows: usize, d: usize, row: usize) -> Result<Tensor, BackendError> {
+        let n: usize = x.shape().iter().product();
+        if n != rows * d || row >= rows {
+            return Err(BackendError::Shape(format!(
+                "row_view: {:?} is not ({rows}, {d}) or row {row} out of range",
+                x.shape()
+            )));
+        }
+        // view_offset takes the shape and the offset itself; a plain `view`
+        // first would demand the same numel and panic (CPU 1024 != 9216).
+        Ok(x.view_offset(vec![1, 1, d], row * d))
+    }
+
     /// KV compaction shift (plan 1.6): rows [shift..pos) of the (B, cap, D)
     /// buffer → a NEW tensor with them at [0..pos−shift) (the rest zeroed),
     /// storage-dtype-preserving (f32 / f16 / q8_0 with the per-32-block

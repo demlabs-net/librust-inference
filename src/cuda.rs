@@ -924,6 +924,18 @@ impl Backend for CudaBackend {
         Ok(Tensor::from_cuda_q3k(s, shape))
     }
 
+    /// fp16 storage download (f16 KV caches, half weights). Signed-off
+    /// counterpart of `to_cpu_f32`: the roll/parity diagnostics download KV in
+    /// its storage dtype instead of widening, so a real f16 cache can be
+    /// compared bit-for-bit with the reference.
+    fn to_cpu_f16(&self, t: &Tensor) -> Result<Vec<half::f16>, BackendError> {
+        if let crate::backend::TensorInner::CudaF16(b) = &t.inner {
+            return self.stream.clone_dtoh(b).map_err(map_err);
+        }
+        let f = self.to_cpu_f32(t)?;
+        Ok(f.into_iter().map(half::f16::from_f32).collect())
+    }
+
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
         // raw bits and widens on the CPU — same result as a device-side cast.

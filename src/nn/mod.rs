@@ -707,20 +707,35 @@ impl KvCache {
     /// Подготовить дозапись `tq` строк на текущую позицию, когда k/v пишет
     /// сам вызывающий (fused-кернел `Backend::qkv_norm_rope_kv`): откат окна
     /// при переполнении и рост ёмкости — как в [`Self::update`]. Возвращает
-    /// (позиция первой строки, k-буфер, v-буфер) — буферы целиком [1, cap, D];
-    /// после записи — [`Self::advance`].
+    /// позицию первой строки; сами буферы читаются через [`Self::k_ref`] /
+    /// [`Self::v_ref`], после записи — [`Self::advance`].
+    ///
+    /// НЕ отдаёт буферы по значению: `Tensor` у CUDA fp16/q8/bf16 (и
+    /// `CudaSlice` внутри) клонируется ГЛУБОКОЙ копией, так что `self.k.clone()`
+    /// давал отсоединённый буфер — fused-путь писал в копию, а настоящий
+    /// f16-KV оставался нулевым (вырожденный вывод Qwen3 0.6B/8B на CUDA).
     pub(crate) fn begin_append(
         &mut self,
         backend: &dyn Backend,
         tq: usize,
-    ) -> Result<(usize, Tensor, Tensor), BackendError> {
+    ) -> Result<usize, BackendError> {
         if let Some(max) = self.max_cap
             && self.pos + tq > max
         {
             self.compact(backend)?;
         }
         self.ensure(backend, self.pos + tq)?;
-        Ok((self.pos, self.k.clone(), self.v.clone()))
+        Ok(self.pos)
+    }
+
+    /// The k/v buffers for a fused append (borrow, never a clone — see
+    /// [`Self::begin_append`]).
+    pub(crate) fn k_ref(&self) -> &Tensor {
+        &self.k
+    }
+
+    pub(crate) fn v_ref(&self) -> &Tensor {
+        &self.v
     }
 
     /// Зафиксировать `tq` строк, записанных после [`Self::begin_append`].

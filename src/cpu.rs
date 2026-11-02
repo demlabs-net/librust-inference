@@ -104,6 +104,17 @@ impl Backend for CpuBackend {
         Ok(Tensor::from_cpu(d.to_vec(), shape))
     }
 
+    /// The CPU reference keeps f32 storage; exposing the fp16 view (rounded)
+    /// lets the KV-roll and CUDA-parity diagnostics download an f16 cache the
+    /// same way the GPU backends do.
+    fn to_cpu_f16(&self, t: &Tensor) -> Result<Vec<half::f16>, BackendError> {
+        Ok(self
+            .to_cpu_f32(t)?
+            .into_iter()
+            .map(half::f16::from_f32)
+            .collect())
+    }
+
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Ограниченный view (view_restricted: логическая форма меньше
         // родительского буфера) — отдаём РОВНО numel элементов, как GPU-

@@ -1832,13 +1832,17 @@ impl Qwen3Model {
         let (q, t_norm, t_upd_d) =
             if let (true, Some(qn), Some(kn)) = (fused, &attn.q_norm, &attn.k_norm) {
                 let t_upd = std::time::Instant::now();
-                let (pos_kv, kb, vb) = cache.begin_append(backend, tq)?;
+                let pos_kv = cache.begin_append(backend, tq)?;
+                // Borrow the cache buffers: a Tensor clone of CUDA f16/q8/bf16
+                // storage is a deep copy (CudaSlice::clone), and the fused
+                // kernel would write into that copy while the real KV stayed
+                // zero (the CUDA f16-KV degeneracy).
                 let q = backend.qkv_norm_rope_kv(
                     qkv.as_ref().expect("fused ⇒ qkv есть"),
                     qn,
                     kn,
-                    &kb,
-                    &vb,
+                    cache.k_ref(),
+                    cache.v_ref(),
                     attn.n_heads,
                     attn.n_kv_heads,
                     attn.head_dim,
@@ -2516,6 +2520,226 @@ mod roll_tests {
             vdev < 1e-2,
             "layer-0 values must match a fresh prefill of the window: dev {vdev}"
         );
+    }
+}
+
+/// CUDA must reproduce the CPU reference bit-for-bit up to rounding: the same
+/// deterministic mini model is prefilled on both backends and the last-row
+/// logits are compared. This is the guard the Ф9 bring-up missed — every
+/// kernel can pass its own unit test while the assembled forward is wrong.
+#[cfg(all(test, feature = "cuda", feature = "cpu"))]
+mod cuda_parity_tests {
+    use super::test_util::{build_model, mini_cfg};
+    use super::Qwen3Config;
+    use crate::backend::Backend;
+
+    fn parity(cfg: Qwen3Config, label: &str, f32_kv: bool) {
+        super::test_util::FORCE_KV_F32.with(|c| c.set(f32_kv));
+        let cpu = std::sync::Arc::new(crate::cpu::CpuBackend);
+        let Ok(cuda) = crate::cuda::CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let gpu = std::sync::Arc::new(cuda);
+
+        let ids: Vec<u32> = (0..6u32).collect();
+        let maxdev = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // Stage 1: the embedding lookup on its own.
+        let mut mc = build_model(cpu.as_ref(), cfg.clone());
+        let mut mg = build_model(gpu.as_ref(), cfg.clone());
+        let ec = cpu
+            .to_cpu_f32(&mc.embed.forward(cpu.as_ref(), &ids, ids.len()).unwrap())
+            .unwrap();
+        let eg = gpu
+            .to_cpu_f32(&mg.embed.forward(gpu.as_ref(), &ids, ids.len()).unwrap())
+            .unwrap();
+        let d_embed = maxdev(&ec, &eg);
+        eprintln!("CUDA vs CPU: embed max|d| = {d_embed}");
+
+        // Stage 2: layer 0 split — input after attn_norm, after the attention
+        // residual add, after the FFN residual add.
+        let (cn, ca, cf) = mc.debug_layer_split(cpu.as_ref(), &ids, 0).unwrap();
+        let (gn, ga, gf) = mg.debug_layer_split(gpu.as_ref(), &ids, 0).unwrap();
+        let d_norm = maxdev(
+            &cpu.to_cpu_f32(&cn).unwrap(),
+            &gpu.to_cpu_f32(&gn).unwrap(),
+        );
+        let d_attn = maxdev(
+            &cpu.to_cpu_f32(&ca).unwrap(),
+            &gpu.to_cpu_f32(&ga).unwrap(),
+        );
+        let d_ffn = maxdev(
+            &cpu.to_cpu_f32(&cf).unwrap(),
+            &gpu.to_cpu_f32(&gf).unwrap(),
+        );
+        eprintln!("CUDA vs CPU: layer0 norm {d_norm}, attn {d_attn}, ffn {d_ffn}");
+
+        // Stage 2b: the KV cache itself after a full prefill — only for the
+        // f32 storage: CUDA has no `to_cpu_f16` yet, so an f16 cache cannot be
+        // downloaded (that gap is tracked separately).
+        let d_kv = {
+            let mut mc_kv = build_model(cpu.as_ref(), cfg.clone());
+            mc_kv.prefill(cpu.as_ref(), &ids).unwrap();
+            let mut mg_kv = build_model(gpu.as_ref(), cfg.clone());
+            mg_kv.prefill(gpu.as_ref(), &ids).unwrap();
+            let ck = crate::backend::download_in_dtype(cpu.as_ref(), &mc_kv.caches[0].view()).unwrap();
+            let gk = crate::backend::download_in_dtype(gpu.as_ref(), &mg_kv.caches[0].view()).unwrap();
+            let cv = crate::backend::download_in_dtype(cpu.as_ref(), &mc_kv.caches[0].view_v()).unwrap();
+            let gv = crate::backend::download_in_dtype(gpu.as_ref(), &mg_kv.caches[0].view_v()).unwrap();
+            let d = maxdev(&ck, &gk).max(maxdev(&cv, &gv));
+            eprintln!("CUDA vs CPU: kv cache {d}\n  cpu k[0..8]={:?}\n  gpu k[0..8]={:?}\n  cpu v[0..8]={:?}\n  gpu v[0..8]={:?}",
+                &ck[..8.min(ck.len())], &gk[..8.min(gk.len())], &cv[..8.min(cv.len())], &gv[..8.min(gv.len())]);
+            d
+        };
+
+        // Stage 3: the last-row logits of a prefilled prompt.
+        let mut mc = build_model(cpu.as_ref(), cfg.clone());
+        let lc = cpu
+            .to_cpu_f32(&mc.prefill_last(cpu.as_ref(), &ids).unwrap())
+            .unwrap();
+        let mut mg = build_model(gpu.as_ref(), cfg);
+        let lg = gpu
+            .to_cpu_f32(&mg.prefill_last(gpu.as_ref(), &ids).unwrap())
+            .unwrap();
+        let d_logits = maxdev(&lc, &lg);
+        eprintln!("CUDA vs CPU: logits {d_logits}");
+
+        // f16 KV storage rounds: the reference (CPU) computes in f32, so the
+        // gap is the quantization noise (~1e-3..5e-2 on a 2-layer random
+        // model), not a defect. A real kernel bug is orders of magnitude
+        // larger (the clone bug measured 4.5 on logits).
+        // Intermediate stages amplify f16 KV rounding on a random 2-layer
+        // model (FFN especially); the decision-relevant number is the logits,
+        // which stay within a few 1e-3.
+        let tol_stage = if f32_kv { 1e-3 } else { 0.5 };
+        let tol_logits = if f32_kv { 1e-3 } else { 0.02 };
+        assert!(
+            d_embed < 1e-3 && d_norm < 1e-3 && d_kv < tol_stage && d_attn < tol_stage && d_ffn < tol_stage && d_logits < tol_logits,
+            "[{label}] CUDA vs CPU mismatch: embed {d_embed}, norm {d_norm}, kv {d_kv}, attn {d_attn}, ffn {d_ffn}, logits {d_logits}"
+        );
+    }
+
+    fn dev(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The two ops the attention block feeds from the normed input, on
+    /// identical synthetic data: the fused per-head norm+RoPE and attention.
+    #[test]
+    fn cuda_attention_ops_match_cpu() {
+        let cpu = std::sync::Arc::new(crate::cpu::CpuBackend);
+        let Ok(cuda) = crate::cuda::CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let gpu = std::sync::Arc::new(cuda);
+        let (t, h, kvh, hd) = (6usize, 4usize, 2usize, 64usize);
+        let d = h * hd;
+        let vals = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32 * 0.13 + seed).sin()) * 0.5).collect()
+        };
+
+        // 1) fused rmsnorm_head_rope
+        let x = vals(t * d, 0.7);
+        let w = vals(hd, 1.3);
+        let ty = {
+            let tx = cpu.from_cpu_f32(&x, vec![1, t, d]).unwrap();
+            let tw = cpu.from_cpu_f32(&w, vec![hd]).unwrap();
+            cpu.to_cpu_f32(&cpu.rmsnorm_head_rope(&tx, &tw, 0, hd, 10_000.0, h, 1e-6, None).unwrap())
+                .unwrap()
+        };
+        let gy = {
+            let gx = gpu.from_cpu_f32(&x, vec![1, t, d]).unwrap();
+            let gw = gpu.from_cpu_f32(&w, vec![hd]).unwrap();
+            gpu.to_cpu_f32(&gpu.rmsnorm_head_rope(&gx, &gw, 0, hd, 10_000.0, h, 1e-6, None).unwrap())
+                .unwrap()
+        };
+        let d_norm_rope = dev(&ty, &gy);
+
+        // 2) attention over a small KV window (no mask: the comparison is
+        // about the kernel's arithmetic, not the causal policy).
+        let q = vals(t * d, 2.1);
+        let k = vals(8 * kvh * hd, 2.7);
+        let v = vals(8 * kvh * hd, 3.1);
+        let run = |b: &dyn Backend| -> Vec<f32> {
+            let tq = b.from_cpu_f32(&q, vec![1, t, d]).unwrap();
+            let tk = b.from_cpu_f32(&k, vec![1, 8, kvh * hd]).unwrap();
+            let tv = b.from_cpu_f32(&v, vec![1, 8, kvh * hd]).unwrap();
+            let out = b.zeros(vec![1, t, d]).unwrap();
+            b.attn_ar(&tq, &tk, &tv, None, &out, h, kvh, hd).unwrap();
+            b.to_cpu_f32(&out).unwrap()
+        };
+        let d_attn = dev(&run(cpu.as_ref()), &run(gpu.as_ref()));
+
+        // 3) the same attention over a REAL f16 KV cache (the storage the
+        // model uses): kv_update writes f16, attn_ar reads the f16 kernel.
+        let run16 = |b: &dyn Backend| -> (Vec<f32>, Vec<f32>) {
+            let tq = b.from_cpu_f32(&q, vec![1, t, d]).unwrap();
+            let tk = b
+                .from_cpu_f32(&k[..t * kvh * hd], vec![1, t, kvh * hd])
+                .unwrap();
+            let tv = b
+                .from_cpu_f32(&v[..t * kvh * hd], vec![1, t, kvh * hd])
+                .unwrap();
+            let zeros = vec![half::f16::from_f32(0.0); 8 * kvh * hd];
+            let ck = b.from_cpu_f16(&zeros, vec![1, 8, kvh * hd]).unwrap();
+            let cv = b.from_cpu_f16(&zeros, vec![1, 8, kvh * hd]).unwrap();
+            b.kv_update(&ck, &tk, 0).unwrap();
+            b.kv_update(&cv, &tv, 0).unwrap();
+            let mut cache: Vec<f32> = b
+                .to_cpu_f16(&ck)
+                .unwrap()
+                .into_iter()
+                .map(f32::from)
+                .collect();
+            cache.extend(b.to_cpu_f16(&cv).unwrap().into_iter().map(f32::from));
+            let out = b.zeros(vec![1, t, d]).unwrap();
+            b.attn_ar(&tq, &ck, &cv, None, &out, h, kvh, hd)
+                .unwrap();
+            (cache, b.to_cpu_f32(&out).unwrap())
+        };
+        let (kc_cpu, ao_cpu) = run16(cpu.as_ref());
+        let (kc_gpu, ao_gpu) = run16(gpu.as_ref());
+        let d_kv16 = dev(&kc_cpu, &kc_gpu);
+        let d_attn16 = dev(&ao_cpu, &ao_gpu);
+
+        eprintln!(
+            "attention ops: norm+rope {d_norm_rope}, attn_ar {d_attn}, f16 cache {d_kv16}, f16 attn {d_attn16}"
+        );
+        assert!(
+            d_norm_rope < 1e-3 && d_attn < 1e-3 && d_kv16 < 1e-3 && d_attn16 < 1e-3,
+            "attention op mismatch: norm+rope {d_norm_rope}, attn_ar {d_attn}, f16 cache {d_kv16}, f16 attn {d_attn16}"
+        );
+    }
+
+    #[test]
+    fn cuda_logits_match_cpu_mini() {
+        parity(mini_cfg(), "mini-f32kv", true);
+        parity(mini_cfg(), "mini-f16kv", false);
+    }
+
+    /// Head dim 64 with GQA 4:2 — the shape family the real Qwen3-0.6B/8B use
+    /// (the 16-wide mini model can hide vectorization assumptions).
+    #[test]
+    fn cuda_logits_match_cpu_realistic() {
+        let mut c = mini_cfg();
+        c.dim = 256;
+        c.n_heads = 4;
+        c.n_kv_heads = 2;
+        c.head_dim = 64;
+        c.ffn_dim = 512;
+        c.vocab_size = 64;
+        c.n_layers = 2;
+        parity(c, "realistic-f16kv", false);
     }
 }
 

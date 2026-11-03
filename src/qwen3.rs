@@ -476,10 +476,15 @@ impl Qwen3Model {
             .get(name)
             .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
         // Таблица эмбеддинга читается gather-ядром, которое умеет f32/f16/bf16
-        // (`CudaBackend::embedding` паникует на CudaI8). Для GGUF Q8_0 держим
-        // таблицу в f32: +~2 ГБ VRAM (0.72→2.9 ГБ у 27B), без этого загрузка
+        // (`CudaBackend::embedding` паникует на любом packed-тензоре: Q8_0 и
+        // K-кванты). Держим её в f32: у 27B +~2 ГБ VRAM (0.72→2.9 ГБ), зато
+        // остальные квантованные веса остаются packed — без этого загрузка
         // 27B Q4_K_M падала на первом же forward.
-        if name == "token_embd.weight" && matches!(tensor.format, crate::dtype::WeightFormat::Q8_0)
+        if name == "token_embd.weight"
+            && !matches!(
+                tensor.format,
+                crate::dtype::WeightFormat::Plain(crate::dtype::Dtype::F32)
+            )
         {
             return upload_w(backend, &crate::weights_map::dequant_f32(tensor), shape);
         }

@@ -57,10 +57,15 @@ impl Qwen3Config {
     pub fn from_gguf(file: &GgufFile<'_>, vocab_size: usize) -> Result<Self, BackendError> {
         // Архитектура из метаданных: qwen3 / qwen3vl / qwen35 (M-RoPE) и т.п.
         let arch = file.architecture().unwrap_or("qwen3").to_string();
-        // Незнакомая архитектура — внятная ошибка (реестр arch::), а не
-        // «missing blk.0.attn_q.weight» через десяток строк.
-        if !crate::arch::is_supported(&arch) && crate::arch::lookup(&arch).is_some() {
-            return Err(crate::arch::unsupported_arch(&arch));
+        // Незнакомая архитектура — внятная ошибка (реестр arch::/плагины), а
+        // не «missing blk.0.attn_q.weight» через десяток строк. Плагинный
+        // слой знает и планируемые версии (qwen4exp → волна A5) и покрытые
+        // архитектуры, поэтому отказ берём у него, если он есть.
+        if !crate::arch::is_supported(&arch) {
+            let err = crate::plugin::lookup_arch(&arch)
+                .err()
+                .unwrap_or_else(|| crate::arch::unsupported_arch(&arch));
+            return Err(err);
         }
         let p = |s: &str| -> String { format!("{arch}.{s}") };
         let u = |k: &str| -> Result<usize, BackendError> {

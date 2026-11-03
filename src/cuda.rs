@@ -670,6 +670,28 @@ impl Backend for CudaBackend {
         let blk_bytes = match format {
             crate::dtype::WeightFormat::Q6_K => 210usize,
             crate::dtype::WeightFormat::Q4_K => 144usize,
+            // GGUF Q8_0: 34 Б/32 (f16 scale + коды) → int8-ядро (коды + f32
+            // scale). Раньше падал в f32-fallback: 4 байта/вес ломали
+            // загрузку 27B Q4_K_M (7.2 ГБ Q8_0 → 28.6 ГБ VRAM, CUDA OOM).
+            crate::dtype::WeightFormat::Q8_0 => {
+                let n: usize = shape.iter().product();
+                match crate::weights_map::q8_0_to_i8(data, n) {
+                    Some((codes, scales)) => {
+                        return self.from_cpu_i8(&codes, &scales, shape);
+                    }
+                    None => {
+                        let tmp = crate::weights_map::WeightTensor {
+                            name: "q".into(),
+                            shape: shape.iter().map(|&d| d as u64).collect(),
+                            format,
+                            offset: 0,
+                            data,
+                        };
+                        let f = crate::weights_map::dequant_f32(&tmp);
+                        return self.from_cpu_f32(&f, shape);
+                    }
+                }
+            }
             _ => {
                 // Fall back to the reference path (dequant → f32).
                 let tmp = crate::weights_map::WeightTensor {

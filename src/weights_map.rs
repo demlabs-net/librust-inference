@@ -4972,8 +4972,34 @@ pub fn dequant_gguf(
 /// rejects those formats with an Err BEFORE calling this (backend.rs), and
 /// here the fallback is an empty vec + a loud marker — the test harness
 /// asserts len == numel and fails loudly.
-pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
-    match t.format {
+/// Распаковать GGUF Q8_0 (блок 34 байта: f16 scale + 32 int8) в раскладку
+/// CUDA int8-пути (`CudaI8`): плоские коды и f32-скейл на каждый блок из 32.
+///
+/// Без этого GGUF Q8_0 приходилось разворачивать в f32 (4 байта/вес):
+/// Q4_K_M-файл 27B содержит 7.2 ГБ Q8_0 → 28.6 ГБ VRAM и CUDA OOM на 32 ГБ.
+/// `None` — данные не кратны блоку (вызывающий падает в f32-fallback).
+pub fn q8_0_to_i8(data: &[u8], n: usize) -> Option<(Vec<i8>, Vec<f32>)> {
+    if n == 0 || !n.is_multiple_of(32) {
+        return None;
+    }
+    let blocks = n / 32;
+    if data.len() != blocks * 34 {
+        return None;
+    }
+    let mut codes = Vec::with_capacity(n);
+    let mut scales = Vec::with_capacity(blocks);
+    for b in 0..blocks {
+        let off = b * 34;
+        // GGUF Q8_0: d (f16 LE), затем 32 кода.
+        scales.push(f16_to_f32([data[off], data[off + 1]]));
+        for i in 0..32 {
+            codes.push(data[off + 2 + i] as i8);
+        }
+    }
+    Some((codes, scales))
+}
+
+pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {    match t.format {
         WeightFormat::Plain(Dtype::F32) => t
             .data
             .chunks_exact(4)
@@ -5090,6 +5116,34 @@ mod tests {
 
     /// Кросс-форматная проверка: все кванты представляют ОДНИ и те же веса
     /// (одинаковые сиды fixture-gen), поэтому деквант ≈ деквант f16.
+    #[test]
+    fn q8_0_to_i8_matches_gguf_dequant() {
+        // Два блока GGUF Q8_0: f16 scale + 32 кода.
+        let mut data = Vec::new();
+        for (scale, codes) in [(0.5f32, 1i8), (0.125, -3)] {
+            let bits = half::f16::from_f32(scale).to_bits().to_le_bytes();
+            data.extend_from_slice(&bits);
+            for i in 0..32 {
+                data.push(codes.wrapping_add(i as i8) as u8);
+            }
+        }
+        let (got_codes, got_scales) = q8_0_to_i8(&data, 64).expect("64 веса, 2 блока");
+        assert_eq!(got_codes.len(), 64);
+        assert_eq!(got_scales.len(), 2);
+        assert!((got_scales[0] - 0.5).abs() < 1e-6);
+        assert!((got_scales[1] - 0.125).abs() < 1e-6);
+        // Коды и масштабы обязаны давать тот же f32, что эталонный деквант.
+        let want = dequant_q8_0(&data);
+        for i in 0..64 {
+            let blk = i / 32;
+            let got = got_codes[i] as f32 * got_scales[blk];
+            assert!((got - want[i]).abs() < 1e-6, "i={i}: {got} vs {}", want[i]);
+        }
+        // Неверная длина/некратность — None (f32-fallback у вызывающего).
+        assert!(q8_0_to_i8(&data, 63).is_none());
+        assert!(q8_0_to_i8(&data[..33], 32).is_none());
+    }
+
     #[test]
     fn dequant_matches_f16_reference() {
         let f16 = dequant_f32(map("mini-f16.gguf").get("token_embd.weight").unwrap());

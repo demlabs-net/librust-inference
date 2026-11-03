@@ -14,10 +14,11 @@
 //! на каждую модельную версию, чтобы сервис и балансировщик маршрутизировали
 //! по факту, а не по имени движка.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::arch::{Family, Support};
+use crate::arch::Family;
 use crate::dtype::KvFormat;
 use crate::error::BackendError;
 
@@ -130,30 +131,19 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Сводка из реестра архитектур: семейство и статус берутся из
-    /// [`crate::arch`], остальное — аргументами (у каждой версии свои
-    /// кернелы, KV и спека).
-    pub const fn from_arch(
-        arch: &'static str,
-        kv_formats: &'static [KvFormat],
-        speculative: &'static [SpecBackend],
-        offload: Offload,
-        batch_slots: u32,
-        max_context: u32,
-        note: &'static str,
-    ) -> Self {
-        // `arch::lookup` не const, поэтому семейство подставляется
-        // вызывающим через `family_for_arch` ниже; пустые списки означают
-        // «ещё не определено» (планируемая версия).
-        let _ = arch;
+    /// Способности версии, о которой плагин ничего не знает (неизвестная
+    /// архитектура или модель, не объявленная внешним движком): ничего не
+    /// умеет, ни одного слота. Нужна как безопасный дефолт для маршрутизации —
+    /// вызывающий не должен получить «умеет всё» по ошибке.
+    pub const fn unknown(note: &'static str) -> Self {
         Self {
             family: Family::Other,
             implemented: false,
-            kv_formats,
-            speculative,
-            offload,
-            batch_slots,
-            max_context,
+            kv_formats: &[],
+            speculative: &[],
+            offload: Offload::NONE,
+            batch_slots: 0,
+            max_context: 0,
             note,
         }
     }
@@ -179,8 +169,10 @@ pub trait EnginePlugin: Send + Sync {
     fn kind(&self) -> PluginKind;
     /// Версия самого плагина (не модели).
     fn version(&self) -> Version;
-    /// Модельные версии, которые плагин обслуживает.
-    fn model_versions(&self) -> &'static [ModelVersion];
+    /// Модельные версии, которые плагин обслуживает. Нативный плагин отдаёт
+    /// статический список (`Cow::Borrowed`), внешний — свой рантайм-список
+    /// (`Cow::Owned`); контракт один для обоих.
+    fn model_versions(&self) -> Cow<'static, [ModelVersion]>;
     /// Способности конкретной модельной версии.
     fn capabilities(&self, v: &ModelVersion) -> Capabilities;
     /// Внятный отказ для версии, которая есть в плане, но ещё не реализована
@@ -309,13 +301,13 @@ impl EnginePlugin for QwenPlugin {
         self.engine_version
     }
 
-    fn model_versions(&self) -> &'static [ModelVersion] {
+    fn model_versions(&self) -> Cow<'static, [ModelVersion]> {
         const VERSIONS: [ModelVersion; 3] = [
             QwenVersion::V3.model_version(),
             QwenVersion::V35.model_version(),
             QwenVersion::V4Exp.model_version(),
         ];
-        &VERSIONS
+        Cow::Borrowed(&VERSIONS)
     }
 
     fn capabilities(&self, v: &ModelVersion) -> Capabilities {
@@ -323,7 +315,7 @@ impl EnginePlugin for QwenPlugin {
             Some(QwenVersion::V3) => QWEN_V3_CAPS,
             Some(QwenVersion::V35) => QWEN_V35_CAPS,
             Some(QwenVersion::V4Exp) => QWEN_V4EXP_CAPS,
-            None => Capabilities::from_arch(v.arch, &[], &[], Offload::NONE, 1, 0, "неизвестная версия"),
+            None => Capabilities::unknown("неизвестная версия"),
         }
     }
 }
@@ -375,17 +367,17 @@ impl EnginePlugin for ExternalEngine {
         self.engine_version.unwrap_or_default()
     }
 
-    fn model_versions(&self) -> &'static [ModelVersion] {
-        // Внешние движки перечисляют модели в рантайме — статического списка
-        // у контракта нет. Сервис опрашивает `self.models` напрямую.
-        &[]
+    fn model_versions(&self) -> Cow<'static, [ModelVersion]> {
+        // Внешний движок объявляет модели в рантайме (манифест/`/v1/models`),
+        // поэтому отдаём копию своего списка.
+        Cow::Owned(self.models.clone())
     }
 
     fn capabilities(&self, v: &ModelVersion) -> Capabilities {
         if self.models.iter().any(|m| m.arch == v.arch || m.name == v.name) {
             self.capabilities
         } else {
-            Capabilities::from_arch(v.arch, &[], &[], Offload::NONE, 0, 0, "модель не объявлена")
+            Capabilities::unknown("модель не объявлена")
         }
     }
 }
@@ -406,7 +398,7 @@ pub fn lookup_arch(arch: &str) -> Result<&'static dyn EnginePlugin, BackendError
         None => {
             let known = NATIVE_REGISTRY
                 .iter()
-                .flat_map(|p| p.model_versions())
+                .flat_map(|p| p.model_versions().into_owned())
                 .map(|m| m.arch)
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -488,9 +480,31 @@ mod tests {
         );
         assert_eq!(engine.kind(), PluginKind::External);
         assert_eq!(engine.id(), "zeus");
+        // Внешний плагин отдаёт СВОЙ список моделей, а не пустой статический.
+        assert_eq!(engine.model_versions().len(), 1);
+        assert_eq!(engine.model_versions()[0].arch, "qwen4exp");
         assert!(engine
             .capabilities(&ModelVersion::new("v4exp", "qwen4exp", true))
             .offload
             .experts);
+        // Необъявленная модель — не «умеет всё», а явный ноль.
+        let other = engine.capabilities(&ModelVersion::new("v3", "qwen3", true));
+        assert!(!other.implemented);
+        assert_eq!(other.batch_slots, 0);
+        assert_eq!(other.max_context, 0);
+    }
+
+    #[test]
+    fn lookup_arch_accepts_implemented_and_names_the_plan() {
+        for arch in ["qwen3", "qwen35"] {
+            let plugin = lookup_arch(arch).expect("реализованная архитектура обязана найти плагин");
+            assert_eq!(plugin.id(), "qwen");
+        }
+        let err = lookup_arch("qwen4exp").err().expect("v4exp ещё в плане");
+        assert!(format!("{err}").contains("qwen4exp"));
+        let err = lookup_arch("llama").err().expect("llama не покрыта ни одним плагином");
+        let text = format!("{err}");
+        assert!(text.contains("llama"), "{text}");
+        assert!(text.contains("qwen35"), "отказ должен перечислять покрытые: {text}");
     }
 }

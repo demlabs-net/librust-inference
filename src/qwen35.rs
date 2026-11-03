@@ -1382,9 +1382,11 @@ impl Qwen35Model {
                 cfg.norm_eps,
             )?;
             st.conv = new_conv;
-            let qn = y.view_offset(vec![1, 1, qk_size], 0);
-            let kn = y.view_offset(vec![1, 1, qk_size], qk_size);
-            let v = y.view_offset(vec![1, 1, inner], 2 * qk_size);
+            // Срезы fused-выхода по последней оси — через slice_last (копия
+            // ядром), а не view_offset: на CUDA ненулевое смещение паникует.
+            let qn = crate::nn::slice_last(backend, &y, qk_size, 0)?;
+            let kn = crate::nn::slice_last(backend, &y, qk_size, qk_size)?;
+            let v = crate::nn::slice_last(backend, &y, inner, 2 * qk_size)?;
             gs(t0, &mut t_cv)?;
             t0 = std::time::Instant::now();
             let (o, new_ssm) = backend.gdn_delta_rule(&qn, &kn, &v, &gate, &b, &st.ssm, hk)?;

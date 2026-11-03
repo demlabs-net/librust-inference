@@ -13,6 +13,8 @@
 //! - [`metal`] — The Metal engine: own MSL kernels + buffers (`metal`
 //!   feature, macOS), the candle-replacement compute runtime.
 //! - [`inference`] — Sampling (top-p, repetition penalty, RAS).
+//! - [`plugin`] — Плагинный слой движков: контракт `EnginePlugin`,
+//!   версионирование, способности; нативные (qwen) и внешние адаптеры.
 //! - [`concurrency`] — Cross-engine inference guards (Metal command-buffer
 //!   serialization; no-op on other backends).
 //! - [`weights`] — Multi-file safetensors index loading + fp32 reader.
@@ -87,6 +89,7 @@ pub mod moe;
 pub mod mtp;
 pub mod nn;
 pub mod omni;
+pub mod plugin;
 pub mod quant;
 pub mod qwen3;
 pub mod qwen35;
@@ -107,6 +110,10 @@ pub mod weights_map;
 pub use backend::{Backend, Tensor};
 pub use dtype::{Dtype, KvFormat, QuantConfig, WeightFormat};
 pub use error::BackendError;
+pub use plugin::{
+    Capabilities, EnginePlugin, ExternalEngine, ModelVersion, Offload, PluginKind, QwenPlugin,
+    QwenVersion, SpecBackend, Version, NATIVE_REGISTRY, QWEN, lookup_arch, qwen_version_for_arch,
+};
 
 // GPU-only rule: a build without an enabled GPU backend must not silently fall
 // back to CPU (there is no implicit CPU path; `cpu` is the test-only reference

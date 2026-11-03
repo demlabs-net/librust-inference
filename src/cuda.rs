@@ -3353,7 +3353,7 @@ impl Backend for CudaBackend {
                 "row_view: non-CUDA tensor on the CUDA backend".into(),
             ));
         };
-        let mut dst = self.take_pooled(d)?;
+        let dst = self.take_pooled(d)?;
         let f = self.function("copy_tail_f32")?;
         let cfg = LaunchConfig::for_num_elems(d as u32);
         let off = (row * d) as i32;

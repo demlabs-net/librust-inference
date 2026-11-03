@@ -1212,10 +1212,9 @@ impl Qwen35Model {
             None
         };
         let (x, t) = if self.last_only && t > 1 {
-            (
-                x.view(vec![t, d]).view_offset(vec![1, 1, d], (t - 1) * d),
-                1,
-            )
+            // Строка последнего токена: row_view (device-copy на CUDA), а не
+            // view_offset — тот паникует на ненулевом смещении (грабля Ф9).
+            (backend.row_view(&x, t, d, t - 1)?, 1)
         } else {
             (x, t)
         };

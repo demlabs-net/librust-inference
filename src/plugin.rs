@@ -261,7 +261,7 @@ const QWEN_V3_CAPS: Capabilities = Capabilities {
     family: Family::Dense,
     implemented: true,
     kv_formats: &[KvFormat::F32, KvFormat::F16, KvFormat::Q8_0],
-    speculative: &[SpecBackend::Off, SpecBackend::DFlash],
+    speculative: &[SpecBackend::Off, SpecBackend::DFlash, SpecBackend::NGramLookup],
     offload: Offload::NONE,
     batch_slots: 4,
     max_context: 131_072,
@@ -272,7 +272,12 @@ const QWEN_V35_CAPS: Capabilities = Capabilities {
     family: Family::Hybrid,
     implemented: true,
     kv_formats: &[KvFormat::F32, KvFormat::F16, KvFormat::Q8_0],
-    speculative: &[SpecBackend::Off, SpecBackend::DFlash],
+    speculative: &[
+        SpecBackend::Off,
+        SpecBackend::DFlash,
+        SpecBackend::Mtp,
+        SpecBackend::NGramLookup,
+    ],
     offload: Offload::NONE,
     batch_slots: 4,
     max_context: 262_144,
@@ -288,7 +293,7 @@ const QWEN_V4EXP_CAPS: Capabilities = Capabilities {
     batch_slots: 2,
     max_context: 262_144,
     note: "Qwen3.8-Flash-Next: hyper-connections, MoE 512/top-10 + shared, \
-           QSA-индексер, PLE n-граммы; forward — A5",
+           QSA-индексер, PLE n-граммы; конфиг/схема — qwen4exp.rs, forward — A5",
 };
 
 impl EnginePlugin for QwenPlugin {

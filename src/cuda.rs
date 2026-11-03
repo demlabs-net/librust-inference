@@ -2317,8 +2317,9 @@ impl Backend for CudaBackend {
         // reference.
         if h == 0 || !x.shape()[1].is_multiple_of(h) {
             return Err(BackendError::Shape(format!(
-                "rmsnorm_head: head count h={h} does not divide x dim {}",
-                x.shape()[1]
+                "rmsnorm_head: head count h={h} does not divide x dim {} (shape {:?})",
+                x.shape()[1],
+                x.shape()
             )));
         }
         let hd = x.shape()[1] / h;

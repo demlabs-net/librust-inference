@@ -2310,19 +2310,20 @@ impl Backend for CudaBackend {
         h: usize,
         eps: f32,
     ) -> Result<(), BackendError> {
-        let rows = x.shape()[0];
-        // h == 0 divides by zero (x.shape()[1] / h) and would launch a
-        // degenerate (rows, 0) grid; a non-multiple x dim silently truncates
-        // hd and mis-addresses rows — strict divisibility, same as the CPU
-        // reference.
-        if h == 0 || !x.shape()[1].is_multiple_of(h) {
+        // Как CPU-эталон: X может быть 2D/3D (батч токенов) — нормируем по
+        // последней оси, строки = все ведущие измерения. Раньше здесь брались
+        // shape()[0]/shape()[1], и 3D-активации qwen35 ([1, T, nh*hd]) падали
+        // «h=24 does not divide x dim T» на первом же forward 27B.
+        let last = x.shape().len() - 1;
+        let dim = x.shape()[last];
+        if h == 0 || !dim.is_multiple_of(h) {
             return Err(BackendError::Shape(format!(
-                "rmsnorm_head: head count h={h} does not divide x dim {} (shape {:?})",
-                x.shape()[1],
+                "rmsnorm_head: head count h={h} does not divide x dim {dim} (shape {:?})",
                 x.shape()
             )));
         }
-        let hd = x.shape()[1] / h;
+        let hd = dim / h;
+        let rows = x.numel() / (h * hd);
         let f = self.function("rmsnorm_head_f32")?;
         // One block per (row, head) — kernel indexes via blockIdx.(x, y).
         let cfg = LaunchConfig {

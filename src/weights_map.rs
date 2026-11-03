@@ -4973,27 +4973,32 @@ pub fn dequant_gguf(
 /// here the fallback is an empty vec + a loud marker — the test harness
 /// asserts len == numel and fails loudly.
 /// Распаковать GGUF Q8_0 (блок 34 байта: f16 scale + 32 int8) в раскладку
-/// CUDA int8-пути (`CudaI8`): плоские коды и f32-скейл на каждый блок из 32.
+/// CUDA int8-GEMM: **kb-major** — блок (kb, col) лежит 32 кодами подряд по
+/// адресу `(kb·n + col)·32`, его скейл — `scales[kb·n + col]`.
 ///
-/// Без этого GGUF Q8_0 приходилось разворачивать в f32 (4 байта/вес):
-/// Q4_K_M-файл 27B содержит 7.2 ГБ Q8_0 → 28.6 ГБ VRAM и CUDA OOM на 32 ГБ.
+/// Без этого GGUF Q8_0 разворачивался в f32 (4 байта/вес): Q4_K_M-файл 27B
+/// содержит 7.2 ГБ Q8_0 → 28.6 ГБ VRAM и CUDA OOM на 32 ГБ. Рядовая
+/// (row-major) раскладка здесь неверна: ядро `gemm_q8k_splitk_*` читает
+/// именно kb-major (см. kernels.cu), иначе выход — мусор.
 /// `None` — данные не кратны блоку (вызывающий падает в f32-fallback).
-pub fn q8_0_to_i8(data: &[u8], n: usize) -> Option<(Vec<i8>, Vec<f32>)> {
-    if n == 0 || !n.is_multiple_of(32) {
+pub fn q8_0_to_i8(data: &[u8], rows: usize, cols: usize) -> Option<(Vec<i8>, Vec<f32>)> {
+    if rows == 0 || cols == 0 || !cols.is_multiple_of(32) {
         return None;
     }
-    let blocks = n / 32;
-    if data.len() != blocks * 34 {
+    let nsuper = cols / 32;
+    if data.len() != rows * nsuper * 34 {
         return None;
     }
-    let mut codes = Vec::with_capacity(n);
-    let mut scales = Vec::with_capacity(blocks);
-    for b in 0..blocks {
-        let off = b * 34;
-        // GGUF Q8_0: d (f16 LE), затем 32 кода.
-        scales.push(f16_to_f32([data[off], data[off + 1]]));
-        for i in 0..32 {
-            codes.push(data[off + 2 + i] as i8);
+    let mut codes = vec![0i8; rows * cols];
+    let mut scales = vec![0f32; rows * nsuper];
+    for r in 0..rows {
+        for kb in 0..nsuper {
+            let src = (r * nsuper + kb) * 34;
+            scales[kb * rows + r] = f16_to_f32([data[src], data[src + 1]]);
+            let dst = (kb * rows + r) * 32;
+            for j in 0..32 {
+                codes[dst + j] = data[src + 2 + j] as i8;
+            }
         }
     }
     Some((codes, scales))
@@ -5117,31 +5122,38 @@ mod tests {
     /// Кросс-форматная проверка: все кванты представляют ОДНИ и те же веса
     /// (одинаковые сиды fixture-gen), поэтому деквант ≈ деквант f16.
     #[test]
-    fn q8_0_to_i8_matches_gguf_dequant() {
-        // Два блока GGUF Q8_0: f16 scale + 32 кода.
+    fn q8_0_to_i8_matches_gguf_dequant_kb_major() {
+        // Два ряда × два k-блока (cols=64): GGUF хранит блоки row-major.
+        let (rows, cols) = (2usize, 64usize);
         let mut data = Vec::new();
-        for (scale, codes) in [(0.5f32, 1i8), (0.125, -3)] {
-            let bits = half::f16::from_f32(scale).to_bits().to_le_bytes();
-            data.extend_from_slice(&bits);
-            for i in 0..32 {
-                data.push(codes.wrapping_add(i as i8) as u8);
+        for r in 0..rows {
+            for kb in 0..2 {
+                let scale = 0.5f32 + (r * 2 + kb) as f32 * 0.25;
+                data.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+                for j in 0..32 {
+                    let code = (r as i8).wrapping_mul(10).wrapping_add(kb as i8 * 3).wrapping_add(j as i8);
+                    data.push(code as u8);
+                }
             }
         }
-        let (got_codes, got_scales) = q8_0_to_i8(&data, 64).expect("64 веса, 2 блока");
-        assert_eq!(got_codes.len(), 64);
-        assert_eq!(got_scales.len(), 2);
-        assert!((got_scales[0] - 0.5).abs() < 1e-6);
-        assert!((got_scales[1] - 0.125).abs() < 1e-6);
-        // Коды и масштабы обязаны давать тот же f32, что эталонный деквант.
-        let want = dequant_q8_0(&data);
-        for i in 0..64 {
-            let blk = i / 32;
-            let got = got_codes[i] as f32 * got_scales[blk];
-            assert!((got - want[i]).abs() < 1e-6, "i={i}: {got} vs {}", want[i]);
+        let (codes, scales) = q8_0_to_i8(&data, rows, cols).expect("2×64");
+        assert_eq!(codes.len(), rows * cols);
+        assert_eq!(scales.len(), rows * 2);
+        // kb-major: scale[kb*rows + r] и блок (kb*n + col)*32.
+        for r in 0..rows {
+            for kb in 0..2 {
+                let want_scale = 0.5f32 + (r * 2 + kb) as f32 * 0.25;
+                assert!((scales[kb * rows + r] - want_scale).abs() < 1e-6);
+                let base = (kb * rows + r) * 32;
+                for j in 0..32 {
+                    let want = (r as i8).wrapping_mul(10).wrapping_add(kb as i8 * 3).wrapping_add(j as i8);
+                    assert_eq!(codes[base + j], want, "r={r} kb={kb} j={j}");
+                }
+            }
         }
         // Неверная длина/некратность — None (f32-fallback у вызывающего).
-        assert!(q8_0_to_i8(&data, 63).is_none());
-        assert!(q8_0_to_i8(&data[..33], 32).is_none());
+        assert!(q8_0_to_i8(&data, rows, 63).is_none());
+        assert!(q8_0_to_i8(&data[..data.len() - 1], rows, cols).is_none());
     }
 
     #[test]

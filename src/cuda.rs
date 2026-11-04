@@ -4963,13 +4963,15 @@ mod tests {
             eprintln!("no CUDA — skipping");
             return;
         };
-        let (nh, nkv, hd, tkv) = (8usize, 2usize, 128usize, 700usize);
+        // Геометрия 27B (Qwen3.8-27B-Q4_K_M): nh=24, nkv=4, hd=256, n_rot=64.
+        let (nh, nkv, hd, tkv) = (24usize, 4usize, 256usize, 120usize);
         let q = be.zeros(vec![1, 1, nh * hd]).unwrap();
         let wq = be.zeros(vec![hd]).unwrap();
-        let kf = be.zeros(vec![1, tkv, nkv * hd]).unwrap();
-        let vf = be.zeros(vec![1, tkv, nkv * hd]).unwrap();
+        let zeros = vec![half::f16::from_f32(0.0); tkv * nkv * hd];
+        let kf = be.from_cpu_f16(&zeros, vec![1, tkv, nkv * hd]).unwrap();
+        let vf = be.from_cpu_f16(&zeros, vec![1, tkv, nkv * hd]).unwrap();
         let y = be.zeros(vec![1, 1, nh * hd]).unwrap();
-        let kn = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        let kn = be.zeros(vec![1, 1, nh * hd]).unwrap();
         let x = be.zeros(vec![2, 2 * nh * hd]).unwrap();
         let time = |label: &str, reps: usize, f: &mut dyn FnMut()| {
             for _ in 0..3 {
@@ -4992,17 +4994,80 @@ mod tests {
         time("rmsnorm_head", 200, &mut || {
             be.rmsnorm_head(&q, &wq, &y, nh, 1e-6).unwrap();
         });
-        time("rope_imrope", 200, &mut || {
+        time("rope_imrope(n_rot=64)", 200, &mut || {
             let _ = be
-                .rope_imrope_text(&q, 700, hd, 1e6, [0, 0, 0, 0], hd)
+                .rope_imrope_text(&q, 120, hd, 1e7, [11, 11, 10, 0], 64)
                 .unwrap();
         });
-        time("attn_ar(tkv=700)", 200, &mut || {
+        time("attn_ar(tkv=120,f16)", 200, &mut || {
             be.attn_ar(&q, &kf, &vf, None, &y, nh, nkv, hd).unwrap();
         });
+        let kvrow = be.zeros(vec![1, 1, nkv * hd]).unwrap();
         time("kv_update(1 row)", 200, &mut || {
-            be.kv_update(&kf, &kn, 699).unwrap();
+            be.kv_update(&kf, &kvrow, 118).unwrap();
         });
+        // Цепочка как в attn_forward_batch: 13 опа подряд, зависимости есть,
+        // синхронизации нет — цена «слоя» на строку.
+        let qg = be.zeros(vec![1, 2 * nh * hd]).unwrap();
+        let krow = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        let vrow = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        let wq = be.zeros(vec![hd]).unwrap();
+        let wk = be.zeros(vec![hd]).unwrap();
+        let gated = be.zeros(vec![1, 2, nh * hd]).unwrap();
+        let mut chain = || {
+            for row in 0..2usize {
+                let qg_j =
+                    be.row_view(&qg, 1, 2 * nh * hd, 0)
+                        .unwrap()
+                        .view(vec![1, 1, 2 * nh * hd]);
+                let q = crate::nn::slice_last(&be, &qg_j, nh * hd, 0).unwrap();
+                let gate = crate::nn::slice_last(&be, &qg_j, nh * hd, nh * hd).unwrap();
+                let qn = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.rmsnorm_head(&q, &wq, &qn, nh, 1e-6).unwrap();
+                let qr = be
+                    .rope_imrope_text(&qn, 120, hd, 1e7, [11, 11, 10, 0], 64)
+                    .unwrap();
+                let kn2 = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+                be.rmsnorm_head(&krow, &wk, &kn2, nkv, 1e-6).unwrap();
+                let kr2 = be
+                    .rope_imrope_text(&kn2, 120, hd, 1e7, [11, 11, 10, 0], 64)
+                    .unwrap();
+                be.kv_update(&kf, &kr2, 118).unwrap();
+                be.kv_update(&vf, &vrow, 118).unwrap();
+                let out = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.attn_ar(&qr, &kf, &vf, None, &out, nh, nkv, hd).unwrap();
+                let sg = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.sigmoid(&gate, &sg).unwrap();
+                let row_out = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.mul(&out, &sg, &row_out).unwrap();
+                let g3 = gated.view(vec![1, 2, nh * hd]);
+                be.row_write(&g3, &row_out, row).unwrap();
+            }
+        };
+        time("цепочка attn (2 строки)", 60, &mut chain);
+        // Та же цепочка, но за спиной стоит длинная очередь (как в шаге
+        // модели, где перед по-слотовой секцией уже поставлены все проекции).
+        be.synchronize().unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..60 {
+            for _ in 0..100 {
+                drop(be.zeros(vec![4096]).unwrap());
+            }
+            chain();
+        }
+        let with_q = t1.elapsed().as_secs_f64() * 1e6 / 60.0;
+        let t2 = std::time::Instant::now();
+        for _ in 0..60 {
+            for _ in 0..100 {
+                drop(be.zeros(vec![4096]).unwrap());
+            }
+        }
+        let base = t2.elapsed().as_secs_f64() * 1e6 / 60.0;
+        eprintln!(
+            "цепочка при глубокой очереди: {:.1} мкс/итерация (фон {:.1})",
+            with_q - base,
+            base
+        );
     }
 
     /// Цена одного запуска с хоста (без синхронизации) — от неё зависит,

@@ -25,7 +25,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::backend::{Backend, Tensor};
+use crate::backend::{Backend, GdnBatchGeom, Tensor};
 use crate::error::BackendError;
 
 /// Elementwise op codes — mirror `elementwise_f32` switch in kernels.cu.
@@ -663,10 +663,8 @@ impl CudaBackend {
         };
         // Выход голов писать прямо в y (см. шаг 3 ниже) — берём его базу.
         let y_base = {
-            let (p, _g) = cudarc::driver::DevicePtrMut::device_ptr_mut(
-                y.as_cuda_mut(),
-                &self.stream,
-            );
+            let (p, _g) =
+                cudarc::driver::DevicePtrMut::device_ptr_mut(y.as_cuda_mut(), &self.stream);
             p
         };
         let q_stride = q.shape()[2] as i32;
@@ -748,6 +746,17 @@ impl CudaBackend {
         Ok(true)
     }
 
+    /// Массив device-указателей на тензоры (один clone_htod) — форма
+    /// передачи стейтов слотов в bulk-ядра без переделки владельца.
+    fn ptr_array(&self, ts: &[&Tensor]) -> Result<cudarc::driver::CudaSlice<u64>, BackendError> {
+        let mut ptrs = Vec::with_capacity(ts.len());
+        for t in ts {
+            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(t.as_cuda(), &self.stream);
+            ptrs.push(p);
+        }
+        self.stream.clone_htod(&ptrs).map_err(map_err)
+    }
+
     /// Bulk-fused GDN (conv → silu → split → l2norm) на B строк: состояние
     /// свёртки стопкой [b, c, K-1], один запуск на все строки. Снимает
     /// по-слотовые мелкие запуски, которые при B=2 съедали 164 мс из 170 мс
@@ -782,49 +791,131 @@ impl CudaBackend {
         Ok((y, ns))
     }
 
-    /// Bulk delta-rule GDN: B слотов за ОДИН запуск (`grid.z` = слот),
-    /// стейты слотов — массивом указателей (тензоры у слотов отдельные).
-    /// Входы — пакетные [b, T, ...] (в декоде T=1). Возвращает [b, T, Hv, S].
+    /// Bulk delta-rule GDN: B слотов за ОДИН запуск (`grid.z` = слот).
+    /// Вход — пакетный QKV [b, T, cq] (q/k/v срезами по смещениям), стейты
+    /// слотов — массив указателей (у слотов свои тензоры). Пишет прямо в
+    /// `out` [1, b, inner] со шагом `out_stride` — лишней копии нет.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_delta_rule_slots(
         &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
+        qkv: &Tensor,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        in_stride: usize,
         gate: &Tensor,
         beta: &Tensor,
         states: &cudarc::driver::CudaSlice<u64>,
+        out: &Tensor,
+        out_stride: usize,
         slots: usize,
         t: usize,
         hk: usize,
         hv: usize,
-    ) -> Result<Tensor, BackendError> {
+    ) -> Result<(), BackendError> {
         if hv == 0 || t == 0 || slots == 0 {
             return Err(BackendError::Shape(format!(
                 "gdn_delta_rule_slots: пустые размерности (slots={slots} t={t} hv={hv})"
             )));
         }
-        let out = self.zeros(vec![slots, t, hv, 128])?;
         let f = self.function("gdn_delta_rule_slots_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (8, hv as u32, slots as u32),
             block_dim: (32, 16, 1),
             shared_mem_bytes: 0,
         };
+        let (qo, ko, vo) = (q_off as i32, k_off as i32, v_off as i32);
+        let (is, os) = (in_stride as i32, out_stride as i32);
         let (t32, hk32, hv32) = (t as i32, hk as i32, hv as i32);
         let mut la = self.stream.launch_builder(&f);
-        la.arg(q.as_cuda());
-        la.arg(k.as_cuda());
-        la.arg(v.as_cuda());
+        la.arg(qkv.as_cuda());
+        la.arg(&qo);
+        la.arg(&ko);
+        la.arg(&vo);
+        la.arg(&is);
         la.arg(gate.as_cuda());
         la.arg(beta.as_cuda());
-        la.arg(states);
         la.arg(out.as_cuda_mut());
+        la.arg(&os);
+        la.arg(states);
         la.arg(&t32);
         la.arg(&hk32);
         la.arg(&hv32);
         unsafe { la.launch(cfg) }.map_err(map_err)?;
-        Ok(out)
+        Ok(())
+    }
+
+    /// Bulk-свёртка GDN: B строк за ОДИН запуск, состояние свёртки каждого
+    /// слота сдвигается НА МЕСТЕ (массив указателей). x [b, c] — строка
+    /// пакета, y [b, c] — conv+silu без нормировки.
+    pub fn gdn_conv_silu_slots(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        states: &cudarc::driver::CudaSlice<u64>,
+        y: &Tensor,
+        rows: usize,
+        c: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        if rows == 0 || c == 0 || k < 2 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv_silu_slots: размерности (rows={rows} c={c} k={k})"
+            )));
+        }
+        let f = self.function("gdn_conv_silu_slots_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (c.div_ceil(256) as u32, 1, rows as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c32, k32) = (c as i32, k as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(states);
+        la.arg(y.as_cuda_mut());
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(())
+    }
+
+    /// L2-нормировка по отрезкам длины `hd` в каждой из `rows` строк шага
+    /// `stride` (x и y могут совпадать — элемент читается до записи).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_l2norm_rows(
+        &self,
+        x: &Tensor,
+        y: &Tensor,
+        rows: usize,
+        hd: usize,
+        segs: usize,
+        stride: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        if rows == 0 || hd == 0 || segs == 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_l2norm_rows: размерности (rows={rows} hd={hd} segs={segs})"
+            )));
+        }
+        let f = self.function("gdn_l2norm_rows_f32")?;
+        let block = hd.next_power_of_two().clamp(32, 256);
+        let cfg = LaunchConfig {
+            grid_dim: (segs as u32, rows as u32, 1),
+            block_dim: (block as u32, 1, 1),
+            shared_mem_bytes: (block * 4) as u32,
+        };
+        let (hd32, sg32, st32) = (hd as i32, segs as i32, stride as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(&hd32);
+        la.arg(&sg32);
+        la.arg(&st32);
+        la.arg(&eps);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(())
     }
 
     /// cuBLAS gemm_ex: C[m,n] = alpha·op(A)·op(B), A/B в f16, C в f32.
@@ -1720,10 +1811,7 @@ impl Backend for CudaBackend {
             if m >= 32 && k >= 1024 {
                 let c_tensor = c;
                 if self.gemm_packed_bf16(
-                    PackedBf16Src::I8 {
-                        data: b8,
-                        wscale,
-                    },
+                    PackedBf16Src::I8 { data: b8, wscale },
                     a,
                     c_tensor,
                     m,
@@ -3285,9 +3373,7 @@ impl Backend for CudaBackend {
         let c = w.shape()[0];
         let k = w.shape()[1];
         if k < 2 {
-            return Err(BackendError::Shape(format!(
-                "gdn_conv: свёртка k={k} < 2"
-            )));
+            return Err(BackendError::Shape(format!("gdn_conv: свёртка k={k} < 2")));
         }
         let t = x.numel() / c;
         let y = self.zeros(x.shape().to_vec())?;
@@ -3315,6 +3401,50 @@ impl Backend for CudaBackend {
         la2.arg(&k32);
         unsafe { la2.launch(cfg2) }.map_err(map_err)?;
         Ok((y, ns))
+    }
+
+    /// Bulk-хвост GDN на B слотов: conv+silu со стейтами на месте (в самом
+    /// пакетном буфере) → l2norm q/k по головам → delta-rule со стейтами
+    /// массивом указателей. Три запуска на слой на весь пакет вместо
+    /// 2·B мелких (замер: по-слотовая секция при B=2 164 мс против 26 мс).
+    fn gdn_batch_tail(
+        &self,
+        qkv: &Tensor,
+        conv_w: &Tensor,
+        conv_states: &[&Tensor],
+        ssm_states: &[&Tensor],
+        gate: &Tensor,
+        beta: &Tensor,
+        out: &Tensor,
+        geom: &GdnBatchGeom,
+    ) -> Result<bool, BackendError> {
+        let b = conv_states.len();
+        // S=128 — геометрия ядра; остальное уходит на по-слотовый путь.
+        if b == 0 || ssm_states.len() != b || geom.s != 128 {
+            return Ok(false);
+        }
+        let y = qkv.view(vec![b, geom.cq]);
+        let conv_ptrs = self.ptr_array(conv_states)?;
+        let ssm_ptrs = self.ptr_array(ssm_states)?;
+        self.gdn_conv_silu_slots(&y, conv_w, &conv_ptrs, &y, b, geom.cq, geom.k)?;
+        self.gdn_l2norm_rows(&y, &y, b, geom.s, 2 * geom.hk, geom.cq, geom.eps)?;
+        self.gdn_delta_rule_slots(
+            &y,
+            0,
+            geom.qk,
+            2 * geom.qk,
+            geom.cq,
+            gate,
+            beta,
+            &ssm_ptrs,
+            out,
+            geom.inner,
+            b,
+            1,
+            geom.hk,
+            geom.hv,
+        )?;
+        Ok(true)
     }
 
     /// L2-нормировка по отрезкам длины hd (out-of-place, как CPU-эталон).
@@ -3629,7 +3759,8 @@ impl Backend for CudaBackend {
             (2, 0) => "attn_ar_v4_q8f32",
             (2, 1) => "attn_ar_v4_q8f16",
             (2, 2) => "attn_ar_v4_q8q8",
-            _ => unreachable!(),        };
+            _ => unreachable!(),
+        };
         let f = self.function(fname)?;
         // N (iter-10): size the block to the ACTIVE warps (nwarps = hd/32) —
         // the old fixed 256-thread block left 4 of 8 warps idle at hd=128
@@ -4124,7 +4255,13 @@ impl Backend for CudaBackend {
     /// CUDA has no nonzero-offset views (`view_offset` panics by design), so
     /// the row read/write pair copies device-side instead. Both are tiny
     /// (one head row per call) and only the offset differs from Metal.
-    fn row_view(&self, x: &Tensor, rows: usize, d: usize, row: usize) -> Result<Tensor, BackendError> {
+    fn row_view(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        d: usize,
+        row: usize,
+    ) -> Result<Tensor, BackendError> {
         let n: usize = x.shape().iter().product();
         if n != rows * d || row >= rows {
             return Err(BackendError::Shape(format!(
@@ -4466,14 +4603,7 @@ impl CudaBackend {
         if m >= 32
             && k >= 1024
             && matches!(name, "gemm_q4kc" | "gemm_q6k")
-            && self.gemm_packed_bf16(
-                PackedBf16Src::K { name, bpack },
-                a,
-                c_tensor,
-                m,
-                k,
-                n,
-            )?
+            && self.gemm_packed_bf16(PackedBf16Src::K { name, bpack }, a, c_tensor, m, k, n)?
         {
             return Ok(());
         }
@@ -4664,76 +4794,112 @@ mod tests {
     /// Bulk delta-rule (слоты в grid.z, стейты массивом указателей) обязан
     /// совпасть с поштучным вызовом на каждом слоте — иначе пакетный шаг
     /// поедет по другому состоянию, чем одиночный декод.
+    /// Bulk-хвост GDN на B слотов сверяется с по-слотовой цепочкой
+    /// (conv+silu+split+norm → delta-rule): и выход, и сдвинутые стейты
+    /// свёртки, и стейты delta-rule (они меняются на месте, поэтому эталон
+    /// берёт свои копии).
     #[test]
-    fn gdn_delta_rule_slots_matches_single() {
+    fn gdn_batch_tail_matches_per_slot() {
         let Ok(be) = CudaBackend::new(0) else {
             eprintln!("no CUDA — skipping");
             return;
         };
-        let (slots, t, hk, hv, s) = (2usize, 1usize, 1usize, 2usize, 128usize);
-        let mk = |n: usize, seed: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32 * 0.11 + seed).sin()) * 0.3).collect()
+        use crate::backend::GdnBatchGeom;
+        let (slots, hk, hv, s, k) = (2usize, 1usize, 2usize, 128usize, 4usize);
+        let (qk, inner, cq) = (hk * s, hv * s, 2 * hk * s + hv * s);
+        let eps = 1e-5f32;
+        let mk = |n: usize, seed: f32, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32 * 0.11 + seed).sin()) * amp)
+                .collect()
         };
-        let q = mk(slots * t * hk * s, 1.0);
-        let k = mk(slots * t * hk * s, 2.0);
-        let v = mk(slots * t * hv * s, 3.0);
-        let g = mk(slots * t * hv, 4.0);
-        let b = mk(slots * t * hv, 5.0);
-        let st = mk(slots * hv * s * s, 6.0);
+        let x = mk(slots * cq, 1.0, 0.4);
+        let w: Vec<f32> = (0..cq * k)
+            .map(|i| ((i as f32 * 0.017).sin()) * 0.4 + 0.6)
+            .collect();
+        let conv0 = mk(slots * cq * (k - 1), 2.0, 0.3);
+        let ssm0 = mk(slots * hv * s * s, 3.0, 0.3);
+        // gate — уже exp-аргумент (в модели softplus·a < 0), beta — уже сигмоид.
+        let gate = mk(slots * hv, 4.0, 0.03);
+        let gate: Vec<f32> = gate.iter().map(|v| v - 0.06).collect();
+        let beta: Vec<f32> = mk(slots * hv, 5.0, 0.25).iter().map(|v| 0.5 + v).collect();
 
-        // bulk: указатели стейтов слотов в одном буфере
-        let mut state_t = Vec::with_capacity(slots);
+        let x_t = be.from_cpu_f32(&x, vec![slots, cq]).unwrap();
+        let w_t = be.from_cpu_f32(&w, vec![cq, k]).unwrap();
+        let gate_t = be.from_cpu_f32(&gate, vec![slots, hv]).unwrap();
+        let beta_t = be.from_cpu_f32(&beta, vec![slots, hv]).unwrap();
+        // bulk пишет стейты на месте — эталону свои копии.
+        let mut conv_bulk = Vec::with_capacity(slots);
+        let mut conv_ref = Vec::with_capacity(slots);
+        let mut ssm_bulk = Vec::with_capacity(slots);
+        let mut ssm_ref = Vec::with_capacity(slots);
         for i in 0..slots {
-            let part = &st[i * hv * s * s..(i + 1) * hv * s * s];
-            state_t.push(be.from_cpu_f32(part, vec![hv, s, s]).unwrap());
+            let c = &conv0[i * cq * (k - 1)..(i + 1) * cq * (k - 1)];
+            conv_bulk.push(be.from_cpu_f32(c, vec![cq, k - 1]).unwrap());
+            conv_ref.push(be.from_cpu_f32(c, vec![cq, k - 1]).unwrap());
+            let m = &ssm0[i * hv * s * s..(i + 1) * hv * s * s];
+            ssm_bulk.push(be.from_cpu_f32(m, vec![hv, s, s]).unwrap());
+            ssm_ref.push(be.from_cpu_f32(m, vec![hv, s, s]).unwrap());
         }
-        // bulk пишет стейты НА МЕСТЕ — для поштучного эталона своя копия.
-        let mut state_single = Vec::with_capacity(slots);
-        for i in 0..slots {
-            let part = &st[i * hv * s * s..(i + 1) * hv * s * s];
-            state_single.push(be.from_cpu_f32(part, vec![hv, s, s]).unwrap());
-        }
-        let mut ptrs = vec![0u64; slots];
-        for (i, st_i) in state_t.iter().enumerate() {
-            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(st_i.as_cuda(), &be.stream);
-            ptrs[i] = p;
-        }
-        let ptr_dev = be.stream.clone_htod(&ptrs).unwrap();
-        let qt = be.from_cpu_f32(&q, vec![slots, t, hk, s]).unwrap();
-        let kt = be.from_cpu_f32(&k, vec![slots, t, hk, s]).unwrap();
-        let vt = be.from_cpu_f32(&v, vec![slots, t, hv, s]).unwrap();
-        let gt = be.from_cpu_f32(&g, vec![slots, t, hv]).unwrap();
-        let bt = be.from_cpu_f32(&b, vec![slots, t, hv]).unwrap();
-        let bulk = be
-            .gdn_delta_rule_slots(&qt, &kt, &vt, &gt, &bt, &ptr_dev, slots, t, hk, hv)
+        let conv_b: Vec<&Tensor> = conv_bulk.iter().collect();
+        let ssm_b: Vec<&Tensor> = ssm_bulk.iter().collect();
+        let out = be.zeros(vec![1, slots, inner]).unwrap();
+        let geom = GdnBatchGeom {
+            cq,
+            qk,
+            inner,
+            hk,
+            hv,
+            s,
+            k,
+            eps,
+        };
+        let done = be
+            .gdn_batch_tail(&x_t, &w_t, &conv_b, &ssm_b, &gate_t, &beta_t, &out, &geom)
             .unwrap();
-        let bulk_host = be.to_cpu_f32(&bulk).unwrap();
+        assert!(done, "bulk-путь GDN не взят");
+        // qkv обновился на месте (conv+silu+norm) — это и есть вход delta-rule
+        let y_bulk = be.to_cpu_f32(&x_t).unwrap();
+        let o_bulk = be.to_cpu_f32(&out).unwrap();
 
-        // поштучно — существующим одиночным путём
         for i in 0..slots {
-            let qs = q[i * t * hk * s..(i + 1) * t * hk * s].to_vec();
-            let ks = k[i * t * hk * s..(i + 1) * t * hk * s].to_vec();
-            let vs = v[i * t * hv * s..(i + 1) * t * hv * s].to_vec();
-            let gs = g[i * t * hv..(i + 1) * t * hv].to_vec();
-            let bs = b[i * t * hv..(i + 1) * t * hv].to_vec();
-            let (o, _st) = be
+            let xt = be.from_cpu_f32(&x[i * cq..(i + 1) * cq], vec![cq]).unwrap();
+            let (y, ns) = be
+                .gdn_conv_silu_split_norm(&xt, &w_t, &conv_ref[i], cq, k, s, qk, eps)
+                .unwrap();
+            let yh = be.to_cpu_f32(&y).unwrap();
+            let mut worst = 0.0f32;
+            for j in 0..cq {
+                worst = worst.max((yh[j] - y_bulk[i * cq + j]).abs());
+            }
+            assert!(worst < 1e-5, "слот {i}: conv+norm {worst}");
+            let ns_h = be.to_cpu_f32(&ns).unwrap();
+            let st_h = be.to_cpu_f32(&conv_bulk[i]).unwrap();
+            let mut worst = 0.0f32;
+            for j in 0..cq * (k - 1) {
+                worst = worst.max((ns_h[j] - st_h[j]).abs());
+            }
+            assert!(worst < 1e-7, "слот {i}: сдвиг conv-стейта {worst}");
+
+            let gr = gate[i * hv..(i + 1) * hv].to_vec();
+            let br = beta[i * hv..(i + 1) * hv].to_vec();
+            let (o, _) = be
                 .gdn_delta_rule(
-                    &be.from_cpu_f32(&qs, vec![t, hk * s]).unwrap(),
-                    &be.from_cpu_f32(&ks, vec![t, hk * s]).unwrap(),
-                    &be.from_cpu_f32(&vs, vec![t, hv * s]).unwrap(),
-                    &be.from_cpu_f32(&gs, vec![t, hv]).unwrap(),
-                    &be.from_cpu_f32(&bs, vec![t, hv]).unwrap(),
-                    &state_single[i],
+                    &be.from_cpu_f32(&yh[..qk], vec![1, qk]).unwrap(),
+                    &be.from_cpu_f32(&yh[qk..2 * qk], vec![1, qk]).unwrap(),
+                    &be.from_cpu_f32(&yh[2 * qk..], vec![1, inner]).unwrap(),
+                    &be.from_cpu_f32(&gr, vec![1, hv]).unwrap(),
+                    &be.from_cpu_f32(&br, vec![1, hv]).unwrap(),
+                    &ssm_ref[i],
                     hk,
                 )
                 .unwrap();
             let single = be.to_cpu_f32(&o).unwrap();
-            let base = i * t * hv * s;
             let mut worst = 0.0f32;
-            for j in 0..t * hv * s {
-                worst = worst.max((bulk_host[base + j] - single[j]).abs());
+            for j in 0..inner {
+                worst = worst.max((single[j] - o_bulk[i * inner + j]).abs());
             }
-            assert!(worst < 1e-5, "слот {i}: bulk против одиночного {worst}");
+            assert!(worst < 1e-5, "слот {i}: delta-rule {worst}");
         }
     }
 
@@ -4768,19 +4934,8 @@ mod tests {
             p
         };
         be.gemm_ex_f16(
-            &blas,
-            kb,
-            hd as i32,
-            qb,
-            hd as i32,
-            cb,
-            tkv as i32,
-            tkv as i32,
-            tq as i32,
-            hd as i32,
-            1.0,
-            true,
-            false,
+            &blas, kb, hd as i32, qb, hd as i32, cb, tkv as i32, tkv as i32, tq as i32, hd as i32,
+            1.0, true, false,
         )
         .unwrap();
         let got = be.stream.clone_dtoh(&sc).unwrap();

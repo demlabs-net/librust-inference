@@ -750,6 +750,27 @@ pub enum RopePairing {
     Adjacent,
 }
 
+/// Геометрия bulk-шага GDN (см. [`Backend::gdn_batch_tail`]).
+#[derive(Clone, Copy, Debug)]
+pub struct GdnBatchGeom {
+    /// Шаг строки пакетного QKV (2·hk·s + hv·s).
+    pub cq: usize,
+    /// Размер q (и k) в строке: hk·s.
+    pub qk: usize,
+    /// Размер v (и выхода) в строке: hv·s.
+    pub inner: usize,
+    /// Число q/k-голов.
+    pub hk: usize,
+    /// Число v-голов.
+    pub hv: usize,
+    /// Размер головы (ssm state), 128 у Qwen3.5/3.8.
+    pub s: usize,
+    /// Ядро свёртки.
+    pub k: usize,
+    /// eps l2-нормировки.
+    pub eps: f32,
+}
+
 pub trait Backend: Send + Sync {
     /// Allocate a zero-initialized tensor of `shape`.
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;
@@ -1304,6 +1325,27 @@ pub trait Backend: Send + Sync {
             self.from_cpu_f32(&out, vec![t, hv, s])?,
             self.from_cpu_f32(&st, state.shape().to_vec())?,
         ))
+    }
+
+    /// Bulk-хвост GDN на B слотов (`t=1`, декод): conv+silu со стейтами
+    /// на месте → l2norm q/k по головам → delta-rule, всё за минимум
+    /// запусков, стейты слотов — массивом указателей.
+    ///
+    /// Default — `Ok(false)`: вызывающий идёт по-слотовым путём. CUDA
+    /// переопределяет (три запуска на слой вместо 2·B мелких).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_batch_tail(
+        &self,
+        _qkv: &Tensor,
+        _conv_w: &Tensor,
+        _conv_states: &[&Tensor],
+        _ssm_states: &[&Tensor],
+        _gate: &Tensor,
+        _beta: &Tensor,
+        _out: &Tensor,
+        _geom: &GdnBatchGeom,
+    ) -> Result<bool, BackendError> {
+        Ok(false)
     }
 
     /// Гейтовая RMS-норма GDN: y = rmsnorm(x)·w·silu(z) по отрезкам длины
@@ -2411,7 +2453,13 @@ pub trait Backend: Send + Sync {
     /// while CUDA has no offset views (a nonzero `elem_offset` panics), so its
     /// impl copies the row device-side. Used by the chunked prefill's last-row
     /// logits and by the batch MTP hidden-row feed.
-    fn row_view(&self, x: &Tensor, rows: usize, d: usize, row: usize) -> Result<Tensor, BackendError> {
+    fn row_view(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        d: usize,
+        row: usize,
+    ) -> Result<Tensor, BackendError> {
         let n: usize = x.shape().iter().product();
         if n != rows * d || row >= rows {
             return Err(BackendError::Shape(format!(

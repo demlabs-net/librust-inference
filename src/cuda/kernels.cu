@@ -3512,14 +3512,15 @@ extern "C" __global__ void gdn_delta_rule_chunk_f32(
 }
 
 // Bulk-вариант delta-rule: B слотов за ОДИН запуск (grid.z = слот).
-// Стейты слотов лежат отдельными тензорами, поэтому передаются массивом
-// указателей (как grouped-GEMM в cuBLAS) — так bulk-путь не требует
-// переделки владельца состояния. Логика — бит-в-бит как в одиночном ядре.
+// Входы — ОДИН пакетный буфер QKV [b, cq]: q/k/v берутся срезами по
+// смещениям (q_off/k_off/v_off), шаг строки — in_stride. Стейты слотов
+// передаются массивом указателей (как grouped-GEMM): у слотов свои тензоры,
+// переделывать владельца состояния не нужно, а по-слотовые запуски исчезают.
 extern "C" __global__ void gdn_delta_rule_slots_f32(
-    const float* __restrict__ Q, const float* __restrict__ Kx,
-    const float* __restrict__ V, const float* __restrict__ G,
-    const float* __restrict__ B, const float* const* __restrict__ STATES,
-    float* __restrict__ OUT, int T, int Hk, int Hv) {
+    const float* __restrict__ QKV, int q_off, int k_off, int v_off,
+    int in_stride, const float* __restrict__ G, const float* __restrict__ B,
+    float* __restrict__ OUT, int out_stride,
+    const float* const* __restrict__ STATES, int T, int Hk, int Hv) {
     __shared__ float kt[GDN_C * GDN_S];
     __shared__ float qt[GDN_C * GDN_S];
     __shared__ float gb[2 * GDN_C];
@@ -3530,15 +3531,12 @@ extern "C" __global__ void gdn_delta_rule_slots_f32(
     const int h = blockIdx.y;
     const int row = blockIdx.x * GDN_ROWS + ty;
     if (h >= Hv || row >= GDN_S) return;
-    const size_t qk_off = (size_t)slot * T * Hk * GDN_S;
-    const size_t v_off = (size_t)slot * T * Hv * GDN_S;
-    const size_t gb_off = (size_t)slot * T * Hv;
-    const float* Qs = Q + qk_off;
-    const float* Ks = Kx + qk_off;
-    const float* Vs = V + v_off;
-    const float* Gs = G + gb_off;
-    const float* Bs = B + gb_off;
-    float* Os = OUT + v_off;
+    const float* Qs = QKV + q_off + (size_t)slot * in_stride;
+    const float* Ks = QKV + k_off + (size_t)slot * in_stride;
+    const float* Vs = QKV + v_off + (size_t)slot * in_stride;
+    const float* Gs = G + (size_t)slot * T * Hv;
+    const float* Bs = B + (size_t)slot * T * Hv;
+    float* Os = OUT + (size_t)slot * out_stride;
     const int hk = h % Hk;
     const float scale = 1.0f / sqrtf((float)GDN_S);
     float* srow = const_cast<float*>(STATES[slot]) + ((size_t)h * GDN_S + row) * GDN_S;
@@ -3551,8 +3549,8 @@ extern "C" __global__ void gdn_delta_rule_slots_f32(
             const int l = rest % 32, ee = rest / 32;
             const int off = tt * GDN_S + l + ee * 32;
             if (tt < c) {
-                kt[off] = Ks[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
-                qt[off] = Qs[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+                kt[off] = Ks[(size_t)(t0 + tt) * in_stride + hk * GDN_S + ee * 32 + l];
+                qt[off] = Qs[(size_t)(t0 + tt) * in_stride + hk * GDN_S + ee * 32 + l];
             } else {
                 kt[off] = 0.0f;
                 qt[off] = 0.0f;
@@ -3574,7 +3572,7 @@ extern "C" __global__ void gdn_delta_rule_slots_f32(
                 kv += __shfl_down_sync(0xffffffffu, kv, off);
             kv = __shfl_sync(0xffffffffu, kv, 0);
             const float delta =
-                (Vs[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] - kv) * beta;
+                (Vs[(size_t)(t0 + tt) * in_stride + h * GDN_S + row] - kv) * beta;
             ls0 += kt[tb + lane] * delta;
             ls1 += kt[tb + lane + 32] * delta;
             ls2 += kt[tb + lane + 64] * delta;
@@ -3584,7 +3582,7 @@ extern "C" __global__ void gdn_delta_rule_slots_f32(
             for (int off = 16; off > 0; off >>= 1)
                 y += __shfl_down_sync(0xffffffffu, y, off);
             if (lane == 0)
-                Os[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] = y * scale;
+                Os[(size_t)(t0 + tt) * out_stride + h * GDN_S + row] = y * scale;
         }
         __syncthreads();
     }
@@ -3592,6 +3590,55 @@ extern "C" __global__ void gdn_delta_rule_slots_f32(
     srow[lane + 32] = ls1;
     srow[lane + 64] = ls2;
     srow[lane + 96] = ls3;
+}
+
+// conv+silu по строкам пакета; состояние свёртки каждого слота — НА МЕСТЕ
+// (массив указателей, как в delta-rule выше).
+extern "C" __global__ void gdn_conv_silu_slots_f32(const float* __restrict__ x,
+                                                   const float* __restrict__ w,
+                                                   const float* const* __restrict__ STATES,
+                                                   float* __restrict__ y,
+                                                   int c, int k) {
+    const int slot = blockIdx.z;
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const float* wch = w + (size_t)ch * k;
+    float* st = const_cast<float*>(STATES[slot]) + (size_t)ch * (k - 1);
+    const float xr = x[(size_t)slot * c + ch];
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float v = (j < k - 1) ? st[j] : xr;
+        acc += wch[j] * v;
+    }
+    y[(size_t)slot * c + ch] = acc / (1.0f + expf(-acc));
+    for (int j = 0; j < k - 1; ++j) {
+        st[j] = (j + 1 < k - 1) ? st[j + 1] : xr;
+    }
+}
+
+// L2-нормировка по строкам: каждая строка — `segs` отрезков длины hd.
+extern "C" __global__ void gdn_l2norm_rows_f32(const float* __restrict__ x,
+                                               float* __restrict__ y,
+                                               int hd, int segs, int stride,
+                                               float eps) {
+    extern __shared__ float ssum[];
+    const int row = blockIdx.y;
+    const int seg = blockIdx.x;
+    if (seg >= segs) return;
+    const size_t base = (size_t)row * stride + (size_t)seg * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float v = x[base + i];
+        acc += v * v;
+    }
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) y[base + i] = x[base + i] * inv;
 }
 
 // Гейтовая RMS-норма GDN: y = x·inv·w·silu(z), inv = 1/√(mean(x²)+eps) по

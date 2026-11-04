@@ -579,9 +579,9 @@ impl Qwen35Model {
             self.embed_f32 = Some(if self.embed.dtype() == crate::dtype::Dtype::F32 {
                 self.embed.clone()
             } else {
-                let emb = w
-                    .get("token_embd.weight")
-                    .ok_or_else(|| BackendError::Shape("missing tensor token_embd.weight".into()))?;
+                let emb = w.get("token_embd.weight").ok_or_else(|| {
+                    BackendError::Shape("missing tensor token_embd.weight".into())
+                })?;
                 let rows = emb.shape.first().copied().unwrap_or(0) as usize;
                 backend.from_cpu_f32(
                     &crate::weights_map::dequant_f32(emb),
@@ -2021,7 +2021,48 @@ impl Qwen35Model {
         let gate_rows = gate.view(vec![b, gdim]);
         let b_rows = bvec.view(vec![b, gdim]);
         let fused = s <= 1024 && cq.is_multiple_of(s);
-        for (row, &j) in active.iter().enumerate() {
+        // Bulk-путь: conv+silu+norm стейтов на месте и delta-rule — по одному
+        // запуску на слой на весь пакет (стейты слотов идут массивом
+        // указателей, владелец не меняется). Default Backend возвращает
+        // false → ниже по-слотовый путь.
+        let bulk = if fused {
+            let geom = crate::backend::GdnBatchGeom {
+                cq,
+                qk: qk_size,
+                inner,
+                hk,
+                hv: cfg.ssm_v_heads,
+                s,
+                k: cfg.conv_kernel,
+                eps: cfg.norm_eps,
+            };
+            let mut cs: Vec<&Tensor> = Vec::with_capacity(active.len());
+            let mut ss: Vec<&Tensor> = Vec::with_capacity(active.len());
+            let mut ok = true;
+            for &j in active {
+                match slots[j].states[layer].as_ref() {
+                    Some(st) => {
+                        cs.push(&st.conv);
+                        ss.push(&st.ssm);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                backend.gdn_batch_tail(
+                    &qkv_rows, &g.conv_w, &cs, &ss, &gate_rows, &b_rows, &o_all, &geom,
+                )?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // В bulk-пути стейты уже сдвинуты на месте — поштучный цикл пропускаем.
+        for (row, &j) in active.iter().enumerate().filter(|_| !bulk) {
             let slot = &mut slots[j];
             let st = slot.states[layer].as_mut().ok_or_else(|| {
                 BackendError::Shape(format!("слот {j}, слой {layer}: нет GDN-стейта"))

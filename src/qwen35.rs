@@ -1320,8 +1320,9 @@ impl Qwen35Model {
         let (s, hk) = (cfg.ssm_state, cfg.ssm_k_heads);
         let inner = cfg.ssm_inner;
         // QWEN35_GDN_PROF=1: время по стадиям GDN-слоя (только диагностика —
-        // синхронизирует после каждой стадии).
-        let gp = std::env::var("QWEN35_GDN_PROF").is_ok() && t == 1;
+        // синхронизирует после каждой стадии). Работает и на префилле
+        // (t>1): там сводка печатается раз в forward (48 GDN-слоёв).
+        let gp = std::env::var("QWEN35_GDN_PROF").is_ok();
         let gs = |t0: std::time::Instant, acc: &mut f64| -> Result<(), BackendError> {
             if gp {
                 backend.to_cpu_f32(&backend.zeros(vec![1])?)?;

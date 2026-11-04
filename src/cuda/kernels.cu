@@ -2684,6 +2684,48 @@ extern "C" __global__ void gemm_##NAME##_tiled_v4(                            \
 DEFINE_K_TILED_V4(q6k, 210, q6k_weight)
 DEFINE_K_TILED_V4(q4kc, 144, q4kc_weight)
 
+// ─────── dequant в плотный bf16 (prefill через tensor cores) ───────
+// На больших m (prefill-чанки) квантовый GEMM на FMA-ядрах упирается в
+// ~25 TFLOPS, а bf16-тензорные ядра дают ×4-8. Поэтому для m ≥ 32 вес
+// раскладывается в плотный bf16 (один проход, ~0.1 мс на матрицу 5120×17408)
+// и считается cuBLAS gemm_ex (bf16×bf16 → f32 accumulate). Раскладка
+// (col·nsuper + kb)·BLK → out[col·k + kb·256 + j].
+#define DEFINE_DEQUANT_BF16(NAME, BLK, WREAD)                                 \
+extern "C" __global__ void dequant_##NAME##_bf16(                             \
+    const unsigned char* __restrict__ B,                                      \
+    __nv_bfloat16* __restrict__ out,                                          \
+    int n, int k)                                                             \
+{                                                                             \
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;         \
+    long long total = (long long)n * (long long)k;                            \
+    if (idx >= total) return;                                                 \
+    int col = (int)(idx / k);                                                 \
+    int r = (int)(idx - (long long)col * k);                                  \
+    int kb = r >> 8;                                                          \
+    int j = r & 255;                                                          \
+    out[idx] = (__nv_bfloat16)WREAD(B + (size_t)(kb * n + col) * BLK, j);     \
+}
+
+DEFINE_DEQUANT_BF16(q4kc, 144, q4kc_weight)
+DEFINE_DEQUANT_BF16(q6k, 210, q6k_weight)
+
+// Q8_0 (наша kb-major упаковка: блок (kb, col) = 32 i8 по (kb·n+col)·32,
+// масштаб wsc[kb·n+col]) → плотный bf16 (n, k) row-major.
+extern "C" __global__ void dequant_q8k_bf16(const signed char* __restrict__ B,
+                                            const float* __restrict__ wsc,
+                                            __nv_bfloat16* __restrict__ out,
+                                            int n, int k) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n * (long long)k;
+    if (idx >= total) return;
+    int col = (int)(idx / k);
+    int r = (int)(idx - (long long)col * k);
+    int kb = r >> 5;
+    int j = r & 31;
+    size_t blk = (size_t)kb * n + col;
+    out[idx] = (__nv_bfloat16)((float)B[blk * 32 + j] * wsc[blk]);
+}
+
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //
 // The DAC codec decoder runs ~10 conv1d + 4 conv-transpose1d per piece
@@ -3039,6 +3081,65 @@ extern "C" __global__ void gdn_l2norm_seg_f32(float* __restrict__ y, float eps,
     }
     const float inv = 1.0f / sqrtf(ssum[0] + eps);
     for (int i = threadIdx.x; i < hd; i += blockDim.x) row[i] *= inv;
+}
+
+// GDN causal depthwise conv для префилла (t>1): y[t,c] = Σ_j w[c,j]·at(c,t+j),
+// at(c,p) = p < K−1 ? state[c·(K−1)+p] : x[(p−(K−1))·C + c]. Один поток на
+// (t, c). Раньше этой операции не было на CUDA — дефолтный Backend гонял
+// 37 МБ на слой через хост (23 мс/слой из 48, весь префилл упирался в это).
+extern "C" __global__ void gdn_conv_seq_f32(const float* __restrict__ x,
+                                            const float* __restrict__ w,
+                                            const float* __restrict__ state,
+                                            float* __restrict__ y,
+                                            int t, int c, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= t * c) return;
+    int tt = idx / c;
+    int ch = idx - tt * c;
+    const float* wch = w + (size_t)ch * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        int p = tt + j;
+        float v = (p < k - 1) ? state[(size_t)ch * (k - 1) + p]
+                              : x[(size_t)(p - (k - 1)) * c + ch];
+        acc += wch[j] * v;
+    }
+    y[idx] = acc;
+}
+
+// Новый conv-стейт = последние K−1 входов окна.
+extern "C" __global__ void gdn_conv_state_f32(const float* __restrict__ x,
+                                              const float* __restrict__ state,
+                                              float* __restrict__ ns,
+                                              int t, int c, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= c * (k - 1)) return;
+    int ch = idx / (k - 1);
+    int j = idx - ch * (k - 1);
+    int p = t + j;
+    ns[idx] = (p < k - 1) ? state[(size_t)ch * (k - 1) + p]
+                          : x[(size_t)(p - (k - 1)) * c + ch];
+}
+
+// L2-нормировка out-of-place (префилл): y = x / sqrt(Σx² + eps) по отрезкам
+// длины hd. Та же редукция и тот же 1/sqrtf, что у in-place версии.
+extern "C" __global__ void gdn_l2norm_out_f32(const float* __restrict__ x,
+                                              float* __restrict__ y,
+                                              float eps, int hd) {
+    extern __shared__ float ssum[];
+    const int seg = blockIdx.x;
+    const float* row = x + (size_t)seg * hd;
+    float* out = y + (size_t)seg * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += row[i] * row[i];
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) out[i] = row[i] * inv;
 }
 
 // Gated delta rule для S=128: state [Hv,128,128] (транспонирован как в ggml),

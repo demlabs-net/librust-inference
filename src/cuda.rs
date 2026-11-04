@@ -158,6 +158,10 @@ pub struct CudaBackend {
     pool_f16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::f16>>>>>,
     /// bf16 scratch pool (activations cast for the bf16 activation axis).
     pool_bf16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::bf16>>>>>,
+    /// Большой bf16-скретч под раскладку квантового веса (prefill через
+    /// tensor cores): 178 МБ на матрицу 5120×17408, поэтому он живёт одним
+    /// буфером «не меньше нужного», а не в пуле мелких (тот режет 8 МБ).
+    bf16_scratch: Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
     /// Activation compute dtype for GEMM A-operands (the plan's activation
     /// axis — `set_activation_dtype`; 0=f32, 1=f16, 2=bf16).
     activation: std::sync::atomic::AtomicU8,
@@ -181,6 +185,7 @@ impl CudaBackend {
             cublas: Mutex::new(None),
             pool_f16: Arc::new(Mutex::new(HashMap::new())),
             pool_bf16: Arc::new(Mutex::new(HashMap::new())),
+            bf16_scratch: Mutex::new(None),
             activation: std::sync::atomic::AtomicU8::new(0),
         })
     }
@@ -563,6 +568,112 @@ impl CudaBackend {
             slice: Some(slice),
             pool: Some(self.pool.clone()),
         })
+    }
+
+    /// Prefill-GEMM на bf16-тензорных ядрах: вес раскладывается в плотный
+    /// bf16 (`dequant_<name>_bf16`), активации кастуются в bf16, счёт —
+    /// cuBLAS `gemm_ex` (16F×16F → 32F accumulate). На больших m это в разы
+    /// быстрее FMA-ядер: у 27B prefill-FMA упирался в ~25 TFLOPS.
+    /// `false` — cuBLAS недоступен или пришёл не тот формат: вызывающий
+    /// идёт прежним путём.
+    fn gemm_packed_bf16(
+        &self,
+        src: PackedBf16Src<'_>,
+        a: &Tensor,
+        c: &Tensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<bool, BackendError> {
+        if std::env::var_os("CUDA_NO_CUBLAS").is_some() {
+            return Ok(false);
+        }
+        let mut guard = lock_poison_resilient(&self.cublas);
+        if guard.is_none() {
+            match CudaBlas::new(self.stream.clone()) {
+                Ok(b) => *guard = Some(Arc::new(b)),
+                Err(e) => {
+                    eprintln!("[cuda] cuBLAS недоступен, bf16-GEMM не применяется: {e}");
+                    return Ok(false);
+                }
+            }
+        }
+        let blas = guard.as_ref().expect("cuBLAS инициализирован выше").clone();
+
+        // Раскладка веса в плотный bf16 (n×k). Буфер — один растущий скретч.
+        {
+            let mut slot = lock_poison_resilient(&self.bf16_scratch);
+            if !slot.as_ref().is_some_and(|s| s.len() >= n * k) {
+                *slot = Some(unsafe { self.stream.alloc::<half::bf16>(n * k) }.map_err(map_err)?);
+            }
+            let w = slot.as_mut().expect("скретч выделен выше");
+            let (fname, has_scale): (&'static str, Option<&cudarc::driver::CudaSlice<f32>>) =
+                match &src {
+                    PackedBf16Src::K { name, .. } => (
+                        if *name == "gemm_q6k" {
+                            "dequant_q6k_bf16"
+                        } else {
+                            "dequant_q4kc_bf16"
+                        },
+                        None,
+                    ),
+                    PackedBf16Src::I8 { wscale, .. } => ("dequant_q8k_bf16", Some(wscale)),
+                };
+            let f = self.function(fname)?;
+            let cfg = LaunchConfig::for_num_elems((n * k) as u32);
+            let (n32, k32) = (n as i32, k as i32);
+            let mut la = self.stream.launch_builder(&f);
+            match &src {
+                PackedBf16Src::K { bpack, .. } => la.arg(*bpack),
+                PackedBf16Src::I8 { data, .. } => la.arg(*data),
+            };
+            if let Some(ws) = has_scale {
+                la.arg(ws);
+            }
+            la.arg(&mut *w);
+            la.arg(&n32);
+            la.arg(&k32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+
+            let a_bf = self.cast_bf16(a)?;
+            let alpha = 1.0f32;
+            let beta = 0.0f32;
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            // Указатели и вызов — в отдельном блоке: guard'ы SyncOnDrop
+            // держат заём на буферы, а a_bf после GEMM возвращается в пул.
+            let res = {
+                let (wptr, _w_guard) = w.device_ptr(&self.stream);
+                let (aptr, _a_guard) = a_bf.device_ptr(&self.stream);
+                let c_slice = c.as_cuda_mut();
+                let (cptr, _c_guard) = c_slice.device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *blas.handle(),
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        n as i32,
+                        m as i32,
+                        k as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        wptr as *const std::ffi::c_void,
+                        cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF,
+                        k as i32,
+                        aptr as *const std::ffi::c_void,
+                        cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF,
+                        k as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        cptr as *mut std::ffi::c_void,
+                        cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
+                        n as i32,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                }
+            };
+            self.pool_a_scratch(KernA::BF16(a_bf));
+            res.map_err(|e| BackendError::native(format!("cublas gemm_ex bf16: {e}")))?;
+        }
+        Ok(true)
     }
 
     /// Block until all queued work on the backend stream completes.
@@ -1292,6 +1403,25 @@ impl Backend for CudaBackend {
                 return Err(BackendError::Shape(format!(
                     "int8 gemm_nt: k={k} not a multiple of 32"
                 )));
+            }
+            // Prefill: bf16-тензорные ядра (тот же приём, что у K-квантов) —
+            // Q8_0-тензоры у 27B это 7.16 ГБ (GDN-проекции), и FMA-путь на
+            // них был основным остатком prefill-времени.
+            if m >= 32 && k >= 1024 {
+                let c_tensor = c;
+                if self.gemm_packed_bf16(
+                    PackedBf16Src::I8 {
+                        data: b8,
+                        wscale,
+                    },
+                    a,
+                    c_tensor,
+                    m,
+                    k,
+                    n,
+                )? {
+                    return Ok(());
+                }
             }
             // Q8_0-style int8 GEMM: per-32-block weight scales, the A
             // operand follows the activation axis (f32 default, fp16/bf16
@@ -2833,6 +2963,75 @@ impl Backend for CudaBackend {
         Ok((g, b))
     }
 
+    /// GDN causal depthwise conv (составной путь t>1: conv → silu → split →
+    /// l2norm). На CUDA раньше не было — дефолтный Backend гонял 37 МБ на
+    /// слой через хост, и весь префилл упирался в 23 мс/слой.
+    fn gdn_conv(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let c = w.shape()[0];
+        let k = w.shape()[1];
+        if k < 2 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv: свёртка k={k} < 2"
+            )));
+        }
+        let t = x.numel() / c;
+        let y = self.zeros(x.shape().to_vec())?;
+        let ns = self.zeros(vec![c, k - 1])?;
+        let f = self.function("gdn_conv_seq_f32")?;
+        let cfg = LaunchConfig::for_num_elems((t * c) as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(state.as_cuda());
+        la.arg(y.as_cuda_mut());
+        let (t32, c32, k32) = (t as i32, c as i32, k as i32);
+        la.arg(&t32);
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        let f2 = self.function("gdn_conv_state_f32")?;
+        let cfg2 = LaunchConfig::for_num_elems((c * (k - 1)) as u32);
+        let mut la2 = self.stream.launch_builder(&f2);
+        la2.arg(x.as_cuda());
+        la2.arg(state.as_cuda());
+        la2.arg(ns.as_cuda_mut());
+        la2.arg(&t32);
+        la2.arg(&c32);
+        la2.arg(&k32);
+        unsafe { la2.launch(cfg2) }.map_err(map_err)?;
+        Ok((y, ns))
+    }
+
+    /// L2-нормировка по отрезкам длины hd (out-of-place, как CPU-эталон).
+    fn gdn_l2norm(&self, x: &Tensor, hd: usize, eps: f32) -> Result<Tensor, BackendError> {
+        let n = x.numel();
+        if hd == 0 || n % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_l2norm: hd={hd} не делит numel={n}"
+            )));
+        }
+        let y = self.zeros(x.shape().to_vec())?;
+        let f = self.function("gdn_l2norm_out_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n / hd) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(&eps);
+        let hd32 = hd as i32;
+        la.arg(&hd32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
     fn gdn_conv_silu_split_norm(
         &self,
         x: &Tensor,
@@ -3801,6 +4000,21 @@ impl Backend for CudaBackend {
     }
 }
 
+/// Источник квантованного веса для bf16-раскладки (prefill через tensor
+/// cores): раскладчик зависит от формата, GEMM общий.
+enum PackedBf16Src<'a> {
+    /// Q4_K / Q6_K (GGUF-блоки 144/210 Б на 256 весов).
+    K {
+        name: &'a str,
+        bpack: &'a cudarc::driver::CudaSlice<u8>,
+    },
+    /// Q8_0 в нашей kb-major упаковке (32 i8 на блок + масштаб на блок).
+    I8 {
+        data: &'a cudarc::driver::CudaSlice<i8>,
+        wscale: &'a cudarc::driver::CudaSlice<f32>,
+    },
+}
+
 impl CudaBackend {
     /// Fused-dequant GEMM for packed weights (Q6_K / Q4_0). `nsup_shift`:
     /// weights per packed block (8 → 256, 5 → 32); `blk_bytes`: 210 / 18;
@@ -3823,6 +4037,9 @@ impl CudaBackend {
         let k32 = k as i32;
         let n32 = n as i32;
         let m32 = m as i32;
+        // bf16-путь берёт ТЕНЗОР выхода (нужен для cuBLAS gemm_ex), поэтому
+        // его запоминаем до затенения срезом.
+        let c_tensor = c;
         let c = c.as_cuda_mut();
         let nblk = k >> nsup_shift;
         let grid_x = n.div_ceil(bn);
@@ -3871,6 +4088,20 @@ impl CudaBackend {
             (_, "gemm_q4kc") => ("gemm_q4kc_splitk_v2_f32", "gemm_q4kc_tiled_v3"),
             _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };
+        if m >= 32
+            && k >= 1024
+            && matches!(name, "gemm_q4kc" | "gemm_q6k")
+            && self.gemm_packed_bf16(
+                PackedBf16Src::K { name, bpack },
+                a,
+                c_tensor,
+                m,
+                k,
+                n,
+            )?
+        {
+            return Ok(());
+        }
         if m == 1 {
             if s > 1 {
                 let cpart = self.take_pooled(s * m * n)?;

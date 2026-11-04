@@ -4643,6 +4643,23 @@ impl CudaBackend {
             (_, "gemm_q4kc") => ("gemm_q4kc_splitk_v2_f32", "gemm_q4kc_tiled_v3"),
             _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };
+        // m = 2..7: tiled-путь считает тайл на 32 строки, из которых полезны
+        // m, и гоняет 16 z-слайсов с reduce — деquant веса оплачен за 32
+        // строки при 2-7 полезных. Замер пакетного шага 27B (BATCH_PROF):
+        // проекции 3.4 мс при B=1 против 24.7 при B=2, ffn 1.2 против 8.0 —
+        // та же 6-7× цена на строку. Гоним m=1 split-k по строке: вес
+        // читается заново, зато нет пустых строк, cpart и reduce.
+        if (2..8).contains(&m) {
+            let c3 = c_tensor.view(vec![1, m, n]);
+            for r in 0..m {
+                let a_r = self.row_view(a, m, k, r)?;
+                let c_r = self.zeros(vec![1, n])?;
+                self.gemm_packed_nt(&a_r, bpack, &c_r, 1, k, n, nsup_shift, blk_bytes, bn, name)?;
+                let src3 = c_r.view(vec![1, 1, n]);
+                self.row_write(&c3, &src3, r)?;
+            }
+            return Ok(());
+        }
         if m >= 32
             && k >= 1024
             && matches!(name, "gemm_q4kc" | "gemm_q6k")
@@ -4837,6 +4854,45 @@ mod tests {
     /// Bulk delta-rule (слоты в grid.z, стейты массивом указателей) обязан
     /// совпасть с поштучным вызовом на каждом слоте — иначе пакетный шаг
     /// поедет по другому состоянию, чем одиночный декод.
+    /// Малая m (2..7) идёт по строке тем же m=1 split-k: строки обязаны
+    /// совпасть с отдельным m=1 прогоном побитово. Иначе пакетный шаг молча
+    /// считает не то (проверяем и раскладку строк A/C, и смещения).
+    #[test]
+    fn gemm_nt_small_m_matches_m1_rows() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (k, n, m) = (512usize, 48usize, 6usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.013).sin()) * 0.5 + 0.1)
+            .collect();
+        let packed = crate::quant::quantize(&w, crate::quant::QuantFormat::Q6_K);
+        let bt = be.from_cpu_q6k(&packed, vec![n, k]).unwrap();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.007).cos()) * 0.8)
+            .collect();
+        let at = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+        let c = be.zeros(vec![m, n]).unwrap();
+        be.gemm_nt(&at, &bt, &c).unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        for r in 0..m {
+            let a_r = be.from_cpu_f32(&a[r * k..(r + 1) * k], vec![1, k]).unwrap();
+            let c_r = be.zeros(vec![1, n]).unwrap();
+            be.gemm_nt(&a_r, &bt, &c_r).unwrap();
+            let want = be.to_cpu_f32(&c_r).unwrap();
+            for j in 0..n {
+                assert_eq!(
+                    got[r * n + j],
+                    want[j],
+                    "m={m} строка {r} столбец {j}: {} против {} у m=1",
+                    got[r * n + j],
+                    want[j]
+                );
+            }
+        }
+    }
+
     /// CUDA-IMROPE текста сверяется с CPU-дефолтом (тот — эталон для
     /// хвоста головы, секторов-«пустышек» и частичной ротации n_rot < hd).
     #[test]

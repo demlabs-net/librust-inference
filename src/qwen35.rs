@@ -1719,6 +1719,36 @@ impl Qwen35Model {
         active: &[usize],
         ids: &[u32],
     ) -> Result<(Tensor, Tensor), BackendError> {
+        // БЫСТРЫЙ ПУТЬ: по слоту одиночный decode. По-слотовый пакетный шаг
+        // (bulk) на CUDA стоит 162 мс из 170 мс — он собран из мелких
+        // по-слотовых ядер (5 tok/s на слот против 28 последовательно),
+        // поэтому по умолчанию идём быстрым путём; bulk — под INFER_BATCH_BULK=1.
+        if std::env::var_os("INFER_BATCH_BULK").is_none() {
+            let b = active.len();
+            let v = self.cfg.vocab_size;
+            let d = self.cfg.dim;
+            let mut host = vec![0f32; b * v];
+            for (j, &si) in active.iter().enumerate() {
+                let slot = slots
+                    .get_mut(si)
+                    .ok_or_else(|| BackendError::Shape(format!("decode_batch: нет слота {si}")))?;
+                let lg = self.with_slot(slot, |m| m.decode(backend, ids[j]))?;
+                let row = backend.to_cpu_f32(&lg)?;
+                if row.len() < v {
+                    return Err(BackendError::Shape(format!(
+                        "decode_batch: логиты {} < vocab {v}",
+                        row.len()
+                    )));
+                }
+                host[j * v..(j + 1) * v].copy_from_slice(&row[..v]);
+            }
+            // Скрытое для MTP-драфтеров быстрым путём не считается — движок
+            // в этом режиме MTP в пакете не включает (batch_hidden_available).
+            return Ok((
+                backend.from_cpu_f32(&host, vec![b, v])?,
+                backend.zeros(vec![b, d])?,
+            ));
+        }
         let b = active.len();
         if b == 0 || ids.len() != b {
             return Err(BackendError::Shape(format!(
@@ -2890,6 +2920,15 @@ impl crate::batch::BatchSlot for Qwen35Slot {
     }
     fn bytes(&self) -> u64 {
         Qwen35Slot::bytes(self)
+    }
+}
+
+impl Qwen35Model {
+    /// Скрытое последней позиции пакетный шаг отдаёт ТОЛЬКО в bulk-режиме
+    /// (его считает сам пакетный forward); быстрый путь скрытое не отдаёт,
+    /// поэтому MTP в пакете выключается, а не кормится нулями.
+    pub fn batch_hidden_available(&self) -> bool {
+        std::env::var_os("INFER_BATCH_BULK").is_some()
     }
 }
 

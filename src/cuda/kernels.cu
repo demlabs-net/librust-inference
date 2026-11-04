@@ -3308,6 +3308,34 @@ extern "C" __global__ void gdn_gates_f32(const float* __restrict__ ba,
 }
 
 // conv1d (k) + SiLU по каналам + сдвиг свёрточного стейта (k-1).
+// Bulk-вариант предыдущего: B строк за ОДИН запуск (grid.z = строка),
+// состояние свёртки стопкой [b, c, K−1]. Нужен пакетному шагу: по-слотовые
+// мелкие ядра стоили 164 мс из 170 мс шага (см. docs/plugin-platform-plan.md,
+// раздел bulk-пакета).
+extern "C" __global__ void gdn_conv_silu_rows_f32(const float* __restrict__ x,
+                                                  const float* __restrict__ w,
+                                                  const float* __restrict__ state,
+                                                  float* __restrict__ y,
+                                                  float* __restrict__ ns,
+                                                  int c, int k) {
+    const int row = blockIdx.z;
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const float* wch = w + (size_t)ch * k;
+    const float* st = state + (size_t)row * c * (k - 1) + (size_t)ch * (k - 1);
+    const float xr = x[(size_t)row * c + ch];
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float v = (j < k - 1) ? st[j] : xr;
+        acc += wch[j] * v;
+    }
+    y[(size_t)row * c + ch] = acc / (1.0f + expf(-acc));
+    float* nsch = ns + (size_t)row * c * (k - 1) + (size_t)ch * (k - 1);
+    for (int j = 0; j < k - 1; ++j) {
+        nsch[j] = (j + 1 < k - 1) ? st[j + 1] : xr;
+    }
+}
+
 extern "C" __global__ void gdn_conv_silu_f32(const float* __restrict__ x,
                                              const float* __restrict__ w,
                                              const float* __restrict__ state,

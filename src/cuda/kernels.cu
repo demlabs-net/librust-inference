@@ -2887,3 +2887,169 @@ extern "C" __global__ void copy_into_f32(const float* __restrict__ src,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < d) dst[off + i] = src[i];
 }
+
+// ─────────────── GDN (gated delta net) ───────────────
+// Три операции qwen35 до этого исполнялись дефолтными CPU-реализациями
+// Backend (to_cpu_f32 → хост-циклы → from_cpu_f32) на КАЖДОМ слое: у 27B
+// 48 GDN-слоёв из 64, и профиль дал 97 мс из 142 мс на токен (68 %) только
+// на них. Семантика повторяет CPU-эталон (см. backend.rs).
+
+// Гейты: BA [T, 2Hv] → g = softplus(alpha + dt_bias)·a, beta = sigmoid(beta_raw).
+extern "C" __global__ void gdn_gates_f32(const float* __restrict__ ba,
+                                         const float* __restrict__ dt_bias,
+                                         const float* __restrict__ a,
+                                         float* __restrict__ g,
+                                         float* __restrict__ b,
+                                         int n, int h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int hh = i % h;
+    const float x = ba[i] + dt_bias[hh];
+    const float sp = x > 20.0f ? x : log1pf(expf(x));
+    g[i] = sp * a[hh];
+    b[i] = 1.0f / (1.0f + expf(-ba[n + i]));
+}
+
+// conv1d (k) + SiLU по каналам + сдвиг свёрточного стейта (k-1).
+extern "C" __global__ void gdn_conv_silu_f32(const float* __restrict__ x,
+                                             const float* __restrict__ w,
+                                             const float* __restrict__ state,
+                                             float* __restrict__ y,
+                                             float* __restrict__ ns,
+                                             int c, int k) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const float* wch = w + (size_t)ch * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float v = (j < k - 1) ? state[(size_t)ch * (k - 1) + j] : x[ch];
+        acc += wch[j] * v;
+    }
+    y[ch] = acc / (1.0f + expf(-acc));
+    float* nsch = ns + (size_t)ch * (k - 1);
+    for (int j = 0; j < k - 1; ++j) {
+        nsch[j] = (j + 1 < k - 1) ? state[(size_t)ch * (k - 1) + j + 1] : x[ch];
+    }
+}
+
+// L2-нормировка сегментов длины hd (первый 2·qk выходa conv).
+extern "C" __global__ void gdn_l2norm_seg_f32(float* __restrict__ y, float eps,
+                                              int hd) {
+    extern __shared__ float ssum[];
+    const int seg = blockIdx.x;
+    float* row = y + (size_t)seg * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += row[i] * row[i];
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) row[i] *= inv;
+}
+
+// Gated delta rule для S=128: state [Hv,128,128] (транспонирован как в ggml),
+// один token-блок 16 токенов в shared один раз на блок. Схема повторяет
+// Metal gdn_delta_rule_chunk_f32: s *= e^g; delta = (v − s·k)·β;
+// s += k·delta; out = s·q/√S. Строка стейта — warp (lane = 0..31,
+// элементы lane + e·32), строки блока — threadIdx.y.
+#define GDN_S 128
+#define GDN_C 16
+#define GDN_ROWS 16
+extern "C" __global__ void gdn_delta_rule_chunk_f32(
+    const float* __restrict__ Q, const float* __restrict__ Kx,
+    const float* __restrict__ V, const float* __restrict__ G,
+    const float* __restrict__ B, float* __restrict__ STATE,
+    float* __restrict__ OUT, int T, int Hk, int Hv) {
+    __shared__ float kt[GDN_C * GDN_S];
+    __shared__ float qt[GDN_C * GDN_S];
+    __shared__ float gb[2 * GDN_C];
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * 32 + lane;
+    const int h = blockIdx.y;
+    const int row = blockIdx.x * GDN_ROWS + ty;
+    if (h >= Hv || row >= GDN_S) return;
+    const int hk = h % Hk;
+    const float scale = 1.0f / sqrtf((float)GDN_S);
+    float* srow = STATE + ((size_t)h * GDN_S + row) * GDN_S;
+    float ls0 = srow[lane], ls1 = srow[lane + 32], ls2 = srow[lane + 64],
+          ls3 = srow[lane + 96];
+    for (int t0 = 0; t0 < T; t0 += GDN_C) {
+        const int c = min(GDN_C, T - t0);
+        for (int i = tid; i < GDN_C * GDN_S; i += 32 * GDN_ROWS) {
+            const int tt = i / GDN_S, rest = i % GDN_S;
+            const int l = rest % 32, ee = rest / 32;
+            const int off = tt * GDN_S + l + ee * 32;
+            if (tt < c) {
+                kt[off] = Kx[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+                qt[off] = Q[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+            } else {
+                kt[off] = 0.0f;
+                qt[off] = 0.0f;
+            }
+        }
+        if (tid < GDN_C) {
+            gb[tid] = (tid < c) ? G[(t0 + tid) * Hv + h] : 0.0f;
+            gb[GDN_C + tid] = (tid < c) ? B[(t0 + tid) * Hv + h] : 0.0f;
+        }
+        __syncthreads();
+        for (int tt = 0; tt < c; ++tt) {
+            const float eg = expf(gb[tt]);
+            const float beta = gb[GDN_C + tt];
+            const int tb = tt * GDN_S;
+            ls0 *= eg; ls1 *= eg; ls2 *= eg; ls3 *= eg;
+            float kv = ls0 * kt[tb + lane] + ls1 * kt[tb + lane + 32] +
+                       ls2 * kt[tb + lane + 64] + ls3 * kt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                kv += __shfl_down_sync(0xffffffffu, kv, off);
+            kv = __shfl_sync(0xffffffffu, kv, 0);
+            const float delta =
+                (V[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] - kv) * beta;
+            ls0 += kt[tb + lane] * delta;
+            ls1 += kt[tb + lane + 32] * delta;
+            ls2 += kt[tb + lane + 64] * delta;
+            ls3 += kt[tb + lane + 96] * delta;
+            float y = ls0 * qt[tb + lane] + ls1 * qt[tb + lane + 32] +
+                      ls2 * qt[tb + lane + 64] + ls3 * qt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                y += __shfl_down_sync(0xffffffffu, y, off);
+            if (lane == 0)
+                OUT[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] = y * scale;
+        }
+        __syncthreads();
+    }
+    srow[lane] = ls0;
+    srow[lane + 32] = ls1;
+    srow[lane + 64] = ls2;
+    srow[lane + 96] = ls3;
+}
+
+// Гейтовая RMS-норма GDN: y = x·inv·w·silu(z), inv = 1/√(mean(x²)+eps) по
+// отрезкам hd. Один блок на строку (hd ≤ 1024).
+extern "C" __global__ void gdn_norm_gated_f32(const float* __restrict__ x,
+                                              const float* __restrict__ z,
+                                              const float* __restrict__ w,
+                                              float* __restrict__ y, int hd,
+                                              float eps) {
+    extern __shared__ float ssum[];
+    const size_t base = (size_t)blockIdx.x * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float v = x[base + i];
+        acc += v * v;
+    }
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] / (float)hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float zz = z[base + i];
+        y[base + i] = x[base + i] * inv * w[i] * (zz / (1.0f + expf(-zz)));
+    }
+}

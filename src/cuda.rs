@@ -2776,6 +2776,177 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 
+    // ── GDN: свои ядра вместо CPU-фолбэка ────────────────────────────────
+    // Дефолтные реализации Backend гоняли тензоры на хост и обратно на
+    // каждом GDN-слое (48 из 64 у 27B): профиль дал 97 мс из 142 мс на
+    // токен. Семантика — как у CPU-эталона в backend.rs.
+
+    fn gdn_gates(
+        &self,
+        ba: &Tensor,
+        dt_bias: &Tensor,
+        a: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let shape = ba.shape().to_vec();
+        let last = *shape
+            .last()
+            .ok_or_else(|| BackendError::Shape("gdn_gates: пустой вход".into()))?;
+        if last % 2 != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_gates: последняя ось {last} не 2·Hv"
+            )));
+        }
+        let h = last / 2;
+        let n = ba.numel() / 2;
+        let mut out_shape = shape;
+        let l = out_shape.len();
+        out_shape[l - 1] = h;
+        let g = self.zeros(out_shape.clone())?;
+        let b = self.zeros(out_shape)?;
+        let f = self.function("gdn_gates_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(ba.as_cuda());
+        la.arg(dt_bias.as_cuda());
+        la.arg(a.as_cuda());
+        la.arg(g.as_cuda_mut());
+        la.arg(b.as_cuda_mut());
+        let (n32, h32) = (n as i32, h as i32);
+        la.arg(&n32);
+        la.arg(&h32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok((g, b))
+    }
+
+    fn gdn_conv_silu_split_norm(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        c: usize,
+        k: usize,
+        hd: usize,
+        qk: usize,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        if k < 2 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv_silu_split_norm: свёртка k={k} < 2"
+            )));
+        }
+        if hd == 0 || (2 * qk) % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv_silu_split_norm: hd={hd} не делит 2·qk={}",
+                2 * qk
+            )));
+        }
+        let y = self.zeros(vec![c])?;
+        let ns = self.zeros(vec![c, k - 1])?;
+        let f = self.function("gdn_conv_silu_f32")?;
+        let cfg = LaunchConfig::for_num_elems(c as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(state.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(ns.as_cuda_mut());
+        let (c32, k32) = (c as i32, k as i32);
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // L2-нормировка по сегментам длины hd (первый 2·qk выходa).
+        let segs = (2 * qk) / hd;
+        let f2 = self.function("gdn_l2norm_seg_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (segs as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let mut la2 = self.stream.launch_builder(&f2);
+        la2.arg(y.as_cuda_mut());
+        la2.arg(&eps);
+        let hd32 = hd as i32;
+        la2.arg(&hd32);
+        unsafe { la2.launch(cfg2) }.map_err(map_err)?;
+        Ok((y, ns))
+    }
+
+    fn gdn_delta_rule(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        b: &Tensor,
+        state: &Tensor,
+        hk: usize,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (hv, s) = (state.shape()[0], state.shape()[1]);
+        if s != 128 {
+            return Err(BackendError::Shape(format!(
+                "gdn_delta_rule: CUDA-ядро реализовано для S=128 (state {s}); \
+                 модель с другой геометрией GDN на CUDA пока не поддержана"
+            )));
+        }
+        let t = v.numel() / (hv * s);
+        let out = self.zeros(vec![t, hv, s])?;
+        let f = self.function("gdn_delta_rule_chunk_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((s / 16) as u32, hv as u32, 1),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(q.as_cuda());
+        la.arg(k.as_cuda());
+        la.arg(v.as_cuda());
+        la.arg(g.as_cuda());
+        la.arg(b.as_cuda());
+        la.arg(state.as_cuda_mut());
+        la.arg(out.as_cuda_mut());
+        let (t32, hk32, hv32) = (t as i32, hk as i32, hv as i32);
+        la.arg(&t32);
+        la.arg(&hk32);
+        la.arg(&hv32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // f32-тензор клонируется по Arc — это тот же буфер с обновлённым стейтом.
+        Ok((out, state.clone()))
+    }
+
+    fn gdn_norm_gated(
+        &self,
+        x: &Tensor,
+        z: &Tensor,
+        w: &Tensor,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let hd = w.numel();
+        if hd == 0 || x.numel() % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_norm_gated: hd={hd} не делит {} элементов",
+                x.numel()
+            )));
+        }
+        let rows = x.numel() / hd;
+        let y = self.zeros(x.shape().to_vec())?;
+        let f = self.function("gdn_norm_gated_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(z.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(y.as_cuda_mut());
+        let hd32 = hd as i32;
+        la.arg(&hd32);
+        la.arg(&eps);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
     fn attn_ar(
         &self,
         q: &Tensor,

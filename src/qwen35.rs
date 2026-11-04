@@ -1878,11 +1878,16 @@ impl Qwen35Model {
             let cache = slot.caches[layer].as_mut().ok_or_else(|| {
                 BackendError::Shape(format!("слот {j}, слой {layer}: нет KV (не attn-слой?)"))
             })?;
-            let qg_j = qg_rows.view_offset(vec![1, nh, 2 * hd], row * 2 * nh * hd);
+            // Строки пакета — row_view (на CUDA device-copy), не view_offset:
+            // ненулевое смещение на CUDA паникует by design, и batch на CUDA
+            // падал на второй беседе (смещение 2048 = kv_size одного слота).
+            let qg_j = backend
+                .row_view(&qg_rows, b, 2 * nh * hd, row)?
+                .view(vec![1, nh, 2 * hd]);
             let q = crate::nn::slice_last(backend, &qg_j, hd, 0)?.view(vec![1, 1, nh * hd]);
             let gate = crate::nn::slice_last(backend, &qg_j, hd, hd)?.view(vec![1, 1, nh * hd]);
-            let k_j = k_rows.view_offset(vec![1, 1, kv_size], row * kv_size);
-            let v_j = v_rows.view_offset(vec![1, 1, kv_size], row * kv_size);
+            let k_j = backend.row_view(&k_rows, b, kv_size, row)?;
+            let v_j = backend.row_view(&v_rows, b, kv_size, row)?;
             let qn = backend.zeros(vec![1, 1, nh * hd])?;
             backend.rmsnorm_head(&q, &a.q_norm, &qn, nh, cfg.norm_eps)?;
             let kn = backend.zeros(vec![1, 1, kv_size])?;
@@ -1980,9 +1985,12 @@ impl Qwen35Model {
             let st = slot.states[layer].as_mut().ok_or_else(|| {
                 BackendError::Shape(format!("слот {j}, слой {layer}: нет GDN-стейта"))
             })?;
-            let qkv_j = qkv_rows.view_offset(vec![1, 1, cq], row * cq);
-            let gate_j = gate_rows.view_offset(vec![1, 1, gdim], row * gdim);
-            let b_j = b_rows.view_offset(vec![1, 1, gdim], row * gdim);
+            // Строка пакета и срезы fused-выхода — row_view/slice_last
+            // (device-copy на CUDA): view_offset с ненулевым смещением там
+            // паникует, из-за чего batch на CUDA не работал вовсе.
+            let qkv_j = backend.row_view(&qkv_rows, b, cq, row)?;
+            let gate_j = backend.row_view(&gate_rows, b, gdim, row)?;
+            let b_j = backend.row_view(&b_rows, b, gdim, row)?;
             let o = if fused {
                 let (y, new_conv) = backend.gdn_conv_silu_split_norm(
                     &qkv_j,
@@ -1995,9 +2003,13 @@ impl Qwen35Model {
                     cfg.norm_eps,
                 )?;
                 st.conv = new_conv;
-                let qn = y.view_offset(vec![1, 1, qk_size], 0);
-                let kn = y.view_offset(vec![1, 1, qk_size], qk_size);
-                let vv = y.view_offset(vec![1, 1, inner], 2 * qk_size);
+                // y приходит одномерным [cq] (контракт fused-op) — slice_last
+                // ждёт 3D, а срезы идут копией ядром (view_offset с ненулевым
+                // смещением на CUDA паникует).
+                let y3 = y.view(vec![1, 1, cq]);
+                let qn = crate::nn::slice_last(backend, &y3, qk_size, 0)?;
+                let kn = crate::nn::slice_last(backend, &y3, qk_size, qk_size)?;
+                let vv = crate::nn::slice_last(backend, &y3, inner, 2 * qk_size)?;
                 let (o, new_ssm) =
                     backend.gdn_delta_rule(&qn, &kn, &vv, &gate_j, &b_j, &st.ssm, hk)?;
                 st.ssm = new_ssm;

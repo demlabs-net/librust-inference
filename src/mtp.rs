@@ -749,7 +749,9 @@ impl Drafter for MtpDrafter {
                     let h_prev = if q == 0 {
                         backend.zeros(vec![1, 1, d])?
                     } else {
-                        rows.view_offset(vec![1, 1, d], (q - 1) * d)
+                        // row_view, не view_offset: на CUDA ненулевое
+                        // смещение паникует by design.
+                        backend.row_view(&rows, t, d, q - 1)?
                     };
                     self.step(backend, &h_prev, history[q], q, false)?;
                 }
@@ -890,7 +892,7 @@ impl Drafter for MtpDrafter {
             // Токены промпта драфтер увидит только в первом draft() (history)
             // — строки h откладываем туда.
             self.pending_rows = Some(h.view(vec![rows, d]));
-            self.pending_h = Some(h.view_offset(vec![1, 1, d], (rows - 1) * d));
+            self.pending_h = Some(backend.row_view(h, rows, d, rows - 1)?);
             return Ok(());
         }
         let n = n.min(self.window.len());
@@ -909,11 +911,11 @@ impl Drafter for MtpDrafter {
                     None => backend.zeros(vec![1, 1, d])?,
                 }
             } else {
-                h.view_offset(vec![1, 1, d], (i - 1) * d)
+                backend.row_view(h, rows, d, i - 1)?
             };
             self.step(backend, &h_prev, self.window[i], base + i, false)?;
         }
-        self.pending_h = Some(h.view_offset(vec![1, 1, d], (n - 1) * d));
+        self.pending_h = Some(backend.row_view(h, rows, d, n - 1)?);
         self.committed = base + n;
         Ok(())
     }

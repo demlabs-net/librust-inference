@@ -3264,7 +3264,7 @@ impl Backend for CudaBackend {
                 smem as i32,
             );
             let cfg = LaunchConfig {
-                grid_dim: (tq.div_ceil(8) as u32, n_heads as u32, 1),
+                grid_dim: (tq.div_ceil(16) as u32, n_heads as u32, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: smem as u32,
             };

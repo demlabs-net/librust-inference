@@ -255,6 +255,21 @@ impl CudaBackend {
     /// blocks; the full-nblk grid (1 k-block per split) measured slightly
     /// worse — 2 k-blocks per split balances grid density vs per-block work.
     fn pick_split(&self, nblk: usize, m: usize, n: usize, grid_x: usize) -> usize {
+        // Экспериментальный рычаг: INFER_GEMM_SPLITK=N фиксирует число
+        // k-делений (0 — не сплитить). Эвристика ниже выбирает максимум,
+        // но при коротком k (2 блока на поток) может быть выгоднее меньше
+        // делений — решается замером.
+        if let Some(v) = std::env::var("INFER_GEMM_SPLITK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if v == 0 {
+                return 1;
+            }
+            if v > 0 && nblk.is_multiple_of(v) {
+                return v;
+            }
+        }
         let cap_cpart = 16 * 1024 * 1024 / 4; // elements (f32)
         let cap_grid = 8192;
         (1..=nblk / 2)

@@ -3511,6 +3511,89 @@ extern "C" __global__ void gdn_delta_rule_chunk_f32(
     srow[lane + 96] = ls3;
 }
 
+// Bulk-вариант delta-rule: B слотов за ОДИН запуск (grid.z = слот).
+// Стейты слотов лежат отдельными тензорами, поэтому передаются массивом
+// указателей (как grouped-GEMM в cuBLAS) — так bulk-путь не требует
+// переделки владельца состояния. Логика — бит-в-бит как в одиночном ядре.
+extern "C" __global__ void gdn_delta_rule_slots_f32(
+    const float* __restrict__ Q, const float* __restrict__ Kx,
+    const float* __restrict__ V, const float* __restrict__ G,
+    const float* __restrict__ B, const float* const* __restrict__ STATES,
+    float* __restrict__ OUT, int T, int Hk, int Hv) {
+    __shared__ float kt[GDN_C * GDN_S];
+    __shared__ float qt[GDN_C * GDN_S];
+    __shared__ float gb[2 * GDN_C];
+    const int slot = blockIdx.z;
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * 32 + lane;
+    const int h = blockIdx.y;
+    const int row = blockIdx.x * GDN_ROWS + ty;
+    if (h >= Hv || row >= GDN_S) return;
+    const size_t qk_off = (size_t)slot * T * Hk * GDN_S;
+    const size_t v_off = (size_t)slot * T * Hv * GDN_S;
+    const size_t gb_off = (size_t)slot * T * Hv;
+    const float* Qs = Q + qk_off;
+    const float* Ks = Kx + qk_off;
+    const float* Vs = V + v_off;
+    const float* Gs = G + gb_off;
+    const float* Bs = B + gb_off;
+    float* Os = OUT + v_off;
+    const int hk = h % Hk;
+    const float scale = 1.0f / sqrtf((float)GDN_S);
+    float* srow = const_cast<float*>(STATES[slot]) + ((size_t)h * GDN_S + row) * GDN_S;
+    float ls0 = srow[lane], ls1 = srow[lane + 32], ls2 = srow[lane + 64],
+          ls3 = srow[lane + 96];
+    for (int t0 = 0; t0 < T; t0 += GDN_C) {
+        const int c = min(GDN_C, T - t0);
+        for (int i = tid; i < GDN_C * GDN_S; i += 32 * GDN_ROWS) {
+            const int tt = i / GDN_S, rest = i % GDN_S;
+            const int l = rest % 32, ee = rest / 32;
+            const int off = tt * GDN_S + l + ee * 32;
+            if (tt < c) {
+                kt[off] = Ks[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+                qt[off] = Qs[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+            } else {
+                kt[off] = 0.0f;
+                qt[off] = 0.0f;
+            }
+        }
+        if (tid < GDN_C) {
+            gb[tid] = (tid < c) ? Gs[(t0 + tid) * Hv + h] : 0.0f;
+            gb[GDN_C + tid] = (tid < c) ? Bs[(t0 + tid) * Hv + h] : 0.0f;
+        }
+        __syncthreads();
+        for (int tt = 0; tt < c; ++tt) {
+            const float eg = expf(gb[tt]);
+            const float beta = gb[GDN_C + tt];
+            const int tb = tt * GDN_S;
+            ls0 *= eg; ls1 *= eg; ls2 *= eg; ls3 *= eg;
+            float kv = ls0 * kt[tb + lane] + ls1 * kt[tb + lane + 32] +
+                       ls2 * kt[tb + lane + 64] + ls3 * kt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                kv += __shfl_down_sync(0xffffffffu, kv, off);
+            kv = __shfl_sync(0xffffffffu, kv, 0);
+            const float delta =
+                (Vs[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] - kv) * beta;
+            ls0 += kt[tb + lane] * delta;
+            ls1 += kt[tb + lane + 32] * delta;
+            ls2 += kt[tb + lane + 64] * delta;
+            ls3 += kt[tb + lane + 96] * delta;
+            float y = ls0 * qt[tb + lane] + ls1 * qt[tb + lane + 32] +
+                      ls2 * qt[tb + lane + 64] + ls3 * qt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                y += __shfl_down_sync(0xffffffffu, y, off);
+            if (lane == 0)
+                Os[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] = y * scale;
+        }
+        __syncthreads();
+    }
+    srow[lane] = ls0;
+    srow[lane + 32] = ls1;
+    srow[lane + 64] = ls2;
+    srow[lane + 96] = ls3;
+}
+
 // Гейтовая RMS-норма GDN: y = x·inv·w·silu(z), inv = 1/√(mean(x²)+eps) по
 // отрезкам hd. Один блок на строку (hd ≤ 1024).
 extern "C" __global__ void gdn_norm_gated_f32(const float* __restrict__ x,

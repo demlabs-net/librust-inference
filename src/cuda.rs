@@ -122,10 +122,20 @@ impl Drop for CudaBuffer {
             // это была не арифметика, а промахи пула.
             // 2 МБ: сюда попадает scratch внимания (b·tq·nh·nchunks·nwarps·34
             // f32 — на 27B это сотни КБ на слой) и прочие рабочие буферы слоя.
-            const MAX_PER_BUCKET_SMALL: usize = 32;
-            const SMALL_BYTES: usize = 2 * 1024 * 1024;
-            let cap = if s.len() * 4 <= SMALL_BYTES { 32 } else { 8 };
-            let _ = MAX_PER_BUCKET_SMALL;
+            // Кап по классу размера: промах = alloc (на живой очереди это
+            // ожидание), а в по-слотовом цикле внимания одновременно живут
+            // десятки буферов одного размера. Замер с QWEN35_POOL_STATS:
+            // 5-8 % промахов при капах 32/8 — как раз они и съедали
+            // по-слотовую секцию пакетного шага.
+            const SMALL_BYTES: usize = 64 * 1024;
+            const MEDIUM_BYTES: usize = 2 * 1024 * 1024;
+            let cap = if s.len() * 4 <= SMALL_BYTES {
+                256
+            } else if s.len() * 4 <= MEDIUM_BYTES {
+                64
+            } else {
+                8
+            };
             if bucket.len() < cap && s.len() * 4 <= MAX_POOL_BYTES {
                 bucket.push(s);
             }

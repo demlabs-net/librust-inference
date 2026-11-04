@@ -2602,6 +2602,88 @@ DEFINE_K_TILED(q5k, 176, q5k_weight)
 DEFINE_K_TILED(q3k, 110, q3k_weight)
 DEFINE_K_TILED(q4kc, 144, q4kc_weight)
 
+// ─────────── K-quant tiled GEMM v4 (m > 1, LLM prefill) ───────────
+// v3 деquant'ит вес ЗАНОВО на каждую из 4 rq-групп строк одной колонки:
+// ~20 ALU на вес при 8 FMA → у 27B prefill шёл на ~2.4 TFLOPS (8.6 мс/токен).
+// v4 деquant'ит колонку ОДИН раз в общий f32-тайл T[256][33] и считает
+// по нему 32 строки: ~0.6 ALU/вес + 1 FMA, активации читаются из shared
+// broadcast'ом (все 32 потока warp'а — один адрес As[r][j]).
+// Dynamic shared: T 33.8 KB + As 32×256 f32 32 KB = 65 KB (+ static Bs 4.6 KB)
+// — сверх 48 KB, поэтому launcher обязан выставить
+// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES (sm_89 предел 99 KB,
+// sm_120 — 227 KB). S=1: результат пишется прямо в C, без reduce-прохода.
+#define DEFINE_K_TILED_V4(NAME, BLK, WREAD)                                   \
+extern "C" __global__ void gemm_##NAME##_tiled_v4(                            \
+    const float* __restrict__ A,                                              \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ C,                                                    \
+    int m,                                                                    \
+    int k,                                                                    \
+    int n)                                                                    \
+{                                                                             \
+    const int BM = 32, BN = 32, BP = 33;                                      \
+    extern __shared__ float sm[];                                             \
+    float* T = sm;                      /* [256][BP] — dequant-тайл */       \
+    float* As = sm + 256 * BP;          /* [BM][256] — активации */           \
+    __shared__ unsigned char Bs[BN * BLK];                                    \
+    int tid = threadIdx.x;                                                    \
+    int col = tid & 31;                                                       \
+    int jg = tid >> 5;                  /* warp → группа из 4 строк */        \
+    int col0 = blockIdx.x * BN;                                               \
+    int r0 = blockIdx.y * BM;                                                 \
+    int nsup = k >> 8;                                                        \
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;                     \
+    for (int kb = 0; kb < nsup; ++kb) {                                       \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK;         \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * BLK) / 16; i += 256)                  \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * BLK;             \
+                unsigned char* d = Bs + tid * BLK;                            \
+                for (int i = 0; i < BLK; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < BLK; ++i) Bs[tid * BLK + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        for (int i = tid; i < BM * 256; i += 256) {                           \
+            int j = i & 255;                                                  \
+            int rr = i >> 8;                                                  \
+            int r = r0 + rr;                                                  \
+            As[rr * 256 + j] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : 0.f;\
+        }                                                                     \
+        __syncthreads();                                                      \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * BLK;                        \
+            for (int r = 0; r < 32; ++r) {                                    \
+                int j = jg * 32 + r;                                          \
+                T[j * BP + col] = WREAD(blk, j);                              \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        for (int j = 0; j < 256; ++j) {                                       \
+            float w = T[j * BP + col];                                        \
+            acc0 += As[jg * 256 + j] * w;                                     \
+            acc1 += As[(jg + 8) * 256 + j] * w;                               \
+            acc2 += As[(jg + 16) * 256 + j] * w;                              \
+            acc3 += As[(jg + 24) * 256 + j] * w;                              \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (col0 + col < n) {                                                     \
+        int c = col0 + col;                                                   \
+        if (r0 + jg < m)      C[(size_t)(r0 + jg) * n + c] = acc0;            \
+        if (r0 + jg + 8 < m)  C[(size_t)(r0 + jg + 8) * n + c] = acc1;        \
+        if (r0 + jg + 16 < m) C[(size_t)(r0 + jg + 16) * n + c] = acc2;       \
+        if (r0 + jg + 24 < m) C[(size_t)(r0 + jg + 24) * n + c] = acc3;       \
+    }                                                                         \
+}
+
+DEFINE_K_TILED_V4(q6k, 210, q6k_weight)
+DEFINE_K_TILED_V4(q4kc, 144, q4kc_weight)
+
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //
 // The DAC codec decoder runs ~10 conv1d + 4 conv-transpose1d per piece

@@ -3917,6 +3917,36 @@ impl CudaBackend {
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
+        } else if matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32 && m >= 8 {
+            // v4 (prefill-чанки LLM): деquant колонки ОДИН раз в общий
+            // f32-тайл, им считаются 32 строки. v3 деquant'ил заново на
+            // каждую из 4 rq-групп строк — на 27B prefill упирался в
+            // ~2.4 TFLOPS (8.6 мс/токен).
+            let f = self.function(if name == "gemm_q6k" {
+                "gemm_q6k_tiled_v4"
+            } else {
+                "gemm_q4kc_tiled_v4"
+            })?;
+            // T[256][33] + As[32][256] f32 = 65 KB dynamic (>48 KB):
+            // без явного атрибута драйвер отклоняет пуск.
+            const V4_SMEM: u32 = (256 * 33 + 32 * 256) * 4;
+            let _ = f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                V4_SMEM as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (n.div_ceil(32) as u32, m.div_ceil(32) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: V4_SMEM,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(bpack);
+            la.arg(c);
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
         } else {
             let s16 = 16usize;
             let cpart = self.take_pooled(s16 * m * n)?;

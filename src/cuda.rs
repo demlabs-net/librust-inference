@@ -748,6 +748,40 @@ impl CudaBackend {
         Ok(true)
     }
 
+    /// Bulk-fused GDN (conv → silu → split → l2norm) на B строк: состояние
+    /// свёртки стопкой [b, c, K-1], один запуск на все строки. Снимает
+    /// по-слотовые мелкие запуски, которые при B=2 съедали 164 мс из 170 мс
+    /// пакетного шага (docs/plugin-platform-plan.md, раздел bulk-пакета).
+    pub fn gdn_conv_silu_rows(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        rows: usize,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let c = w.shape()[0];
+        let k = w.shape()[1];
+        let y = self.zeros(vec![rows, c])?;
+        let ns = self.zeros(vec![rows, c, k - 1])?;
+        let f = self.function("gdn_conv_silu_rows_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (c.div_ceil(256) as u32, 1, rows as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c32, k32) = (c as i32, k as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(state.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(ns.as_cuda_mut());
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok((y, ns))
+    }
+
     /// cuBLAS gemm_ex: C[m,n] = alpha·op(A)·op(B), A/B в f16, C в f32.
     #[allow(clippy::too_many_arguments)]
     fn gemm_ex_f16(

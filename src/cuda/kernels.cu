@@ -2825,6 +2825,113 @@ DEFINE_K_SPLITK(q4kc, f32, float, 144, q4kc_subblock)
 DEFINE_K_SPLITK(q4kc, f16, __half, 144, q4kc_subblock)
 DEFINE_K_SPLITK(q4kc, bf16, __nv_bfloat16, 144, q4kc_subblock)
 
+// Split-k с НЕСКОЛЬКИМИ строками активаций в одном блоке (m = 2..8): B-тайл
+// k-среза и его dequant в T[256][32] оплачиваются один раз на все строки,
+// а не на каждую (по-строчный m=1 split-k читает вес m раз — именно он и был
+// «2× дороже за строку» на пакетном шаге). Частичные суммы по 8 варпам
+// лежат отдельно на строку: part[8][MMAX][33].
+#define DEFINE_K_SPLITK_MB(NAME, SUF, AT, BLK, WSUB, MMAX)                     \
+extern "C" __global__ void gemm_##NAME##_splitk_v2m_##SUF(                     \
+    const AT* __restrict__ A,        /* (m, k) — активации */                 \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ Cpart,       /* (S·m, n) */                           \
+    int k,                                                                    \
+    int n,                                                                    \
+    int S,                                                                    \
+    int m)                                                                    \
+{                                                                             \
+    const int BN = 32;                                                        \
+    extern __shared__ float gmb_sm[];                                           \
+    float* T = gmb_sm;                          /* [256][BN] */                 \
+    float* part = T + 256 * BN;               /* [8][MMAX][33] */             \
+    AT* As = (AT*)(part + 8 * MMAX * 33);     /* [MMAX][256] */               \
+    unsigned char* Bs = (unsigned char*)(As + MMAX * 256); /* [BN][BLK] */    \
+    int tid = threadIdx.x;                                                    \
+    int nb = blockIdx.x;                                                      \
+    int col0 = nb * BN;                                                       \
+    int nsup = k >> 8;                                                        \
+    int nblk_s = (k / S) >> 8;                                                \
+    int kb0 = blockIdx.y * nblk_s;                                            \
+    float acc[MMAX];                                                          \
+    _Pragma("unroll")                                                         \
+    for (int r = 0; r < MMAX; ++r) acc[r] = 0.0f;                             \
+    int col = tid & 31;                                                       \
+    int jg = tid >> 5;                                                        \
+    for (int t = 0; t < nblk_s; ++t) {                                        \
+        int kb = kb0 + t;                                                     \
+        for (int i = tid; i < MMAX * 256; i += 256) {                         \
+            int r = i >> 8;                                                   \
+            int j = i & 255;                                                  \
+            As[i] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : (AT)0;        \
+        }                                                                     \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK;         \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * BLK) / 16; i += 256) {                \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+            }                                                                 \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * BLK;             \
+                unsigned char* d = Bs + tid * BLK;                            \
+                for (int i = 0; i < BLK; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < BLK; ++i) Bs[tid * BLK + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * BLK;                        \
+            float vals[32];                                                   \
+            WSUB(blk, jg, vals);                                              \
+            for (int r = 0; r < 32; ++r) T[(jg * 32 + r) * BN + col] = vals[r];\
+        }                                                                     \
+        __syncthreads();                                                      \
+        const int j0 = jg * 32;                                               \
+        for (int r = 0; r < MMAX; ++r) {                                      \
+            if (r >= m) break;                                                \
+            const AT* ar = As + r * 256;                                      \
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;                 \
+            for (int j = j0; j < j0 + 32; j += 4) {                           \
+                a0 += (float)ar[j + 0] * T[(j + 0) * BN + col];               \
+                a1 += (float)ar[j + 1] * T[(j + 1) * BN + col];               \
+                a2 += (float)ar[j + 2] * T[(j + 2) * BN + col];               \
+                a3 += (float)ar[j + 3] * T[(j + 3) * BN + col];               \
+            }                                                                 \
+            part[(jg * MMAX + r) * 33 + col] = (a0 + a1) + (a2 + a3);         \
+        }                                                                     \
+        __syncthreads();                                                      \
+        if (tid < BN && col0 + tid < n) {                                     \
+            for (int r = 0; r < MMAX; ++r) {                                  \
+                if (r >= m) break;                                            \
+                float p0 = part[(0 * MMAX + r) * 33 + tid];                   \
+                float p1 = part[(1 * MMAX + r) * 33 + tid];                   \
+                float p2 = part[(2 * MMAX + r) * 33 + tid];                   \
+                float p3 = part[(3 * MMAX + r) * 33 + tid];                   \
+                float p4 = part[(4 * MMAX + r) * 33 + tid];                   \
+                float p5 = part[(5 * MMAX + r) * 33 + tid];                   \
+                float p6 = part[(6 * MMAX + r) * 33 + tid];                   \
+                float p7 = part[(7 * MMAX + r) * 33 + tid];                   \
+                acc[r] += (((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));\
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (tid < BN && col0 + tid < n) {                                         \
+        for (int r = 0; r < MMAX; ++r) {                                      \
+            if (r >= m) break;                                                \
+            Cpart[(blockIdx.y * m + r) * n + col0 + tid] = acc[r];            \
+        }                                                                     \
+    }                                                                         \
+}
+
+DEFINE_K_SPLITK_MB(q6k, f32, float, 210, q6k_subblock, 8)
+DEFINE_K_SPLITK_MB(q6k, f16, __half, 210, q6k_subblock, 8)
+DEFINE_K_SPLITK_MB(q6k, bf16, __nv_bfloat16, 210, q6k_subblock, 8)
+DEFINE_K_SPLITK_MB(q4kc, f32, float, 144, q4kc_subblock, 8)
+DEFINE_K_SPLITK_MB(q4kc, f16, __half, 144, q4kc_subblock, 8)
+DEFINE_K_SPLITK_MB(q4kc, bf16, __nv_bfloat16, 144, q4kc_subblock, 8)
+
 /// K-quant GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
 /// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The
 /// 32×256 activation tile is staged in shared; the packed B tile is staged
@@ -2989,6 +3096,87 @@ extern "C" __global__ void gemm_##NAME##_tiled_v4(                            \
 
 DEFINE_K_TILED_V4(q6k, 210, q6k_weight)
 DEFINE_K_TILED_V4(q4kc, 144, q4kc_weight)
+
+// Малая m: тот же dequant-тайл, но строк в блоке меньше (8·ROWG). v4 всегда
+// считает 32 строки, из них при m=2..16 полезны единицы — на пакетном шаге
+// 27B это и была цена строки. Деquant веса (T[256][33]) от ROWG не зависит:
+// он на 32 столбца B, поэтому блок на 8 строк стоит почти столько же, сколько
+// на 32, и при m<8 выигрывает у 32-строчного в ~4 раза.
+#define DEFINE_K_TILED_V4R(NAME, SUF, BLK, WREAD, ROWG)                        \
+extern "C" __global__ void gemm_##NAME##_tiled_##SUF(                          \
+    const float* __restrict__ A,                                              \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ C,                                                    \
+    int m,                                                                    \
+    int k,                                                                    \
+    int n)                                                                    \
+{                                                                             \
+    const int BM = 8 * ROWG, BN = 32, BP = 33;                                \
+    extern __shared__ float sm[];                                             \
+    float* T = sm;                      /* [256][BP] — dequant-тайл */        \
+    float* As = sm + 256 * BP;          /* [BM][256] — активации */           \
+    __shared__ unsigned char Bs[BN * BLK];                                    \
+    int tid = threadIdx.x;                                                    \
+    int col = tid & 31;                                                       \
+    int jg = tid >> 5;                  /* warp → строка jg+8·g */            \
+    int col0 = blockIdx.x * BN;                                               \
+    int r0 = blockIdx.y * BM;                                                 \
+    int nsup = k >> 8;                                                        \
+    float acc[ROWG];                                                          \
+    _Pragma("unroll")                                                         \
+    for (int g = 0; g < ROWG; ++g) acc[g] = 0.f;                              \
+    for (int kb = 0; kb < nsup; ++kb) {                                       \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK;         \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * BLK) / 16; i += 256)                  \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * BLK;             \
+                unsigned char* d = Bs + tid * BLK;                            \
+                for (int i = 0; i < BLK; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < BLK; ++i) Bs[tid * BLK + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        for (int i = tid; i < BM * 256; i += 256) {                           \
+            int j = i & 255;                                                  \
+            int rr = i >> 8;                                                  \
+            int r = r0 + rr;                                                  \
+            As[rr * 256 + j] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : 0.f;\
+        }                                                                     \
+        __syncthreads();                                                      \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * BLK;                        \
+            for (int r = 0; r < 32; ++r) {                                    \
+                int j = jg * 32 + r;                                          \
+                T[j * BP + col] = WREAD(blk, j);                              \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        _Pragma("unroll")                                                     \
+        for (int g = 0; g < ROWG; ++g) {                                      \
+            const float* Ar = As + (jg + 8 * g) * 256;                        \
+            float a = acc[g];                                                 \
+            for (int j = 0; j < 256; ++j) a += Ar[j] * T[j * BP + col];       \
+            acc[g] = a;                                                       \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (col0 + col < n) {                                                     \
+        _Pragma("unroll")                                                     \
+        for (int g = 0; g < ROWG; ++g) {                                      \
+            int r = r0 + jg + 8 * g;                                          \
+            if (r < m) C[(size_t)r * n + col0 + col] = acc[g];                \
+        }                                                                     \
+    }                                                                         \
+}
+
+DEFINE_K_TILED_V4R(q6k, v4r1, 210, q6k_weight, 1)
+DEFINE_K_TILED_V4R(q6k, v4r2, 210, q6k_weight, 2)
+DEFINE_K_TILED_V4R(q4kc, v4r1, 144, q4kc_weight, 1)
+DEFINE_K_TILED_V4R(q4kc, v4r2, 144, q4kc_weight, 2)
 
 // ─────── dequant в плотный bf16 (prefill через tensor cores) ───────
 // На больших m (prefill-чанки) квантовый GEMM на FMA-ядрах упирается в

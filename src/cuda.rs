@@ -4643,13 +4643,12 @@ impl CudaBackend {
             (_, "gemm_q4kc") => ("gemm_q4kc_splitk_v2_f32", "gemm_q4kc_tiled_v3"),
             _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };
-        // m = 2..7: tiled-путь считает тайл на 32 строки, из которых полезны
-        // m, и гоняет 16 z-слайсов с reduce — деquant веса оплачен за 32
-        // строки при 2-7 полезных. Замер пакетного шага 27B (BATCH_PROF):
-        // проекции 3.4 мс при B=1 против 24.7 при B=2, ffn 1.2 против 8.0 —
-        // та же 6-7× цена на строку. Гоним m=1 split-k по строке: вес
-        // читается заново, зато нет пустых строк, cpart и reduce.
-        if (2..8).contains(&m) {
+        // m = 2..7 у форматов БЕЗ v4-семейства (q5k/q3k/q4_0): 16 z-слайсов
+        // с cpart и reduce деquant'ят вес за 32 строки при 2-7 полезных.
+        // Гоним m=1 split-k по строке: вес читается заново, зато нет пустых
+        // строк и reduce. q4kc/q6k идут ниже v4r1/v4r2 (8/16 строк в блоке).
+        let has_v4 = matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32;
+        if (2..8).contains(&m) && !has_v4 {
             let c3 = c_tensor.view(vec![1, m, n]);
             for r in 0..m {
                 let a_r = self.row_view(a, m, k, r)?;
@@ -4713,27 +4712,91 @@ impl CudaBackend {
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
-        } else if matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32 && m >= 8 {
-            // v4 (prefill-чанки LLM): деquant колонки ОДИН раз в общий
-            // f32-тайл, им считаются 32 строки. v3 деquant'ил заново на
-            // каждую из 4 rq-групп строк — на 27B prefill упирался в
-            // ~2.4 TFLOPS (8.6 мс/токен).
-            let f = self.function(if name == "gemm_q6k" {
-                "gemm_q6k_tiled_v4"
+        } else if matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32 && m <= 8 {
+            // m = 2..8: split-k с НЕСКОЛЬКИМИ строками в блоке — B-тайл и его
+            // dequant оплачены один раз на весь блок (по-строчный m=1 читает
+            // вес по разу на строку). MMAX=8 в ядре, m — рантайм.
+            let s = self.pick_split(nblk, 1, n, grid_x);
+            let nmb = if name == "gemm_q6k" {
+                match act {
+                    crate::dtype::Dtype::F16 => "gemm_q6k_splitk_v2m_f16",
+                    crate::dtype::Dtype::BF16 => "gemm_q6k_splitk_v2m_bf16",
+                    _ => "gemm_q6k_splitk_v2m_f32",
+                }
             } else {
-                "gemm_q4kc_tiled_v4"
-            })?;
-            // T[256][33] + As[32][256] f32 = 65 KB dynamic (>48 KB):
-            // без явного атрибута драйвер отклоняет пуск.
-            const V4_SMEM: u32 = (256 * 33 + 32 * 256) * 4;
+                match act {
+                    crate::dtype::Dtype::F16 => "gemm_q4kc_splitk_v2m_f16",
+                    crate::dtype::Dtype::BF16 => "gemm_q4kc_splitk_v2m_bf16",
+                    _ => "gemm_q4kc_splitk_v2m_f32",
+                }
+            };
+            let cpart = self.take_pooled(s * m * n)?;
+            let f = self.function(nmb)?;
+            // T[256][32] + part[8][8][33] + As[8][256] + Bs[32][BLK]:
+            // 32.8+8.4+4+4.6 КБ — только динамическая shared.
+            let asz = match act {
+                crate::dtype::Dtype::F32 => 4,
+                _ => 2,
+            };
+            let smb: u32 = (256 * 32 * 4 + 8 * 8 * 33 * 4 + 8 * 256 * asz + 32 * blk_bytes) as u32;
             let _ = f.set_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                V4_SMEM as i32,
+                smb as i32,
             );
             let cfg = LaunchConfig {
-                grid_dim: (n.div_ceil(32) as u32, m.div_ceil(32) as u32, 1),
+                grid_dim: (grid_x as u32, s as u32, 1),
                 block_dim: (256, 1, 1),
-                shared_mem_bytes: V4_SMEM,
+                shared_mem_bytes: smb,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            match &a_arg {
+                KernA::F32(t) => la.arg(t.as_cuda()),
+                KernA::F16(sl) => la.arg(sl),
+                KernA::BF16(sl) => la.arg(sl),
+            };
+            la.arg(bpack);
+            la.arg(&cpart);
+            la.arg(&k32);
+            la.arg(&n32);
+            let s32 = s as i32;
+            la.arg(&s32);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            self.reduce_and_pool(cpart, c, m, n, s, s * m * n)?;
+        } else if matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32 && m >= 2 {
+            // v4 (prefill-чанки LLM): деquant колонки ОДИН раз в общий
+            // f32-тайл, им считаются строки блока. v3 dequant'ил заново на
+            // каждую из 4 rq-групп строк — на 27B prefill упирался в
+            // ~2.4 TFLOPS (8.6 мс/токен).
+            // Малая m (2..16): строк в блоке меньше (8/16), иначе блок считает
+            // 32 строки при 2 полезных — на пакетном шаге 27B это была вся
+            // цена строки (замер: m=2 вдвое дороже двух m=1).
+            let (suf, bm) = match m {
+                0..=8 => ("tiled_v4r1", 8usize),
+                9..=16 => ("tiled_v4r2", 16),
+                _ => ("tiled_v4", 32),
+            };
+            // Имена функций статические (`function` кэширует по &'static str).
+            let fname: &'static str = match (name, suf) {
+                ("gemm_q6k", "tiled_v4r1") => "gemm_q6k_tiled_v4r1",
+                ("gemm_q6k", "tiled_v4r2") => "gemm_q6k_tiled_v4r2",
+                ("gemm_q6k", _) => "gemm_q6k_tiled_v4",
+                (_, "tiled_v4r1") => "gemm_q4kc_tiled_v4r1",
+                (_, "tiled_v4r2") => "gemm_q4kc_tiled_v4r2",
+                _ => "gemm_q4kc_tiled_v4",
+            };
+            let f = self.function(fname)?;
+            // T[256][33] + As[bm][256] f32 (42..66 KB dynamic): без явного
+            // атрибута драйвер отклоняет пуск свыше 48 KB.
+            let v4_smem: u32 = ((256 * 33 + bm * 256) * 4) as u32;
+            let _ = f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                v4_smem as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (n.div_ceil(32) as u32, m.div_ceil(bm) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: v4_smem,
             };
             let mut la = self.stream.launch_builder(&f);
             la.arg(a.as_cuda());
@@ -4854,6 +4917,44 @@ mod tests {
     /// Bulk delta-rule (слоты в grid.z, стейты массивом указателей) обязан
     /// совпасть с поштучным вызовом на каждом слоте — иначе пакетный шаг
     /// поедет по другому состоянию, чем одиночный декод.
+    /// Кривая GEMM по m (Q4_K, как в модели): где ломается цена строки.
+    /// `cargo test --release --features cuda --lib gemm_small_m_curve -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gemm_small_m_curve() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        for (k, n) in [(5120usize, 5120usize), (5120, 17408)] {
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.001).sin()) * 0.4)
+                .collect();
+            let packed = crate::quant::quantize(&w, crate::quant::QuantFormat::Q4_K_M);
+            let bt = be.from_cpu_q4kc(&packed, vec![n, k]).unwrap();
+            for m in [1usize, 2, 4, 8, 16, 32] {
+                let a: Vec<f32> = (0..m * k)
+                    .map(|i| ((i as f32 * 0.01).cos()) * 0.5)
+                    .collect();
+                let at = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+                let c = be.zeros(vec![m, n]).unwrap();
+                be.gemm_nt(&at, &bt, &c).unwrap();
+                be.synchronize().unwrap();
+                let reps = 20;
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    be.gemm_nt(&at, &bt, &c).unwrap();
+                    be.synchronize().unwrap();
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                eprintln!(
+                    "k={k} n={n} m={m}: {ms:.3} ms  ({:.1} ms/строка)",
+                    ms / m as f64
+                );
+            }
+        }
+    }
+
     /// Малая m (2..7) идёт по строке тем же m=1 split-k: строки обязаны
     /// совпасть с отдельным m=1 прогоном побитово. Иначе пакетный шаг молча
     /// считает не то (проверяем и раскладку строк A/C, и смещения).

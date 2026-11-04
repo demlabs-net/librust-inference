@@ -620,7 +620,7 @@ impl CudaBackend {
         let blas = guard.as_ref().expect("cuBLAS инициализирован").clone();
         let q16_len = tq * n_heads * hd;
         let need_f16 = q16_len + rows_pad;
-        let need_f32 = rows_pad + tq * hd;
+        let need_f32 = rows_pad;
         let mut f16s = lock_poison_resilient(&self.attn_f16);
         if !f16s.as_ref().is_some_and(|s| s.len() >= need_f16) {
             *f16s = Some(unsafe { self.stream.alloc::<half::f16>(need_f16) }.map_err(map_err)?);
@@ -661,10 +661,17 @@ impl CudaBackend {
             let (p, _g) = v16.device_ptr(&self.stream);
             p
         };
+        // Выход голов писать прямо в y (см. шаг 3 ниже) — берём его базу.
+        let y_base = {
+            let (p, _g) = cudarc::driver::DevicePtrMut::device_ptr_mut(
+                y.as_cuda_mut(),
+                &self.stream,
+            );
+            p
+        };
         let q_stride = q.shape()[2] as i32;
         let kv_stride = (kv_heads * hd) as i32;
         let q16_off = q16_len as u64 * 2;
-        let out_off = rows_pad as u64 * 4;
         let (tq32, tkv32, hd32) = (tq as i32, tkv as i32, hd as i32);
         let tkvpad32 = tkv_pad as i32;
         let (nh32, nkv32) = (n_heads as i32, kv_heads as i32);
@@ -717,18 +724,18 @@ impl CudaBackend {
                 la.arg(&stride32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
-            // 3) out[q, d] = Σ_k P[q,k]·V[k,d]. head_out — row-major [tq][hd],
-            // т.е. col-major (hd, tq) = outᵀ, поэтому C = Vᵀ·Pᵀ:
-            // m = hd, n = tq, k = tkv, A = V (без транспонирования),
-            // B = P (без транспонирования), ldc = hd.
+            // 3) out[q, d] = Σ_k P[q,k]·V[k,d] — пишем СРАЗУ в срез y головы h:
+            // y row-major [tq][q_stride], значит col-major C (hd, tq) с
+            // ldc = q_stride и базой y + h·hd — ровно раскладка y. Копия
+            // выхода головы отдельным ядром больше не нужна.
             self.gemm_ex_f16(
                 &blas,
                 v_base + (g * hd * 2) as u64,
                 kv_stride,
                 f16_base + q16_off,
                 tkvpad32,
-                f32_base + out_off,
-                hd32,
+                y_base + (h * hd * 4) as u64,
+                q_stride,
                 hd32,
                 tq32,
                 tkv32,
@@ -736,27 +743,6 @@ impl CudaBackend {
                 false,
                 false,
             )?;
-            // 4) выход головы → срез y
-            {
-                let f = self.function("copy_head_f32")?;
-                let cfg = LaunchConfig {
-                    grid_dim: (hd.div_ceil(256) as u32, tq as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let hoff = (h * hd) as i32;
-                // so — смещение выхода головы В ЭЛЕМЕНТАХ (после score).
-                let so = rows_pad as i64;
-                let mut la = self.stream.launch_builder(&f);
-                la.arg(y.as_cuda_mut());
-                la.arg(&*f32buf);
-                la.arg(&tq32);
-                la.arg(&hd32);
-                la.arg(&q_stride);
-                la.arg(&hoff);
-                la.arg(&so);
-                unsafe { la.launch(cfg) }.map_err(map_err)?;
-            }
         }
         let _ = (nh32, nkv32);
         Ok(true)

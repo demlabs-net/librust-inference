@@ -3456,6 +3456,11 @@ impl Backend for CudaBackend {
         Ok((y, ns))
     }
 
+    /// Дождаться очереди устройства (inherent `CudaBackend::synchronize`).
+    fn synchronize(&self) -> Result<(), BackendError> {
+        CudaBackend::synchronize(self)
+    }
+
     /// Bulk-хвост GDN на B слотов: conv+silu со стейтами на месте (в самом
     /// пакетном буфере) → l2norm q/k по головам → delta-rule со стейтами
     /// массивом указателей. Три запуска на слой на весь пакет вместо
@@ -5016,6 +5021,22 @@ mod tests {
             unsafe { la.launch(cfg) }.unwrap();
         }
         let host = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        // То же, но очередью глубиной 20k: если очередь переполняется, цена
+        // запуска падает до скорости GPU (наблюдаем излом).
+        let t1 = std::time::Instant::now();
+        for _ in 0..20_000 {
+            let mut la = be.stream.launch_builder(&f);
+            la.arg(x.as_cuda());
+            la.arg(x.as_cuda());
+            la.arg(y.as_cuda_mut());
+            la.arg(&n32);
+            la.arg(&op);
+            la.arg(&0.0f32);
+            unsafe { la.launch(cfg) }.unwrap();
+        }
+        let deep = t1.elapsed().as_secs_f64() * 1e6 / 20_000.0;
+        eprintln!("очередь 20k: {deep:.2} мкс/запуск");
+        be.synchronize().unwrap();
         be.synchronize().unwrap();
         let total = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
         eprintln!("launch: хост {host:.2} мкс/запуск, с синхронизацией {total:.2} мкс");

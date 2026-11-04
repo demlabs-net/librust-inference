@@ -1807,7 +1807,16 @@ impl Qwen35Model {
         let prof = std::env::var("QWEN35_BATCH_PROF").is_ok();
         // Профиль — ХОСТ-время секций (без синхронизаций: шаг CPU-bound, а
         // каждый sync добавлял ожидание GPU и искажал картину).
-        let sync = |_t: &Tensor| -> Result<(), BackendError> { Ok(()) };
+        // QWEN35_BATCH_PROF_SYNC=1 делает секции GPU-инклюзивными: видно,
+        // сколько реально работает устройство, а не сколько длится постановка.
+        let sync_gpu = std::env::var("QWEN35_BATCH_PROF_SYNC").is_ok();
+        let sync = |t: &Tensor| -> Result<(), BackendError> {
+            if sync_gpu {
+                backend.synchronize()?;
+            }
+            let _ = t;
+            Ok(())
+        };
         let (mut t_shared, mut t_slot, mut t_ffn, mut t_gates) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let mut x = backend.zeros(vec![1, b, d])?;
         backend.embedding_quant(ids, &self.embed, &x)?;

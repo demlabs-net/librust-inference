@@ -1453,6 +1453,13 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Дождаться завершения всей очереди устройства. Нужен диагностике
+    /// (секции профайлера без него показывают только время запусков) и
+    /// тестам; default — no-op для бэкендов без асинхронной очереди.
+    fn synchronize(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// N (iter-10): exact top-k over the FULL penalty pipeline of one logits
     /// row (the TTS slow-AR sampler): per-occurrence repetition penalty
     /// (logit>0 ? /=pen^count : *=pen^count), RAS window penalty (−ras·(cnt−1)

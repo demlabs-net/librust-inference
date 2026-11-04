@@ -600,9 +600,14 @@ impl CudaBackend {
             return Ok(false);
         }
         let rows = tq * tkv;
+        // Ведущие размерности cuBLAS для 16/32-бит должны быть кратны 8/4 —
+        // выравниваем tkv (значимых столбцов остаётся tkv, k-размерность не
+        // меняется, поэтому математика та же).
+        let tkv_pad = (tkv + 7) & !7usize;
+        let rows_pad = tq * tkv_pad;
         // score f32 + вероятности f16: бюджет 512 МБ, длинный контекст
         // уходит тайловому ядру.
-        if rows.saturating_mul(6) > 512 * 1024 * 1024 {
+        if rows_pad.saturating_mul(6) > 512 * 1024 * 1024 {
             return Ok(false);
         }
         let mut guard = lock_poison_resilient(&self.cublas);
@@ -614,8 +619,8 @@ impl CudaBackend {
         }
         let blas = guard.as_ref().expect("cuBLAS инициализирован").clone();
         let q16_len = tq * n_heads * hd;
-        let need_f16 = q16_len + rows;
-        let need_f32 = rows + tq * hd;
+        let need_f16 = q16_len + rows_pad;
+        let need_f32 = rows_pad + tq * hd;
         let mut f16s = lock_poison_resilient(&self.attn_f16);
         if !f16s.as_ref().is_some_and(|s| s.len() >= need_f16) {
             *f16s = Some(unsafe { self.stream.alloc::<half::f16>(need_f16) }.map_err(map_err)?);
@@ -659,8 +664,9 @@ impl CudaBackend {
         let q_stride = q.shape()[2] as i32;
         let kv_stride = (kv_heads * hd) as i32;
         let q16_off = q16_len as u64 * 2;
-        let out_off = rows as u64 * 4;
+        let out_off = rows_pad as u64 * 4;
         let (tq32, tkv32, hd32) = (tq as i32, tkv as i32, hd as i32);
+        let tkvpad32 = tkv_pad as i32;
         let (nh32, nkv32) = (n_heads as i32, kv_heads as i32);
         let has_mask = if mask.is_some() { 1i32 } else { 0i32 };
         let (mslice, _) = match mask {
@@ -679,7 +685,7 @@ impl CudaBackend {
                 f16_base + (h * hd * 2) as u64,
                 q_stride,
                 f32_base,
-                tkv32,
+                tkvpad32,
                 tkv32,
                 tq32,
                 hd32,
@@ -699,6 +705,7 @@ impl CudaBackend {
                 // p_off — смещение вероятностей в f16-буфере В ЭЛЕМЕНТАХ
                 // (q16 занимает q16_len элементов).
                 let p_off = q16_len as i64;
+                let stride32 = tkvpad32;
                 let mut la = self.stream.launch_builder(&f);
                 la.arg(&*f32buf);
                 la.arg(mslice);
@@ -707,23 +714,27 @@ impl CudaBackend {
                 la.arg(&has_mask);
                 la.arg(&sc_off);
                 la.arg(&p_off);
+                la.arg(&stride32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
-            // 3) out[tq, hd] = P · V (col-major: m=tq, n=hd, k=tkv)
+            // 3) out[q, d] = Σ_k P[q,k]·V[k,d]. head_out — row-major [tq][hd],
+            // т.е. col-major (hd, tq) = outᵀ, поэтому C = Vᵀ·Pᵀ:
+            // m = hd, n = tq, k = tkv, A = V (без транспонирования),
+            // B = P (без транспонирования), ldc = hd.
             self.gemm_ex_f16(
                 &blas,
-                f16_base + q16_off,
-                tkv32,
                 v_base + (g * hd * 2) as u64,
                 kv_stride,
+                f16_base + q16_off,
+                tkvpad32,
                 f32_base + out_off,
                 hd32,
-                tq32,
                 hd32,
+                tq32,
                 tkv32,
                 1.0,
-                true,
-                true,
+                false,
+                false,
             )?;
             // 4) выход головы → срез y
             {
@@ -735,7 +746,7 @@ impl CudaBackend {
                 };
                 let hoff = (h * hd) as i32;
                 // so — смещение выхода головы В ЭЛЕМЕНТАХ (после score).
-                let so = rows as i64;
+                let so = rows_pad as i64;
                 let mut la = self.stream.launch_builder(&f);
                 la.arg(y.as_cuda_mut());
                 la.arg(&*f32buf);
@@ -3478,13 +3489,12 @@ impl Backend for CudaBackend {
             ));
         }
         // Префилл на f16-тензорных ядрах: score материализуется, но GEMM идёт
-        // на tensor cores. ВКЛЮЧАЕТСЯ ТОЛЬКО ЯВНО (CUDA_ATTN_BLAS=1): путь
-        // ещё не сошёлся с эталоном (расхождение 0.3–0.6 на тесте), поэтому
-        // по умолчанию работает проверенное тайловое ядро.
+        // на tensor cores. Основной путь; отключается CUDA_NO_ATTN_BLAS.
+        // Не взялись (бюджет/формат/нет cuBLAS) — падаем на тайловое ядро.
         if tq >= 32
-            && std::env::var_os("CUDA_ATTN_BLAS").is_some()
+            && std::env::var_os("CUDA_NO_ATTN_BLAS").is_none()
             && hd <= 256
-            && hd % 32 == 0
+            && hd % 8 == 0
             && n_heads % kv_heads == 0
             && let (
                 crate::backend::TensorInner::CudaF16(k16),
@@ -4511,6 +4521,141 @@ impl CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tiled GEMMs write ceil(nsup/nkz) of the 16 z-slices; reducing
+    /// Полный путь `attn_prefill_blas` на минимальной конфигурации (одна
+    /// голова, без GQA и маски) против наивного эталона — с печатью первых
+    /// значений выхода, чтобы видеть характер ошибки (нули/перестановка).
+    #[test]
+    fn attn_prefill_blas_minimal() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (tq, tkv, hd) = (32usize, 9usize, 8usize);
+        let q: Vec<f32> = (0..tq * hd).map(|i| ((i as f32) * 0.29).sin()).collect();
+        let k: Vec<f32> = (0..tkv * hd).map(|i| ((i as f32) * 0.41).cos()).collect();
+        let v: Vec<f32> = (0..tkv * hd).map(|i| ((i as f32) * 0.17).sin()).collect();
+        let qt = be.from_cpu_f32(&q, vec![1, tq, hd]).unwrap();
+        let tk = be.from_cpu_f32(&k, vec![1, tkv, hd]).unwrap();
+        let tv = be.from_cpu_f32(&v, vec![1, tkv, hd]).unwrap();
+        let zeros = vec![half::f16::from_f32(0.0); tkv * hd];
+        let ck = be.from_cpu_f16(&zeros, vec![1, tkv, hd]).unwrap();
+        let cv = be.from_cpu_f16(&zeros, vec![1, tkv, hd]).unwrap();
+        be.kv_update(&ck, &tk, 0).unwrap();
+        be.kv_update(&cv, &tv, 0).unwrap();
+        let out = be.zeros(vec![1, tq, hd]).unwrap();
+        let (crate::backend::TensorInner::CudaF16(k16), crate::backend::TensorInner::CudaF16(v16)) =
+            (&ck.inner, &cv.inner)
+        else {
+            panic!("cache не f16");
+        };
+        let took = be
+            .attn_prefill_blas(&qt, k16, v16, None, &out, tq, tkv, 1, 1, hd)
+            .unwrap();
+        assert!(took, "BLAS-путь не взялся");
+        let got = be.to_cpu_f32(&out).unwrap();
+        let h = |x: f32| half::f16::from_f32(x).to_f32();
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let mut worst = 0.0f32;
+        for qi in 0..tq {
+            for d in 0..hd {
+                // наивный эталон: softmax по ключам от score·scale
+                let mut mx = f32::NEG_INFINITY;
+                let mut sc = vec![0.0f32; tkv];
+                for key in 0..tkv {
+                    let mut a = 0.0f32;
+                    for j in 0..hd {
+                        a += h(q[qi * hd + j]) * h(k[key * hd + j]);
+                    }
+                    sc[key] = a * scale;
+                    mx = mx.max(sc[key]);
+                }
+                let mut den = 0.0f32;
+                for s in &sc {
+                    den += (s - mx).exp();
+                }
+                let mut want = 0.0f32;
+                for key in 0..tkv {
+                    want += ((sc[key] - mx).exp() / den) * h(v[key * hd + d]);
+                }
+                let diff = (got[qi * hd + d] - want).abs();
+                if diff > worst {
+                    worst = diff;
+                    if worst > 1e-2 {
+                        eprintln!(
+                            "q={qi} d={d}: got {:.4} want {:.4} (first scores {:?})",
+                            got[qi * hd + d],
+                            want,
+                            &sc[..3]
+                        );
+                    }
+                }
+            }
+        }
+        assert!(worst < 1e-2, "attn_prefill_blas расходится: {worst}");
+    }
+
+    /// Конвенция QK-GEMM из `attn_prefill_blas`: score[q·tkv + key] =
+    /// Σ_d Q[q,d]·K[key,d]. Проверяем самим GEMM'ом на f16-входах — так
+    /// отладка внимания отделяется от softmax и копирования.
+    #[test]
+    fn gemm_ex_f16_qk_convention() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (tq, tkv, hd) = (5usize, 7usize, 8usize);
+        let q: Vec<f32> = (0..tq * hd).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let k: Vec<f32> = (0..tkv * hd).map(|i| ((i as f32) * 0.51).cos()).collect();
+        let qt = be.from_cpu_f32(&q, vec![1, tq, hd]).unwrap();
+        let kt = be.from_cpu_f32(&k, vec![1, tkv, hd]).unwrap();
+        let q16 = be.cast_f16(&qt).unwrap();
+        let k16 = be.cast_f16(&kt).unwrap();
+        let mut sc = unsafe { be.stream.alloc::<f32>(tq * tkv) }.unwrap();
+        let blas = CudaBlas::new(be.stream.clone()).unwrap();
+        let kb = {
+            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&k16, &be.stream);
+            p
+        };
+        let qb = {
+            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&q16, &be.stream);
+            p
+        };
+        let cb = {
+            let (p, _g) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut sc, &be.stream);
+            p
+        };
+        be.gemm_ex_f16(
+            &blas,
+            kb,
+            hd as i32,
+            qb,
+            hd as i32,
+            cb,
+            tkv as i32,
+            tkv as i32,
+            tq as i32,
+            hd as i32,
+            1.0,
+            true,
+            false,
+        )
+        .unwrap();
+        let got = be.stream.clone_dtoh(&sc).unwrap();
+        let h = |x: f32| half::f16::from_f32(x).to_f32();
+        let mut worst = 0.0f32;
+        for qi in 0..tq {
+            for key in 0..tkv {
+                let mut want = 0.0f32;
+                for d in 0..hd {
+                    want += h(q[qi * hd + d]) * h(k[key * hd + d]);
+                }
+                worst = worst.max((got[qi * tkv + key] - want).abs());
+            }
+        }
+        assert!(worst < 1e-3, "QK-конвенция не сходится: {worst}");
+    }
 
     /// The tiled GEMMs write ceil(nsup/nkz) of the 16 z-slices; reducing
     /// more would sum stale pool contents (the STT-garbage bug).

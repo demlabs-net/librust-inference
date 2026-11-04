@@ -1543,11 +1543,14 @@ extern "C" __global__ void attn_softmax_mask_f16(const float* __restrict__ sc,
                                                  const float* __restrict__ mask,
                                                  __half* __restrict__ p,
                                                  int tkv, int has_mask,
-                                                 long long sc_off, long long p_off) {
+                                                 long long sc_off, long long p_off,
+                                                 int stride) {
     extern __shared__ float red[];
     const int row = blockIdx.x;          // строка = запрос (одна голова)
-    const float* r = sc + sc_off + (size_t)row * tkv;
-    __half* o = p + p_off + (size_t)row * tkv;
+    // stride — ведущая размерность буфера (tkv, выровненный до 8 под cuBLAS);
+    // значимых столбцов — tkv.
+    const float* r = sc + sc_off + (size_t)row * stride;
+    __half* o = p + p_off + (size_t)row * stride;
     // Маска [tq, tkv]: строка маски — номер запроса (= blockIdx.x).
     const int qrow = (int)blockIdx.x;
     const float* mk = has_mask ? mask + (size_t)qrow * tkv : nullptr;

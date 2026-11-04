@@ -128,11 +128,11 @@ impl Drop for CudaBuffer {
             // 5-8 % промахов при капах 32/8 — как раз они и съедали
             // по-слотовую секцию пакетного шага.
             const SMALL_BYTES: usize = 64 * 1024;
-            const MEDIUM_BYTES: usize = 2 * 1024 * 1024;
+            const MEDIUM_BYTES: usize = 8 * 1024 * 1024;
             let cap = if s.len() * 4 <= SMALL_BYTES {
                 256
             } else if s.len() * 4 <= MEDIUM_BYTES {
-                64
+                256
             } else {
                 8
             };

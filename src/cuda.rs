@@ -111,8 +111,19 @@ impl Drop for CudaBuffer {
             // never free (18 GB of dead KV after a few calls — the live
             // VRAM creep). Small hot buffers (activations, cpart) stay.
             const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
-            const MAX_PER_BUCKET: usize = 8;
-            if bucket.len() < MAX_PER_BUCKET && s.len() * 4 <= MAX_POOL_BYTES {
+            // Мелкие буферы (активации, строки пакета) в шаге живут десятками
+            // одновременно: при капе 8 девятый запрос размера 1024 уходил в
+            // cudaMalloc, а тот синхронизирует устройство. Замер пакетного
+            // шага: по-слотовая секция 21 мс при B=2 против 3.8 при B=1 —
+            // это была не арифметика, а промахи пула.
+            const MAX_PER_BUCKET_SMALL: usize = 64;
+            const SMALL_BYTES: usize = 64 * 1024;
+            let cap = if s.len() * 4 <= SMALL_BYTES {
+                MAX_PER_BUCKET_SMALL
+            } else {
+                8
+            };
+            if bucket.len() < cap && s.len() * 4 <= MAX_POOL_BYTES {
                 bucket.push(s);
             }
             // else: drop — the cudaMalloc'd memory is released.
@@ -4917,6 +4928,100 @@ mod tests {
     /// Bulk delta-rule (слоты в grid.z, стейты массивом указателей) обязан
     /// совпасть с поштучным вызовом на каждом слоте — иначе пакетный шаг
     /// поедет по другому состоянию, чем одиночный декод.
+    /// Цена по-слотовых опа модели (B=2): где именно 50 мкс на вызов.
+    #[test]
+    #[ignore]
+    fn attn_row_ops_probe() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (nh, nkv, hd, tkv) = (8usize, 2usize, 128usize, 700usize);
+        let q = be.zeros(vec![1, 1, nh * hd]).unwrap();
+        let wq = be.zeros(vec![hd]).unwrap();
+        let kf = be.zeros(vec![1, tkv, nkv * hd]).unwrap();
+        let vf = be.zeros(vec![1, tkv, nkv * hd]).unwrap();
+        let y = be.zeros(vec![1, 1, nh * hd]).unwrap();
+        let kn = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        let x = be.zeros(vec![2, 2 * nh * hd]).unwrap();
+        let time = |label: &str, reps: usize, f: &mut dyn FnMut()| {
+            for _ in 0..3 {
+                f();
+            }
+            be.synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                f();
+            }
+            be.synchronize().unwrap();
+            eprintln!(
+                "{label}: {:.1} мкс/вызов",
+                t0.elapsed().as_secs_f64() * 1e6 / reps as f64
+            );
+        };
+        time("row_view(1024)", 200, &mut || {
+            let _ = be.row_view(&x, 2, 2 * nh * hd, 1).unwrap();
+        });
+        time("rmsnorm_head", 200, &mut || {
+            be.rmsnorm_head(&q, &wq, &y, nh, 1e-6).unwrap();
+        });
+        time("rope_imrope", 200, &mut || {
+            let _ = be
+                .rope_imrope_text(&q, 700, hd, 1e6, [0, 0, 0, 0], hd)
+                .unwrap();
+        });
+        time("attn_ar(tkv=700)", 200, &mut || {
+            be.attn_ar(&q, &kf, &vf, None, &y, nh, nkv, hd).unwrap();
+        });
+        time("kv_update(1 row)", 200, &mut || {
+            be.kv_update(&kf, &kn, 699).unwrap();
+        });
+    }
+
+    /// Цена одного запуска с хоста (без синхронизации) — от неё зависит,
+    /// сколько мелких ядер в шаге вообще имеет смысл запускать.
+    #[test]
+    #[ignore]
+    fn launch_cost_probe() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let x = be.zeros(vec![4096]).unwrap();
+        let y = be.zeros(vec![4096]).unwrap();
+        let f = be.function("elementwise_f32").unwrap();
+        let cfg = LaunchConfig::for_num_elems(4096);
+        let (n32, op) = (4096i32, 0i32);
+        let reps = 10_000;
+        // прогрев: кэш функций, пул, контекст
+        for _ in 0..100 {
+            let mut la = be.stream.launch_builder(&f);
+            la.arg(x.as_cuda());
+            la.arg(x.as_cuda());
+            la.arg(y.as_cuda_mut());
+            la.arg(&n32);
+            la.arg(&op);
+            la.arg(&0.0f32);
+            unsafe { la.launch(cfg) }.unwrap();
+        }
+        be.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let mut la = be.stream.launch_builder(&f);
+            la.arg(x.as_cuda());
+            la.arg(x.as_cuda());
+            la.arg(y.as_cuda_mut());
+            la.arg(&n32);
+            la.arg(&op);
+            la.arg(&0.0f32);
+            unsafe { la.launch(cfg) }.unwrap();
+        }
+        let host = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        be.synchronize().unwrap();
+        let total = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        eprintln!("launch: хост {host:.2} мкс/запуск, с синхронизацией {total:.2} мкс");
+    }
+
     /// Кривая GEMM по m (Q4_K, как в модели): где ломается цена строки.
     /// `cargo test --release --features cuda --lib gemm_small_m_curve -- --ignored --nocapture`
     #[test]

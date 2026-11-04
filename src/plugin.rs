@@ -32,7 +32,11 @@ pub struct Version {
 
 impl Version {
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 }
 
@@ -58,7 +62,11 @@ impl FromStr for Version {
         if parts.next().is_some() {
             return Err(format!("версия «{s}» не в формате X.Y.Z"));
         }
-        Ok(Self { major, minor, patch })
+        Ok(Self {
+            major,
+            minor,
+            patch,
+        })
     }
 }
 
@@ -89,7 +97,11 @@ pub struct Offload {
 }
 
 impl Offload {
-    pub const NONE: Self = Self { experts: false, kv: false, prefix_cache: false };
+    pub const NONE: Self = Self {
+        experts: false,
+        kv: false,
+        prefix_cache: false,
+    };
 }
 
 /// Модельная версия, которую обслуживает плагин: публичное имя (`v3`,
@@ -105,11 +117,21 @@ pub struct ModelVersion {
 
 impl ModelVersion {
     pub const fn new(name: &'static str, arch: &'static str, implemented: bool) -> Self {
-        Self { name, arch, implemented, plan: None }
+        Self {
+            name,
+            arch,
+            implemented,
+            plan: None,
+        }
     }
 
     pub const fn planned(name: &'static str, arch: &'static str, plan: &'static str) -> Self {
-        Self { name, arch, implemented: false, plan: Some(plan) }
+        Self {
+            name,
+            arch,
+            implemented: false,
+            plan: Some(plan),
+        }
     }
 }
 
@@ -150,7 +172,9 @@ impl Capabilities {
 
     /// Семейство по GGUF-архитектуре (через реестр; unknown → `Other`).
     pub fn family_for_arch(arch: &str) -> Family {
-        crate::arch::lookup(arch).map(|i| i.family).unwrap_or(Family::Other)
+        crate::arch::lookup(arch)
+            .map(|i| i.family)
+            .unwrap_or(Family::Other)
     }
 }
 
@@ -245,7 +269,9 @@ pub struct QwenPlugin {
 
 impl Default for QwenPlugin {
     fn default() -> Self {
-        Self { engine_version: Version::new(1, 0, 0) }
+        Self {
+            engine_version: Version::new(1, 0, 0),
+        }
     }
 }
 
@@ -253,7 +279,11 @@ const QWEN_V3_CAPS: Capabilities = Capabilities {
     family: Family::Dense,
     implemented: true,
     kv_formats: &[KvFormat::F32, KvFormat::F16, KvFormat::Q8_0],
-    speculative: &[SpecBackend::Off, SpecBackend::DFlash, SpecBackend::NGramLookup],
+    speculative: &[
+        SpecBackend::Off,
+        SpecBackend::DFlash,
+        SpecBackend::NGramLookup,
+    ],
     offload: Offload::NONE,
     batch_slots: 4,
     max_context: 131_072,
@@ -281,7 +311,11 @@ const QWEN_V4EXP_CAPS: Capabilities = Capabilities {
     implemented: false,
     kv_formats: &[],
     speculative: &[SpecBackend::Off],
-    offload: Offload { experts: true, kv: false, prefix_cache: false },
+    offload: Offload {
+        experts: true,
+        kv: false,
+        prefix_cache: false,
+    },
     batch_slots: 2,
     max_context: 262_144,
     note: "Qwen3.8-Flash-Next: hyper-connections, MoE 512/top-10 + shared, \
@@ -374,7 +408,11 @@ impl EnginePlugin for ExternalEngine {
     }
 
     fn capabilities(&self, v: &ModelVersion) -> Capabilities {
-        if self.models.iter().any(|m| m.arch == v.arch || m.name == v.name) {
+        if self
+            .models
+            .iter()
+            .any(|m| m.arch == v.arch || m.name == v.name)
+        {
             self.capabilities
         } else {
             Capabilities::unknown("модель не объявлена")
@@ -383,7 +421,9 @@ impl EnginePlugin for ExternalEngine {
 }
 
 /// Реестр нативных плагинов (внешние добавляются сервисом в рантайме).
-pub static QWEN: QwenPlugin = QwenPlugin { engine_version: Version::new(1, 0, 0) };
+pub static QWEN: QwenPlugin = QwenPlugin {
+    engine_version: Version::new(1, 0, 0),
+};
 
 pub static NATIVE_REGISTRY: &[&dyn EnginePlugin] = &[&QWEN];
 
@@ -463,10 +503,18 @@ mod tests {
         let caps = QWEN.capabilities(&v);
         assert!(!caps.implemented);
         assert_eq!(caps.family, Family::Moe);
-        assert!(caps.offload.experts, "Flash-Next без offload экспертов не живёт");
-        let err = QWEN.planned_error(&v).expect("планируемая версия обязана давать внятный отказ");
+        assert!(
+            caps.offload.experts,
+            "Flash-Next без offload экспертов не живёт"
+        );
+        let err = QWEN
+            .planned_error(&v)
+            .expect("планируемая версия обязана давать внятный отказ");
         let text = format!("{err}");
-        assert!(text.contains("qwen4exp"), "отказ должен называть архитектуру: {text}");
+        assert!(
+            text.contains("qwen4exp"),
+            "отказ должен называть архитектуру: {text}"
+        );
     }
 
     #[test]
@@ -483,10 +531,12 @@ mod tests {
         // Внешний плагин отдаёт СВОЙ список моделей, а не пустой статический.
         assert_eq!(engine.model_versions().len(), 1);
         assert_eq!(engine.model_versions()[0].arch, "qwen4exp");
-        assert!(engine
-            .capabilities(&ModelVersion::new("v4exp", "qwen4exp", true))
-            .offload
-            .experts);
+        assert!(
+            engine
+                .capabilities(&ModelVersion::new("v4exp", "qwen4exp", true))
+                .offload
+                .experts
+        );
         // Необъявленная модель — не «умеет всё», а явный ноль.
         let other = engine.capabilities(&ModelVersion::new("v3", "qwen3", true));
         assert!(!other.implemented);
@@ -502,9 +552,14 @@ mod tests {
         }
         let err = lookup_arch("qwen4exp").err().expect("v4exp ещё в плане");
         assert!(format!("{err}").contains("qwen4exp"));
-        let err = lookup_arch("llama").err().expect("llama не покрыта ни одним плагином");
+        let err = lookup_arch("llama")
+            .err()
+            .expect("llama не покрыта ни одним плагином");
         let text = format!("{err}");
         assert!(text.contains("llama"), "{text}");
-        assert!(text.contains("qwen35"), "отказ должен перечислять покрытые: {text}");
+        assert!(
+            text.contains("qwen35"),
+            "отказ должен перечислять покрытые: {text}"
+        );
     }
 }

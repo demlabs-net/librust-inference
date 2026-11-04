@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use rust_inference::backend::Backend as _;
 use rust_inference::gguf;
-use rust_inference::inference::generate::{generate, GenerateParams, SpecStats};
+use rust_inference::inference::generate::{GenerateParams, SpecStats, generate};
 use rust_inference::metal::MetalBackend;
 use rust_inference::qwen35;
 use rust_inference::spec::Drafter;
@@ -21,7 +21,9 @@ use rust_inference::weights_map::WeightsMap;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).ok_or("usage: spec_oracle_probe <model.gguf> [GAMMA]")?;
+    let path = args
+        .get(1)
+        .ok_or("usage: spec_oracle_probe <model.gguf> [GAMMA]")?;
     let gamma: u32 = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1);
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -48,7 +50,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ar = generate(&mut m, &be, &tok, &prompt, &base(n), |_| true)?;
 
     // 2) Спекуляция: N-грамм-драфтер, γ задан.
-    let drafter: Arc<Mutex<dyn Drafter>> = Arc::new(Mutex::new(rust_inference::spec::NGramDrafter::new(4)));
+    let drafter: Arc<Mutex<dyn Drafter>> =
+        Arc::new(Mutex::new(rust_inference::spec::NGramDrafter::new(4)));
     let mut p = base(n);
     p.drafter = Some(drafter);
     p.spec_gamma = gamma as usize;
@@ -71,7 +74,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("OK: одиночный спек == AR (движок верен, искать в драйвере)");
     } else {
         let i = ar.iter().zip(spec.iter()).position(|(a, b)| a != b);
-        println!("РАСХОЖДЕНИЕ на токене {i:?}: AR {:?}, спек {:?}", i.map(|i| ar[i]), i.map(|i| spec[i]));
+        println!(
+            "РАСХОЖДЕНИЕ на токене {i:?}: AR {:?}, спек {:?}",
+            i.map(|i| ar[i]),
+            i.map(|i| spec[i])
+        );
     }
     Ok(())
 }

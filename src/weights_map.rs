@@ -5004,7 +5004,8 @@ pub fn q8_0_to_i8(data: &[u8], rows: usize, cols: usize) -> Option<(Vec<i8>, Vec
     Some((codes, scales))
 }
 
-pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {    match t.format {
+pub fn dequant_f32(t: &WeightTensor<'_>) -> Vec<f32> {
+    match t.format {
         WeightFormat::Plain(Dtype::F32) => t
             .data
             .chunks_exact(4)
@@ -5131,7 +5132,10 @@ mod tests {
                 let scale = 0.5f32 + (r * 2 + kb) as f32 * 0.25;
                 data.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
                 for j in 0..32 {
-                    let code = (r as i8).wrapping_mul(10).wrapping_add(kb as i8 * 3).wrapping_add(j as i8);
+                    let code = (r as i8)
+                        .wrapping_mul(10)
+                        .wrapping_add(kb as i8 * 3)
+                        .wrapping_add(j as i8);
                     data.push(code as u8);
                 }
             }
@@ -5146,7 +5150,10 @@ mod tests {
                 assert!((scales[kb * rows + r] - want_scale).abs() < 1e-6);
                 let base = (kb * rows + r) * 32;
                 for j in 0..32 {
-                    let want = (r as i8).wrapping_mul(10).wrapping_add(kb as i8 * 3).wrapping_add(j as i8);
+                    let want = (r as i8)
+                        .wrapping_mul(10)
+                        .wrapping_add(kb as i8 * 3)
+                        .wrapping_add(j as i8);
                     assert_eq!(codes[base + j], want, "r={r} kb={kb} j={j}");
                 }
             }

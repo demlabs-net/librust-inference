@@ -135,3 +135,103 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+[[example]]
+name = "attn_bench"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_generate"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_longctx"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_overflow"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_serve"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_step"
+required-features = ["metal"]
+
+[[example]]
+name = "bench_iq4xs"
+required-features = ["metal"]
+
+[[example]]
+name = "gdn_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "mtp_check"
+required-features = ["metal"]
+
+[[example]]
+name = "orc_vec_run"
+required-features = ["metal"]
+
+[[example]]
+name = "prefill_hidden_check"
+required-features = ["metal"]
+
+[[example]]
+name = "prefix_cache"
+required-features = ["metal"]
+
+[[example]]
+name = "slot_switch"
+required-features = ["metal"]
+
+[[example]]
+name = "spec_oracle_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "spec_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "spec_slot_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "window_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_tile_glm_inputs"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_vec_check"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_vec_decode_long"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_vec_glm_inputs"
+required-features = ["metal"]
+
+[[example]]
+name = "iq4_mm_check"
+required-features = ["metal"]
+
+[[example]]
+name = "mv_q4k_check"
+required-features = ["metal"]
+
+[[example]]
+name = "mv_q50_synth"
+required-features = ["metal"]
+
+[[example]]
+name = "swiglu_check"
+required-features = ["metal"]

@@ -29,7 +29,9 @@ fn argmax(row: &[f32]) -> u32 {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).ok_or("usage: spec_slot_probe <model.gguf> [GAMMA]")?;
+    let path = args
+        .get(1)
+        .ok_or("usage: spec_slot_probe <model.gguf> [GAMMA]")?;
     let gamma: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(8);
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };

@@ -2547,8 +2547,8 @@ mod roll_tests {
 /// kernel can pass its own unit test while the assembled forward is wrong.
 #[cfg(all(test, feature = "cuda", feature = "cpu"))]
 mod cuda_parity_tests {
-    use super::test_util::{build_model, mini_cfg};
     use super::Qwen3Config;
+    use super::test_util::{build_model, mini_cfg};
     use crate::backend::Backend;
 
     fn parity(cfg: Qwen3Config, label: &str, f32_kv: bool) {
@@ -2584,18 +2584,9 @@ mod cuda_parity_tests {
         // residual add, after the FFN residual add.
         let (cn, ca, cf) = mc.debug_layer_split(cpu.as_ref(), &ids, 0).unwrap();
         let (gn, ga, gf) = mg.debug_layer_split(gpu.as_ref(), &ids, 0).unwrap();
-        let d_norm = maxdev(
-            &cpu.to_cpu_f32(&cn).unwrap(),
-            &gpu.to_cpu_f32(&gn).unwrap(),
-        );
-        let d_attn = maxdev(
-            &cpu.to_cpu_f32(&ca).unwrap(),
-            &gpu.to_cpu_f32(&ga).unwrap(),
-        );
-        let d_ffn = maxdev(
-            &cpu.to_cpu_f32(&cf).unwrap(),
-            &gpu.to_cpu_f32(&gf).unwrap(),
-        );
+        let d_norm = maxdev(&cpu.to_cpu_f32(&cn).unwrap(), &gpu.to_cpu_f32(&gn).unwrap());
+        let d_attn = maxdev(&cpu.to_cpu_f32(&ca).unwrap(), &gpu.to_cpu_f32(&ga).unwrap());
+        let d_ffn = maxdev(&cpu.to_cpu_f32(&cf).unwrap(), &gpu.to_cpu_f32(&gf).unwrap());
         eprintln!("CUDA vs CPU: layer0 norm {d_norm}, attn {d_attn}, ffn {d_ffn}");
 
         // Stage 2b: the KV cache itself after a full prefill — only for the
@@ -2606,13 +2597,22 @@ mod cuda_parity_tests {
             mc_kv.prefill(cpu.as_ref(), &ids).unwrap();
             let mut mg_kv = build_model(gpu.as_ref(), cfg.clone());
             mg_kv.prefill(gpu.as_ref(), &ids).unwrap();
-            let ck = crate::backend::download_in_dtype(cpu.as_ref(), &mc_kv.caches[0].view()).unwrap();
-            let gk = crate::backend::download_in_dtype(gpu.as_ref(), &mg_kv.caches[0].view()).unwrap();
-            let cv = crate::backend::download_in_dtype(cpu.as_ref(), &mc_kv.caches[0].view_v()).unwrap();
-            let gv = crate::backend::download_in_dtype(gpu.as_ref(), &mg_kv.caches[0].view_v()).unwrap();
+            let ck =
+                crate::backend::download_in_dtype(cpu.as_ref(), &mc_kv.caches[0].view()).unwrap();
+            let gk =
+                crate::backend::download_in_dtype(gpu.as_ref(), &mg_kv.caches[0].view()).unwrap();
+            let cv =
+                crate::backend::download_in_dtype(cpu.as_ref(), &mc_kv.caches[0].view_v()).unwrap();
+            let gv =
+                crate::backend::download_in_dtype(gpu.as_ref(), &mg_kv.caches[0].view_v()).unwrap();
             let d = maxdev(&ck, &gk).max(maxdev(&cv, &gv));
-            eprintln!("CUDA vs CPU: kv cache {d}\n  cpu k[0..8]={:?}\n  gpu k[0..8]={:?}\n  cpu v[0..8]={:?}\n  gpu v[0..8]={:?}",
-                &ck[..8.min(ck.len())], &gk[..8.min(gk.len())], &cv[..8.min(cv.len())], &gv[..8.min(gv.len())]);
+            eprintln!(
+                "CUDA vs CPU: kv cache {d}\n  cpu k[0..8]={:?}\n  gpu k[0..8]={:?}\n  cpu v[0..8]={:?}\n  gpu v[0..8]={:?}",
+                &ck[..8.min(ck.len())],
+                &gk[..8.min(gk.len())],
+                &cv[..8.min(cv.len())],
+                &gv[..8.min(gv.len())]
+            );
             d
         };
 
@@ -2638,7 +2638,12 @@ mod cuda_parity_tests {
         let tol_stage = if f32_kv { 1e-3 } else { 0.5 };
         let tol_logits = if f32_kv { 1e-3 } else { 0.02 };
         assert!(
-            d_embed < 1e-3 && d_norm < 1e-3 && d_kv < tol_stage && d_attn < tol_stage && d_ffn < tol_stage && d_logits < tol_logits,
+            d_embed < 1e-3
+                && d_norm < 1e-3
+                && d_kv < tol_stage
+                && d_attn < tol_stage
+                && d_ffn < tol_stage
+                && d_logits < tol_logits,
             "[{label}] CUDA vs CPU mismatch: embed {d_embed}, norm {d_norm}, kv {d_kv}, attn {d_attn}, ffn {d_ffn}, logits {d_logits}"
         );
     }
@@ -2663,7 +2668,9 @@ mod cuda_parity_tests {
         let (t, h, kvh, hd) = (6usize, 4usize, 2usize, 64usize);
         let d = h * hd;
         let vals = |n: usize, seed: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32 * 0.13 + seed).sin()) * 0.5).collect()
+            (0..n)
+                .map(|i| ((i as f32 * 0.13 + seed).sin()) * 0.5)
+                .collect()
         };
 
         // 1) fused rmsnorm_head_rope
@@ -2672,14 +2679,20 @@ mod cuda_parity_tests {
         let ty = {
             let tx = cpu.from_cpu_f32(&x, vec![1, t, d]).unwrap();
             let tw = cpu.from_cpu_f32(&w, vec![hd]).unwrap();
-            cpu.to_cpu_f32(&cpu.rmsnorm_head_rope(&tx, &tw, 0, hd, 10_000.0, h, 1e-6, None).unwrap())
-                .unwrap()
+            cpu.to_cpu_f32(
+                &cpu.rmsnorm_head_rope(&tx, &tw, 0, hd, 10_000.0, h, 1e-6, None)
+                    .unwrap(),
+            )
+            .unwrap()
         };
         let gy = {
             let gx = gpu.from_cpu_f32(&x, vec![1, t, d]).unwrap();
             let gw = gpu.from_cpu_f32(&w, vec![hd]).unwrap();
-            gpu.to_cpu_f32(&gpu.rmsnorm_head_rope(&gx, &gw, 0, hd, 10_000.0, h, 1e-6, None).unwrap())
-                .unwrap()
+            gpu.to_cpu_f32(
+                &gpu.rmsnorm_head_rope(&gx, &gw, 0, hd, 10_000.0, h, 1e-6, None)
+                    .unwrap(),
+            )
+            .unwrap()
         };
         let d_norm_rope = dev(&ty, &gy);
 
@@ -2721,8 +2734,7 @@ mod cuda_parity_tests {
                 .collect();
             cache.extend(b.to_cpu_f16(&cv).unwrap().into_iter().map(f32::from));
             let out = b.zeros(vec![1, t, d]).unwrap();
-            b.attn_ar(&tq, &ck, &cv, None, &out, h, kvh, hd)
-                .unwrap();
+            b.attn_ar(&tq, &ck, &cv, None, &out, h, kvh, hd).unwrap();
             (cache, b.to_cpu_f32(&out).unwrap())
         };
         let (kc_cpu, ao_cpu) = run16(cpu.as_ref());
@@ -2766,12 +2778,8 @@ mod cuda_parity_tests {
             let cv = b
                 .from_cpu_f16(&zeros, vec![1, tkv_n, kvh_t * hd_t])
                 .unwrap();
-            let tk = b
-                .from_cpu_f32(&k_t, vec![1, tkv_n, kvh_t * hd_t])
-                .unwrap();
-            let tv = b
-                .from_cpu_f32(&v_t, vec![1, tkv_n, kvh_t * hd_t])
-                .unwrap();
+            let tk = b.from_cpu_f32(&k_t, vec![1, tkv_n, kvh_t * hd_t]).unwrap();
+            let tv = b.from_cpu_f32(&v_t, vec![1, tkv_n, kvh_t * hd_t]).unwrap();
             b.kv_update(&ck, &tk, 0).unwrap();
             b.kv_update(&cv, &tv, 0).unwrap();
             let m = b.from_cpu_f32(&mask_t, vec![tq_n, tkv_n]).unwrap();
@@ -3783,11 +3791,7 @@ impl Qwen3Slot {
 impl Qwen3Model {
     /// Снимок состояния слота: у плотной модели его нет (prefix-кэш работает
     /// через историю `cached`), поэтому тип-заглушка.
-    fn with_slot_state<R>(
-        &mut self,
-        slot: &mut Qwen3Slot,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    fn with_slot_state<R>(&mut self, slot: &mut Qwen3Slot, f: impl FnOnce(&mut Self) -> R) -> R {
         std::mem::swap(&mut self.caches, &mut slot.caches);
         std::mem::swap(&mut self.pos_rope, &mut slot.pos_rope);
         let r = f(self);
@@ -3835,7 +3839,10 @@ impl crate::batch::BatchModel for Qwen3Model {
             nc.set_max_cap(Some(self.cfg.rope_max_seq));
             caches.push(nc);
         }
-        Ok(Qwen3Slot { caches, pos_rope: 0 })
+        Ok(Qwen3Slot {
+            caches,
+            pos_rope: 0,
+        })
     }
     fn slot_snapshot(&self, _backend: &dyn Backend, _slot: &Qwen3Slot) -> Result<(), BackendError> {
         Ok(())

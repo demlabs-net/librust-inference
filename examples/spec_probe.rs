@@ -120,7 +120,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     ar.truncate(n + 1);
     let same = spec == ar;
     println!("\nAR      ({} шагов, pos {}): {:?}", n, ar_pos, ar);
-    println!("с окнами ({} шагов, принято {}): {:?}", steps, accepted_total, spec);
+    println!(
+        "с окнами ({} шагов, принято {}): {:?}",
+        steps, accepted_total, spec
+    );
     println!(
         "первое расхождение: {:?}",
         spec.iter()

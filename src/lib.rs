@@ -111,8 +111,8 @@ pub use backend::{Backend, Tensor};
 pub use dtype::{Dtype, KvFormat, QuantConfig, WeightFormat};
 pub use error::BackendError;
 pub use plugin::{
-    Capabilities, EnginePlugin, ExternalEngine, ModelVersion, Offload, PluginKind, QwenPlugin,
-    QwenVersion, SpecBackend, Version, NATIVE_REGISTRY, QWEN, lookup_arch, qwen_version_for_arch,
+    Capabilities, EnginePlugin, ExternalEngine, ModelVersion, NATIVE_REGISTRY, Offload, PluginKind,
+    QWEN, QwenPlugin, QwenVersion, SpecBackend, Version, lookup_arch, qwen_version_for_arch,
 };
 
 // GPU-only rule: a build without an enabled GPU backend must not silently fall

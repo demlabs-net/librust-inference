@@ -2431,6 +2431,7 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
     __shared__ unsigned char Bs[BN * BLK];                                    \
     __shared__ float T[256][BN];                                              \
     __shared__ AT As[256];                                                    \
+    __shared__ float part[8][33];                                             \
     int tid = threadIdx.x;                                                    \
     int bx = blockIdx.x;                                                      \
     int row = bx % m;                                                         \
@@ -2476,20 +2477,28 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
             }                                                                 \
         }                                                                     \
         __syncthreads();                                                      \
-        /* Compute: 32 threads (one per column), pure FMA over the f32 tile.\
-           N (iter-10): 4 accumulators — the old single-acc 256-FMA chain    \
-           (4-cycle latency ≈ 1 K cycles per k-block) was the kernel's       \
-           dependency stall; 4-way ILP hides it (the v2 kernel was ~3-5x     \
-           slower than fp16, mostly this). */                                 \
-        if (tid < BN && col0 + tid < n) {                                     \
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;         \
-            for (int j = 0; j < 256; j += 4) {                               \
-                acc0 += (float)As[j + 0] * T[j + 0][tid];                     \
-                acc1 += (float)As[j + 1] * T[j + 1][tid];                     \
-                acc2 += (float)As[j + 2] * T[j + 2][tid];                     \
-                acc3 += (float)As[j + 3] * T[j + 3][tid];                     \
+        /* Compute: раньше FMA делали 32 потока из 256 (7/8 блока
+           простаивали). Теперь каждый из 8 warp'ов (jg) суммирует свою
+           восьмую часть k-блока в part[jg][col], затем потоки tid<BN
+           складывают восемь частичных. Порядок суммирования отличается от
+           прежнего (f32-шум ~1e-6), точность не страдает. */              \
+        {                                                                     \
+            const int j0 = jg * 32;                                           \
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;                 \
+            for (int j = j0; j < j0 + 32; j += 4) {                           \
+                a0 += (float)As[j + 0] * T[j + 0][col];                       \
+                a1 += (float)As[j + 1] * T[j + 1][col];                       \
+                a2 += (float)As[j + 2] * T[j + 2][col];                       \
+                a3 += (float)As[j + 3] * T[j + 3][col];                       \
             }                                                                 \
-            acc += (acc0 + acc1) + (acc2 + acc3);                             \
+            part[jg][col] = (a0 + a1) + (a2 + a3);                            \
+        }                                                                     \
+        __syncthreads();                                                      \
+        if (tid < BN && col0 + tid < n) {                                     \
+            float p0 = part[0][tid], p1 = part[1][tid], p2 = part[2][tid];    \
+            float p3 = part[3][tid], p4 = part[4][tid], p5 = part[5][tid];    \
+            float p6 = part[6][tid], p7 = part[7][tid];                       \
+            acc += (((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));       \
         }                                                                     \
         __syncthreads();                                                      \
     }                                                                         \

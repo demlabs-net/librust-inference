@@ -2092,6 +2092,34 @@ __device__ inline float q5k_weight(const unsigned char* blk, int j) {
 /// qs[128] (@16..144, chunk-major). Dequant (ggml dequantize_row_q4_K):
 /// w = d·sc·q − dmin·m, q = 4-bit nibble. N (iter-10): GGUF Q4_K tensors
 /// previously ran dequantized to f32 (7x DRAM); this feeds the v2 GEMM.
+/// 32 значения ОДНОГО K-субблока Q4_K с вынесенными константами: у декода
+/// скейл/мин/d/dmin постоянны внутри субблока, поэтому на вес остаётся
+/// «извлечь ниббл + 2 умножения», а не ~20 операций по-элементного декода
+/// (это и держало decode на 22 tok/s при полосе 1.8 ТБ/с).
+__device__ inline void q4kc_subblock(const unsigned char* blk, int jg, float* out) {
+    const int b = jg;   // 0..7
+    int sc, mn;
+    if (b < 4) {
+        sc = blk[4 + b] & 63;
+        mn = blk[8 + b] & 63;
+    } else {
+        sc = (blk[4 + b + 4] & 0xF) | ((blk[4 + b - 4] >> 6) << 4);
+        mn = (blk[4 + b + 4] >> 4) | ((blk[4 + b] >> 6) << 4);
+    }
+    const float cd = __half2float(*(const __half*)(blk)) * (float)sc;
+    const float cm = __half2float(*(const __half*)(blk + 2)) * (float)mn;
+    // qs: байт 16 + 32c + r держит w[64c + r] в младшем ниббле и
+    // w[64c + 32 + r] в старшем; для субблока b: c = b>>1, ниббл = b&1.
+    const unsigned char* qb = blk + 16 + 32 * (b >> 1);
+    if (b & 1) {
+        _Pragma("unroll")
+        for (int r = 0; r < 32; ++r) out[r] = cd * (float)(qb[r] >> 4) - cm;
+    } else {
+        _Pragma("unroll")
+        for (int r = 0; r < 32; ++r) out[r] = cd * (float)(qb[r] & 0xF) - cm;
+    }
+}
+
 __device__ inline float q4kc_weight(const unsigned char* blk, int j) {
     int b = j >> 5;   // 0..7 (32-weight sub-blocks)
     int l = j & 31;
@@ -2164,6 +2192,18 @@ __device__ inline float q3k_weight(const unsigned char* blk, int j) {
     int h = (blk[hbase + l] & mbit) ? 0 : 4;
     return d * (float)(scs - 32) * (float)(q2 - h);
 }
+
+/// Субблок из 32 значений для форматов без вынесенных констант (q6k/q5k/q3k):
+/// просто 32 вызова по-элементного декода — контракт тот же, что у
+/// q4kc_subblock (её ускорение — в выносе скейла/мина из цикла).
+#define DEFINE_GENERIC_SUB(NAME, WREAD)                                       \
+__device__ inline void NAME##_subblock(const unsigned char* blk, int jg, float* out) { \
+    _Pragma("unroll")                                                         \
+    for (int r = 0; r < 32; ++r) out[r] = WREAD(blk, jg * 32 + r);            \
+}
+DEFINE_GENERIC_SUB(q6k, q6k_weight)
+DEFINE_GENERIC_SUB(q5k, q5k_weight)
+DEFINE_GENERIC_SUB(q3k, q3k_weight)
 
 /// Q4_0 packed-weight dequant, 18 bytes per 32-weight block: f16 d (bytes
 /// 0..2) + 16 bytes of 4-bit nibbles. NOTE (iter-10): this is the SPEECH-
@@ -2641,7 +2681,7 @@ DEFINE_Q8K_TILED(bf16, __nv_bfloat16)
 // tile 32 KB fits the 48 KB static-shared budget. The A operand follows
 // the activation axis: the activation tile As is stored AT (f32/f16/bf16 —
 // the half widths halve the shared traffic and the (float) conversions).
-#define DEFINE_K_SPLITK(NAME, SUF, AT, BLK, WREAD)                             \
+#define DEFINE_K_SPLITK(NAME, SUF, AT, BLK, WSUB)                             \
 extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
     const AT* __restrict__ A,        /* (m, k) — activation axis */          \
     const unsigned char* __restrict__ B,/* packed blocks, (col·nsuper + kb)·BLK */ \
@@ -2690,15 +2730,15 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
         }                                                                     \
         __syncthreads();                                                      \
         /* Dequant pass: thread (col, jg) → TILE[j][col] (transposed —       \
-           conflict-free writes and reads). */                                \
+           conflict-free writes and reads). Субблок jg собирается разом:     \
+           у Q4_K это выносит скейл/мин/d/dmin из цикла (см. q4kc_subblock). */\
         int col = tid & 31;                                                   \
         int jg = tid >> 5;                                                    \
         {                                                                     \
             const unsigned char* blk = Bs + col * BLK;                        \
-            for (int r = 0; r < 32; ++r) {                                    \
-                int j = jg * 32 + r;                                          \
-                T[j][col] = WREAD(blk, j);                                    \
-            }                                                                 \
+            float vals[32];                                                   \
+            WSUB(blk, jg, vals);                                              \
+            for (int r = 0; r < 32; ++r) T[jg * 32 + r][col] = vals[r];       \
         }                                                                     \
         __syncthreads();                                                      \
         /* Compute: раньше FMA делали 32 потока из 256 (7/8 блока
@@ -2731,17 +2771,17 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
     }                                                                         \
 }
 
-DEFINE_K_SPLITK(q6k, f32, float, 210, q6k_weight)
-DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_weight)
-DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_weight)
-DEFINE_K_SPLITK(q5k, f32, float, 176, q5k_weight)
-DEFINE_K_SPLITK(q3k, f32, float, 110, q3k_weight)
+DEFINE_K_SPLITK(q6k, f32, float, 210, q6k_subblock)
+DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_subblock)
+DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_subblock)
+DEFINE_K_SPLITK(q5k, f32, float, 176, q5k_subblock)
+DEFINE_K_SPLITK(q3k, f32, float, 110, q3k_subblock)
 // N (iter-10): canonical Q4_K (GGUF) — 144 B/256, the same v2 structure as
 // q6k (dequant-amortized f32 tile). Previously GGUF Q4_K was dequantized to
 // f32 on the host (7x DRAM traffic); this kernel is fed by from_cpu_q4kc.
-DEFINE_K_SPLITK(q4kc, f32, float, 144, q4kc_weight)
-DEFINE_K_SPLITK(q4kc, f16, __half, 144, q4kc_weight)
-DEFINE_K_SPLITK(q4kc, bf16, __nv_bfloat16, 144, q4kc_weight)
+DEFINE_K_SPLITK(q4kc, f32, float, 144, q4kc_subblock)
+DEFINE_K_SPLITK(q4kc, f16, __half, 144, q4kc_subblock)
+DEFINE_K_SPLITK(q4kc, bf16, __nv_bfloat16, 144, q4kc_subblock)
 
 /// K-quant GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
 /// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The

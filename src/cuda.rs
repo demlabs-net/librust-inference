@@ -3018,6 +3018,49 @@ impl Backend for CudaBackend {
         Ok(y)
     }
 
+    /// IMROPE текста с частичной ротацией (n_rot из hd): раньше шёл
+    /// CPU-дефолтом через хост — в пакетном шаге это 4 синхронизации на
+    /// слой и на строку (замер: 10 мс на слой при B=2 против 0.1 у attn).
+    fn rope_imrope_text(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+        n_rot: usize,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if hd == 0 || n_rot == 0 || !n_rot.is_multiple_of(2) || n_rot > hd || d % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_imrope_text: hd={hd} n_rot={n_rot} d={d}"
+            )));
+        }
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let y = self.zeros(vec![1, tq, d])?;
+        let f = self.function("rope_imrope_text_f32")?;
+        let cfg = LaunchConfig::for_num_elems((tq * d) as u32);
+        let (tq32, d32, hd32, nr32, pos32) =
+            (tq as i32, d as i32, hd as i32, n_rot as i32, pos as i32);
+        let (s0, s1, s2) = (sections[0] as i32, sections[1] as i32, sections[2] as i32);
+        let sd = sect_dims as i32;
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda());
+        la.arg(&tq32);
+        la.arg(&d32);
+        la.arg(&hd32);
+        la.arg(&nr32);
+        la.arg(&pos32);
+        la.arg(&theta);
+        la.arg(&s0);
+        la.arg(&s1);
+        la.arg(&s2);
+        la.arg(&sd);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
     fn rope_mrope(
         &self,
         x: &Tensor,
@@ -4794,6 +4837,52 @@ mod tests {
     /// Bulk delta-rule (слоты в grid.z, стейты массивом указателей) обязан
     /// совпасть с поштучным вызовом на каждом слоте — иначе пакетный шаг
     /// поедет по другому состоянию, чем одиночный декод.
+    /// CUDA-IMROPE текста сверяется с CPU-дефолтом (тот — эталон для
+    /// хвоста головы, секторов-«пустышек» и частичной ротации n_rot < hd).
+    #[test]
+    fn rope_imrope_text_matches_cpu() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        use crate::backend::Backend as _;
+        let cpu = crate::cpu::CpuBackend;
+        let (tq, nh, hd, n_rot) = (3usize, 2usize, 16usize, 8usize);
+        let x: Vec<f32> = (0..tq * nh * hd)
+            .map(|i| ((i as f32 * 0.37).sin()) * 1.5)
+            .collect();
+        for (sections, pos) in [
+            ([2usize, 2, 2, 0], 0usize),
+            ([2, 2, 2, 0], 7),
+            ([0, 0, 0, 0], 5),
+        ] {
+            let want = cpu
+                .rope_imrope_text(
+                    &cpu.from_cpu_f32(&x, vec![1, tq, nh * hd]).unwrap(),
+                    pos,
+                    hd,
+                    1e6,
+                    sections,
+                    n_rot,
+                )
+                .unwrap();
+            let want = cpu.to_cpu_f32(&want).unwrap();
+            let xt = be.from_cpu_f32(&x, vec![1, tq, nh * hd]).unwrap();
+            let got = be
+                .rope_imrope_text(&xt, pos, hd, 1e6, sections, n_rot)
+                .unwrap();
+            let got = be.to_cpu_f32(&got).unwrap();
+            let mut worst = 0.0f32;
+            for (a, b) in got.iter().zip(&want) {
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst < 1e-5,
+                "sections {sections:?} pos {pos}: расхождение {worst}"
+            );
+        }
+    }
+
     /// Bulk-хвост GDN на B слотов сверяется с по-слотовой цепочкой
     /// (conv+silu+split+norm → delta-rule): и выход, и сдвинутые стейты
     /// свёртки, и стейты delta-rule (они меняются на месте, поэтому эталон

@@ -696,6 +696,48 @@ extern "C" __global__ void rope_mrope_text_f32(
     y[base + n_pairs] = x1 * c + x0 * s;
 }
 
+/// IMROPE для текста с ЧАСТИЧНОЙ ротацией (Qwen3.5/3.8): в голове ширины
+/// `hd` ротируется только первые `n_rot` элементов, пары (i, i + n_rot/2),
+/// частота theta^(-2i/n_rot); сектор i % sect_dims выбирает ось (для текста
+/// все позиции = pos), хвост [n_rot..hd) копируется как есть.
+/// Один поток на элемент: элемент либо первый в паре (i < n_rot/2), либо
+/// второй (n_rot/2 <= i < n_rot), либо хвост (копия).
+extern "C" __global__ void rope_imrope_text_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int tq, int d, int hd, int n_rot, int pos, float theta,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tq * d) return;
+    int t = i / d;
+    int rem = i - t * d;
+    int head = rem / hd;
+    int e = rem - head * hd;
+    int half = n_rot / 2;
+    if (e >= n_rot) {                 // хвост головы не ротируется
+        y[i] = x[i];
+        return;
+    }
+    int pair = (e < half) ? e : e - half;
+    int sector = pair % sect_dims;
+    bool is_e = !((sector % 3 == 0 && sector < 3 * s0)
+               || (sector % 3 == 1 && sector < 3 * s1)
+               || (sector % 3 == 2 && sector < 3 * s2));
+    int base = t * d + head * hd + pair;
+    if (is_e) {
+        y[i] = x[i];
+        return;
+    }
+    float p = (float)(pos + t);
+    float inv = 1.0f / powf(theta, 2.0f * (float)pair / (float)n_rot);
+    float c = cosf(p * inv);
+    float s = sinf(p * inv);
+    float x0 = x[base];
+    float x1 = x[base + half];
+    y[i] = (e < half) ? (x0 * c - x1 * s) : (x1 * c + x0 * s);
+}
+
 /// M-RoPE per-token 4D (Qwen3-VL IMROPE): pos4d [tq·4] = (t, h, w, e) as
 /// FLOAT (positions < 2^24 are exact in f32); the per-pair position comes
 /// from the category's axis (e = no rotation). Port of the CPU default.

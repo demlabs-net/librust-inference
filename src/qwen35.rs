@@ -2061,6 +2061,12 @@ impl Qwen35Model {
         } else {
             false
         };
+        if std::env::var("QWEN35_GDN_BATCH_PROF").is_ok() {
+            eprintln!(
+                "GDN_BATCH layer={layer} b={b} bulk={bulk} t={:.2}ms",
+                t_slot.elapsed().as_secs_f64() * 1e3
+            );
+        }
         // В bulk-пути стейты уже сдвинуты на месте — поштучный цикл пропускаем.
         for (row, &j) in active.iter().enumerate().filter(|_| !bulk) {
             let slot = &mut slots[j];

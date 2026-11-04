@@ -2737,6 +2737,55 @@ mod cuda_parity_tests {
             d_norm_rope < 1e-3 && d_attn < 1e-3 && d_kv16 < 1e-3 && d_attn16 < 1e-3,
             "attention op mismatch: norm+rope {d_norm_rope}, attn_ar {d_attn}, f16 cache {d_kv16}, f16 attn {d_attn16}"
         );
+
+        // 4) ПРЕФИЛЛ-тайлинг (tq ≥ 8, f16 KV): отдельный кернел с онлайн-
+        // softmax, K/V-тайлами в shared и маской [tq, tkv]. Сверяем с
+        // CPU-эталоном на причинной маске — именно так зовёт префилл.
+        // tkv = 150 > 2·64: несколько K/V-тайлов, т.е. проверяется и
+        // онлайн-softmax между тайлами. Маска оставляет каждой строке
+        // ~131 ключ — активных тайлов больше одного.
+        let (tq_n, tkv_n, hd_t) = (20usize, 150usize, 128usize);
+        let (h_t, kvh_t) = (8usize, 4usize);
+        let d_t = h_t * hd_t;
+        let q_t = vals(tq_n * d_t, 4.3);
+        let k_t = vals(tkv_n * kvh_t * hd_t, 4.7);
+        let v_t = vals(tkv_n * kvh_t * hd_t, 5.1);
+        let mut mask_t = vec![0f32; tq_n * tkv_n];
+        for i in 0..tq_n {
+            let allow = (i + 130).min(tkv_n - 1);
+            for j in (allow + 1)..tkv_n {
+                mask_t[i * tkv_n + j] = -10000.0;
+            }
+        }
+        let run_t = |b: &dyn Backend| -> Vec<f32> {
+            let qq = b.from_cpu_f32(&q_t, vec![1, tq_n, d_t]).unwrap();
+            let zeros = vec![half::f16::from_f32(0.0); tkv_n * kvh_t * hd_t];
+            let ck = b
+                .from_cpu_f16(&zeros, vec![1, tkv_n, kvh_t * hd_t])
+                .unwrap();
+            let cv = b
+                .from_cpu_f16(&zeros, vec![1, tkv_n, kvh_t * hd_t])
+                .unwrap();
+            let tk = b
+                .from_cpu_f32(&k_t, vec![1, tkv_n, kvh_t * hd_t])
+                .unwrap();
+            let tv = b
+                .from_cpu_f32(&v_t, vec![1, tkv_n, kvh_t * hd_t])
+                .unwrap();
+            b.kv_update(&ck, &tk, 0).unwrap();
+            b.kv_update(&cv, &tv, 0).unwrap();
+            let m = b.from_cpu_f32(&mask_t, vec![tq_n, tkv_n]).unwrap();
+            let out = b.zeros(vec![1, tq_n, d_t]).unwrap();
+            b.attn_ar(&qq, &ck, &cv, Some(&m), &out, h_t, kvh_t, hd_t)
+                .unwrap();
+            b.to_cpu_f32(&out).unwrap()
+        };
+        let d_tiled = dev(&run_t(cpu.as_ref()), &run_t(gpu.as_ref()));
+        eprintln!("attention ops: prefill tiled {d_tiled}");
+        assert!(
+            d_tiled < 2e-3,
+            "prefill tiled attention mismatch vs CPU: {d_tiled}"
+        );
     }
 
     #[test]

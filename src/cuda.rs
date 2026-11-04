@@ -3243,6 +3243,56 @@ impl Backend for CudaBackend {
                 "attn_ar: bf16 KV storage is not supported on CUDA (no bf16 kernel — the f16 kernels would decode bf16 bits as f16)".into(),
             ));
         }
+        // Префилл: тайловое внимание (8 запросов одной головы, K/V в shared,
+        // онлайн-softmax) — attn_ar_v4 перечитывает весь KV на каждую пару
+        // (запрос, голова), на 4.8K это O(K²) глобального трафика.
+        if tq >= 8
+            && hd <= 256
+            && hd % 32 == 0
+            && n_heads % kv_heads == 0
+            && std::env::var_os("CUDA_NO_ATTN_TILED").is_none()
+            && let (
+                crate::backend::TensorInner::CudaF16(k16),
+                crate::backend::TensorInner::CudaF16(v16),
+            ) = (&k.inner, &v.inner)
+        {
+            let f = self.function("attn_prefill_tiled_f16")?;
+            // Kt (hd·66 f16) + Vt (64·hd f16) — dynamic shared.
+            let smem = (hd * (64 + 2) + 64 * hd) * 2;
+            let _ = f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (tq.div_ceil(8) as u32, n_heads as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem as u32,
+            };
+            let (mslice, has_mask) = match mask {
+                Some(m) => (m.as_cuda(), 1i32),
+                None => (q.as_cuda(), 0i32),
+            };
+            let q_stride = q.shape()[2] as i32;
+            let kv_stride = (kv_heads * hd) as i32;
+            let (tq32, tkv32) = (tq as i32, tkv as i32);
+            let (nh32, nkv32, hd32) = (n_heads as i32, kv_heads as i32, hd as i32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(q.as_cuda());
+            la.arg(k16);
+            la.arg(v16);
+            la.arg(mslice);
+            la.arg(y.as_cuda_mut());
+            la.arg(&tq32);
+            la.arg(&tkv32);
+            la.arg(&nh32);
+            la.arg(&nkv32);
+            la.arg(&hd32);
+            la.arg(&q_stride);
+            la.arg(&kv_stride);
+            la.arg(&has_mask);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            return Ok(());
+        }
         let fname: &'static str = match (kfmt, vfmt) {
             (0, 0) => "attn_ar_v4_f32f32",
             (0, 1) => "attn_ar_v4_f32f16",
@@ -3253,8 +3303,7 @@ impl Backend for CudaBackend {
             (2, 0) => "attn_ar_v4_q8f32",
             (2, 1) => "attn_ar_v4_q8f16",
             (2, 2) => "attn_ar_v4_q8q8",
-            _ => unreachable!(),
-        };
+            _ => unreachable!(),        };
         let f = self.function(fname)?;
         // N (iter-10): size the block to the ACTIVE warps (nwarps = hd/32) —
         // the old fixed 256-thread block left 4 of 8 warps idle at hd=128

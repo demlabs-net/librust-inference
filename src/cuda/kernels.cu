@@ -1531,6 +1531,138 @@ ATTN_K(q8, signed char, 2)
 
 ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
 
+// ───────── префилл-внимание тайлами (8 запросов × 64 ключа) ─────────
+// attn_ar_v4 написан под декод: каждая пара (запрос, голова) перечитывает
+// ВЕСЬ KV-кэш из глобальной памяти — на префилле 4.8K это O(K²) трафика
+// (~6 с из 9 с TTFT). Здесь блок = 8 запросов ОДНОЙ головы (8 warp'ов),
+// K/V-тайл 64 ключей лежит в shared, softmax онлайн в регистрах:
+//   score(lane) = Σ_dim q[dim]·Kt[dim][lane]   (q — broadcast из shared)
+//   p = exp(s − m), acc[dim] += p·V[key][dim]  (dim = lane + 32e)
+// Kt хранится транспонированным с шагом TK+2: и запись при транспозиции,
+// и чтение в скалярном произведении идут без банк-конфликтов.
+// Динамическая shared: Kt (hd·(TK+2)·2) + Vt (TK·hd·2); Qs/Ps — статика.
+#define ATTN_TK 64
+#define ATTN_TQ 8
+extern "C" __global__ void attn_prefill_tiled_f16(
+    const float* __restrict__ q,      // [tq, nh·hd] f32
+    const __half* __restrict__ kc,    // [cap, nkv·hd] f16
+    const __half* __restrict__ vc,    // [cap, nkv·hd] f16
+    const float* __restrict__ mask,   // [tq, tkv] аддитивная или null
+    float* __restrict__ y,            // [tq, nh·hd]
+    int tq, int tkv, int nh, int nkv, int hd,
+    int q_stride, int kv_stride, int has_mask)
+{
+    extern __shared__ __half smem[];
+    __half* Kt = smem;                          // [hd][TK+2]
+    __half* Vt = smem + hd * (ATTN_TK + 2);     // [TK][hd]
+    __shared__ float Qs[ATTN_TQ * 256];         // строка запроса (broadcast)
+    __shared__ float Ps[ATTN_TQ * ATTN_TK];     // вероятности тайла
+    const int h = blockIdx.y;
+    const int g = h / (nh / nkv);
+    const int q0 = blockIdx.x * ATTN_TQ;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int qt = q0 + warp;
+    const int nd = hd >> 5;                     // значений на lane (≤ 8)
+
+    if (tid < 0) return;
+    for (int i = tid; i < ATTN_TQ * hd; i += blockDim.x) {
+        const int w = i / hd, d = i - w * hd;
+        const int r = q0 + w;
+        Qs[w * 256 + d] = (r < tq) ? q[(size_t)r * q_stride + h * hd + d] : 0.0f;
+    }
+    __syncthreads();
+
+    float acc[8];
+    float m = -INFINITY, l = 0.0f;
+    for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+
+    for (int k0 = 0; k0 < tkv; k0 += ATTN_TK) {
+        // ── загрузка тайлов: по одному ключу, потоки делят dim ──
+        for (int kk = 0; kk < ATTN_TK; ++kk) {
+            const int key = k0 + kk;
+            for (int d = tid; d < hd; d += blockDim.x) {
+                __half kv = __float2half(0.0f), vv = __float2half(0.0f);
+                if (key < tkv) {
+                    kv = kc[(size_t)key * kv_stride + g * hd + d];
+                    vv = vc[(size_t)key * kv_stride + g * hd + d];
+                }
+                Kt[d * (ATTN_TK + 2) + kk] = kv;
+                Vt[kk * hd + d] = vv;
+            }
+        }
+        __syncthreads();
+        if (qt < tq) {
+            // ── скалярные произведения: lane = ключ (два ключа на lane) ──
+            // 4 независимых аккумулятора на ключ: одна цепочка FMA на 4 такта
+            // латентности давала 1 FMA/4 такта на поток (ядро упиралось в ILP,
+            // а не в полосу shared).
+            float s0a = 0.0f, s0b = 0.0f, s0c = 0.0f, s0d = 0.0f;
+            float s1a = 0.0f, s1b = 0.0f, s1c = 0.0f, s1d = 0.0f;
+            const float* qr = Qs + warp * 256;
+            const int lane2 = lane + 32;
+            for (int d = 0; d < hd; d += 4) {
+                const int d1 = d * (ATTN_TK + 2);
+                const int d2 = d1 + (ATTN_TK + 2);
+                const int d3 = d2 + (ATTN_TK + 2);
+                const int d4 = d3 + (ATTN_TK + 2);
+                const float q0 = qr[d], q1 = qr[d + 1], q2 = qr[d + 2], q3 = qr[d + 3];
+                s0a += q0 * __half2float(Kt[d1 + lane]);
+                s0b += q1 * __half2float(Kt[d2 + lane]);
+                s0c += q2 * __half2float(Kt[d3 + lane]);
+                s0d += q3 * __half2float(Kt[d4 + lane]);
+                s1a += q0 * __half2float(Kt[d1 + lane2]);
+                s1b += q1 * __half2float(Kt[d2 + lane2]);
+                s1c += q2 * __half2float(Kt[d3 + lane2]);
+                s1d += q3 * __half2float(Kt[d4 + lane2]);
+            }
+            float s0 = (s0a + s0b) + (s0c + s0d);
+            float s1 = (s1a + s1b) + (s1c + s1d);
+            const int k1 = k0 + lane, k2 = k0 + lane + 32;
+            // Масштаб 1/√hd — как у CPU-эталона и ядер attn_ar_v4.
+            const float scale = 1.0f / sqrtf((float)hd);
+            s0 *= scale;
+            s1 *= scale;
+            if (k1 >= tkv) s0 = -INFINITY;
+            else if (has_mask) s0 += mask[(size_t)qt * tkv + k1];
+            if (k2 >= tkv) s1 = -INFINITY;
+            else if (has_mask) s1 += mask[(size_t)qt * tkv + k2];
+            // ── онлайн-softmax (максимум и сумма — по warp'у) ──
+            float mx = fmaxf(s0, s1);
+            for (int off = 16; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+            const float m_new = fmaxf(m, mx);
+            const float sc = (m > -INFINITY) ? __expf(m - m_new) : 0.0f;
+            const float p0 = (s0 > -INFINITY) ? __expf(s0 - m_new) : 0.0f;
+            const float p1 = (s1 > -INFINITY) ? __expf(s1 - m_new) : 0.0f;
+            float ps = p0 + p1;
+            for (int off = 16; off > 0; off >>= 1)
+                ps += __shfl_xor_sync(0xffffffff, ps, off);
+            Ps[warp * ATTN_TK + lane] = p0;
+            Ps[warp * ATTN_TK + lane + 32] = p1;
+            l = l * sc + ps;
+            m = m_new;
+            __syncwarp();
+            // ── взвешенная сумма V по своим dim ──
+            for (int e = 0; e < nd; ++e) acc[e] *= sc;
+            for (int kk = 0; kk < ATTN_TK; ++kk) {
+                const float p = Ps[warp * ATTN_TK + kk];
+                if (p == 0.0f) continue;
+                const __half* vrow = Vt + kk * hd + lane;
+                for (int e = 0; e < nd; ++e) acc[e] += p * __half2float(vrow[32 * e]);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+    if (tid < 0) return;   // держим все потоки до конца тайла
+    if (qt >= tq) return;
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int e = 0; e < nd; ++e)
+        y[(size_t)qt * q_stride + h * hd + lane + 32 * e] = acc[e] * inv;
+}
+
 // ─────────────────── relative-position attention (NeMo/Zipformer) ───────
 // Bidirectional MHSA with relative position scores:
 //   ac = (q + u) · kᵀ                          content–content (over dk)

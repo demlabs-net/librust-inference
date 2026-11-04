@@ -116,13 +116,12 @@ impl Drop for CudaBuffer {
             // cudaMalloc, а тот синхронизирует устройство. Замер пакетного
             // шага: по-слотовая секция 21 мс при B=2 против 3.8 при B=1 —
             // это была не арифметика, а промахи пула.
-            const MAX_PER_BUCKET_SMALL: usize = 64;
-            const SMALL_BYTES: usize = 64 * 1024;
-            let cap = if s.len() * 4 <= SMALL_BYTES {
-                MAX_PER_BUCKET_SMALL
-            } else {
-                8
-            };
+            // 2 МБ: сюда попадает scratch внимания (b·tq·nh·nchunks·nwarps·34
+            // f32 — на 27B это сотни КБ на слой) и прочие рабочие буферы слоя.
+            const MAX_PER_BUCKET_SMALL: usize = 32;
+            const SMALL_BYTES: usize = 2 * 1024 * 1024;
+            let cap = if s.len() * 4 <= SMALL_BYTES { 32 } else { 8 };
+            let _ = MAX_PER_BUCKET_SMALL;
             if bucket.len() < cap && s.len() * 4 <= MAX_POOL_BYTES {
                 bucket.push(s);
             }

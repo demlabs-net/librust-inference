@@ -1093,7 +1093,11 @@ impl Qwen35Model {
             }
         }
         let out_logits = if gpu_greedy {
-            logits.view_offset(vec![1, 1, v], row_idx * v)
+            // Строка окна — row_view (device-copy), а не view_offset: на CUDA
+            // ненулевое смещение паникует (row_idx·v = vocab при row_idx=1).
+            // Из-за этого спека на CUDA не работала вообще.
+            let rows = logits.shape()[1];
+            backend.row_view(&logits, rows, v, row_idx)?
         } else {
             let row = &ld[row_idx * v..(row_idx + 1) * v];
             backend.from_cpu_f32(row, vec![1, 1, v])?

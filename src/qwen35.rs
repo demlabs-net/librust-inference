@@ -573,14 +573,21 @@ impl Qwen35Model {
         w: &WeightsMap<'_>,
     ) -> Result<(Tensor, Tensor), BackendError> {
         if self.embed_f32.is_none() {
-            let emb = w
-                .get("token_embd.weight")
-                .ok_or_else(|| BackendError::Shape("missing tensor token_embd.weight".into()))?;
-            let rows = emb.shape.first().copied().unwrap_or(0) as usize;
-            self.embed_f32 = Some(backend.from_cpu_f32(
-                &crate::weights_map::dequant_f32(emb),
-                vec![rows, self.cfg.dim],
-            )?);
+            // Эмбеддинг уже лежит в f32 (CUDA-путь держит token_embd в f32:
+            // gather не умеет кванты) — вторая копия для драфтера не нужна.
+            // У 27B это лишние 2.9 ГБ VRAM, из-за которых спека падала OOM.
+            self.embed_f32 = Some(if self.embed.dtype() == crate::dtype::Dtype::F32 {
+                self.embed.clone()
+            } else {
+                let emb = w
+                    .get("token_embd.weight")
+                    .ok_or_else(|| BackendError::Shape("missing tensor token_embd.weight".into()))?;
+                let rows = emb.shape.first().copied().unwrap_or(0) as usize;
+                backend.from_cpu_f32(
+                    &crate::weights_map::dequant_f32(emb),
+                    vec![rows, self.cfg.dim],
+                )?
+            });
         }
         let embed = self.embed_f32.clone().expect("embed_f32 собран выше");
         Ok((embed, self.output.clone()))

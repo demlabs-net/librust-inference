@@ -84,6 +84,10 @@ fn lock_poison_resilient<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// to the backend's size-keyed pool when the last `Arc` reference drops —
 /// inference allocates hundreds of temporaries per token, so avoiding
 /// `cuMemAlloc` per op is a launch-budget win.
+/// Счётчики пула (диагностика QWEN35_POOL_STATS): промах = cudaMalloc.
+static POOL_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static POOL_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Debug)]
 pub struct CudaBuffer {
     slice: Option<CudaSlice<f32>>,
@@ -1097,7 +1101,16 @@ impl CudaBackend {
         if let Some(bucket) = pool.get_mut(&n)
             && let Some(s) = bucket.pop()
         {
+            POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(s);
+        }
+        POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var_os("QWEN35_POOL_STATS").is_some() {
+            let m = POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+            if m.is_multiple_of(256) {
+                let h = POOL_HITS.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!("POOL: промахов {m} из {} ({} элементов)", h + m, n);
+            }
         }
         self.stream.alloc_zeros::<f32>(n).map_err(map_err)
     }

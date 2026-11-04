@@ -1913,6 +1913,11 @@ impl Qwen35Model {
         let qg_rows = qg.view(vec![b, 2 * nh * hd]);
         let k_rows = k.view(vec![b, kv_size]);
         let v_rows = v.view(vec![b, kv_size]);
+        // QWEN35_ATTN_BATCH_PROF=1 — из чего складывается по-слотовая часть.
+        let aprof = std::env::var("QWEN35_ATTN_BATCH_PROF").is_ok();
+        let (mut a_copy, mut a_norm_rope, mut a_kv, mut a_attn, mut a_gate) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut t_mark = std::time::Instant::now();
         for (row, &j) in active.iter().enumerate() {
             let slot = &mut slots[j];
             let pos = slot.pos;
@@ -1929,6 +1934,11 @@ impl Qwen35Model {
             let gate = crate::nn::slice_last(backend, &qg_j, hd, hd)?.view(vec![1, 1, nh * hd]);
             let k_j = backend.row_view(&k_rows, b, kv_size, row)?;
             let v_j = backend.row_view(&v_rows, b, kv_size, row)?;
+            if aprof {
+                let n = std::time::Instant::now();
+                a_copy += n.duration_since(t_mark).as_secs_f64();
+                t_mark = n;
+            }
             let qn = backend.zeros(vec![1, 1, nh * hd])?;
             backend.rmsnorm_head(&q, &a.q_norm, &qn, nh, cfg.norm_eps)?;
             let kn = backend.zeros(vec![1, 1, kv_size])?;
@@ -1949,14 +1959,44 @@ impl Qwen35Model {
                 cfg.rope_sections,
                 cfg.n_rot,
             )?;
+            if aprof {
+                let n = std::time::Instant::now();
+                a_norm_rope += n.duration_since(t_mark).as_secs_f64();
+                t_mark = n;
+            }
             cache.update(backend, &kr, &v_j)?;
+            if aprof {
+                let n = std::time::Instant::now();
+                a_kv += n.duration_since(t_mark).as_secs_f64();
+                t_mark = n;
+            }
             let out = backend.zeros(vec![1, 1, nh * hd])?;
             backend.attn_ar(&qr, &cache.view(), &cache.view_v(), None, &out, nh, nkv, hd)?;
+            if aprof {
+                let n = std::time::Instant::now();
+                a_attn += n.duration_since(t_mark).as_secs_f64();
+                t_mark = n;
+            }
             let sg = backend.zeros(vec![1, 1, nh * hd])?;
             backend.sigmoid(&gate, &sg)?;
             let row_out = backend.zeros(vec![1, 1, nh * hd])?;
             backend.mul(&out, &sg, &row_out)?;
             backend.row_write(&gated, &row_out, row)?;
+            if aprof {
+                let n = std::time::Instant::now();
+                a_gate += n.duration_since(t_mark).as_secs_f64();
+                t_mark = n;
+            }
+        }
+        if aprof {
+            eprintln!(
+                "ATTN_BATCH layer={layer} b={b}: копии {:.2}ms норм+rope {:.2}ms kv {:.2}ms attn {:.2}ms gate+write {:.2}ms",
+                a_copy * 1e3,
+                a_norm_rope * 1e3,
+                a_kv * 1e3,
+                a_attn * 1e3,
+                a_gate * 1e3
+            );
         }
         if let Some(p) = prof.as_mut() {
             p[1] += t_slot.elapsed().as_secs_f64();

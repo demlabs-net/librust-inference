@@ -1531,6 +1531,70 @@ ATTN_K(q8, signed char, 2)
 
 ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
 
+// ─────────── префилл-внимание через тензорные ядра (cuBLAS) ───────────
+// Тайловое ядро на FMA-ядрах даёт ~2 TFLOPS — в 50 раз ниже bf16-тензорных
+// ядер. Поэтому оценка/сумма разложены на два cuBLAS-GEMM (f16×f16 → f32) с
+// материализацией score: для чанков ≤ 2048 токенов буфер (tq×tkv×4 Б) влезает
+// в VRAM и это дешевле, чем перечитывать K/V по головам.
+//
+// Softmax по строке с аддитивной маской → вероятности в f16 (вход второго
+// GEMM). Блок — одна строка (запрос одной головы), 256 потоков.
+extern "C" __global__ void attn_softmax_mask_f16(const float* __restrict__ sc,
+                                                 const float* __restrict__ mask,
+                                                 __half* __restrict__ p,
+                                                 int tkv, int has_mask,
+                                                 long long sc_off, long long p_off) {
+    extern __shared__ float red[];
+    const int row = blockIdx.x;          // строка = запрос (одна голова)
+    const float* r = sc + sc_off + (size_t)row * tkv;
+    __half* o = p + p_off + (size_t)row * tkv;
+    // Маска [tq, tkv]: строка маски — номер запроса (= blockIdx.x).
+    const int qrow = (int)blockIdx.x;
+    const float* mk = has_mask ? mask + (size_t)qrow * tkv : nullptr;
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < tkv; i += blockDim.x) {
+        float s = r[i];
+        if (s > -INFINITY && mk) s += mk[i];
+        mx = fmaxf(mx, (s > -INFINITY) ? s : -INFINITY);
+    }
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < tkv; i += blockDim.x) {
+        float s = r[i];
+        if (mk) s += mk[i];
+        sum += (s > -INFINITY) ? __expf(s - mx) : 0.0f;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = (red[0] > 0.0f) ? 1.0f / red[0] : 0.0f;
+    for (int i = threadIdx.x; i < tkv; i += blockDim.x) {
+        float s = r[i];
+        if (mk) s += mk[i];
+        o[i] = __float2half((s > -INFINITY) ? __expf(s - mx) * inv : 0.0f);
+    }
+}
+
+// Копия выхода головы [tq, hd] в срез y[.., hoff..hoff+hd] (y — [tq, ystride]).
+extern "C" __global__ void copy_head_f32(float* __restrict__ y,
+                                         const float* __restrict__ src,
+                                         int tq, int hd, int ystride, int hoff,
+                                         long long src_off) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (i >= hd || row >= tq) return;
+    y[(size_t)row * ystride + (size_t)hoff + i] = src[src_off + (size_t)row * hd + i];
+}
+
 // ───────── префилл-внимание тайлами (8 запросов × 64 ключа) ─────────
 // attn_ar_v4 написан под декод: каждая пара (запрос, голова) перечитывает
 // ВЕСЬ KV-кэш из глобальной памяти — на префилле 4.8K это O(K²) трафика

@@ -162,6 +162,10 @@ pub struct CudaBackend {
     /// tensor cores): 178 МБ на матрицу 5120×17408, поэтому он живёт одним
     /// буфером «не меньше нужного», а не в пуле мелких (тот режет 8 МБ).
     bf16_scratch: Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    /// Скретчи префилл-внимания на cuBLAS: score/выход головы (f32) и
+    /// Q/вероятности (f16). Растут по требованию, один буфер на каждый тип.
+    attn_f32: Mutex<Option<cudarc::driver::CudaSlice<f32>>>,
+    attn_f16: Mutex<Option<cudarc::driver::CudaSlice<half::f16>>>,
     /// Activation compute dtype for GEMM A-operands (the plan's activation
     /// axis — `set_activation_dtype`; 0=f32, 1=f16, 2=bf16).
     activation: std::sync::atomic::AtomicU8,
@@ -186,6 +190,8 @@ impl CudaBackend {
             pool_f16: Arc::new(Mutex::new(HashMap::new())),
             pool_bf16: Arc::new(Mutex::new(HashMap::new())),
             bf16_scratch: Mutex::new(None),
+            attn_f32: Mutex::new(None),
+            attn_f16: Mutex::new(None),
             activation: std::sync::atomic::AtomicU8::new(0),
         })
     }
@@ -568,6 +574,234 @@ impl CudaBackend {
             slice: Some(slice),
             pool: Some(self.pool.clone()),
         })
+    }
+
+    /// Префилл-внимание на f16-тензорных ядрах: score = Q·Kᵀ (gemm_ex),
+    /// softmax+маска (ядро), out = P·V (gemm_ex). Материализует score
+    /// (tq×tkv) — под чанки ≤ 2048 это дешевле тайлового FMA-ядра.
+    /// `false` — не взялись (нет cuBLAS, бюджет буфера, не тот формат).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prefill_blas(
+        &self,
+        q: &Tensor,
+        k16: &cudarc::driver::CudaSlice<half::f16>,
+        v16: &cudarc::driver::CudaSlice<half::f16>,
+        mask: Option<&Tensor>,
+        y: &Tensor,
+        tq: usize,
+        tkv: usize,
+        n_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Result<bool, BackendError> {
+        if std::env::var_os("CUDA_NO_CUBLAS").is_some()
+            || std::env::var_os("CUDA_NO_ATTN_BLAS").is_some()
+        {
+            return Ok(false);
+        }
+        let rows = tq * tkv;
+        // score f32 + вероятности f16: бюджет 512 МБ, длинный контекст
+        // уходит тайловому ядру.
+        if rows.saturating_mul(6) > 512 * 1024 * 1024 {
+            return Ok(false);
+        }
+        let mut guard = lock_poison_resilient(&self.cublas);
+        if guard.is_none() {
+            match CudaBlas::new(self.stream.clone()) {
+                Ok(b) => *guard = Some(Arc::new(b)),
+                Err(_) => return Ok(false),
+            }
+        }
+        let blas = guard.as_ref().expect("cuBLAS инициализирован").clone();
+        let q16_len = tq * n_heads * hd;
+        let need_f16 = q16_len + rows;
+        let need_f32 = rows + tq * hd;
+        let mut f16s = lock_poison_resilient(&self.attn_f16);
+        if !f16s.as_ref().is_some_and(|s| s.len() >= need_f16) {
+            *f16s = Some(unsafe { self.stream.alloc::<half::f16>(need_f16) }.map_err(map_err)?);
+        }
+        let mut f32s = lock_poison_resilient(&self.attn_f32);
+        if !f32s.as_ref().is_some_and(|s| s.len() >= need_f32) {
+            *f32s = Some(unsafe { self.stream.alloc::<f32>(need_f32) }.map_err(map_err)?);
+        }
+        let f16buf = f16s.as_mut().expect("f16 скретч");
+        let f32buf = f32s.as_mut().expect("f32 скретч");
+        // Q → f16 в начало f16-скретча (один раз на все головы).
+        {
+            let f = self.function("cast_f32_f16")?;
+            let cfg = LaunchConfig::for_num_elems(q16_len as u32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(q.as_cuda());
+            la.arg(&mut *f16buf);
+            let n32 = q16_len as i32;
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        }
+        use cudarc::driver::DevicePtr;
+        // Указатели берём и сразу отпускаем guard'ы: работа идёт на том же
+        // потоке, буферы живут в скретче до конца вызова.
+        let f16_base = {
+            let (p, _g) = f16buf.device_ptr(&self.stream);
+            p
+        };
+        let f32_base = {
+            let (p, _g) = f32buf.device_ptr(&self.stream);
+            p
+        };
+        let k_base = {
+            let (p, _g) = k16.device_ptr(&self.stream);
+            p
+        };
+        let v_base = {
+            let (p, _g) = v16.device_ptr(&self.stream);
+            p
+        };
+        let q_stride = q.shape()[2] as i32;
+        let kv_stride = (kv_heads * hd) as i32;
+        let q16_off = q16_len as u64 * 2;
+        let out_off = rows as u64 * 4;
+        let (tq32, tkv32, hd32) = (tq as i32, tkv as i32, hd as i32);
+        let (nh32, nkv32) = (n_heads as i32, kv_heads as i32);
+        let has_mask = if mask.is_some() { 1i32 } else { 0i32 };
+        let (mslice, _) = match mask {
+            Some(m) => (m.as_cuda(), ()),
+            None => (q.as_cuda(), ()),
+        };
+        // Маска — в f32-буфере? Нет: отдельный тензор, берём срез как есть.
+        for h in 0..n_heads {
+            let g = h / (n_heads / kv_heads);
+            // 1) score[tq, tkv] = Q_h · K_gᵀ · 1/√hd (col-major: m=tkv, n=tq, k=hd)
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            self.gemm_ex_f16(
+                &blas,
+                k_base + (g * hd * 2) as u64,
+                kv_stride,
+                f16_base + (h * hd * 2) as u64,
+                q_stride,
+                f32_base,
+                tkv32,
+                tkv32,
+                tq32,
+                hd32,
+                scale,
+                true,
+                false,
+            )?;
+            // 2) softmax + маска → вероятности f16
+            {
+                let f = self.function("attn_softmax_mask_f16")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (tq as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 256 * 4,
+                };
+                let sc_off = 0i64;
+                // p_off — смещение вероятностей в f16-буфере В ЭЛЕМЕНТАХ
+                // (q16 занимает q16_len элементов).
+                let p_off = q16_len as i64;
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&*f32buf);
+                la.arg(mslice);
+                la.arg(&mut *f16buf);
+                la.arg(&tkv32);
+                la.arg(&has_mask);
+                la.arg(&sc_off);
+                la.arg(&p_off);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            }
+            // 3) out[tq, hd] = P · V (col-major: m=tq, n=hd, k=tkv)
+            self.gemm_ex_f16(
+                &blas,
+                f16_base + q16_off,
+                tkv32,
+                v_base + (g * hd * 2) as u64,
+                kv_stride,
+                f32_base + out_off,
+                hd32,
+                tq32,
+                hd32,
+                tkv32,
+                1.0,
+                true,
+                true,
+            )?;
+            // 4) выход головы → срез y
+            {
+                let f = self.function("copy_head_f32")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (hd.div_ceil(256) as u32, tq as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let hoff = (h * hd) as i32;
+                // so — смещение выхода головы В ЭЛЕМЕНТАХ (после score).
+                let so = rows as i64;
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(y.as_cuda_mut());
+                la.arg(&*f32buf);
+                la.arg(&tq32);
+                la.arg(&hd32);
+                la.arg(&q_stride);
+                la.arg(&hoff);
+                la.arg(&so);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            }
+        }
+        let _ = (nh32, nkv32);
+        Ok(true)
+    }
+
+    /// cuBLAS gemm_ex: C[m,n] = alpha·op(A)·op(B), A/B в f16, C в f32.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_ex_f16(
+        &self,
+        blas: &CudaBlas,
+        aptr: u64,
+        lda: i32,
+        bptr: u64,
+        ldb: i32,
+        cptr: u64,
+        ldc: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        transa_t: bool,
+        transb_t: bool,
+    ) -> Result<(), BackendError> {
+        let beta = 0.0f32;
+        unsafe {
+            cudarc::cublas::result::gemm_ex(
+                *blas.handle(),
+                if transa_t {
+                    cublasOperation_t::CUBLAS_OP_T
+                } else {
+                    cublasOperation_t::CUBLAS_OP_N
+                },
+                if transb_t {
+                    cublasOperation_t::CUBLAS_OP_T
+                } else {
+                    cublasOperation_t::CUBLAS_OP_N
+                },
+                m,
+                n,
+                k,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                aptr as *const std::ffi::c_void,
+                cudarc::cublas::sys::cudaDataType_t::CUDA_R_16F,
+                lda,
+                bptr as *const std::ffi::c_void,
+                cudarc::cublas::sys::cudaDataType_t::CUDA_R_16F,
+                ldb,
+                &beta as *const f32 as *const std::ffi::c_void,
+                cptr as *mut std::ffi::c_void,
+                cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+        .map_err(|e| BackendError::native(format!("cublas gemm_ex f16: {e}")))
     }
 
     /// Prefill-GEMM на bf16-тензорных ядрах: вес раскладывается в плотный
@@ -3242,6 +3476,23 @@ impl Backend for CudaBackend {
             return Err(BackendError::UnsupportedFormat(
                 "attn_ar: bf16 KV storage is not supported on CUDA (no bf16 kernel — the f16 kernels would decode bf16 bits as f16)".into(),
             ));
+        }
+        // Префилл на f16-тензорных ядрах: score материализуется, но GEMM идёт
+        // на tensor cores. ВКЛЮЧАЕТСЯ ТОЛЬКО ЯВНО (CUDA_ATTN_BLAS=1): путь
+        // ещё не сошёлся с эталоном (расхождение 0.3–0.6 на тесте), поэтому
+        // по умолчанию работает проверенное тайловое ядро.
+        if tq >= 32
+            && std::env::var_os("CUDA_ATTN_BLAS").is_some()
+            && hd <= 256
+            && hd % 32 == 0
+            && n_heads % kv_heads == 0
+            && let (
+                crate::backend::TensorInner::CudaF16(k16),
+                crate::backend::TensorInner::CudaF16(v16),
+            ) = (&k.inner, &v.inner)
+            && self.attn_prefill_blas(q, k16, v16, mask, y, tq, tkv, n_heads, kv_heads, hd)?
+        {
+            return Ok(());
         }
         // Префилл: тайловое внимание (8 запросов одной головы, K/V в shared,
         // онлайн-softmax) — attn_ar_v4 перечитывает весь KV на каждую пару

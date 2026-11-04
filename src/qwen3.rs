@@ -3755,3 +3755,169 @@ mod pp_range_tests {
         (backend, ma, mb)
     }
 }
+
+// ── Пакетный контракт для ПЛОТНОЙ модели (см. `crate::batch::BatchModel`) ──
+// Плотная qwen3 держит один набор KV (`self.caches` + `pos_rope`), поэтому
+// слот — это «сташ» этих полей: перед операцией состояние слота подменяет
+// состояние модели, после — меняется обратно (std::mem::swap, без копий).
+// Так пакетный режим получает ЛЮБАЯ qwen3-совместимая модель, не требуя
+// отдельного батчевого forward.
+pub struct Qwen3Slot {
+    caches: Vec<crate::nn::KvCache>,
+    pos_rope: usize,
+}
+
+impl Qwen3Slot {
+    /// Байты памяти слота (KV-кэши по ёмкости).
+    pub fn bytes(&self) -> u64 {
+        self.caches
+            .iter()
+            .map(|c| c.storage_bytes() as u64)
+            .sum::<u64>()
+    }
+    pub fn pos(&self) -> usize {
+        self.pos_rope
+    }
+}
+
+impl Qwen3Model {
+    /// Снимок состояния слота: у плотной модели его нет (prefix-кэш работает
+    /// через историю `cached`), поэтому тип-заглушка.
+    fn with_slot_state<R>(
+        &mut self,
+        slot: &mut Qwen3Slot,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        std::mem::swap(&mut self.caches, &mut slot.caches);
+        std::mem::swap(&mut self.pos_rope, &mut slot.pos_rope);
+        let r = f(self);
+        std::mem::swap(&mut self.caches, &mut slot.caches);
+        std::mem::swap(&mut self.pos_rope, &mut slot.pos_rope);
+        r
+    }
+}
+
+impl crate::batch::BatchSlot for Qwen3Slot {
+    fn pos(&self) -> usize {
+        Qwen3Slot::pos(self)
+    }
+    fn bytes(&self) -> u64 {
+        Qwen3Slot::bytes(self)
+    }
+}
+
+impl crate::batch::BatchModel for Qwen3Model {
+    type Slot = Qwen3Slot;
+    type Snap = ();
+
+    fn dim(&self) -> usize {
+        self.cfg.dim
+    }
+    fn max_seq(&self) -> usize {
+        self.cfg.rope_max_seq
+    }
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn new_slot(&self, backend: &dyn Backend) -> Result<Qwen3Slot, BackendError> {
+        let mut caches = Vec::with_capacity(self.caches.len());
+        for c in &self.caches {
+            let g = c.geometry();
+            let mut nc = crate::nn::KvCache::new(
+                backend,
+                g.n_kv_heads,
+                g.head_dim,
+                g.k_format,
+                g.v_format,
+                g.rope_theta,
+                g.mrope_sections,
+            )?;
+            nc.set_max_cap(Some(self.cfg.rope_max_seq));
+            caches.push(nc);
+        }
+        Ok(Qwen3Slot { caches, pos_rope: 0 })
+    }
+    fn slot_snapshot(&self, _backend: &dyn Backend, _slot: &Qwen3Slot) -> Result<(), BackendError> {
+        Ok(())
+    }
+    fn slot_restore(&mut self, _slot: &mut Qwen3Slot, _snap: &()) {}
+    fn prefill_slot_chunk_ext(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen3Slot,
+        ids: &[u32],
+        want_logits: bool,
+        want_hidden: bool,
+    ) -> Result<(Option<Tensor>, Option<Tensor>), BackendError> {
+        // Плотная qwen3 не отдаёт скрытое префилла (это нужно драфтерам,
+        // которых у неё в слоте нет), логиты — только если попросили.
+        let r = self.with_slot_state(slot, |m| m.prefill_extract_last(backend, ids, &[]));
+        let (lg, _) = r?;
+        let _ = want_hidden;
+        Ok((want_logits.then_some(lg), None))
+    }
+    fn decode_batch_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen3Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let b = active.len();
+        if b == 0 || ids.len() != b {
+            return Err(BackendError::Shape(format!(
+                "qwen3 batch: {} слотов против {} токенов",
+                b,
+                ids.len()
+            )));
+        }
+        let v = self.cfg.vocab_size;
+        let d = self.cfg.dim;
+        let mut host = vec![0f32; b * v];
+        for (j, &si) in active.iter().enumerate() {
+            let slot = slots
+                .get_mut(si)
+                .ok_or_else(|| BackendError::Shape(format!("qwen3 batch: нет слота {si}")))?;
+            let lg = self.with_slot_state(slot, |m| m.decode(backend, ids[j]))?;
+            let row = backend.to_cpu_f32(&lg)?;
+            if row.len() < v {
+                return Err(BackendError::Shape(format!(
+                    "qwen3 batch: логиты {} < vocab {v}",
+                    row.len()
+                )));
+            }
+            host[j * v..(j + 1) * v].copy_from_slice(&row[..v]);
+        }
+        // Скрытое для драфтеров: плотная модель пакетную спекуляцию не
+        // поддерживает (MTP/DFlash в слоте — только гибрид), поэтому нули.
+        Ok((
+            backend.from_cpu_f32(&host, vec![b, v])?,
+            backend.zeros(vec![b, d])?,
+        ))
+    }
+    fn prefill_slot_last(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen3Slot,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        self.with_slot_state(slot, |m| m.prefill_last(backend, ids))
+    }
+    fn decode_batch_active(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen3Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        Ok(self.decode_batch_hidden(backend, slots, active, ids)?.0)
+    }
+    fn decode_step(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen3Slot,
+        id: u32,
+    ) -> Result<Tensor, BackendError> {
+        self.with_slot_state(slot, |m| m.decode(backend, id))
+    }
+}

@@ -2881,3 +2881,113 @@ mod tests {
         close(&be.to_cpu_f32(&y).unwrap(), &want, 1e-6, "embedding q8_0");
     }
 }
+
+// ── Пакетный контракт (см. `crate::batch::BatchModel`) ─────────────────
+// Гибрид умеет всё: пакетный шаг, снимки GDN-стейтов, спекуляцию в слоте.
+impl crate::batch::BatchSlot for Qwen35Slot {
+    fn pos(&self) -> usize {
+        Qwen35Slot::pos(self)
+    }
+    fn bytes(&self) -> u64 {
+        Qwen35Slot::bytes(self)
+    }
+}
+
+impl crate::batch::BatchModel for Qwen35Model {
+    type Slot = Qwen35Slot;
+    type Snap = SlotSnap;
+
+    fn dim(&self) -> usize {
+        self.cfg.dim
+    }
+    fn max_seq(&self) -> usize {
+        self.cfg.max_seq
+    }
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn new_slot(&self, backend: &dyn Backend) -> Result<Qwen35Slot, BackendError> {
+        Qwen35Model::new_slot(self, backend)
+    }
+    fn slot_snapshot(
+        &self,
+        backend: &dyn Backend,
+        slot: &Qwen35Slot,
+    ) -> Result<SlotSnap, BackendError> {
+        Qwen35Model::slot_snapshot(self, backend, slot)
+    }
+    fn slot_restore(&mut self, slot: &mut Qwen35Slot, snap: &SlotSnap) {
+        Qwen35Model::slot_restore(self, slot, snap)
+    }
+    fn prefill_slot_chunk_ext(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        ids: &[u32],
+        want_logits: bool,
+        want_hidden: bool,
+    ) -> Result<(Option<Tensor>, Option<Tensor>), BackendError> {
+        Qwen35Model::prefill_slot_chunk_ext(self, backend, slot, ids, want_logits, want_hidden)
+    }
+    fn decode_batch_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen35Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        Qwen35Model::decode_batch_hidden(self, backend, slots, active, ids)
+    }
+    fn prefill_slot_last(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        Qwen35Model::prefill_slot_last(self, backend, slot, ids)
+    }
+    fn decode_batch_active(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Qwen35Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError> {
+        Qwen35Model::decode_batch_active(self, backend, slots, active, ids)
+    }
+    fn decode_step(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        id: u32,
+    ) -> Result<Tensor, BackendError> {
+        self.with_slot(slot, |m| m.decode(backend, id))
+    }
+    fn decode_spec_in_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Qwen35Slot,
+        anchor: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        greedy: bool,
+        hist: &[u32],
+        sp: &crate::inference::sampling::SamplingParams,
+        rng: &mut Option<u64>,
+        layers: &[usize],
+    ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
+        self.with_slot(slot, |m| {
+            m.decode_spec(
+                backend,
+                anchor,
+                draft,
+                draft_probs,
+                rng,
+                layers,
+                greedy,
+                hist,
+                sp,
+            )
+        })
+    }
+}

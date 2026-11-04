@@ -28,8 +28,115 @@ use crate::inference::generate::{
     Emit, FinishReason, GenerateEvent, GenerateParams, Timings, check_stop, emit,
 };
 use crate::inference::sampling::state_from_seed;
-use crate::qwen35::{Qwen35Model, Qwen35Slot};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
+
+/// Состояние беседы в слоте: собственная позиция и свои KV/рекуррентные
+/// стейты. Пакетный драйвер о внутренностях не знает.
+pub trait BatchSlot {
+    fn pos(&self) -> usize;
+    /// Память состояния слота (KV + рекуррентные стейты), байт.
+    fn bytes(&self) -> u64;
+}
+
+/// Модель, умеющая пакетный шаг. Реализуется КАЖДЫМ движком (гибрид qwen35,
+/// плотная qwen3, …), поэтому пакетный режим перестал быть свойством одного
+/// архитектного варианта.
+pub trait BatchModel {
+    type Slot: BatchSlot;
+    type Snap;
+
+    fn dim(&self) -> usize;
+    fn max_seq(&self) -> usize;
+    fn vocab_size(&self) -> usize;
+    fn new_slot(&self, backend: &dyn Backend) -> Result<Self::Slot, BackendError>;
+    fn slot_snapshot(
+        &self,
+        backend: &dyn Backend,
+        slot: &Self::Slot,
+    ) -> Result<Self::Snap, BackendError>;
+    fn slot_restore(&mut self, slot: &mut Self::Slot, snap: &Self::Snap);
+    fn prefill_slot_chunk_ext(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Self::Slot,
+        ids: &[u32],
+        want_logits: bool,
+        want_hidden: bool,
+    ) -> Result<(Option<Tensor>, Option<Tensor>), BackendError>;
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_hidden(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Self::Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<(Tensor, Tensor), BackendError>;
+
+    /// Логиты только последней позиции промпта в слот (короткий ход).
+    fn prefill_slot_last(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Self::Slot,
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError>;
+
+    /// Пакетный шаг с логитами по каждой активной беседе ([b, V]).
+    fn decode_batch_active(
+        &mut self,
+        backend: &dyn Backend,
+        slots: &mut [Self::Slot],
+        active: &[usize],
+        ids: &[u32],
+    ) -> Result<Tensor, BackendError>;
+
+    /// Один AR-шаг одной беседы на ЕЁ состоянии (диагностика/сверка окон).
+    fn decode_step(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Self::Slot,
+        id: u32,
+    ) -> Result<Tensor, BackendError>;
+
+    /// Спекулятивная верификация в слоте. Гибрид умеет (окно на GDN-стейтах);
+    /// прочие движки честно отказывают — вызывающий идёт AR-путём.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_spec_in_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: &mut Self::Slot,
+        anchor: u32,
+        draft: &[u32],
+        draft_probs: &[f32],
+        greedy: bool,
+        hist: &[u32],
+        sp: &crate::inference::sampling::SamplingParams,
+        rng: &mut Option<u64>,
+        layers: &[usize],
+    ) -> Result<crate::qwen3::SpecOutcome, BackendError> {
+        let _ = (
+            backend,
+            slot,
+            anchor,
+            draft,
+            draft_probs,
+            greedy,
+            hist,
+            sp,
+            rng,
+            layers,
+        );
+        Err(BackendError::UnsupportedFormat(
+            "спекуляция в пакетном слоте этим движком не поддержана".into(),
+        ))
+    }
+}
+
+/// Слоты пакета вместе с кэшем префикса (переезжают между пакетами).
+pub type BatchCache<M> = (
+    Vec<<M as BatchModel>::Slot>,
+    Vec<Vec<u32>>,
+    Vec<Option<(Vec<u32>, <M as BatchModel>::Snap)>>,
+);
 
 /// Учёт беседы в слоте (позиция живёт в самом слоте).
 #[derive(Debug, Clone, Copy)]
@@ -41,9 +148,9 @@ pub struct SlotMeta {
 }
 
 /// Пакетный движок: модель + фиксированный набор слотов.
-pub struct BatchEngine<'m> {
-    model: &'m mut Qwen35Model,
-    slots: Vec<Qwen35Slot>,
+pub struct BatchEngine<'m, M: BatchModel> {
+    model: &'m mut M,
+    slots: Vec<M::Slot>,
     meta: Vec<Option<SlotMeta>>,
     /// КЭШ ПРЕФИКСА: история, лежащая в KV слота после `finish_keep`. Следующий
     /// ход той же беседы префиллит ТОЛЬКО хвост, если новый промпт начинается
@@ -53,14 +160,14 @@ pub struct BatchEngine<'m> {
     /// Снимок состояния на КОНЦЕ ПРЕФИЛЛА: промпт + стейты. По нему идёт
     /// подхват префикса (в отличие от `cached`, не требует, чтобы клиент
     /// вернул сгенерированные токены — достаточно того же промпта).
-    prefixed: Vec<Option<(Vec<u32>, crate::qwen35::SlotSnap)>>,
+    prefixed: Vec<Option<(Vec<u32>, M::Snap)>>,
 }
 
-impl<'m> BatchEngine<'m> {
+impl<'m, M: BatchModel> BatchEngine<'m, M> {
     /// Создать движок на `capacity` мест. Состояние каждого слота (KV + GDN)
     /// выделяется сразу: для 4B это ~50 МБ, для 27B — сотни МБ на слот.
     pub fn new(
-        model: &'m mut Qwen35Model,
+        model: &'m mut M,
         backend: &dyn Backend,
         capacity: usize,
     ) -> Result<Self, BackendError> {
@@ -82,7 +189,7 @@ impl<'m> BatchEngine<'m> {
 
     /// Движок на ГОТОВЫХ слотах: сервис держит их между пакетами — состояние
     /// последовательностей выделяется один раз, а не на каждый пакет.
-    pub fn with_slots(model: &'m mut Qwen35Model, slots: Vec<Qwen35Slot>) -> Self {
+    pub fn with_slots(model: &'m mut M, slots: Vec<M::Slot>) -> Self {
         let meta = vec![None; slots.len()];
         let cached = vec![Vec::new(); slots.len()];
         let prefixed = (0..slots.len()).map(|_| None).collect();
@@ -96,7 +203,7 @@ impl<'m> BatchEngine<'m> {
     }
 
     /// Забрать слоты обратно (состояние бесед уже закрыто/освобождено).
-    pub fn into_slots(self) -> Vec<Qwen35Slot> {
+    pub fn into_slots(self) -> Vec<M::Slot> {
         self.slots
     }
 
@@ -106,9 +213,9 @@ impl<'m> BatchEngine<'m> {
     pub fn into_parts(
         self,
     ) -> (
-        Vec<Qwen35Slot>,
+        Vec<M::Slot>,
         Vec<Vec<u32>>,
-        Vec<Option<(Vec<u32>, crate::qwen35::SlotSnap)>>,
+        Vec<Option<(Vec<u32>, M::Snap)>>,
     ) {
         (self.slots, self.cached, self.prefixed)
     }
@@ -116,10 +223,10 @@ impl<'m> BatchEngine<'m> {
     /// Движок на готовых слотах + сохранённом кэше префикса (см.
     /// [`Self::into_parts`]).
     pub fn with_cache(
-        model: &'m mut Qwen35Model,
-        slots: Vec<Qwen35Slot>,
+        model: &'m mut M,
+        slots: Vec<M::Slot>,
         cached: Vec<Vec<u32>>,
-        prefixed: Vec<Option<(Vec<u32>, crate::qwen35::SlotSnap)>>,
+        prefixed: Vec<Option<(Vec<u32>, M::Snap)>>,
     ) -> Self {
         let n = slots.len();
         let meta = vec![None; n];
@@ -160,12 +267,12 @@ impl<'m> BatchEngine<'m> {
 
     /// Размерность скрытого (для примирения драфтера).
     pub fn dim(&self) -> usize {
-        self.model.cfg.dim
+        self.model.dim()
     }
 
     /// Предел контекста модели (окно, из метаданных GGUF).
     pub fn max_seq(&self) -> usize {
-        self.model.cfg.max_seq
+        self.model.max_seq()
     }
 
     pub fn meta(&self, slot: usize) -> Option<SlotMeta> {
@@ -310,8 +417,8 @@ impl<'m> BatchEngine<'m> {
                 .decode_batch_hidden(backend, &mut self.slots, &active, &ids)?;
         let host = backend.to_cpu_f32(&logits)?;
         let hhost = backend.to_cpu_f32(&hidden)?;
-        let v = self.model.cfg.vocab_size;
-        let d = self.model.cfg.dim;
+        let v = self.model.vocab_size();
+        let d = self.model.dim();
         let mut out = Vec::with_capacity(active.len());
         for (row, &slot) in active.iter().enumerate() {
             out.push((
@@ -374,7 +481,7 @@ impl<'m> BatchEngine<'m> {
             .model
             .decode_batch_active(backend, &mut self.slots, &active, &ids)?;
         let host = backend.to_cpu_f32(&logits)?;
-        let v = self.model.cfg.vocab_size;
+        let v = self.model.vocab_size();
         let mut out = Vec::with_capacity(active.len());
         for (row, &slot) in active.iter().enumerate() {
             let from = row * v;
@@ -412,19 +519,18 @@ impl<'m> BatchEngine<'m> {
         }
         let m = &mut *self.model;
         let s = &mut self.slots[slot];
-        m.with_slot(s, |m| {
-            m.decode_spec(
-                backend,
-                anchor,
-                draft,
-                draft_probs,
-                rng,
-                layers,
-                greedy,
-                hist,
-                sp,
-            )
-        })
+        m.decode_spec_in_slot(
+            backend,
+            s,
+            anchor,
+            draft,
+            draft_probs,
+            greedy,
+            hist,
+            sp,
+            rng,
+            layers,
+        )
     }
 
     /// Один AR-шаг ОДНОЙ беседы на её состоянии (диагностика/сверка окон).
@@ -442,7 +548,7 @@ impl<'m> BatchEngine<'m> {
         }
         let m = &mut *self.model;
         let s = &mut self.slots[slot];
-        m.with_slot(s, |m| m.decode(backend, id))
+        m.decode_step(backend, s, id)
     }
 
     /// Освободить слот, СОХРАНИВ KV и историю — кэш префикса для следующего
@@ -698,8 +804,8 @@ struct Stream {
 /// `false` из колбэка — отмена ЭТОЙ беседы (остальные продолжают).
 ///
 /// Возвращает токены каждого запроса (в порядке `reqs`).
-pub fn generate_batch(
-    engine: &mut BatchEngine<'_>,
+pub fn generate_batch<M: BatchModel>(
+    engine: &mut BatchEngine<'_, M>,
     backend: &dyn Backend,
     tok: &Tokenizer,
     reqs: &[BatchRequest],
@@ -733,8 +839,8 @@ pub type BatchPrimeFn<'a> = dyn FnMut(usize, &crate::backend::Tensor, usize) -> 
 /// Как [`generate_batch`], но черновики даёт ВНЕШНИЙ драфтер на слот (MTP,
 /// обученный nextn-модуль таргета). Без него черновики берутся из
 /// prompt-lookup, как в [`generate_batch`].
-pub fn generate_batch_with(
-    engine: &mut BatchEngine<'_>,
+pub fn generate_batch_with<M: BatchModel>(
+    engine: &mut BatchEngine<'_, M>,
     backend: &dyn Backend,
     tok: &Tokenizer,
     reqs: &[BatchRequest],
@@ -746,8 +852,8 @@ pub fn generate_batch_with(
 
 /// То же, но с ПРИМИРЕНИЕМ драфтера: `prime_fn` получает скрытое по всем
 /// строкам промпта сразу после префилла (MTP без этого «слеп»).
-pub fn generate_batch_full(
-    engine: &mut BatchEngine<'_>,
+pub fn generate_batch_full<M: BatchModel>(
+    engine: &mut BatchEngine<'_, M>,
     backend: &dyn Backend,
     tok: &Tokenizer,
     reqs: &[BatchRequest],
@@ -795,7 +901,7 @@ pub fn generate_batch_full(
     // Закрытие беседы: кэш префикса — только если история в пределах лимита
     // (иначе слот освобождается целиком, иначе KV/снимок висели бы вечно).
     let keep_or_finish =
-        |eng: &mut BatchEngine<'_>, slot: usize, hist: &[u32]| -> Result<(), BackendError> {
+        |eng: &mut BatchEngine<'_, M>, slot: usize, hist: &[u32]| -> Result<(), BackendError> {
             if hist.len() <= prefix_cache_max {
                 eng.finish_keep(slot, hist)
             } else {

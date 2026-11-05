@@ -1817,6 +1817,7 @@ impl Qwen35Model {
             let _ = t;
             Ok(())
         };
+        let t_step = std::time::Instant::now();
         let (mut t_shared, mut t_slot, mut t_ffn, mut t_gates) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let mut x = backend.zeros(vec![1, b, d])?;
         backend.embedding_quant(ids, &self.embed, &x)?;
@@ -1871,6 +1872,23 @@ impl Qwen35Model {
         let hidden = h.clone();
         if prof {
             sync(&logits)?;
+            // QWEN35_BATCH_CPU=1 — CPU-время шага (user+sys) против стены:
+            // видно, шаг упирается в процессор или в ожидание.
+            if std::env::var("QWEN35_BATCH_CPU").is_ok() {
+                use std::cell::Cell;
+                thread_local! {
+                    static PREV: Cell<f64> = const { Cell::new(-1.0) };
+                }
+                let ru = crate::util_proc::cpu_times();
+                let now = ru.0 + ru.1;
+                let prev = PREV.with(|c| c.replace(now));
+                let cpu = if prev < 0.0 { 0.0 } else { now - prev };
+                eprintln!(
+                    "BATCH_CPU B={b}: user+sys {:.1}ms, wall {:.1}ms",
+                    cpu * 1e3,
+                    t_step.elapsed().as_secs_f64() * 1e3
+                );
+            }
             eprintln!(
                 "BATCH_PROF B={b}: проекции+нормы {:.1}ms, по-слоту {:.1}ms, ffn+norm {:.1}ms, gates {:.1}ms",
                 t_shared * 1e3,

@@ -102,6 +102,7 @@ pub mod tp;
 pub mod train;
 pub mod train_qwen3;
 mod unicode_data;
+pub mod util_proc;
 pub mod vision;
 pub mod vision_qwen3vl;
 pub mod weights;

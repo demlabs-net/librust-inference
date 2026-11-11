@@ -200,6 +200,47 @@ pub fn reorder_blocks(src: &[u8], order: &[usize], block_bytes: usize) -> Result
     Ok(out)
 }
 
+/// Раскладка `q8_g32_fp16`: НЕ чередующиеся 34-байтовые блоки, а ДВА массива.
+///
+/// Проверено на живом объекте `moe/shared/down` [2560, 640] (1 740 800 байт):
+///
+/// - сначала `numel` байт квантов i8 (absmax 127, mean|q| ≈ 39);
+/// - затем `numel/32` масштабов fp16 (51 200 значений, все в 5e-5…4e-3).
+///
+/// Сумма сходится ровно: 1 638 400 + 102 400 = 1 740 800.
+///
+/// Арифметика «34 байта на блок подряд» на этих данных даёт мусорные
+/// масштабы в каждом втором блоке — поэтому формат разобран отдельно.
+/// Порядок групп внутри массивов зависит от `row_split_k128_v1` и
+/// определяется сверкой с Infernix (как и остальные раскладки).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Q8G32 {
+    pub group: usize,
+}
+
+impl Q8G32 {
+    pub const GROUP: usize = 32;
+
+    /// Байты на тензор из `numel` элементов.
+    pub fn bytes(numel: u64) -> u64 {
+        numel + numel / Self::GROUP as u64 * 2
+    }
+
+    /// Разделить сырые байты на (кванты i8, масштабы fp16 в байтах).
+    pub fn split<'a>(&self, data: &'a [u8], numel: u64) -> Result<(&'a [u8], &'a [u8]), String> {
+        let q = numel as usize;
+        let s = numel as usize / self.group * 2;
+        if data.len() != q + s {
+            return Err(format!(
+                "q8_g32: {} байт вместо {} (кванты {q} + масштабы {s})",
+                data.len(),
+                q + s
+            ));
+        }
+        Ok((&data[..q], &data[q..]))
+    }
+}
+
 /// Формат объекта из манифеста → геометрия блока кванта.
 ///
 /// Имена форматов в NINFER — свои (`ggml_q6_k`, `q8_g32_fp16`, `bf16`, …),
@@ -358,6 +399,25 @@ mod tests {
         assert_eq!(q8.ggml, None, "в ggml такого формата нет");
         assert_eq!(q8.bytes_of(0, 2560 * 640), Some((0, 2560 * 640 / 32 * 34)));
         assert!(block_geom("nvfp4_rg16").is_err());
+    }
+
+    /// q8_g32_fp16 — два массива, а не 34-байтовые блоки подряд.
+    #[test]
+    fn q8_g32_is_two_arrays() {
+        let numel = 2560u64 * 640;
+        assert_eq!(Q8G32::bytes(numel), 1_740_800);
+        let data = vec![0u8; 1_740_800];
+        let (q, s) = Q8G32 { group: 32 }.split(&data, numel).unwrap();
+        assert_eq!(q.len(), 1_638_400);
+        assert_eq!(s.len(), 102_400);
+        // Общий размер тот же, что у «34 байта на блок» (34/32 на элемент) —
+        // различие ТОЛЬКО в расположении: кванты и масштабы идут двумя
+        // массивами, поэтому чтение по 34-байтовым блокам даёт мусорные
+        // масштабы в каждом втором блоке (проверено на живом файле).
+        assert_eq!(numel / 32 * 34, Q8G32::bytes(numel));
+        let mut bad = data.clone();
+        bad.push(0);
+        assert!(Q8G32 { group: 32 }.split(&bad, numel).is_err());
     }
 
     #[test]

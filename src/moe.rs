@@ -24,9 +24,13 @@
 //! никакого «распакуй все эксперты в f16».
 //!
 //! Что НЕ поддержано этим модулем (и почему это громкая ошибка, а не тихая
-//! подмена): общие эксперты (`ffn_*_shexp`), биасы роутера/экспертов, отбор
-//! по группам (DeepSeek), латентная проекция экспертов. Всё это — следующие
-//! шаги волны A3, и до них такие модели обязаны падать с объяснением.
+//! подмена): биасы роутера/экспертов, отбор по группам (DeepSeek), латентная
+//! проекция экспертов. Всё это — следующие шаги волны A3, и до них такие
+//! модели обязаны падать с объяснением.
+//!
+//! Общие эксперты (`ffn_*_shexp`) ПОДДЕРЖАНЫ (шаг Э2.1, 11.11): один общий
+//! эксперт слоя, SwiGLU по всем токенам батчем, у Qwen3-Next/Flash-Next —
+//! с сигмоидным гейтом `ffn_gate_inp_shexp`. Это опора forward qwen4exp.
 
 use crate::backend::{Backend, Tensor};
 use crate::error::BackendError;
@@ -77,6 +81,12 @@ pub struct MoeConfig {
     /// 0/1 — группового отбора нет.
     pub n_expert_groups: usize,
     pub n_group_used: usize,
+    /// Общие эксперты (`expert_shared_count`; Qwen3-Next/Flash-Next: 1).
+    /// Сейчас поддержан ровно один — этого достаточно всем известным MoE
+    /// с общим экспертом; больше — громкая ошибка, а не молчаливый пропуск.
+    pub n_expert_shared: usize,
+    /// Длина FFN общего эксперта (`expert_shared_feed_forward_length`).
+    pub shared_ffn: usize,
 }
 
 /// Ключи hparams, общие для всех MoE-архитектур llama.cpp
@@ -90,6 +100,8 @@ const KEYS: &[(&str, &str)] = &[
     ("norm", "expert_weights_norm"),
     ("groups", "expert_group_count"),
     ("groups_used", "expert_group_used_count"),
+    ("shared_count", "expert_shared_count"),
+    ("shared_ffn", "expert_shared_feed_forward_length"),
 ];
 
 /// Разбор значения "число или массив из n_layers": llama.cpp читает
@@ -177,6 +189,12 @@ impl MoeConfig {
         let n_group_used = scalar_u32(file, &p(KEYS[7].1), n_layers)?
             .map(|v| v as usize)
             .unwrap_or(0);
+        let n_expert_shared = scalar_u32(file, &p(KEYS[8].1), n_layers)?
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let shared_ffn = scalar_u32(file, &p(KEYS[9].1), n_layers)?
+            .map(|v| v as usize)
+            .unwrap_or(0);
         Ok(Some(Self {
             n_expert,
             n_expert_used,
@@ -186,6 +204,8 @@ impl MoeConfig {
             expert_weights_scale,
             n_expert_groups,
             n_group_used,
+            n_expert_shared,
+            shared_ffn,
         }))
     }
 
@@ -324,7 +344,7 @@ impl ExpertTensor {
     }
 }
 
-/// Ветвь MoE слоя: роутер + эксперты (up/gate/down).
+/// Ветвь MoE слоя: роутер + эксперты (up/gate/down) + общий эксперт.
 #[derive(Debug, Clone)]
 pub struct MoeLayer {
     pub cfg: MoeConfig,
@@ -337,6 +357,98 @@ pub struct MoeLayer {
     pub gate: ExpertTensor,
     /// `ffn_down_exps` [E, dim, ffn].
     pub down: ExpertTensor,
+    /// Общий эксперт (`ffn_*_shexp`): считается на КАЖДЫЙ токен и
+    /// прибавляется к сумме маршрутизированных. У Qwen3-Next/Flash-Next
+    /// вход общего эксперта дополнительно гейтится сигмоидой
+    /// (`ffn_gate_inp_shexp`), у остальных — нет.
+    pub shared: Option<SharedExpert>,
+}
+
+/// Общий (невыбираемый) эксперт слоя. FFN обычный SwiGLU, отличие — он
+/// считается для всех токенов и (у hybrid-архитектур) масштабируется
+/// сигмоидой от скалярного произведения входа на `gate_in`.
+#[derive(Debug, Clone)]
+pub struct SharedExpert {
+    /// `ffn_gate_inp_shexp.weight` [dim]: скалярный гейт `sigmoid(x·w)`.
+    /// None — общий эксперт без гейта (складывается как есть).
+    pub gate_in: Option<Tensor>,
+    /// `ffn_gate_shexp` [ffn, dim].
+    pub gate: Tensor,
+    /// `ffn_up_shexp` [ffn, dim].
+    pub up: Tensor,
+    /// `ffn_down_shexp` [dim, ffn].
+    pub down: Tensor,
+    pub ffn: usize,
+}
+
+impl SharedExpert {
+    /// Загрузить общий эксперт слоя `prefix`. Все три проекции обязательны;
+    /// `ffn_gate_inp_shexp` — опционален (у части архитектур его нет).
+    pub fn load(
+        backend: &dyn Backend,
+        wm: &WeightsMap<'_>,
+        prefix: &str,
+        dim: usize,
+        ffn: usize,
+    ) -> Result<Self, BackendError> {
+        let t = |s: &str| format!("{prefix}{s}");
+        let need = |name: &str| {
+            wm.get(name)
+                .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))
+        };
+        need(&t("ffn_gate_shexp.weight"))?;
+        need(&t("ffn_up_shexp.weight"))?;
+        need(&t("ffn_down_shexp.weight"))?;
+        let gate_in = match wm.get(&t("ffn_gate_inp_shexp.weight")) {
+            Some(wt) => Some(backend.from_cpu_f32(
+                &crate::weights_map::dequant_f32(wt),
+                vec![dim],
+            )?),
+            None => None,
+        };
+        Ok(Self {
+            gate_in,
+            gate: crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("ffn_gate_shexp.weight"), vec![ffn, dim])?,
+            up: crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("ffn_up_shexp.weight"), vec![ffn, dim])?,
+            down: crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("ffn_down_shexp.weight"), vec![dim, ffn])?,
+            ffn,
+        })
+    }
+
+    /// Forward: x [T, dim] → y [T, dim]. Один путь для префилла и декода:
+    /// все матрицы batched по T (не по токену), гейт — `mul_rows`.
+    pub fn forward(
+        &self,
+        backend: &dyn Backend,
+        x: &Tensor,
+        d: usize,
+    ) -> Result<Tensor, BackendError> {
+        let t = x.shape()[0];
+        let g = backend.zeros(vec![t, self.ffn])?;
+        backend.gemm_nt(x, &self.gate, &g)?;
+        let u = backend.zeros(vec![t, self.ffn])?;
+        backend.gemm_nt(x, &self.up, &u)?;
+        let prod = backend.zeros(vec![t, self.ffn])?;
+        // Один кернел оркала, где он есть; иначе композиция.
+        if backend.swiglu(&g, &u, &prod).is_err() {
+            let act = backend.zeros(vec![t, self.ffn])?;
+            backend.silu(&g, &act)?;
+            backend.mul(&act, &u, &prod)?;
+        }
+        let out = backend.zeros(vec![t, d])?;
+        backend.gemm_nt(&prod, &self.down, &out)?;
+        let Some(gin) = &self.gate_in else {
+            return Ok(out);
+        };
+        // s = sigmoid(x · gate_in) — скаляр на строку.
+        let lg = backend.zeros(vec![t, 1])?;
+        backend.gemm_nt(x, &gin.view(vec![1, d]), &lg)?;
+        let s = backend.zeros(vec![t, 1])?;
+        backend.sigmoid(&lg, &s)?;
+        let scaled = backend.zeros(vec![t, d])?;
+        backend.mul_rows(&out, &s.view(vec![t]), &scaled)?;
+        Ok(scaled)
+    }
 }
 
 impl MoeLayer {
@@ -353,9 +465,6 @@ impl MoeLayer {
         dense_ffn: usize,
     ) -> Result<Self, BackendError> {
         for suffix in [
-            "ffn_gate_shexp.weight",
-            "ffn_up_shexp.weight",
-            "ffn_down_shexp.weight",
             "ffn_gate_inp.bias",
             "ffn_gate_exps.bias",
             "ffn_up_exps.bias",
@@ -363,7 +472,7 @@ impl MoeLayer {
         ] {
             if wm.get(&format!("{prefix}{suffix}")).is_some() {
                 return Err(BackendError::UnsupportedFormat(format!(
-                    "MoE {prefix}: {suffix} не поддержан (общие эксперты/биасы — \
+                    "MoE {prefix}: {suffix} не поддержан (биасы роутера/экспертов — \
                      следующий шаг A3)"
                 )));
             }
@@ -384,6 +493,33 @@ impl MoeLayer {
             ffn_dim: ffn,
             ..cfg
         };
+        // Общий эксперт: ровно один (Qwen3-Next/Flash-Next). Больше — отказ:
+        // несколько общих экспертов потребовали бы своего роутера, а тихо
+        // взять первый нельзя — ответ разойдётся.
+        let has_shexp = wm.get(&format!("{prefix}ffn_up_shexp.weight")).is_some();
+        if cfg.n_expert_shared > 1 {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "MoE {prefix}: {} общих экспертов не поддержано (максимум 1)",
+                cfg.n_expert_shared
+            )));
+        }
+        let shared_ffn = if cfg.shared_ffn == 0 {
+            ffn
+        } else {
+            cfg.shared_ffn
+        };
+        let shared = if has_shexp {
+            Some(SharedExpert::load(backend, wm, prefix, dim, shared_ffn)?)
+        } else {
+            if cfg.n_expert_shared > 0 {
+                return Err(BackendError::Shape(format!(
+                    "MoE {prefix}: метаданные обещают {} общих экспертов, а тензоров \
+                     ffn_*_shexp нет",
+                    cfg.n_expert_shared
+                )));
+            }
+            None
+        };
         let n = cfg.n_expert;
         let t = |s: &str| format!("{prefix}{s}");
         Ok(Self {
@@ -403,6 +539,7 @@ impl MoeLayer {
             up: ExpertTensor::load(backend, wm, &t("ffn_up_exps.weight"), n, ffn, dim)?,
             gate: ExpertTensor::load(backend, wm, &t("ffn_gate_exps.weight"), n, ffn, dim)?,
             down: ExpertTensor::load(backend, wm, &t("ffn_down_exps.weight"), n, dim, ffn)?,
+            shared,
         })
     }
 
@@ -502,15 +639,26 @@ impl MoeLayer {
         // INFER_MOE_NO_ID=1 — по-слотовый путь (A/B и бэкенды без mul_mat_id;
         // на UnsupportedFormat откат происходит сам).
         let id_path = std::env::var("INFER_MOE_NO_ID").is_err();
-        if !id_path {
-            return self.ffn_per_slot(backend, &x2, &routed, t, d, ffn);
-        }
-        match self.ffn_id(backend, &x2, &logits, &routed, t, d, ffn, e) {
-            Err(BackendError::UnsupportedFormat(_)) => {
-                self.ffn_per_slot(backend, &x2, &routed, t, d, ffn)
+        let routed_out = if !id_path {
+            self.ffn_per_slot(backend, &x2, &routed, t, d, ffn)?
+        } else {
+            match self.ffn_id(backend, &x2, &logits, &routed, t, d, ffn, e) {
+                Err(BackendError::UnsupportedFormat(_)) => {
+                    self.ffn_per_slot(backend, &x2, &routed, t, d, ffn)?
+                }
+                r => r?,
             }
-            r => r,
-        }
+        };
+        // Общий эксперт считается для ВСЕХ токенов и прибавляется к сумме
+        // маршрутизированных (llama.cpp: cur = cur + shexp_ffn(x)·sigmoid(gate)).
+        // Путь тот же batched по T — отдельных «по токену» вызовов нет.
+        let Some(se) = &self.shared else {
+            return Ok(routed_out);
+        };
+        let sh = se.forward(backend, &x2, d)?;
+        let y = backend.zeros(vec![1, t, d])?;
+        backend.add(&routed_out, &sh.view(vec![1, t, d]), &y)?;
+        Ok(y)
     }
 
     /// Страховочный путь: по одному matvec на (токен, слот) без id-кернелов.
@@ -804,7 +952,83 @@ mod tests {
             expert_weights_scale: 0.0,
             n_expert_groups: 0,
             n_group_used: 0,
+            n_expert_shared: 0,
+            shared_ffn: 0,
         }
+    }
+
+    /// Общий эксперт: SwiGLU по всем токенам батчем + сигмоидный гейт на
+    /// строку. Сверка с ручным счётом на хосте (CPU-бэкенд) — это опора
+    /// forward Flash-Next, где `ffn_*_shexp` есть в каждом MoE-слое.
+    #[test]
+    fn shared_expert_forward_matches_host_math() {
+        use crate::backend::Backend as _;
+        let be = crate::cpu::CpuBackend;
+        let (d, ffn, t) = (4usize, 3usize, 2usize);
+        // Детерминированные «веса» без ГСЧ.
+        let gate: Vec<f32> = (0..ffn * d).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+        let up: Vec<f32> = (0..ffn * d).map(|i| -0.05 * (i as f32 + 1.0)).collect();
+        let down: Vec<f32> = (0..d * ffn).map(|i| 0.2 * (i as f32) - 0.3).collect();
+        let gate_in: Vec<f32> = vec![0.5, -0.25, 0.75, 0.125];
+        let x: Vec<f32> = vec![0.3, -0.7, 0.9, 0.2, -0.4, 0.6, 0.1, -0.8];
+        let se = SharedExpert {
+            gate_in: Some(be.from_cpu_f32(&gate_in, vec![d]).unwrap()),
+            gate: be.from_cpu_f32(&gate, vec![ffn, d]).unwrap(),
+            up: be.from_cpu_f32(&up, vec![ffn, d]).unwrap(),
+            down: be.from_cpu_f32(&down, vec![d, ffn]).unwrap(),
+            ffn,
+        };
+        let xt = be.from_cpu_f32(&x, vec![t, d]).unwrap();
+        let got = be.to_cpu_f32(&se.forward(&be, &xt, d).unwrap()).unwrap();
+
+        let mut want = vec![0f32; t * d];
+        for ti in 0..t {
+            let xr = &x[ti * d..(ti + 1) * d];
+            let mut prod = vec![0f32; ffn];
+            for f in 0..ffn {
+                let g: f32 = (0..d).map(|k| xr[k] * gate[f * d + k]).sum();
+                let u: f32 = (0..d).map(|k| xr[k] * up[f * d + k]).sum();
+                prod[f] = (g / (1.0 + (-g).exp())) * u; // silu(g)·u
+            }
+            let s: f32 = (0..d).map(|k| xr[k] * gate_in[k]).sum();
+            let s = 1.0 / (1.0 + (-s).exp());
+            for k in 0..d {
+                let v: f32 = (0..ffn).map(|f| prod[f] * down[k * ffn + f]).sum();
+                want[ti * d + k] = v * s;
+            }
+        }
+        for i in 0..t * d {
+            assert!(
+                (got[i] - want[i]).abs() <= 1e-5 * (1.0 + want[i].abs()),
+                "элемент {i}: {} против {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// Без `ffn_gate_inp_shexp` общий эксперт складывается без масштаба.
+    #[test]
+    fn shared_expert_without_gate_is_unscaled() {
+        use crate::backend::Backend as _;
+        let be = crate::cpu::CpuBackend;
+        let (d, ffn, t) = (2usize, 2usize, 1usize);
+        let ones = vec![1f32; ffn * d];
+        let se = SharedExpert {
+            gate_in: None,
+            gate: be.from_cpu_f32(&ones, vec![ffn, d]).unwrap(),
+            up: be.from_cpu_f32(&ones, vec![ffn, d]).unwrap(),
+            down: be.from_cpu_f32(&ones, vec![d, ffn]).unwrap(),
+            ffn,
+        };
+        let x = vec![1.0f32, 2.0];
+        let xt = be.from_cpu_f32(&x, vec![t, d]).unwrap();
+        let y = be.to_cpu_f32(&se.forward(&be, &xt, d).unwrap()).unwrap();
+        // g = u = 3 → silu(3)·3 ≈ 2.8577·3; down = [1,1] → сумма по ffn
+        let s = 3.0 / (1.0 + (-3f32).exp());
+        let want = s * 3.0 * 2.0;
+        assert!((y[0] - want).abs() <= 1e-5, "{y:?} против {want}");
+        assert!((y[0] - y[1]).abs() <= 1e-6, "строки равны: {y:?}");
     }
 
     /// Роутер: softmax по всем, top-k по убыванию, веса — ИЗ НЕСМЕЩЁННЫХ probs.

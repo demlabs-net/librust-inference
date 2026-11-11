@@ -200,6 +200,77 @@ pub fn reorder_blocks(src: &[u8], order: &[usize], block_bytes: usize) -> Result
     Ok(out)
 }
 
+/// Порядок групп внутри двух массивов `q8_g32_fp16` — часть раскладки
+/// `row_split_k128_v1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Q8Order {
+    /// Строка за строкой: кванты `r·cols + j`, масштабы — по группам строки.
+    RowMajor,
+    /// Панели по 128 столбцов снаружи: `panel → row → 128 значений`,
+    /// масштабы в том же порядке (по 4 на панель-строку).
+    PanelOuter,
+}
+
+impl Q8G32 {
+    /// Деквантовать в f32 для CPU-эталона (`w = q · scale`).
+    ///
+    /// На CUDA это не нужно: там квант пойдёт своими ядрами, но для parity и
+    /// для слоёв, которые считаются на хосте (нормы, роутер), нужен точный
+    /// CPU-путь.
+    pub fn dequant(
+        &self,
+        data: &[u8],
+        rows: usize,
+        cols: usize,
+        order: Q8Order,
+    ) -> Result<Vec<f32>, String> {
+        let numel = (rows * cols) as u64;
+        if !cols.is_multiple_of(128) || !cols.is_multiple_of(self.group) {
+            return Err(format!("q8_g32: cols {cols} не кратны 128"));
+        }
+        let (q, sc) = self.split(data, numel)?;
+        let panels = cols / 128;
+        let per_panel_group = 128 / self.group; // 4 группы по 32
+        let mut out = vec![0f32; rows * cols];
+        for r in 0..rows {
+            for p in 0..panels {
+                for jj in 0..128 {
+                    let j = p * 128 + jj;
+                    let g = jj / self.group;
+                    let (qi, si) = match order {
+                        Q8Order::RowMajor => (r * cols + j, (r * cols + j) / self.group),
+                        Q8Order::PanelOuter => (
+                            p * rows * 128 + r * 128 + jj,
+                            (p * rows + r) * per_panel_group + g,
+                        ),
+                    };
+                    let qv = q[qi] as i8 as f32;
+                    let sb = &sc[si * 2..si * 2 + 2];
+                    let scale = f16_to_f32(u16::from_le_bytes([sb[0], sb[1]]));
+                    out[r * cols + j] = qv * scale;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// fp16 → f32 (полный, включая субнормали и NaN).
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let out = if exp == 0 {
+        // субнормаль/ноль
+        (frac as f32) * 2f32.powi(-24)
+    } else if exp == 0x1f {
+        if frac == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
+    };
+    if sign == 1 { -out } else { out }
+}
+
 /// Раскладка `q8_g32_fp16`: НЕ чередующиеся 34-байтовые блоки, а ДВА массива.
 ///
 /// Проверено на живом объекте `moe/shared/down` [2560, 640] (1 740 800 байт):
@@ -418,6 +489,48 @@ mod tests {
         let mut bad = data.clone();
         bad.push(0);
         assert!(Q8G32 { group: 32 }.split(&bad, numel).is_err());
+    }
+
+    /// Деквант q8_g32: оба порядка дают `q · scale`, и каждый порядок
+    /// восстанавливает свои же данные.
+    #[test]
+    fn q8_g32_dequant_both_orders() {
+        let (rows, cols) = (2usize, 256usize); // 2 панели по 128
+        let numel = (rows * cols) as u64;
+        let scales = numel as usize / 32;
+        let mut data = vec![0u8; numel as usize + scales * 2];
+        // кванты: 1..=127 по кругу; масштабы: 0.5 для всех
+        for (i, b) in data[..numel as usize].iter_mut().enumerate() {
+            *b = (i % 127 + 1) as u8;
+        }
+        for i in 0..scales {
+            data[numel as usize + i * 2] = 0x00; // f16 0x3800 = 0.5
+            data[numel as usize + i * 2 + 1] = 0x38;
+        }
+        let g = Q8G32 { group: 32 };
+        for order in [Q8Order::RowMajor, Q8Order::PanelOuter] {
+            let w = g.dequant(&data, rows, cols, order).unwrap();
+            assert_eq!(w.len(), rows * cols);
+            // масштаб 0.5 → |w| = |q|/2, все значения не больше 63.5
+            assert!(w.iter().all(|v| v.abs() <= 63.5 + 1e-3), "{order:?}");
+            assert!(w.iter().any(|v| v.abs() > 1.0), "{order:?}");
+        }
+        // разные порядки дают разные перестановки на одних данных
+        let a = g.dequant(&data, rows, cols, Q8Order::RowMajor).unwrap();
+        let b = g.dequant(&data, rows, cols, Q8Order::PanelOuter).unwrap();
+        assert_ne!(a, b);
+        // отказ: cols не кратен 128
+        assert!(g.dequant(&data, rows, 96, Q8Order::RowMajor).is_err());
+    }
+
+    #[test]
+    fn f16_conversion_known_values() {
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0x3800), 0.5);
+        assert_eq!(f16_to_f32(0xbc00), -1.0);
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert!(f16_to_f32(0x7c00).is_infinite());
+        assert!(f16_to_f32(0x7e00).is_nan());
     }
 
     #[test]

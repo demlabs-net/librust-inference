@@ -88,6 +88,8 @@ pub mod inference;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod moe;
+/// Чтение контейнера NINFER (артефакт Infernix), только чтение.
+pub mod ninfer;
 pub mod mtp;
 pub mod nn;
 pub mod omni;

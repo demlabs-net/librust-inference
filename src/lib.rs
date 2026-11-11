@@ -91,6 +91,8 @@ pub mod moe;
 pub mod mtp;
 pub mod nn;
 pub mod omni;
+/// PLE (`qwen4exp`): n-граммные эмбеддинги, хэш-строки таблицы.
+pub mod ple;
 pub mod plugin;
 pub mod quant;
 pub mod qwen3;

@@ -200,30 +200,13 @@ pub fn reorder_blocks(src: &[u8], order: &[usize], block_bytes: usize) -> Result
     Ok(out)
 }
 
-/// Порядок групп внутри двух массивов `q8_g32_fp16` — часть раскладки
-/// `row_split_k128_v1`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Q8Order {
-    /// Строка за строкой: кванты `r·cols + j`, масштабы — по группам строки.
-    RowMajor,
-    /// Панели по 128 столбцов снаружи: `panel → row → 128 значений`,
-    /// масштабы в том же порядке (по 4 на панель-строку).
-    PanelOuter,
-}
-
 impl Q8G32 {
     /// Деквантовать в f32 для CPU-эталона (`w = q · scale`).
     ///
     /// На CUDA это не нужно: там квант пойдёт своими ядрами, но для parity и
     /// для слоёв, которые считаются на хосте (нормы, роутер), нужен точный
     /// CPU-путь.
-    pub fn dequant(
-        &self,
-        data: &[u8],
-        rows: usize,
-        cols: usize,
-        order: Q8Order,
-    ) -> Result<Vec<f32>, String> {
+    pub fn dequant(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<f32>, String> {
         let numel = (rows * cols) as u64;
         if !cols.is_multiple_of(128) || !cols.is_multiple_of(self.group) {
             return Err(format!("q8_g32: cols {cols} не кратны 128"));
@@ -237,13 +220,11 @@ impl Q8G32 {
                 for jj in 0..128 {
                     let j = p * 128 + jj;
                     let g = jj / self.group;
-                    let (qi, si) = match order {
-                        Q8Order::RowMajor => (r * cols + j, (r * cols + j) / self.group),
-                        Q8Order::PanelOuter => (
-                            p * rows * 128 + r * 128 + jj,
-                            (p * rows + r) * per_panel_group + g,
-                        ),
-                    };
+                    // Спецификация (§3.2/3.5): обход строкой-группами, кванты
+                    // в base-плоскости, масштабы — в scale-плоскости с тем же
+                    // порядком индексов.
+                    let _ = (p, jj, per_panel_group, g);
+                    let (qi, si) = (r * cols + j, (r * cols + j) / self.group);
                     let qv = q[qi] as i8 as f32;
                     let sb = &sc[si * 2..si * 2 + 2];
                     let scale = f16_to_f32(u16::from_le_bytes([sb[0], sb[1]]));
@@ -269,6 +250,105 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
     };
     if sign == 1 { -out } else { out }
+}
+
+/// Банк экспертов MoE (`ggml_expert_iq4_nl_v1` / `ggml_expert_q2_0_v1`).
+///
+/// Спецификация (`infernix/src/docs/maintainer/storage-layouts.md` §8):
+/// эксперт — одна запись из трёх матриц, все строки — вербатим ggml-блоки:
+///
+/// - gate rows `[I, H]` и up rows `[I, H]` — тип из поля `format` объекта;
+/// - down rows `[H, I]` — тип из ИМЕНИ раскладки (`ggml_iq4_nl`/`ggml_q2_0`);
+/// - `record_stride = align_up(record_bytes, 4096)`, хвост записи — нули.
+///
+/// На живом объекте `[512, 2560, 640]` iq3_xxs: gate_row 980 Б, down_row
+/// 360 Б, record 2 176 000 → stride 2 179 072, и `bytes/512` совпадает
+/// ровно — поэтому «лишние» 297 472 Б были не таблицей, а down-матрицами
+/// в iq4_nl плюс паддинг.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertBank {
+    pub experts: usize,
+    /// `H` — ширина gate/up и число строк down.
+    pub h: usize,
+    /// `I` — строк gate/up и ширина down.
+    pub i: usize,
+    pub gate_up: BlockGeom,
+    pub down: BlockGeom,
+}
+
+impl ExpertBank {
+    /// Собрать банк по формату объекта и имени раскладки.
+    pub fn new(
+        experts: usize,
+        h: usize,
+        i: usize,
+        gate_up_format: &str,
+        layout: &str,
+    ) -> Result<Self, String> {
+        let gate_up = block_geom(gate_up_format)?;
+        let down_type = match layout {
+            "ggml_expert_iq4_nl_v1" => "ggml_iq4_nl",
+            "ggml_expert_q2_0_v1" => "ggml_q2_0",
+            other => return Err(format!("NINFER: {other} — не банк экспертов")),
+        };
+        let down = block_geom(down_type)?;
+        if !(h as u64).is_multiple_of(gate_up.elems) || !(i as u64).is_multiple_of(down.elems) {
+            return Err(format!(
+                "bank: H {h} / блок {} или I {i} / блок {} не делятся",
+                gate_up.elems, down.elems
+            ));
+        }
+        Ok(Self {
+            experts,
+            h,
+            i,
+            gate_up,
+            down,
+        })
+    }
+
+    pub fn gate_row_bytes(&self) -> u64 {
+        (self.h as u64 / self.gate_up.elems) * self.gate_up.bytes
+    }
+
+    pub fn down_row_bytes(&self) -> u64 {
+        (self.i as u64 / self.down.elems) * self.down.bytes
+    }
+
+    pub fn record_bytes(&self) -> u64 {
+        2 * self.i as u64 * self.gate_row_bytes() + self.h as u64 * self.down_row_bytes()
+    }
+
+    pub fn record_stride(&self) -> u64 {
+        align_up_u64(self.record_bytes(), 4096)
+    }
+
+    pub fn payload_bytes(&self) -> u64 {
+        self.experts as u64 * self.record_stride()
+    }
+
+    /// Байтовые срезы матриц эксперта `e`: (gate, up, down) внутри записи.
+    pub fn slices(
+        &self,
+        e: usize,
+    ) -> (
+        std::ops::Range<usize>,
+        std::ops::Range<usize>,
+        std::ops::Range<usize>,
+    ) {
+        let stride = self.record_stride() as usize;
+        let gr = self.gate_row_bytes() as usize;
+        let dr = self.down_row_bytes() as usize;
+        let base = e * stride;
+        let gate = base..base + self.i * gr;
+        let up = base + self.i * gr..base + 2 * self.i * gr;
+        let down = base + 2 * self.i * gr..base + 2 * self.i * gr + self.h * dr;
+        (gate, up, down)
+    }
+}
+
+fn align_up_u64(v: u64, a: u64) -> u64 {
+    v.div_ceil(a) * a
 }
 
 /// Раскладка `q8_g32_fp16`: НЕ чередующиеся 34-байтовые блоки, а ДВА массива.
@@ -491,8 +571,8 @@ mod tests {
         assert!(Q8G32 { group: 32 }.split(&bad, numel).is_err());
     }
 
-    /// Деквант q8_g32: оба порядка дают `q · scale`, и каждый порядок
-    /// восстанавливает свои же данные.
+    /// Деквант q8_g32 по спецификации (row-major группы, отдельная
+    /// плоскость масштабов).
     #[test]
     fn q8_g32_dequant_both_orders() {
         let (rows, cols) = (2usize, 256usize); // 2 панели по 128
@@ -508,19 +588,38 @@ mod tests {
             data[numel as usize + i * 2 + 1] = 0x38;
         }
         let g = Q8G32 { group: 32 };
-        for order in [Q8Order::RowMajor, Q8Order::PanelOuter] {
-            let w = g.dequant(&data, rows, cols, order).unwrap();
-            assert_eq!(w.len(), rows * cols);
-            // масштаб 0.5 → |w| = |q|/2, все значения не больше 63.5
-            assert!(w.iter().all(|v| v.abs() <= 63.5 + 1e-3), "{order:?}");
-            assert!(w.iter().any(|v| v.abs() > 1.0), "{order:?}");
-        }
-        // разные порядки дают разные перестановки на одних данных
-        let a = g.dequant(&data, rows, cols, Q8Order::RowMajor).unwrap();
-        let b = g.dequant(&data, rows, cols, Q8Order::PanelOuter).unwrap();
-        assert_ne!(a, b);
+        let w = g.dequant(&data, rows, cols).unwrap();
+        assert_eq!(w.len(), rows * cols);
+        // масштаб 0.5 → |w| = |q|/2, все значения не больше 63.5
+        assert!(w.iter().all(|v| v.abs() <= 63.5 + 1e-3));
+        assert!(w.iter().any(|v| v.abs() > 1.0));
         // отказ: cols не кратен 128
-        assert!(g.dequant(&data, rows, 96, Q8Order::RowMajor).is_err());
+        assert!(g.dequant(&data, rows, 96).is_err());
+    }
+
+    /// Банк экспертов сходится с живым объектом до байта.
+    #[test]
+    fn expert_bank_matches_live_sizes() {
+        // слой 0: iq3_xxs, down — iq4_nl (имя раскладки)
+        let b = ExpertBank::new(512, 2560, 640, "ggml_iq3_xxs", "ggml_expert_iq4_nl_v1").unwrap();
+        assert_eq!(b.gate_row_bytes(), 10 * 98);
+        assert_eq!(b.down_row_bytes(), 20 * 18);
+        assert_eq!(b.record_bytes(), 2 * 640 * 980 + 2560 * 360);
+        assert_eq!(b.record_bytes(), 2_176_000);
+        assert_eq!(b.record_stride(), 2_179_072);
+        assert_eq!(b.payload_bytes(), 1_115_684_864);
+        // слой 3: iq2_s, down — iq4_nl (тот же layout)
+        let b3 = ExpertBank::new(512, 2560, 640, "ggml_iq2_s", "ggml_expert_iq4_nl_v1").unwrap();
+        assert_eq!(b3.gate_row_bytes(), 10 * 82);
+        assert_eq!(b3.record_bytes(), 2 * 640 * 820 + 2560 * 360);
+        // срезы не пересекаются и лежат внутри СВОЕЙ записи
+        let (g, u, d) = b.slices(1);
+        let base = b.record_stride() as usize;
+        assert_eq!(g.start, base);
+        assert_eq!(g.end, u.start);
+        assert_eq!(u.end, d.start);
+        assert!(d.end - base <= b.record_stride() as usize);
+        assert!(b.slices(0).2.end <= b.record_stride() as usize);
     }
 
     #[test]

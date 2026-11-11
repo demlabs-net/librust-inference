@@ -2207,6 +2207,33 @@ pub trait Backend: Send + Sync {
     /// Column-wise scale: X (rows, D) · w (D,) → Y (rows, D).
     fn mul_vec(&self, x: &Tensor, w: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// Сумма групп подряд идущих строк: X (rows, D) → Y (rows/groups, D),
+    /// `y[i] = Σ_{c<groups} x[i*groups + c]`. Опора hyper-connections
+    /// qwen4exp: остаточный поток — hc строк [hc, dim] на токен, свёртка
+    /// потоков в один и есть эта сумма.
+    ///
+    /// Дефолт — не поддержано: у hyper.rs есть честный host-фолбэк, а
+    /// CUDA/Metal-ядра добавятся вместе с fused-HC (Э3.3).
+    fn sum_rows_grouped(&self, _x: &Tensor, _y: &Tensor, _groups: usize) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "sum_rows_grouped: бэкенд не умеет".into(),
+        ))
+    }
+
+    /// Раскладка выхода блока по потокам hyper-connections:
+    /// block (T, D) × w (T, groups) → Y (T, groups·D),
+    /// `y[t, c·D + k] = block[t, k] · w[t, c]`.
+    fn hc_scatter(
+        &self,
+        _block: &Tensor,
+        _w: &Tensor,
+        _y: &Tensor,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "hc_scatter: бэкенд не умеет".into(),
+        ))
+    }
+
     /// Роутер MoE НА УСТРОЙСТВЕ: softmax по всем экспертам, top-k (ничьи —
     /// меньший индекс), при `norm` — нормировка top-k (clamp 6.1e-5), затем
     /// масштаб. Пишет `ids` (u32 [T, k]) и `weights` (f32 [T, k]).

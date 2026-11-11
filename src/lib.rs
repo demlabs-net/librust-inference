@@ -82,6 +82,8 @@ pub mod gguf;
 pub mod glm4;
 #[cfg(feature = "cpu")]
 pub mod harness;
+/// Hyper-connections (`qwen4exp` / Flash-Next): остаток из hc потоков.
+pub mod hyper;
 pub mod inference;
 #[cfg(feature = "metal")]
 pub mod metal;

@@ -1204,6 +1204,48 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn sum_rows_grouped(&self, x: &Tensor, y: &Tensor, groups: usize) -> Result<(), BackendError> {
+        let (rows, d) = (x.shape()[0], x.shape()[1]);
+        if groups == 0 || rows % groups != 0 {
+            return Err(BackendError::Shape(format!(
+                "sum_rows_grouped: {rows} строк на {groups} групп"
+            )));
+        }
+        let out = rows / groups;
+        check_len(y, out * d)?;
+        let xd = data(x).to_vec();
+        let mut yd = data_mut(y);
+        for i in 0..out {
+            let dst = &mut yd[i * d..(i + 1) * d];
+            dst.fill(0.0);
+            for c in 0..groups {
+                let src = &xd[(i * groups + c) * d..(i * groups + c + 1) * d];
+                for k in 0..d {
+                    dst[k] += src[k];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn hc_scatter(&self, block: &Tensor, w: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        let (t, d) = (block.shape()[0], block.shape()[1]);
+        let g = w.shape()[1];
+        check_len(y, t * g * d)?;
+        let (bd, wd) = (data(block).to_vec(), data(w).to_vec());
+        let mut yd = data_mut(y);
+        for ti in 0..t {
+            for c in 0..g {
+                let s = wd[ti * g + c];
+                let dst = &mut yd[(ti * g + c) * d..(ti * g + c + 1) * d];
+                for k in 0..d {
+                    dst[k] = bd[ti * d + k] * s;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn glu(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError> {
         let (rows, two_d) = (x.shape()[0], x.shape()[1]);
         let d = two_d / 2;

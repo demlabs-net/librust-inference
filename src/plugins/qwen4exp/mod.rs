@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod hyper;
+pub mod load;
 pub mod ple;
 pub mod qsa;
 

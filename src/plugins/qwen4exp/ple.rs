@@ -132,6 +132,127 @@ impl PleCfg {
     }
 }
 
+// ─────────────────── вывод констант (порт ngram_hash.cpp) ───────────────────
+
+const K_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+const K_PRIME1: u64 = 10_007;
+
+fn splitmix64(x: u64) -> u64 {
+    let x = x.wrapping_add(K_GAMMA);
+    let x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn is_prime(v: u64) -> bool {
+    if v < 2 {
+        return false;
+    }
+    if v.is_multiple_of(2) {
+        return v == 2;
+    }
+    let mut d = 3u64;
+    while d * d <= v {
+        if v.is_multiple_of(d) {
+            return false;
+        }
+        d += 2;
+    }
+    true
+}
+
+/// Константы хэша PLE, выведенные из конфига (как `NgramHash` в Infernix).
+///
+/// В GGUF они лежали бы массивами, но артефакт Infernix их не хранит —
+/// значит обязаны совпасть бит-в-бит с этой формулой, иначе строки таблицы
+/// n-грамм поедут и текст разойдётся.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PleHash {
+    pub multipliers: Vec<u64>,
+    pub offsets: Vec<u64>,
+    pub sizes: Vec<u64>,
+    /// Полное число строк таблицы, выровненное (`make_divisible`).
+    pub padded_rows: u64,
+}
+
+/// Вывести константы. `ple_layer_index` — номер МОДУЛЯ PLE (не слоя модели):
+/// у Flash-Next PLE один, и это 0 — проверено сверкой `padded_rows` с
+/// `ngram_table.rows` живого артефакта (320 001 536).
+#[allow(clippy::too_many_arguments)]
+pub fn derive(
+    seed: u64,
+    vocab_size: u64,
+    ngram_size: usize,
+    heads_per_ngram: usize,
+    ngram_vocab_size_base: u64,
+    make_divisible: u64,
+    ple_layer_index: u32,
+) -> Result<PleHash, String> {
+    if ngram_size < 2 || heads_per_ngram == 0 || vocab_size == 0 || ngram_vocab_size_base == 0 {
+        return Err("PLE: неполный конфиг хэша".into());
+    }
+    if make_divisible == 0 {
+        return Err("PLE: make_divisible = 0".into());
+    }
+    let max_long = i64::MAX as u64;
+    let half_bound = (max_long / vocab_size / 2).max(1);
+    let base = seed.wrapping_add(K_PRIME1.wrapping_mul(ple_layer_index as u64));
+    let mut multipliers = Vec::with_capacity(ngram_size);
+    for i in 0..ngram_size as u64 {
+        multipliers.push(
+            2 * (splitmix64(base.wrapping_add(K_GAMMA.wrapping_mul(i + 1))) % half_bound) + 1,
+        );
+    }
+
+    let heads = (ngram_size - 1) * heads_per_ngram;
+    let mut prime = ngram_vocab_size_base - 1;
+    let mut total = 0u64;
+    let mut sizes = Vec::with_capacity(heads);
+    let mut offsets = Vec::with_capacity(heads);
+    let first = ple_layer_index as u64 * heads as u64;
+    let last = (ple_layer_index as u64 + 1) * heads as u64;
+    for i in 0..last {
+        loop {
+            prime += 1;
+            if is_prime(prime) {
+                break;
+            }
+        }
+        if i >= first {
+            sizes.push(prime);
+            offsets.push(total);
+            total += prime;
+        }
+    }
+    let padded_rows = total.div_ceil(make_divisible) * make_divisible;
+    Ok(PleHash {
+        multipliers,
+        offsets,
+        sizes,
+        padded_rows,
+    })
+}
+
+impl PleHash {
+    /// Собрать `PleCfg` для слоя: множители/диапазоны — из вывода, EOS — из конфига.
+    pub fn into_cfg(
+        self,
+        ngram_size: usize,
+        heads_per_ngram: usize,
+        eos: u32,
+    ) -> Result<PleCfg, String> {
+        PleCfg::new(
+            ngram_size,
+            heads_per_ngram,
+            eos,
+            None,
+            self.multipliers,
+            self.offsets,
+            self.sizes,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +321,30 @@ mod tests {
         // токен 5: n=2: 5 ⊕ 4·3=12 → 5⊕12=9 → 109,209; n=3: 9⊕15=6 → 306,406
         let rows = c.rows(&[2, 5], &[3, 4, 3, 4]).unwrap();
         assert_eq!(rows, vec![104, 204, 301, 401, 109, 209, 306, 406]);
+    }
+
+    /// Вывод констант сверен с живым артефактом: у Flash-Next таблица
+    /// n-грамм ровно 320 001 536 строк (это `padded_rows` при layer_index 0).
+    #[test]
+    fn derived_hash_matches_live_ngram_table() {
+        let h = derive(1234, 248_320, 3, 8, 20_000_000, 128, 0).unwrap();
+        assert_eq!(h.sizes.len(), 16, "голов = (3-1)·8");
+        assert_eq!(h.multipliers.len(), 3);
+        assert_eq!(h.sizes[0], 20_000_003);
+        assert_eq!(h.offsets[0], 0);
+        assert_eq!(h.padded_rows, 320_001_536, "ngram_table.rows артефакта");
+        // множители нечётные (как в эталоне: 2·r+1)
+        assert!(h.multipliers.iter().all(|m| m % 2 == 1));
+        // смещения — префиксные суммы размеров
+        let mut acc = 0u64;
+        for (o, sz) in h.offsets.iter().zip(h.sizes.iter()) {
+            assert_eq!(*o, acc);
+            acc += sz;
+        }
+        // другой индекс модуля PLE даёт другой набор — проверка, что параметр жив
+        let h1 = derive(1234, 248_320, 3, 8, 20_000_000, 128, 1).unwrap();
+        assert_ne!(h.sizes, h1.sizes);
+        assert_ne!(h.multipliers, h1.multipliers);
     }
 
     #[test]

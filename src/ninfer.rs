@@ -322,11 +322,13 @@ impl Ninfer {
 
     /// Логический тензор по bindings-имени с учётом упаковки.
     ///
-    /// Часть имён ссылается на объект целиком (`object`), часть — на
-    /// БАЙТОВЫЙ ДИАПАЗОН внутри общего объекта (`parts: [{object, range}]`):
-    /// так Infernix пакует q|k GDN, HC down|inject, роутер|shared_score.
-    /// Возвращает куски `(объект, смещение-в-объекте, длина)` в порядке
-    /// bindings — их склейка и есть тензор.
+    /// Часть имён ссылается на объект целиком (`object`), часть — на диапазон
+    /// внутри общего объекта (`parts: [{object, range}]`): так Infernix пакует
+    /// q|k GDN, hc down|inject и роутер|shared_score. **`range` — в ЭЛЕМЕНТАХ
+    /// объекта, не в байтах** (проверено: у q6_k-объекта [4096, 2560] диапазоны
+    /// дают ровно 10 485 760 = numel, тогда как байтов в нём 8 601 600).
+    ///
+    /// Возвращает `(объект, смещение-в-элементах, длина-в-элементах)`.
     pub fn parts(&self, name: &str) -> Result<Vec<(&Object, u64, u64)>, String> {
         let Some(v) = self.raw_bindings.get(name) else {
             return Err(format!("bindings: нет {name}"));
@@ -336,7 +338,7 @@ impl Ninfer {
             let obj = self
                 .object(id)
                 .ok_or_else(|| format!("bindings {name}: нет объекта {id}"))?;
-            out.push((obj, 0, obj.bytes));
+            out.push((obj, 0, obj.numel()));
         }
         if let Some(arr) = v.get("parts").and_then(|x| x.as_array()) {
             for p in arr {
@@ -356,10 +358,11 @@ impl Ninfer {
                 }
                 let a = r[0].as_u64().unwrap_or(0);
                 let b = r[1].as_u64().unwrap_or(0);
-                if b < a || b > obj.bytes {
+                if b < a || b > obj.numel() {
                     return Err(format!(
-                        "bindings {name}: range [{a}, {b}] вне объекта {} ({} байт)",
-                        obj.id, obj.bytes
+                        "bindings {name}: диапазон [{a}, {b}] вне объекта {} ({} элементов)",
+                        obj.id,
+                        obj.numel()
                     ));
                 }
                 out.push((obj, a, b - a));
@@ -371,13 +374,70 @@ impl Ninfer {
         Ok(out)
     }
 
-    /// Прочитать логический тензор (склеивает части, при необходимости
-    /// пересекая тома).
+    /// Прочитать логический тензор в сырых байтах, приведя диапазоны
+    /// элементов к байтам по геометрии блока кванта.
+    ///
+    /// `block_elems`/`block_bytes` — из формата объекта (`1`/размер элемента
+    /// для bf16/fp32). Границы частей обязаны попадать на границу блока:
+    /// иначе разрезать квантованный тензор нельзя, и это ошибка, а не догадка.
+    pub fn read_name_blocks(
+        &self,
+        name: &str,
+        block_elems: u64,
+        block_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        if block_elems == 0 || block_bytes == 0 {
+            return Err("read_name_blocks: нулевая геометрия блока".into());
+        }
+        let parts = self.parts(name)?;
+        let mut out = Vec::new();
+        for (obj, off, len) in parts {
+            if off % block_elems != 0 || len % block_elems != 0 {
+                return Err(format!(
+                    "bindings {name}: диапазон [{off}, {}] не кратен блоку {block_elems} \
+                     элементов ({:?} {:?})",
+                    off + len,
+                    obj.format,
+                    obj.layout
+                ));
+            }
+            let byte_off = off / block_elems * block_bytes;
+            let byte_len = len / block_elems * block_bytes;
+            if byte_off + byte_len > obj.bytes {
+                return Err(format!(
+                    "bindings {name}: часть {byte_off}+{byte_len} за объектом {} ({} байт)",
+                    obj.id, obj.bytes
+                ));
+            }
+            let slice = Object {
+                offset: obj.offset + byte_off,
+                bytes: byte_len,
+                ..obj.clone()
+            };
+            for r in self.slice_ranges(&slice)? {
+                let map = &self.maps[r.volume];
+                let a = r.file_offset as usize;
+                out.extend_from_slice(&map[a..a + r.len as usize]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Прочитать логический тензор в сырых байтах (диапазоны считаются
+    /// байтовыми — годится только для форматов, где элемент = байт).
     pub fn read_name(&self, name: &str) -> Result<Vec<u8>, String> {
         let parts = self.parts(name)?;
-        let total: u64 = parts.iter().map(|(_, _, n)| *n).sum();
-        let mut out = Vec::with_capacity(total as usize);
+        let mut out = Vec::new();
         for (obj, off, len) in parts {
+            if off + len > obj.bytes {
+                return Err(format!(
+                    "bindings {name}: диапазон [{off}, {}] вне объекта {} ({} байт); \
+                     для квантованных использовать read_name_blocks",
+                    off + len,
+                    obj.id,
+                    obj.bytes
+                ));
+            }
             let slice = Object {
                 offset: obj.offset + off,
                 bytes: len,
@@ -416,14 +476,16 @@ mod tests {
                 // 8 байт «resource» в начале payload
                 { "id": "resource/x", "kind": "resource", "offset": 0, "bytes": 8 },
                 // объект, который начинается в томе 0 и продолжается в томе 1
+                // numel = 2·3 = 6 элементов; bf16 → 12 байт (в тесте упакован
+                // по 1 байту на элемент, чтобы проверить арифметику диапазонов)
                 { "id": "weight/0", "kind": "tensor", "shape": [2, 3], "format": "bf16",
-                  "layout": "contiguous_le_v1", "offset": 6, "bytes": 10 }
+                  "layout": "contiguous_le_v1", "offset": 6, "bytes": 6 }
             ],
             "bindings": {
                 "text/a": { "object": "weight/0" },
                 // упаковка: два логических тензора в одном объекте
                 "text/q": { "parts": [{ "object": "weight/0", "range": [0, 4] }] },
-                "text/k": { "parts": [{ "object": "weight/0", "range": [4, 10] }] }
+                "text/k": { "parts": [{ "object": "weight/0", "range": [4, 6] }] }
             },
             "files": [
                 { "path": null, "payload_bytes": 16 },
@@ -460,14 +522,14 @@ mod tests {
         assert_eq!(n.name, "test-model");
         let obj = n.object_by_name("text/a").unwrap().clone();
         assert_eq!(obj.numel(), 6);
-        // объект: offset 6, длина 10 → байты 6..16 тома 0 (10 значений 6..15)
-        assert_eq!(n.read(&obj).unwrap(), (6u8..16).collect::<Vec<u8>>());
-        // parts: q = первые 4 байта объекта, k = остальные 6
-        assert_eq!(n.read_name("text/q").unwrap(), vec![6u8, 7, 8, 9]);
+        // объект: offset 6, 6 байт → значения 6..12 тома 0
+        assert_eq!(n.read(&obj).unwrap(), (6u8..12).collect::<Vec<u8>>());
+        // parts в ЭЛЕМЕНТАХ: q = элементы 0..4, k = 4..6 (блок 1 элемент/1 байт)
         assert_eq!(
-            n.read_name("text/k").unwrap(),
-            vec![10u8, 11, 12, 13, 14, 15]
+            n.read_name_blocks("text/q", 1, 1).unwrap(),
+            vec![6u8, 7, 8, 9]
         );
+        assert_eq!(n.read_name_blocks("text/k", 1, 1).unwrap(), vec![10u8, 11]);
         let ranges = n.slice_ranges(&obj).unwrap();
         assert_eq!(
             ranges.len(),
@@ -482,6 +544,18 @@ mod tests {
         let ranges = n.slice_ranges(&crossing).unwrap();
         assert_eq!(ranges.len(), 2);
         assert_eq!(n.read(&crossing).unwrap(), (12u8..20).collect::<Vec<u8>>());
+
+        // Квантованный диапазон: блок 2 элемента / 1 байт — половина блока
+        // должна быть отвергнута, целый блок читается.
+        let mut qobj = obj.clone();
+        qobj.shape = vec![4];
+        qobj.bytes = 2;
+        qobj.offset = 6;
+        assert!(n.parts("text/q").is_ok());
+        assert!(
+            n.read_name_blocks("text/q", 3, 1).is_err(),
+            "4 элемента не делятся на блок 3"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

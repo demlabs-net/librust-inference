@@ -200,6 +200,69 @@ pub fn reorder_blocks(src: &[u8], order: &[usize], block_bytes: usize) -> Result
     Ok(out)
 }
 
+/// Формат объекта из манифеста → геометрия блока кванта.
+///
+/// Имена форматов в NINFER — свои (`ggml_q6_k`, `q8_g32_fp16`, `bf16`, …),
+/// а не ggml-коды. Здесь только размеры: сам деквант делает `weights_map`
+/// (для известных ggml-форматов) или отдельный кодек (для `q8_g32_fp16`,
+/// которого в ggml нет).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockGeom {
+    pub elems: u64,
+    pub bytes: u64,
+    /// ggml-тип, если формат совпадает с ним (для декванта).
+    pub ggml: Option<crate::gguf::GgmlType>,
+}
+
+impl BlockGeom {
+    /// Диапазон в элементах → байты (границы обязаны попадать на блок).
+    pub fn bytes_of(&self, elem_offset: u64, elem_len: u64) -> Option<(u64, u64)> {
+        if self.elems == 0
+            || !elem_offset.is_multiple_of(self.elems)
+            || !elem_len.is_multiple_of(self.elems)
+        {
+            return None;
+        }
+        Some((
+            elem_offset / self.elems * self.bytes,
+            elem_len / self.elems * self.bytes,
+        ))
+    }
+}
+
+/// Разобрать имя формата из манифеста NINFER.
+pub fn block_geom(format: &str) -> Result<BlockGeom, String> {
+    use crate::gguf::GgmlType as G;
+    let g = |t: G| BlockGeom {
+        elems: t.block_elems() as u64,
+        bytes: t.block_bytes() as u64,
+        ggml: Some(t),
+    };
+    Ok(match format {
+        "bf16" => g(G::Bf16),
+        "fp16" => g(G::F16),
+        "fp32" => g(G::F32),
+        "ggml_q4_k" => g(G::Q4K),
+        "ggml_q5_k" => g(G::Q5K),
+        "ggml_q6_k" => g(G::Q6K),
+        "ggml_q8_0" => g(G::Q8_0),
+        "ggml_iq2_s" => g(G::Iq2S),
+        "ggml_iq3_s" => g(G::Iq3S),
+        "ggml_iq3_xxs" => g(G::Iq3Xxs),
+        "ggml_iq4_xs" => g(G::Iq4Xs),
+        "ggml_iq4_nl" => g(G::Iq4Nl),
+        "ggml_q2_0" => g(G::Q2_0),
+        // Q8 с группой 32 и fp16-масштабом: 32 байта кодов + 2 байта скейла.
+        // В ggml такого формата нет — деквант пишется отдельно.
+        "q8_g32_fp16" => BlockGeom {
+            elems: 32,
+            bytes: 34,
+            ggml: None,
+        },
+        other => return Err(format!("NINFER: неизвестный формат {other}")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +338,26 @@ mod tests {
     fn reorder_rejects_size_mismatch() {
         let order = vec![0usize, 1];
         assert!(reorder_blocks(&[0u8; 4], &order, 4).is_err());
+    }
+
+    #[test]
+    fn block_geometry_matches_manifest_sizes() {
+        // gdn/output [2560, 6144] q6_k: 24 блока в строке × 210 Б × 2560 = 12 902 400
+        let q6 = block_geom("ggml_q6_k").unwrap();
+        assert_eq!((q6.elems, q6.bytes), (256, 210));
+        assert_eq!(6144 / 256 * 210 * 2560u64, 12_902_400);
+        // моя ошибка ранее: диапазоны parts — элементы, а не байты
+        let total = 4096u64 * 2560;
+        assert_eq!(q6.bytes_of(0, 5_242_880), Some((0, 5_242_880 / 256 * 210)));
+        assert_eq!(q6.bytes_of(0, total), Some((0, 8_601_600)));
+        // половина блока — отказ
+        assert!(q6.bytes_of(0, 100).is_none());
+        // q8_g32_fp16: 32 элемента на 34 байта
+        let q8 = block_geom("q8_g32_fp16").unwrap();
+        assert_eq!((q8.elems, q8.bytes), (32, 34));
+        assert_eq!(q8.ggml, None, "в ggml такого формата нет");
+        assert_eq!(q8.bytes_of(0, 2560 * 640), Some((0, 2560 * 640 / 32 * 34)));
+        assert!(block_geom("nvfp4_rg16").is_err());
     }
 
     #[test]

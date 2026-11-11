@@ -90,6 +90,8 @@ pub mod metal;
 pub mod moe;
 /// Чтение контейнера NINFER (артефакт Infernix), только чтение.
 pub mod ninfer;
+/// Раскладки контейнера NINFER → ggml row-major.
+pub mod ninfer_layout;
 pub mod mtp;
 pub mod nn;
 pub mod omni;

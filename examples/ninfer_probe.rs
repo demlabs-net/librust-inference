@@ -49,7 +49,10 @@ fn main() {
         .unwrap_or_else(|| "text/layers/0/attn_hc/norm".to_string());
     if let Some(o) = n.object_by_name(&want) {
         let bytes = n.read(o).expect("прочитать объект");
-        println!("\n{want} → {} {:?} {} {}", o.id, o.shape, o.format, o.layout);
+        println!(
+            "\n{want} → {} {:?} {} {}",
+            o.id, o.shape, o.format, o.layout
+        );
         println!("прочитано {} байт (ожидалось {})", bytes.len(), o.bytes);
         // bf16 → f32 (старшие 16 бит f32)
         if o.format == "bf16" && bytes.len() >= 4 {
@@ -77,7 +80,12 @@ fn main() {
                 for (o, off, len) in &parts {
                     println!(
                         "  {} +{}..{} ({} байт) {} {}",
-                        o.id, off, off + len, len, o.format, o.layout
+                        o.id,
+                        off,
+                        off + len,
+                        len,
+                        o.format,
+                        o.layout
                     );
                 }
                 let bytes = n.read_name(&want).expect("прочитать по имени");

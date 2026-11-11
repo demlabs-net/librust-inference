@@ -85,7 +85,7 @@ pub fn pool_blocks(
     if ratio == 0 || idx_dim == 0 {
         return Err("QSA: pool при нулевом ratio/idx_dim".into());
     }
-    if cells.len() % ratio != 0 {
+    if !cells.len().is_multiple_of(ratio) {
         return Err(format!(
             "QSA: ячеек {} не кратно блоку {ratio}",
             cells.len()
@@ -93,7 +93,7 @@ pub fn pool_blocks(
     }
     let blocks = cells.len() / ratio;
     let n_kv = keys.len() / idx_dim;
-    if keys.len() % idx_dim != 0 {
+    if !keys.len().is_multiple_of(idx_dim) {
         return Err(format!("QSA: ключи {} не кратны {idx_dim}", keys.len()));
     }
     let mut out = vec![0f32; blocks * idx_dim];
@@ -132,12 +132,9 @@ pub fn block_scores(
     cfg.validate()?;
     let (d, h) = (cfg.idx_dim, cfg.n_heads);
     if q.len() != n_tokens * h * d {
-        return Err(format!(
-            "QSA: запрос {} ≠ {n_tokens}·{h}·{d}",
-            q.len()
-        ));
+        return Err(format!("QSA: запрос {} ≠ {n_tokens}·{h}·{d}", q.len()));
     }
-    if pooled.len() % d != 0 {
+    if !pooled.len().is_multiple_of(d) {
         return Err(format!("QSA: pooled {} не кратен {d}", pooled.len()));
     }
     let blocks = pooled.len() / d;
@@ -191,7 +188,9 @@ pub fn top_k_cells(
             let s = block_scores[t * n_blocks + b];
             for i in 0..cfg.ratio {
                 let cell = cells[b * cfg.ratio + i];
-                let add = bias.map(|v| v.get(cell as usize).copied().unwrap_or(0.0)).unwrap_or(0.0);
+                let add = bias
+                    .map(|v| v.get(cell as usize).copied().unwrap_or(0.0))
+                    .unwrap_or(0.0);
                 per_cell.push((s + add, cell));
             }
         }

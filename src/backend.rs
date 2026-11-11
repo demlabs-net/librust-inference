@@ -2214,7 +2214,12 @@ pub trait Backend: Send + Sync {
     ///
     /// Дефолт — не поддержано: у hyper.rs есть честный host-фолбэк, а
     /// CUDA/Metal-ядра добавятся вместе с fused-HC (Э3.3).
-    fn sum_rows_grouped(&self, _x: &Tensor, _y: &Tensor, _groups: usize) -> Result<(), BackendError> {
+    fn sum_rows_grouped(
+        &self,
+        _x: &Tensor,
+        _y: &Tensor,
+        _groups: usize,
+    ) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedFormat(
             "sum_rows_grouped: бэкенд не умеет".into(),
         ))
@@ -2223,12 +2228,7 @@ pub trait Backend: Send + Sync {
     /// Раскладка выхода блока по потокам hyper-connections:
     /// block (T, D) × w (T, groups) → Y (T, groups·D),
     /// `y[t, c·D + k] = block[t, k] · w[t, c]`.
-    fn hc_scatter(
-        &self,
-        _block: &Tensor,
-        _w: &Tensor,
-        _y: &Tensor,
-    ) -> Result<(), BackendError> {
+    fn hc_scatter(&self, _block: &Tensor, _w: &Tensor, _y: &Tensor) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedFormat(
             "hc_scatter: бэкенд не умеет".into(),
         ))

@@ -82,29 +82,23 @@ pub mod gguf;
 pub mod glm4;
 #[cfg(feature = "cpu")]
 pub mod harness;
-/// Hyper-connections (`qwen4exp` / Flash-Next): остаток из hc потоков.
-pub mod hyper;
 pub mod inference;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod moe;
+pub mod mtp;
 /// Чтение контейнера NINFER (артефакт Infernix), только чтение.
 pub mod ninfer;
 /// Раскладки контейнера NINFER → ggml row-major.
 pub mod ninfer_layout;
-pub mod mtp;
 pub mod nn;
 pub mod omni;
-/// PLE (`qwen4exp`): n-граммные эмбеддинги, хэш-строки таблицы.
-pub mod ple;
 pub mod plugin;
+/// Встроенные плагины движков (по каталогу на архитектуру).
+pub mod plugins;
 pub mod quant;
 pub mod qwen3;
 pub mod qwen35;
-/// Qwen3.8-Flash-Next (`qwen4exp`): конфиг + схема файла (forward — A5).
-pub mod qwen4exp;
-/// QSA-индексер (`qwen4exp`): сжатие ключей блоками и top-k ячеек.
-pub mod qsa;
 pub mod rope;
 pub mod spec;
 pub mod tokenizer;

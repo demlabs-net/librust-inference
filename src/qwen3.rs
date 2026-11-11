@@ -62,9 +62,17 @@ impl Qwen3Config {
         // слой знает и планируемые версии (qwen4exp → волна A5) и покрытые
         // архитектуры, поэтому отказ берём у него, если он есть.
         if !crate::arch::is_supported(&arch) {
-            let err = crate::plugin::lookup_arch(&arch)
-                .err()
-                .unwrap_or_else(|| crate::arch::unsupported_arch(&arch));
+            // Плагин может знать архитектуру, но ещё не реализовать forward:
+            // тогда его отказ конкретнее родового «архитектура в плане».
+            let err = match crate::plugin::lookup_arch(&arch) {
+                Ok(p) => p
+                    .model_versions()
+                    .iter()
+                    .find(|v| v.arch == arch)
+                    .and_then(|v| p.planned_error(v))
+                    .unwrap_or_else(|| crate::arch::unsupported_arch(&arch)),
+                Err(e) => e,
+            };
             return Err(err);
         }
         let p = |s: &str| -> String { format!("{arch}.{s}") };

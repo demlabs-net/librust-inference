@@ -73,7 +73,11 @@ impl Variant {
     pub fn candidates(layout: Layout) -> &'static [Variant] {
         match layout {
             Layout::ContiguousLe | Layout::GgmlRows | Layout::ExpertPacked => &[Variant::Identity],
-            Layout::GgmlTiles16 => &[Variant::TileMajor, Variant::TileMajorKOuter, Variant::Identity],
+            Layout::GgmlTiles16 => &[
+                Variant::TileMajor,
+                Variant::TileMajorKOuter,
+                Variant::Identity,
+            ],
             Layout::RowSplitK128 => &[Variant::PanelOuter, Variant::PanelInner, Variant::Identity],
         }
     }
@@ -177,11 +181,7 @@ pub fn block_order(
 }
 
 /// Применить порядок к сырым байтам блоков: `src[order[dst]] → dst`.
-pub fn reorder_blocks(
-    src: &[u8],
-    order: &[usize],
-    block_bytes: usize,
-) -> Result<Vec<u8>, String> {
+pub fn reorder_blocks(src: &[u8], order: &[usize], block_bytes: usize) -> Result<Vec<u8>, String> {
     let n = order.len();
     if src.len() != n * block_bytes {
         return Err(format!(
@@ -206,9 +206,7 @@ mod tests {
 
     fn blocks(n: usize) -> Vec<u8> {
         // каждый блок — 4 байта с номером блока
-        (0..n)
-            .flat_map(|i| (i as u32).to_le_bytes())
-            .collect()
+        (0..n).flat_map(|i| (i as u32).to_le_bytes()).collect()
     }
 
     fn ids(data: &[u8]) -> Vec<u32> {
@@ -222,7 +220,10 @@ mod tests {
         for l in [Layout::ContiguousLe, Layout::GgmlRows] {
             let order = block_order(l, Variant::Identity, 4, 3).unwrap();
             assert_eq!(order, (0..12).collect::<Vec<_>>());
-            assert_eq!(ids(&reorder_blocks(&blocks(12), &order, 4).unwrap()), (0..12).collect::<Vec<_>>());
+            assert_eq!(
+                ids(&reorder_blocks(&blocks(12), &order, 4).unwrap()),
+                (0..12).collect::<Vec<_>>()
+            );
         }
     }
 
@@ -278,9 +279,18 @@ mod tests {
 
     #[test]
     fn parse_and_plainness() {
-        assert_eq!(Layout::parse("contiguous_le_v1").unwrap(), Layout::ContiguousLe);
-        assert_eq!(Layout::parse("ggml_tiles16_v1").unwrap(), Layout::GgmlTiles16);
-        assert_eq!(Layout::parse("row_split_k128_v1").unwrap(), Layout::RowSplitK128);
+        assert_eq!(
+            Layout::parse("contiguous_le_v1").unwrap(),
+            Layout::ContiguousLe
+        );
+        assert_eq!(
+            Layout::parse("ggml_tiles16_v1").unwrap(),
+            Layout::GgmlTiles16
+        );
+        assert_eq!(
+            Layout::parse("row_split_k128_v1").unwrap(),
+            Layout::RowSplitK128
+        );
         assert_eq!(
             Layout::parse("ggml_expert_iq4_nl_v1").unwrap(),
             Layout::ExpertPacked

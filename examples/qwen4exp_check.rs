@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let gf = rust_inference::gguf::parse(&mmap)?;
     let arch = gf.architecture().unwrap_or("").to_string();
-    if !rust_inference::qwen4exp::Qwen4ExpConfig::is_arch(&arch) {
+    if !rust_inference::plugins::qwen4exp::config::Qwen4ExpConfig::is_arch(&arch) {
         println!("архитектура {arch:?} — не qwen4exp");
         return Ok(());
     }
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    let cfg = rust_inference::qwen4exp::Qwen4ExpConfig::from_gguf(&gf, vocab)
+    let cfg = rust_inference::plugins::qwen4exp::config::Qwen4ExpConfig::from_gguf(&gf, vocab)
         .map_err(|e| format!("конфиг: {e}"))?;
     println!(
         "qwen4exp: dim={} слоёв {} (GDN {}, attention {}), головы {}/{}, hd={}, n_rot={}",
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         plan.len(),
         gf.tensors.len()
     );
-    let problems = rust_inference::qwen4exp::check_file(&cfg, &gf, vocab);
+    let problems = rust_inference::plugins::qwen4exp::config::check_file(&cfg, &gf, vocab);
     if problems.is_empty() {
         println!("СХЕМА СОВПАЛА");
     } else {

@@ -209,23 +209,24 @@ pub trait EnginePlugin: Send + Sync {
     }
 }
 
-/// Qwen: dense `v3`, гибрид `v3.5` (GDN; включая Qwen3.8-27B) и MoE
-/// `v4exp` (Qwen3.8-Flash-Next — в плане, волна A5).
+/// Qwen: dense `v3` и гибрид `v3.5` (GDN; включая Qwen3.8-27B).
+///
+/// Flash-Next (`qwen4exp`) сюда НЕ входит: у него свой каталог и свой плагин
+/// (`crate::plugins::qwen4exp`) — MoE с hyper-connections, индексером и PLE
+/// не помещается в «версию dense/hybrid-движка».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenVersion {
     V3,
     V35,
-    V4Exp,
 }
 
 impl QwenVersion {
-    pub const ALL: [Self; 3] = [Self::V3, Self::V35, Self::V4Exp];
+    pub const ALL: [Self; 2] = [Self::V3, Self::V35];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::V3 => "v3",
             Self::V35 => "v3.5",
-            Self::V4Exp => "v4exp",
         }
     }
 
@@ -233,7 +234,6 @@ impl QwenVersion {
         match self {
             Self::V3 => "qwen3",
             Self::V35 => "qwen35",
-            Self::V4Exp => "qwen4exp",
         }
     }
 
@@ -241,11 +241,6 @@ impl QwenVersion {
         match self {
             Self::V3 => ModelVersion::new("v3", "qwen3", true),
             Self::V35 => ModelVersion::new("v3.5", "qwen35", true),
-            Self::V4Exp => ModelVersion::planned(
-                "v4exp",
-                "qwen4exp",
-                ".zcode/plans/plan-archs-and-tiered-inference.md (A5)",
-            ),
         }
     }
 }
@@ -306,22 +301,6 @@ const QWEN_V35_CAPS: Capabilities = Capabilities {
     note: "Qwen3.5/3.8 hybrid (GDN-миксер + внимание): включает Qwen3.8-27B",
 };
 
-const QWEN_V4EXP_CAPS: Capabilities = Capabilities {
-    family: Family::Moe,
-    implemented: false,
-    kv_formats: &[],
-    speculative: &[SpecBackend::Off],
-    offload: Offload {
-        experts: true,
-        kv: false,
-        prefix_cache: false,
-    },
-    batch_slots: 2,
-    max_context: 262_144,
-    note: "Qwen3.8-Flash-Next: hyper-connections, MoE 512/top-10 + shared, \
-           QSA-индексер, PLE n-граммы; конфиг/схема — qwen4exp.rs, forward — A5",
-};
-
 impl EnginePlugin for QwenPlugin {
     fn id(&self) -> &str {
         "qwen"
@@ -336,10 +315,9 @@ impl EnginePlugin for QwenPlugin {
     }
 
     fn model_versions(&self) -> Cow<'static, [ModelVersion]> {
-        const VERSIONS: [ModelVersion; 3] = [
+        const VERSIONS: [ModelVersion; 2] = [
             QwenVersion::V3.model_version(),
             QwenVersion::V35.model_version(),
-            QwenVersion::V4Exp.model_version(),
         ];
         Cow::Borrowed(&VERSIONS)
     }
@@ -348,7 +326,6 @@ impl EnginePlugin for QwenPlugin {
         match qwen_version_for_arch(v.arch) {
             Some(QwenVersion::V3) => QWEN_V3_CAPS,
             Some(QwenVersion::V35) => QWEN_V35_CAPS,
-            Some(QwenVersion::V4Exp) => QWEN_V4EXP_CAPS,
             None => Capabilities::unknown("неизвестная версия"),
         }
     }
@@ -425,27 +402,32 @@ pub static QWEN: QwenPlugin = QwenPlugin {
     engine_version: Version::new(1, 0, 0),
 };
 
-pub static NATIVE_REGISTRY: &[&dyn EnginePlugin] = &[&QWEN];
+/// Встроенные плагины, идущие в комплекте с крейтом. Новый движок
+/// добавляется здесь одной строкой и живёт в своём каталоге `plugins/<arch>/`.
+pub static NATIVE_REGISTRY: &[&dyn EnginePlugin] = &[&QWEN, &crate::plugins::qwen4exp::PLUGIN];
 
 /// Проверка поддержки модели плагином: `Ok(plugin)` — есть реализованная
 /// версия, `Err` — внятный отказ (включая «в плане») или «нет такого».
 pub fn lookup_arch(arch: &str) -> Result<&'static dyn EnginePlugin, BackendError> {
-    // qwen-версии покрывают все три архитектуры; другие плагины добавляются
-    // сюда по мере появления.
-    match qwen_version_for_arch(arch) {
-        Some(QwenVersion::V3 | QwenVersion::V35) => Ok(&QWEN as &dyn EnginePlugin),
-        Some(QwenVersion::V4Exp) => Err(crate::arch::unsupported_arch(arch)),
-        None => {
-            let known = NATIVE_REGISTRY
-                .iter()
-                .flat_map(|p| p.model_versions().into_owned())
-                .map(|m| m.arch)
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(BackendError::UnsupportedFormat(format!(
-                "архитектура {arch} не покрыта ни одним плагином; покрыты: {known}"
-            )))
+    // Реестр — единственный источник истины: плагин находится по списку
+    // объявленных им архитектур. Планируемая (implemented=false) версия
+    // отдаёт плагин, а не ошибку — вызывающий сам спросит `planned_error`,
+    // чтобы получить конкретный отказ.
+    for plugin in NATIVE_REGISTRY {
+        if plugin.model_versions().iter().any(|m| m.arch == arch) {
+            return Ok(*plugin);
         }
+    }
+    {
+        let known = NATIVE_REGISTRY
+            .iter()
+            .flat_map(|p| p.model_versions().into_owned())
+            .map(|m| m.arch)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(BackendError::UnsupportedFormat(format!(
+            "архитектура {arch} не покрыта ни одним плагином; покрыты: {known}"
+        )))
     }
 }
 
@@ -464,25 +446,22 @@ mod tests {
     }
 
     #[test]
-    fn qwen_plugin_serves_three_model_versions() {
+    fn qwen_plugin_serves_dense_and_hybrid() {
         assert_eq!(QWEN.id(), "qwen");
         assert_eq!(QWEN.kind(), PluginKind::Native);
         let versions = QWEN.model_versions();
-        assert_eq!(versions.len(), 3);
+        assert_eq!(versions.len(), 2, "v4exp живёт в своём плагине");
         assert_eq!(versions[0].name, "v3");
         assert_eq!(versions[1].name, "v3.5");
-        assert_eq!(versions[2].name, "v4exp");
-        assert!(versions[0].implemented);
-        assert!(versions[1].implemented);
-        assert!(!versions[2].implemented);
-        assert!(versions[2].plan.is_some());
+        assert!(versions.iter().all(|v| v.implemented));
     }
 
     #[test]
     fn qwen_version_for_arch_maps_gguf_names() {
         assert_eq!(qwen_version_for_arch("qwen3"), Some(QwenVersion::V3));
         assert_eq!(qwen_version_for_arch("qwen35"), Some(QwenVersion::V35));
-        assert_eq!(qwen_version_for_arch("qwen4exp"), Some(QwenVersion::V4Exp));
+        // qwen4exp — отдельный плагин, в QwenVersion его нет
+        assert_eq!(qwen_version_for_arch("qwen4exp"), None);
         assert_eq!(qwen_version_for_arch("llama"), None);
         assert_eq!(qwen_version_for_arch(""), None);
     }
@@ -497,24 +476,15 @@ mod tests {
         assert!(!caps.offload.experts);
     }
 
+    /// Flash-Next переехал в свой плагин: qwen-плагин его больше не объявляет,
+    /// а способности чужой архитектуры — честный ноль.
     #[test]
-    fn v4exp_is_planned_and_needs_expert_offload() {
-        let v = QwenVersion::V4Exp.model_version();
-        let caps = QWEN.capabilities(&v);
-        assert!(!caps.implemented);
-        assert_eq!(caps.family, Family::Moe);
-        assert!(
-            caps.offload.experts,
-            "Flash-Next без offload экспертов не живёт"
-        );
-        let err = QWEN
-            .planned_error(&v)
-            .expect("планируемая версия обязана давать внятный отказ");
-        let text = format!("{err}");
-        assert!(
-            text.contains("qwen4exp"),
-            "отказ должен называть архитектуру: {text}"
-        );
+    fn qwen_plugin_no_longer_owns_flash_next() {
+        assert!(!QWEN.model_versions().iter().any(|m| m.arch == "qwen4exp"));
+        let foreign = ModelVersion::new("v4exp", "qwen4exp", true);
+        let caps = QWEN.capabilities(&foreign);
+        assert_eq!(caps.batch_slots, 0);
+        assert_eq!(caps.max_context, 0);
     }
 
     #[test]
@@ -524,7 +494,8 @@ mod tests {
             "infernix",
             "http://10.0.33.2:8095",
             vec![ModelVersion::new("v4exp", "qwen4exp", true)],
-            QWEN_V4EXP_CAPS,
+            crate::plugins::qwen4exp::PLUGIN
+                .capabilities(&ModelVersion::new("v4exp", "qwen4exp", true)),
         );
         assert_eq!(engine.kind(), PluginKind::External);
         assert_eq!(engine.id(), "zeus");
@@ -550,8 +521,20 @@ mod tests {
             let plugin = lookup_arch(arch).expect("реализованная архитектура обязана найти плагин");
             assert_eq!(plugin.id(), "qwen");
         }
-        let err = lookup_arch("qwen4exp").err().expect("v4exp ещё в плане");
-        assert!(format!("{err}").contains("qwen4exp"));
+        // Планируемая версия отдаёт СВОЙ плагин (а не родовую ошибку):
+        // конкретный отказ спрашивается у него через `planned_error`.
+        let plugin = lookup_arch("qwen4exp").expect("qwen4exp объявлен плагином");
+        assert_eq!(plugin.id(), "qwen4exp");
+        let v = plugin
+            .model_versions()
+            .iter()
+            .find(|m| m.arch == "qwen4exp")
+            .cloned()
+            .expect("версия объявлена");
+        assert!(!v.implemented);
+        let err = plugin.planned_error(&v).expect("у плана есть отказ");
+        let text = format!("{err}");
+        assert!(text.contains("qwen4exp"), "{text}");
         let err = lookup_arch("llama")
             .err()
             .expect("llama не покрыта ни одним плагином");
@@ -560,6 +543,10 @@ mod tests {
         assert!(
             text.contains("qwen35"),
             "отказ должен перечислять покрытые: {text}"
+        );
+        assert!(
+            text.contains("qwen4exp"),
+            "реестр обязан включать встроенный плагин qwen4exp: {text}"
         );
     }
 }

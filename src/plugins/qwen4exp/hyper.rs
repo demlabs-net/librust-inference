@@ -93,12 +93,11 @@ impl HyperConn {
         let up_wt = get(&t("up.weight"))?;
         check(&t("up.weight"), up_wt, [lr, hc_dim])?;
 
-        let norm = backend.from_cpu_f32(
-            &crate::weights_map::dequant_f32(norm_wt),
-            vec![hc_dim],
-        )?;
-        let down = crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("down.weight"), vec![lr, hc_dim])?;
-        let up = crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("up.weight"), vec![hc_dim, lr])?;
+        let norm = backend.from_cpu_f32(&crate::weights_map::dequant_f32(norm_wt), vec![hc_dim])?;
+        let down =
+            crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("down.weight"), vec![lr, hc_dim])?;
+        let up =
+            crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("up.weight"), vec![hc_dim, lr])?;
 
         let inject = match wm.get(&t("inject.weight")) {
             Some(wt) => {
@@ -200,7 +199,12 @@ impl HyperConn {
 
     /// `Σ` по потокам; ядро бэкенда, иначе честный host-фолбэк (пока
     /// fused-HC-ядра не написаны — Э3.3).
-    fn sum_streams(&self, backend: &dyn Backend, gated: &Tensor, t: usize) -> Result<Tensor, BackendError> {
+    fn sum_streams(
+        &self,
+        backend: &dyn Backend,
+        gated: &Tensor,
+        t: usize,
+    ) -> Result<Tensor, BackendError> {
         let (hc, dim) = (self.hc, self.dim);
         let y = backend.zeros(vec![t, dim])?;
         match backend.sum_rows_grouped(&gated.view(vec![t * hc, dim]), &y, hc) {
@@ -329,9 +333,8 @@ mod tests {
                     (0..hc).map(|c| gated[c * dim + k]).sum::<f32>() / hc as f32;
             }
             for c in 0..hc {
-                want_inject[ti * hc + c] = (0..hc * dim)
-                    .map(|i| inj[c * hc * dim + i] * xn[i])
-                    .sum();
+                want_inject[ti * hc + c] =
+                    (0..hc * dim).map(|i| inj[c * hc * dim + i] * xn[i]).sum();
             }
         }
         for i in 0..t * dim {

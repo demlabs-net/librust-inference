@@ -205,8 +205,30 @@ mod tests {
     #[test]
     fn rejects_incomplete_metadata() {
         assert!(PleCfg::new(1, 2, 0, None, vec![1], vec![0, 0], vec![1, 1]).is_err());
-        assert!(PleCfg::new(3, 2, 0, None, vec![1, 2], vec![0, 0, 0, 0], vec![1, 1, 1, 1]).is_err());
+        assert!(
+            PleCfg::new(
+                3,
+                2,
+                0,
+                None,
+                vec![1, 2],
+                vec![0, 0, 0, 0],
+                vec![1, 1, 1, 1]
+            )
+            .is_err()
+        );
         assert!(PleCfg::new(3, 2, 0, None, vec![1, 2, 3], vec![0, 0], vec![1, 1, 1, 1]).is_err());
-        assert!(PleCfg::new(3, 2, 0, None, vec![1, 2, 3], vec![0, 0, 0, 0], vec![1, 0, 1, 1]).is_err());
+        assert!(
+            PleCfg::new(
+                3,
+                2,
+                0,
+                None,
+                vec![1, 2, 3],
+                vec![0, 0, 0, 0],
+                vec![1, 0, 1, 1]
+            )
+            .is_err()
+        );
     }
 }

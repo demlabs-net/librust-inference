@@ -400,17 +400,31 @@ impl SharedExpert {
         need(&t("ffn_up_shexp.weight"))?;
         need(&t("ffn_down_shexp.weight"))?;
         let gate_in = match wm.get(&t("ffn_gate_inp_shexp.weight")) {
-            Some(wt) => Some(backend.from_cpu_f32(
-                &crate::weights_map::dequant_f32(wt),
-                vec![dim],
-            )?),
+            Some(wt) => {
+                Some(backend.from_cpu_f32(&crate::weights_map::dequant_f32(wt), vec![dim])?)
+            }
             None => None,
         };
         Ok(Self {
             gate_in,
-            gate: crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("ffn_gate_shexp.weight"), vec![ffn, dim])?,
-            up: crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("ffn_up_shexp.weight"), vec![ffn, dim])?,
-            down: crate::qwen3::Qwen3Model::upload_q(backend, wm, &t("ffn_down_shexp.weight"), vec![dim, ffn])?,
+            gate: crate::qwen3::Qwen3Model::upload_q(
+                backend,
+                wm,
+                &t("ffn_gate_shexp.weight"),
+                vec![ffn, dim],
+            )?,
+            up: crate::qwen3::Qwen3Model::upload_q(
+                backend,
+                wm,
+                &t("ffn_up_shexp.weight"),
+                vec![ffn, dim],
+            )?,
+            down: crate::qwen3::Qwen3Model::upload_q(
+                backend,
+                wm,
+                &t("ffn_down_shexp.weight"),
+                vec![dim, ffn],
+            )?,
             ffn,
         })
     }

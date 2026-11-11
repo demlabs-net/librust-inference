@@ -113,10 +113,7 @@ impl Ninfer {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let map = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap: {e}"))?;
         if map.len() < 32 || &map[0..7] != MAGIC {
-            return Err(format!(
-                "{}: не NINFER-контейнер",
-                path.display()
-            ));
+            return Err(format!("{}: не NINFER-контейнер", path.display()));
         }
         if map[7] != VERSION {
             return Err(format!(
@@ -200,10 +197,7 @@ impl Ninfer {
             let Some(rel) = entry.get("path").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let part_path = path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(rel);
+            let part_path = path.parent().unwrap_or_else(|| Path::new(".")).join(rel);
             let f = std::fs::File::open(&part_path)
                 .map_err(|e| format!("{}: {e}", part_path.display()))?;
             let m = unsafe { Mmap::map(&f) }.map_err(|e| format!("mmap: {e}"))?;
@@ -470,9 +464,16 @@ mod tests {
         assert_eq!(n.read(&obj).unwrap(), (6u8..16).collect::<Vec<u8>>());
         // parts: q = первые 4 байта объекта, k = остальные 6
         assert_eq!(n.read_name("text/q").unwrap(), vec![6u8, 7, 8, 9]);
-        assert_eq!(n.read_name("text/k").unwrap(), vec![10u8, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            n.read_name("text/k").unwrap(),
+            vec![10u8, 11, 12, 13, 14, 15]
+        );
         let ranges = n.slice_ranges(&obj).unwrap();
-        assert_eq!(ranges.len(), 1, "в этом раскладе объект не пересекает границу");
+        assert_eq!(
+            ranges.len(),
+            1,
+            "в этом раскладе объект не пересекает границу"
+        );
 
         // Теперь сдвинем объект так, чтобы он пересёк границу томов.
         let mut crossing = obj.clone();
@@ -490,7 +491,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ninfer-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("x.bin");
-        std::fs::write(&p, b"NOPE\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        std::fs::write(
+            &p,
+            b"NOPE\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        )
+        .unwrap();
         assert!(Ninfer::open(&p).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

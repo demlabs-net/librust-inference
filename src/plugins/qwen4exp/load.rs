@@ -92,6 +92,24 @@ impl Weights {
         &self.container.name
     }
 
+    /// Конфиг модели из манифеста (`components.text.config`) — артефакт
+    /// NINFER не хранит GGUF-метаданные, конфиг живёт здесь.
+    pub fn config(&self) -> Result<crate::plugins::qwen4exp::config::Qwen4ExpConfig, BackendError> {
+        let cfg = self
+            .container
+            .manifest()
+            .get("components")
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.get("config"))
+            .ok_or_else(|| {
+                BackendError::UnsupportedFormat(
+                    "NINFER: в манифесте нет components.text.config".into(),
+                )
+            })?;
+        crate::plugins::qwen4exp::config::Qwen4ExpConfig::from_json(cfg)
+            .map_err(BackendError::UnsupportedFormat)
+    }
+
     /// Имена bindings с префиксом (диагностика/карта слоёв).
     pub fn names_with_prefix(&self, prefix: &str) -> Vec<String> {
         self.container

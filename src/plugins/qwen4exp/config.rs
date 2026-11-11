@@ -331,6 +331,150 @@ pub struct TensorSpec {
 
 /// Сверка плана с файлом: чего нет, что лишнее по размерностям.
 /// Возвращает текст для человека; пусто — файл соответствует схеме.
+impl Qwen4ExpConfig {
+    /// Конфиг из манифеста артефакта NINFER (`components.text.config`,
+    /// HF-имена полей). Артефакт Infernix не хранит GGUF-метаданные —
+    /// конфиг лежит здесь, и читать его надо отсюда, а не из `from_gguf`.
+    ///
+    /// PLE-константы (множители, диапазоны голов) в конфиге не хранятся:
+    /// они ВЫВОДЯТСЯ формулой `ngram_hash.cpp`, поэтому здесь же
+    /// вызывается [`crate::plugins::qwen4exp::ple::derive`] с индексом
+    /// модуля PLE 0 (у Flash-Next модуль один; сверено с `ngram_table.rows`).
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        let u = |k: &str| -> Result<usize, String> {
+            v.get(k)
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .ok_or_else(|| format!("config: нет {k}"))
+        };
+        let f = |k: &str| -> Option<f32> { v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32) };
+
+        let dim = u("hidden_size")?;
+        let n_layers = u("num_hidden_layers")?;
+        let n_heads = u("num_attention_heads")?;
+        let n_kv_heads = u("num_key_value_heads")?;
+        let head_dim = u("head_dim")?;
+        let vocab_size = u("vocab_size")?;
+
+        // rope_parameters: {rope_theta, partial_rotary_factor, mrope_section}
+        let rope = v.get("rope_parameters");
+        let rope_theta = rope
+            .and_then(|r| r.get("rope_theta"))
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .or_else(|| f("rope_theta"))
+            .unwrap_or(10_000.0);
+        let partial = rope
+            .and_then(|r| r.get("partial_rotary_factor"))
+            .and_then(|x| x.as_f64())
+            .unwrap_or(1.0);
+        let n_rot = ((head_dim as f64) * partial).round() as usize;
+        let mut rope_sections = [0usize; 4];
+        if let Some(secs) = rope
+            .and_then(|r| r.get("mrope_section"))
+            .and_then(|x| x.as_array())
+        {
+            for (i, s) in secs.iter().take(3).enumerate() {
+                rope_sections[i] = s.as_u64().unwrap_or(0) as usize;
+            }
+        }
+
+        // Типы слоёв: linear_attention = GDN (recurrent), full_attention — обычный.
+        let layer_types = v
+            .get("layer_types")
+            .and_then(|x| x.as_array())
+            .ok_or("config: нет layer_types")?;
+        if layer_types.len() != n_layers {
+            return Err(format!(
+                "config: layer_types {} на {n_layers} слоёв",
+                layer_types.len()
+            ));
+        }
+        let recurrent: Vec<bool> = layer_types
+            .iter()
+            .map(|t| t.as_str().map(|s| s == "linear_attention").unwrap_or(false))
+            .collect();
+        let full_attn_interval = recurrent
+            .iter()
+            .position(|r| !*r)
+            .map(|p| p + 1)
+            .unwrap_or(n_layers);
+
+        let ratio = u("indexer_compress_ratio").unwrap_or(0);
+        let compress_ratios: Vec<usize> = recurrent
+            .iter()
+            .map(|r| if *r { 0 } else { ratio })
+            .collect();
+
+        let n_v_heads = u("linear_num_value_heads")?;
+        let v_dim = u("linear_value_head_dim")?;
+
+        // PLE-константы выводятся, а не читаются.
+        let ngram_size = u("ngram_size")?;
+        let heads_per_ngram = u("heads_per_ngram")?;
+        let eos = u("eos_token_id")? as u32;
+        let hash = crate::plugins::qwen4exp::ple::derive(
+            u("seed").unwrap_or(0) as u64,
+            vocab_size as u64,
+            ngram_size,
+            heads_per_ngram,
+            u("ngram_vocab_size_base")? as u64,
+            u("make_ngram_vocab_size_divisible_by")? as u64,
+            0,
+        )?;
+
+        Ok(Self {
+            arch: ARCH.to_string(),
+            dim,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_rot,
+            rope_sections,
+            rope_theta,
+            norm_eps: f("rms_norm_eps").unwrap_or(1e-6),
+            max_seq: u("max_position_embeddings").unwrap_or(4096),
+            vocab_size,
+            n_experts: u("num_experts")?,
+            n_experts_used: u("num_experts_per_tok")?,
+            expert_ff: u("moe_intermediate_size")?,
+            shared_ff: u("shared_expert_intermediate_size").unwrap_or(0),
+            conv_kernel: u("linear_conv_kernel_dim")?,
+            ssm_state: u("linear_key_head_dim")?,
+            ssm_k_heads: u("linear_num_key_heads")?,
+            ssm_v_heads: n_v_heads,
+            ssm_inner: n_v_heads * v_dim,
+            full_attn_interval,
+            compress_ratios,
+            indexer_heads: u("indexer_n_heads").unwrap_or(0),
+            indexer_head_dim: u("indexer_head_dim").unwrap_or(0),
+            indexer_top_k: u("indexer_budget").unwrap_or(0),
+            hc_count: u("hc_count").unwrap_or(1),
+            hc_lowrank: u("hc_lowrank").unwrap_or(0),
+            ple_layers: v
+                .get("ple_layer_ids")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64())
+                        .map(|x| x as usize)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ngram_size,
+            ple_heads_per_ngram: heads_per_ngram,
+            ple_conv_kernel: u("ple_conv_kernel_size").unwrap_or(0),
+            ple_eos: eos,
+            ple_row_width: u("ple_embed_dim").unwrap_or(dim),
+            ple_layer_multipliers: hash.multipliers,
+            ple_head_offsets: hash.offsets,
+            ple_head_vocab_sizes: hash.sizes,
+            recurrent,
+        })
+    }
+}
+
 pub fn check_file(cfg: &Qwen4ExpConfig, file: &GgufFile<'_>, n_vocab: usize) -> Vec<String> {
     let plan = cfg.tensor_plan(n_vocab);
     let mut problems = Vec::new();
@@ -365,6 +509,56 @@ pub fn arch_entry() -> arch::ArchInfo {
 
 #[cfg(test)]
 mod tests {
+    /// Конфиг живого артефакта (значения из манифеста NINFER): парсится и
+    /// даёт те же числа, что мы вывели по файлу вручную.
+    #[test]
+    fn parses_manifest_config() {
+        let v = serde_json::json!({
+            "hidden_size": 2560, "vocab_size": 248320, "num_hidden_layers": 48,
+            "max_position_embeddings": 262144, "rms_norm_eps": 1e-6,
+            "layer_types": (0..48).map(|i| if (i + 1) % 4 == 0 { "full_attention" } else { "linear_attention" }).collect::<Vec<_>>(),
+            "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+            "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10]},
+            "linear_num_key_heads": 16, "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48, "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 512, "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640, "shared_expert_intermediate_size": 640,
+            "hc_count": 4, "hc_lowrank": 320,
+            "indexer_n_heads": 4, "indexer_head_dim": 128, "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "ple_layer_ids": [2], "ple_embed_dim": 2560, "ple_conv_kernel_size": 4,
+            "ngram_size": 3, "heads_per_ngram": 8,
+            "ngram_vocab_size_base": 20000000, "make_ngram_vocab_size_divisible_by": 128,
+            "seed": 1234, "eos_token_id": 248044
+        });
+        let c = Qwen4ExpConfig::from_json(&v).unwrap();
+        assert_eq!((c.dim, c.n_layers, c.vocab_size), (2560, 48, 248320));
+        assert_eq!((c.n_heads, c.n_kv_heads, c.head_dim), (24, 2, 256));
+        assert_eq!(c.n_rot, 64, "partial_rotary_factor 0.25 от 256");
+        assert_eq!(c.rope_sections, [11, 11, 10, 0]);
+        assert_eq!(
+            c.n_recurrent(),
+            36,
+            "48 слоёв, каждый 4-й — полное внимание"
+        );
+        assert_eq!(c.n_full(), 12);
+        assert_eq!(c.gdn_conv_dim(), 2 * 16 * 128 + 6144);
+        assert_eq!((c.n_experts, c.n_experts_used), (512, 10));
+        assert_eq!((c.expert_ff, c.shared_ff), (640, 640));
+        assert_eq!((c.hc_count, c.hc_lowrank), (4, 320));
+        assert_eq!(c.hc_hidden(), 10240);
+        assert_eq!((c.indexer_heads, c.indexer_top_k), (4, 2048));
+        assert_eq!(c.compress_ratios[0], 0, "у GDN-слоя индексера нет");
+        assert_eq!(c.compress_ratios[3], 4, "у полного внимания — 4");
+        assert_eq!(c.ple_layers, vec![2]);
+        // PLE-константы выведены и совпадают с таблицей артефакта
+        assert_eq!(c.ple_head_vocab_sizes.len(), 16);
+        let total: u64 = c.ple_layer_multipliers.iter().len() as u64;
+        assert_eq!(total, 3);
+        assert_eq!(c.ple_head_vocab_sizes[0], 20_000_003);
+    }
+
     use super::*;
     use std::collections::HashMap;
 

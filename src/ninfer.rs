@@ -93,6 +93,8 @@ pub struct Ninfer {
     raw_bindings: HashMap<String, serde_json::Value>,
     /// Имя артефакта из манифеста.
     pub name: String,
+    /// Разобранный манифест (нужен плагину для конфига модели).
+    manifest: serde_json::Value,
 }
 
 impl std::fmt::Debug for Ninfer {
@@ -231,12 +233,18 @@ impl Ninfer {
             by_id,
             named,
             raw_bindings,
+            manifest,
             name,
         })
     }
 
     pub fn objects(&self) -> &[Object] {
         &self.objects
+    }
+
+    /// Манифест целиком (конфиг модели лежит в `components.text.config`).
+    pub fn manifest(&self) -> &serde_json::Value {
+        &self.manifest
     }
 
     /// Объект по `bindings`-имени (`text/layers/0/attn_hc/norm`).

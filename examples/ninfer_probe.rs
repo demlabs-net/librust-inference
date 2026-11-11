@@ -70,6 +70,20 @@ fn main() {
             );
         }
     } else {
-        println!("\nнет bindings-имени {want}");
+        // имя может ссылаться на диапазоны внутри упакованного объекта
+        match n.parts(&want) {
+            Ok(parts) => {
+                println!("\n{want}: упаковано в {} частей", parts.len());
+                for (o, off, len) in &parts {
+                    println!(
+                        "  {} +{}..{} ({} байт) {} {}",
+                        o.id, off, off + len, len, o.format, o.layout
+                    );
+                }
+                let bytes = n.read_name(&want).expect("прочитать по имени");
+                println!("собрано {} байт", bytes.len());
+            }
+            Err(e) => println!("\nнет bindings-имени {want}: {e}"),
+        }
     }
 }

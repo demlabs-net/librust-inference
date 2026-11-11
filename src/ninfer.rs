@@ -87,8 +87,10 @@ pub struct Ninfer {
     bases: Vec<u64>,
     objects: Vec<Object>,
     by_id: HashMap<String, usize>,
-    /// bindings: смысловое имя → индекс объекта.
+    /// bindings: смысловое имя → индекс объекта (только «цельный» случай).
     named: HashMap<String, usize>,
+    /// Сырые записи bindings: имя → `{object}` или `{parts:[{object,range}]}`.
+    raw_bindings: HashMap<String, serde_json::Value>,
     /// Имя артефакта из манифеста.
     pub name: String,
 }
@@ -167,14 +169,16 @@ impl Ninfer {
             by_id.insert(o.id.clone(), i);
         }
 
-        // Bindings: { "text/layers/0/attn_hc/norm": { "object": "weight/000310" } }
+        // Bindings: { "text/.../norm": { "object": "weight/000310" } } либо
+        // { "text/.../query": { "parts": [{ "object": "...", "range": [a,b] }] } }
         let mut named = HashMap::new();
+        let mut raw_bindings = HashMap::new();
         if let Some(b) = manifest.get("bindings").and_then(|v| v.as_object()) {
             for (k, v) in b {
-                let Some(id) = v.get("object").and_then(|x| x.as_str()) else {
-                    continue;
-                };
-                if let Some(&idx) = by_id.get(id) {
+                raw_bindings.insert(k.clone(), v.clone());
+                if let Some(id) = v.get("object").and_then(|x| x.as_str())
+                    && let Some(&idx) = by_id.get(id)
+                {
                     named.insert(k.clone(), idx);
                 }
             }
@@ -232,6 +236,7 @@ impl Ninfer {
             objects,
             by_id,
             named,
+            raw_bindings,
             name,
         })
     }
@@ -320,6 +325,78 @@ impl Ninfer {
         }
         Ok(out)
     }
+
+    /// Логический тензор по bindings-имени с учётом упаковки.
+    ///
+    /// Часть имён ссылается на объект целиком (`object`), часть — на
+    /// БАЙТОВЫЙ ДИАПАЗОН внутри общего объекта (`parts: [{object, range}]`):
+    /// так Infernix пакует q|k GDN, HC down|inject, роутер|shared_score.
+    /// Возвращает куски `(объект, смещение-в-объекте, длина)` в порядке
+    /// bindings — их склейка и есть тензор.
+    pub fn parts(&self, name: &str) -> Result<Vec<(&Object, u64, u64)>, String> {
+        let Some(v) = self.raw_bindings.get(name) else {
+            return Err(format!("bindings: нет {name}"));
+        };
+        let mut out = Vec::new();
+        if let Some(id) = v.get("object").and_then(|x| x.as_str()) {
+            let obj = self
+                .object(id)
+                .ok_or_else(|| format!("bindings {name}: нет объекта {id}"))?;
+            out.push((obj, 0, obj.bytes));
+        }
+        if let Some(arr) = v.get("parts").and_then(|x| x.as_array()) {
+            for p in arr {
+                let id = p
+                    .get("object")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| format!("bindings {name}: part без object"))?;
+                let obj = self
+                    .object(id)
+                    .ok_or_else(|| format!("bindings {name}: нет объекта {id}"))?;
+                let r = p
+                    .get("range")
+                    .and_then(|x| x.as_array())
+                    .ok_or_else(|| format!("bindings {name}: part без range"))?;
+                if r.len() != 2 {
+                    return Err(format!("bindings {name}: range не из двух чисел"));
+                }
+                let a = r[0].as_u64().unwrap_or(0);
+                let b = r[1].as_u64().unwrap_or(0);
+                if b < a || b > obj.bytes {
+                    return Err(format!(
+                        "bindings {name}: range [{a}, {b}] вне объекта {} ({} байт)",
+                        obj.id, obj.bytes
+                    ));
+                }
+                out.push((obj, a, b - a));
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("bindings {name}: ни object, ни parts"));
+        }
+        Ok(out)
+    }
+
+    /// Прочитать логический тензор (склеивает части, при необходимости
+    /// пересекая тома).
+    pub fn read_name(&self, name: &str) -> Result<Vec<u8>, String> {
+        let parts = self.parts(name)?;
+        let total: u64 = parts.iter().map(|(_, _, n)| *n).sum();
+        let mut out = Vec::with_capacity(total as usize);
+        for (obj, off, len) in parts {
+            let slice = Object {
+                offset: obj.offset + off,
+                bytes: len,
+                ..obj.clone()
+            };
+            for r in self.slice_ranges(&slice)? {
+                let map = &self.maps[r.volume];
+                let a = r.file_offset as usize;
+                out.extend_from_slice(&map[a..a + r.len as usize]);
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -348,7 +425,12 @@ mod tests {
                 { "id": "weight/0", "kind": "tensor", "shape": [2, 3], "format": "bf16",
                   "layout": "contiguous_le_v1", "offset": 6, "bytes": 10 }
             ],
-            "bindings": { "text/a": { "object": "weight/0" } },
+            "bindings": {
+                "text/a": { "object": "weight/0" },
+                // упаковка: два логических тензора в одном объекте
+                "text/q": { "parts": [{ "object": "weight/0", "range": [0, 4] }] },
+                "text/k": { "parts": [{ "object": "weight/0", "range": [4, 10] }] }
+            },
             "files": [
                 { "path": null, "payload_bytes": 16 },
                 { "path": "c-00002.infernix", "payload_bytes": 16 }
@@ -386,6 +468,9 @@ mod tests {
         assert_eq!(obj.numel(), 6);
         // объект: offset 6, длина 10 → байты 6..16 тома 0 (10 значений 6..15)
         assert_eq!(n.read(&obj).unwrap(), (6u8..16).collect::<Vec<u8>>());
+        // parts: q = первые 4 байта объекта, k = остальные 6
+        assert_eq!(n.read_name("text/q").unwrap(), vec![6u8, 7, 8, 9]);
+        assert_eq!(n.read_name("text/k").unwrap(), vec![10u8, 11, 12, 13, 14, 15]);
         let ranges = n.slice_ranges(&obj).unwrap();
         assert_eq!(ranges.len(), 1, "в этом раскладе объект не пересекает границу");
 

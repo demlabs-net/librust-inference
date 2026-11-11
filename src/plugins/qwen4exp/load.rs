@@ -20,7 +20,9 @@
 
 use crate::error::BackendError;
 use crate::ninfer::{Ninfer, Object};
-use crate::ninfer_layout::{BlockGeom, Layout, Variant, block_geom, block_order, reorder_blocks};
+use crate::ninfer_layout::{
+    BlockGeom, ExpertBank, Layout, Variant, block_geom, block_order, reorder_blocks,
+};
 
 /// Логический тензор в ggml-порядке (нативный квант, без декванта).
 #[derive(Debug, Clone)]
@@ -40,6 +42,15 @@ impl Tensor {
     pub fn bytes(&self) -> usize {
         self.data.len()
     }
+}
+
+/// Матрицы одного эксперта в нативных квантах.
+#[derive(Debug, Clone)]
+pub struct ExpertMatrices {
+    pub gate: Vec<u8>,
+    pub up: Vec<u8>,
+    pub down: Vec<u8>,
+    pub bank: ExpertBank,
 }
 
 /// Открытые веса: контейнер + выбранные варианты раскладок.
@@ -179,15 +190,86 @@ impl Weights {
         out.ok_or_else(|| BackendError::UnsupportedFormat(format!("NINFER: пустой тензор {name}")))
     }
 
-    /// Список объектов-экспертов (3-Д) — их раскладка (`ExpertPacked`)
-    /// разбирается отдельно: на эксперта приходится больше байт, чем три
-    /// матрицы, значит внутри есть таблица масштабов.
+    /// Список объектов-экспертов (3-Д) — банков MoE по одному на слой.
     pub fn expert_objects(&self) -> Vec<&Object> {
         self.container
             .objects()
             .iter()
             .filter(|o| o.is_tensor() && o.shape.len() == 3)
             .collect()
+    }
+
+    /// Банк экспертов слоя и сам объект: геометрия — по спецификации
+    /// (`ggml_expert_iq4_nl_v1`: gate/up — тип из `format`, down — из имени
+    /// раскладки, страйд `align_up(record, 4096)`).
+    pub fn expert_bank(&self, layer: usize) -> Result<ExpertBank, BackendError> {
+        let name = format!("text/layers/{layer}/moe/experts");
+        let (obj, _, _) = self
+            .container
+            .parts(&name)
+            .map_err(BackendError::UnsupportedFormat)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackendError::UnsupportedFormat(format!("NINFER: пустой {name}")))?;
+        // shape в GGUF-порядке: [I, H, E] (ne0 — ширина down? нет: см. ниже)
+        if obj.shape.len() != 3 {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "{name}: ожидался 3-Д банк, у {} {:?}",
+                obj.id, obj.shape
+            )));
+        }
+        // Манифест: [512, 2560, 640] = [E, H, I] (см. storage-layouts §8),
+        // поэтому H = shape[1], I = shape[2], экспертов = shape[0].
+        let experts = obj.shape[0] as usize;
+        let h = obj.shape[1] as usize;
+        let i = obj.shape[2] as usize;
+        let bank = ExpertBank::new(experts, h, i, &obj.format, &obj.layout)
+            .map_err(BackendError::UnsupportedFormat)?;
+        if bank.payload_bytes() != obj.bytes {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "{name}: по спецификации {} байт, в объекте {}",
+                bank.payload_bytes(),
+                obj.bytes
+            )));
+        }
+        Ok(bank)
+    }
+
+    /// Одна матрица эксперта `e`: gate (`[I,H]`), up (`[I,H]`), down (`[H,I]`).
+    /// Читается ТОЛЬКО запись эксперта — 1.1 ГБ объекта целиком не нужны.
+    pub fn expert(&self, layer: usize, e: usize) -> Result<ExpertMatrices, BackendError> {
+        let bank = self.expert_bank(layer)?;
+        if e >= bank.experts {
+            return Err(BackendError::UnsupportedFormat(format!(
+                "эксперт {e} вне банка ({} шт)",
+                bank.experts
+            )));
+        }
+        let name = format!("text/layers/{layer}/moe/experts");
+        let (obj, _, _) = self
+            .container
+            .parts(&name)
+            .map_err(BackendError::UnsupportedFormat)?
+            .into_iter()
+            .next()
+            .expect("parts непустой (проверено в expert_bank)");
+        let stride = bank.record_stride();
+        let record = Object {
+            offset: obj.offset + e as u64 * stride,
+            bytes: bank.record_bytes(),
+            ..obj.clone()
+        };
+        let raw = self
+            .container
+            .read(&record)
+            .map_err(BackendError::UnsupportedFormat)?;
+        let (g, u, d) = bank.slices(0); // срезы внутри записи
+        Ok(ExpertMatrices {
+            gate: raw[g].to_vec(),
+            up: raw[u].to_vec(),
+            down: raw[d].to_vec(),
+            bank,
+        })
     }
 }
 
@@ -311,6 +393,60 @@ mod tests {
         assert_eq!(u16::from_le_bytes([top1.data[2], top1.data[3]]), 16);
         assert_eq!(u16::from_le_bytes([top1.data[4], top1.data[5]]), 1);
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Банк экспертов: запись читается по спецификации, срезы не пересекаются,
+    /// xвост записи — паддинг до 4096.
+    #[test]
+    fn expert_record_slices_follow_spec() {
+        let dir = std::env::temp_dir().join(format!("q4e-exp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // H=256 (1 блок gate/up), I=32 (1 группа down iq4_nl),
+        // record = 2·32·98 + 256·18 = 10 880 → stride 12 288, E=2.
+        let (e, h, i) = (2usize, 256usize, 32usize);
+        let stride = 12288usize;
+        let json = serde_json::json!({
+            "metadata": { "name": "exp" },
+            "objects": [
+                { "id": "w", "kind": "tensor", "shape": [e, h, i], "format": "ggml_iq3_xxs",
+                  "layout": "ggml_expert_iq4_nl_v1", "offset": 0, "bytes": stride * e }
+            ],
+            "bindings": { "text/layers/0/moe/experts": { "object": "w" } },
+            "files": [{ "path": null, "payload_bytes": stride * e }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(MAGIC);
+        file.push(VERSION);
+        file.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        file.extend_from_slice(&[0u8; 16]);
+        file.extend_from_slice(&body);
+        while file.len() % PAYLOAD_ALIGN as usize != 0 {
+            file.push(0);
+        }
+        // payload: экспертные записи залиты своим номером
+        for ex in 0..e {
+            file.extend(std::iter::repeat(ex as u8 + 1).take(stride));
+        }
+        let path = dir.join("e.ninfer");
+        std::fs::write(&path, &file).unwrap();
+
+        let w = Weights::open(&path, Variant::TileMajor, Variant::Identity).unwrap();
+        let bank = w.expert_bank(0).unwrap();
+        assert_eq!(bank.experts, e);
+        assert_eq!(bank.record_bytes(), 10880);
+        assert_eq!(bank.record_stride() as usize, stride);
+        assert_eq!(bank.payload_bytes() as usize, stride * e);
+
+        let e0 = w.expert(0, 0).unwrap();
+        assert_eq!(e0.gate.len(), 32 * 98);
+        assert_eq!(e0.up.len(), 32 * 98);
+        assert_eq!(e0.down.len(), 256 * 18);
+        assert!(e0.gate.iter().all(|b| *b == 1), "запись 0 залита единицами");
+        let e1 = w.expert(0, 1).unwrap();
+        assert!(e1.down.iter().all(|b| *b == 2), "запись 1 — двойками");
+        assert!(w.expert(0, 2).is_err(), "эксперт вне банка");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

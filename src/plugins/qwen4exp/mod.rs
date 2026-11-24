@@ -14,6 +14,7 @@
 pub mod config;
 pub mod hyper;
 pub mod load;
+pub mod model;
 pub mod ple;
 pub mod qsa;
 

@@ -127,6 +127,51 @@ impl Weights {
         }
     }
 
+    /// Форма логического тензора без чтения байт: (rows, cols, format).
+    /// Нужна сверке карты весов с конфигом — она не должна тянуть 51 ГиБ.
+    pub fn shape(&self, name: &str) -> Result<(usize, usize, String), BackendError> {
+        let parts = self
+            .container
+            .parts(name)
+            .map_err(BackendError::UnsupportedFormat)?;
+        let mut rows = 0usize;
+        let mut cols = 0usize;
+        let mut format = String::new();
+        for (obj, elem_off, elem_len) in parts {
+            // Манифест даёт форму в ЛОГИЧЕСКОМ порядке [rows, cols]
+            // (token_embedding = [248320, 2560], а не GGUF ne-порядок).
+            // 1-Д (нормы/векторы) — строка [1, n]; 3-Д сюда не идут.
+            let (rows_obj, c) = match obj.shape.len() {
+                1 => (1usize, obj.shape[0] as usize),
+                2 => (obj.shape[0] as usize, obj.shape[1] as usize),
+                _ => {
+                    return Err(BackendError::UnsupportedFormat(format!(
+                        "NINFER {name}: ожидался 1-Д/2-Д объект, у {} {:?}",
+                        obj.id, obj.shape
+                    )));
+                }
+            };
+            let rank1 = obj.shape.len() == 1;
+            if cols == 0 {
+                cols = c;
+                format = obj.format.clone();
+            } else if cols != c {
+                return Err(BackendError::UnsupportedFormat(format!(
+                    "NINFER {name}: части с разной шириной ({cols} и {c})"
+                )));
+            }
+            if !elem_len.is_multiple_of(c as u64) {
+                return Err(BackendError::UnsupportedFormat(format!(
+                    "NINFER {name}: диапазон {elem_len} не кратен строке {c}"
+                )));
+            }
+            let _ = elem_off;
+            rows += if rank1 { 1 } else { (elem_len / c as u64) as usize };
+            debug_assert!(rows <= rows_obj);
+        }
+        Ok((rows, cols, format))
+    }
+
     /// Прочитать логический тензор по bindings-имени в ggml row-major.
     ///
     /// Части (если их несколько, как у `gdn/query`+`gdn/key`) склеиваются —
@@ -141,14 +186,21 @@ impl Weights {
         for (obj, elem_off, elem_len) in parts {
             let geom = block_geom(&obj.format).map_err(BackendError::UnsupportedFormat)?;
             let layout = Layout::parse(&obj.layout).map_err(BackendError::UnsupportedFormat)?;
-            let cols = obj.shape.first().copied().unwrap_or(0) as usize;
-            if cols == 0 || obj.shape.len() != 2 {
+            if obj.shape.len() != 2 {
                 return Err(BackendError::UnsupportedFormat(format!(
                     "NINFER {name}: ожидался 2-Д объект, у {} {:?}",
                     obj.id, obj.shape
                 )));
             }
-            let rows_total = obj.numel() as usize / cols;
+            // Логический порядок манифеста: [rows, cols].
+            let cols = obj.shape[1] as usize;
+            if cols == 0 {
+                return Err(BackendError::UnsupportedFormat(format!(
+                    "NINFER {name}: нулевая ширина у {}",
+                    obj.id
+                )));
+            }
+            let rows_total = obj.shape[0] as usize;
             let blocks_per_row = cols / geom.elems as usize;
 
             // 1. Объект целиком (может пересекать тома), 2. раскладка → row-major.

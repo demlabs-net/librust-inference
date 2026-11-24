@@ -106,7 +106,30 @@ impl Tensor {
             crate::metal::GpuDtype::Q4_0
             | crate::metal::GpuDtype::Q8_0
             | crate::metal::GpuDtype::Q4_K
-            | crate::metal::GpuDtype::Q6_K => Dtype::I8,
+            | crate::metal::GpuDtype::Q6_K
+            | crate::metal::GpuDtype::Q5_K
+            | crate::metal::GpuDtype::Q5_0
+            | crate::metal::GpuDtype::Iq4Xs
+            | crate::metal::GpuDtype::Iq4Nl
+            | crate::metal::GpuDtype::Mxfp4
+            | crate::metal::GpuDtype::Nvfp4
+            | crate::metal::GpuDtype::Q2_K
+            | crate::metal::GpuDtype::Q3_K
+            | crate::metal::GpuDtype::Q4_1
+            | crate::metal::GpuDtype::Q5_1
+            | crate::metal::GpuDtype::Q8_1
+            | crate::metal::GpuDtype::Q8_K
+            | crate::metal::GpuDtype::Q1_0
+            | crate::metal::GpuDtype::Q2_0
+            | crate::metal::GpuDtype::TQ1_0
+            | crate::metal::GpuDtype::TQ2_0
+            | crate::metal::GpuDtype::Iq2Xxs
+            | crate::metal::GpuDtype::Iq3Xxs
+            | crate::metal::GpuDtype::Iq2Xs
+            | crate::metal::GpuDtype::Iq2S
+            | crate::metal::GpuDtype::Iq3S
+            | crate::metal::GpuDtype::Iq1S
+            | crate::metal::GpuDtype::Iq1M => Dtype::I8,
         };
         Self {
             inner: TensorInner::Metal(t),
@@ -260,7 +283,11 @@ impl Tensor {
         }
     }
 
+    // Доступ к GPU-слоям K-квантов: ядро уже держит эти тензоры, а кернелы
+    // (fused dequant-GEMM) подключаются отдельно, поэтому в lib-сборке
+    // геттеры пока не вызываются. Осознанный задел, не мёртвый код.
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q6k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ6K(b) => b,
@@ -309,6 +336,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q4k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ4K(b) => b,
@@ -317,6 +345,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q5k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ5K(b) => b,
@@ -325,6 +354,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_q3k(&self) -> &cudarc::driver::CudaSlice<u8> {
         match &self.inner {
             TensorInner::CudaQ3K(b) => b,
@@ -352,6 +382,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_f16(&self) -> &cudarc::driver::CudaSlice<half::f16> {
         match &self.inner {
             TensorInner::CudaF16(b) => b,
@@ -360,6 +391,7 @@ impl Tensor {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     pub(crate) fn as_cuda_bf16(&self) -> &cudarc::driver::CudaSlice<half::bf16> {
         match &self.inner {
             TensorInner::CudaBF16(b) => b,
@@ -367,10 +399,27 @@ impl Tensor {
         }
     }
 
+    /// True when both tensors are the SAME CUDA allocation. Cloned tensors and
+    /// pool-reused buffers share their `Arc<CudaBuffer>`, so this catches the
+    /// aliasing that would otherwise turn a `&mut` built in
+    /// [`Tensor::as_cuda_mut`] into undefined behaviour (two live references,
+    /// one of them mutable, into the same slice).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn shares_buffer_with(&self, other: &Tensor) -> bool {
+        match (&self.inner, &other.inner) {
+            (TensorInner::Cuda(a), TensorInner::Cuda(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn as_cuda_mut(&self) -> &mut cudarc::driver::CudaSlice<f32> {
         // &mut through &self: the caller is the only holder of the backend
         // during an op (no concurrent mutation of this tensor's storage).
+        // SAFETY: callers must also guarantee that no OTHER live reference to
+        // this allocation exists for the duration — see
+        // [`Tensor::shares_buffer_with`], which the GEMM path uses to reject
+        // aliased operands.
         match &self.inner {
             TensorInner::Cuda(b) => unsafe {
                 &mut *Arc::as_ptr(b).cast_mut().as_mut().unwrap().as_slice_mut()
@@ -424,8 +473,51 @@ impl Tensor {
         // R30: same as view — the debug_assert alone was a release-mode
         // silent-corruption hole.
         let n = shape.iter().product::<usize>();
-        assert!(n <= self.numel(), "view_restricted: {n} > numel {}", self.numel());
+        assert!(
+            n <= self.numel(),
+            "view_restricted: {n} > numel {}",
+            self.numel()
+        );
         self.view_inner(shape)
+    }
+
+    /// Zero-copy срез буфера, смещение — в БАЙТАХ. Нужен для блочно-
+    /// квантованных тензоров (packed-раскладка: «элемент» хранилища — байт,
+    /// а shape — логические строки/столбцы), в частности для среза эксперта
+    /// MoE. Смещение обязано быть кратно блоку формата (иначе строка начнётся
+    /// в середине блока и кернел прочитает мусор) — это ответственность
+    /// вызывающего ([`crate::moe::ExpertTensor`] считает смещение по строкам).
+    ///
+    /// На не-paked тензорах — паника: у f32/f16 «элемент» не байт, и такой
+    /// вызов означал бы смещение в 4/2 раза больше задуманного.
+    pub fn view_offset_bytes(&self, shape: Vec<usize>, byte_offset: usize) -> Tensor {
+        assert!(
+            self.is_block_quantized(),
+            "view_offset_bytes: тензор не блочно-квантован (dtype {:?})",
+            self.dtype
+        );
+        self.view_offset(shape, byte_offset)
+    }
+
+    /// Хранится ли тензор в блочно-квантованном (packed) виде на СВОЁМ
+    /// бэкенде. CPU-бэкенд держит веса в f32 — там срезов по байтам нет.
+    pub fn is_block_quantized(&self) -> bool {
+        #[cfg(feature = "metal")]
+        if let TensorInner::Metal(g) = &self.inner {
+            return g.dtype.block_elems().is_some();
+        }
+        #[cfg(feature = "cuda")]
+        if matches!(
+            self.inner,
+            TensorInner::CudaQ4K(_)
+                | TensorInner::CudaQ4KC(_)
+                | TensorInner::CudaQ5K(_)
+                | TensorInner::CudaQ3K(_)
+                | TensorInner::CudaQ6K(_)
+        ) {
+            return true;
+        }
+        false
     }
 
     /// View starting `elem_offset` elements into the buffer. Metal — zero-copy
@@ -454,8 +546,12 @@ impl Tensor {
                 };
             }
         }
+        // Только CPU-тензор: раньше блок стоял безусловно, и при сборке с
+        // cpu+cuda view_offset ЛЮБОГО тензора уходил сюда — на CUDA-тензоре
+        // это паника cpu_read() («non-CPU tensor»), а CUDA-хвост ниже был
+        // недостижим (clippy: unreachable statement).
         #[cfg(feature = "cpu")]
-        {
+        if matches!(self.inner, TensorInner::Cpu(_)) {
             let data = self.cpu_read();
             let mut v = Vec::with_capacity(n);
             v.extend_from_slice(&data[elem_offset..elem_offset + n]);
@@ -474,7 +570,6 @@ impl Tensor {
                  (the old code silently returned data from element 0)"
             );
         }
-        #[allow(unreachable_code)]
         self.view_restricted(shape)
     }
 
@@ -505,19 +600,19 @@ impl Tensor {
     }
 }
 
-/// Compute-surface operations. Every method dispatches its kernels through
-/// the backend; implementations are responsible for allocation and
-/// synchronization semantics. Errors cross the boundary as [`BackendError`].
+// Compute-surface operations. Every method dispatches its kernels through
+// the backend; implementations are responsible for allocation and
+// synchronization semantics. Errors cross the boundary as [`BackendError`].
 
 /// erf(x) — аппроксимация Abramowitz & Stegun 7.1.26 (max |ε| ≈ 1.5e-7),
 /// та же формула, что в Metal-кернеле gelu_erf (CPU=Metal согласованы).
 pub fn erf_approx(x: f32) -> f32 {
     const P: f32 = 0.3275911;
-    const A1: f32 = 0.254829592;
-    const A2: f32 = -0.284496736;
-    const A3: f32 = 1.421413741;
-    const A4: f32 = -1.453152027;
-    const A5: f32 = 1.061405429;
+    const A1: f32 = 0.254_829_6;
+    const A2: f32 = -0.284_496_72;
+    const A3: f32 = 1.421_413_8;
+    const A4: f32 = -1.453_152_1;
+    const A5: f32 = 1.061_405_4;
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let ax = x.abs();
     let t = 1.0 / (1.0 + P * ax);
@@ -545,7 +640,13 @@ pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
         return Ok(std::sync::Arc::new(crate::cuda::CudaBackend::new(0)?));
     }
     #[cfg(feature = "cpu")]
-    if requested.as_deref().map(|r| r == "cpu").unwrap_or(false) {
+    // K30 promised that `cpu` in the default feature set would run the CPU
+    // reference integration tests, but this branch required an explicit
+    // `BACKEND=cpu`: a bare `cargo test` fell through to BackendUnavailable and
+    // the tests that skip on `None` silently did not run (which is how the
+    // CPU re-rotation defect survived). GPU backends are still checked first,
+    // so a build that also enables metal/cuda keeps its priority.
+    if requested.as_deref().map(|r| r == "cpu").unwrap_or(true) {
         return Ok(std::sync::Arc::new(crate::cpu::CpuBackend));
     }
     #[allow(unreachable_code)]
@@ -558,7 +659,6 @@ pub fn default_backend() -> Result<std::sync::Arc<dyn Backend>, BackendError> {
 /// `&dyn Backend`, а реализации аллоцируют в своём рантайме (входной массив
 /// не конвертируется в Self). Отключаем педантичный wrong_self_convention.
 #[allow(clippy::wrong_self_convention)]
-
 /// Re-upload host f32 data into the SAME storage dtype as `src` (the
 /// kv_shifted/kv_rerotated defaults must preserve the KV storage format).
 /// Generic over `B: ?Sized` so the trait defaults can pass `&Self`.
@@ -578,7 +678,7 @@ fn reupload_in_dtype<B: Backend + ?Sized>(
         // creates: i8 data + one f32 scale per 32-block).
         Dtype::I8 => {
             let d = src.shape()[2];
-            if d % 32 != 0 {
+            if !d.is_multiple_of(32) {
                 return Err(BackendError::Shape(format!(
                     "reupload_same_dtype: q8_0 requires d % 32 == 0, got d={d}"
                 )));
@@ -610,12 +710,72 @@ fn reupload_in_dtype<B: Backend + ?Sized>(
     }
 }
 
+/// Download KV storage to the host as f32 — the read side of
+/// [`reupload_in_dtype`], dtype-dispatched the same way.
+///
+/// f16 goes through [`Backend::to_cpu_f16`]: `to_cpu_f32` REFUSES f16 storage
+/// by design, so the KV-roll defaults used to error out ("to_cpu_f32 on a
+/// quantized (f16/bf16) tensor") on every f16 KV — and Qwen3/Draft models
+/// build their caches as f16 — on any backend without a native
+/// `kv_shifted`/`kv_rerotated` (Metal). Backends whose f16 uploads are
+/// f32-backed (the `from_cpu_f16` default) report `F32` tensors and take the
+/// exact f32 branch.
+pub(crate) fn download_in_dtype<B: Backend + ?Sized>(
+    backend: &B,
+    src: &Tensor,
+) -> Result<Vec<f32>, BackendError> {
+    use crate::dtype::Dtype;
+    match src.dtype {
+        Dtype::F32 => backend.to_cpu_f32(src),
+        Dtype::F16 => Ok(backend
+            .to_cpu_f16(src)?
+            .into_iter()
+            .map(f32::from)
+            .collect()),
+        // q8_0 KV (Dtype::I8) has no reader here: its per-32-block scales are
+        // not part of the tensor. No cache is constructed with Q8_0 (see
+        // make_kv_tensor) — a loud error the day one is, never wrong data.
+        other => Err(BackendError::UnsupportedFormat(format!(
+            "download_in_dtype: unsupported KV storage {other:?}"
+        ))),
+    }
+}
+
+/// Парность компонент в RoPE (см. [`Backend::rope_partial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopePairing {
+    /// (k, k+n_rot/2) — llama.cpp NEOX/MROPE/IMROPE, HF rotate_half.
+    Halves,
+    /// (2k, 2k+1) — llama.cpp ROPE_TYPE_NORM (GLM-4/chatglm, GPT-J).
+    Adjacent,
+}
+
+/// Геометрия bulk-шага GDN (см. [`Backend::gdn_batch_tail`]).
+#[derive(Clone, Copy, Debug)]
+pub struct GdnBatchGeom {
+    /// Шаг строки пакетного QKV (2·hk·s + hv·s).
+    pub cq: usize,
+    /// Размер q (и k) в строке: hk·s.
+    pub qk: usize,
+    /// Размер v (и выхода) в строке: hv·s.
+    pub inner: usize,
+    /// Число q/k-голов.
+    pub hk: usize,
+    /// Число v-голов.
+    pub hv: usize,
+    /// Размер головы (ssm state), 128 у Qwen3.5/3.8.
+    pub s: usize,
+    /// Ядро свёртки.
+    pub k: usize,
+    /// eps l2-нормировки.
+    pub eps: f32,
+}
+
 pub trait Backend: Send + Sync {
     /// Allocate a zero-initialized tensor of `shape`.
     fn zeros(&self, shape: Vec<usize>) -> Result<Tensor, BackendError>;
     /// Upload host data (row-major) into a new tensor.
     fn from_cpu_f32(&self, data: &[f32], shape: Vec<usize>) -> Result<Tensor, BackendError>;
-
 
     /// Upload fp16 data (GEMM weight storage; activations stay fp32).
     /// Default: convert to f32 and behave like `from_cpu_f32` (CPU reference,
@@ -637,6 +797,23 @@ pub trait Backend: Send + Sync {
 
     /// Upload int8 weights with a per-channel fp32 scale (GEMM storage).
     /// Default: dequantize to f32.
+    /// Прочитать буфер как u32 (индексы MoE: id экспертов, записанные
+    /// роутером на устройстве). Хранение — те же 4 байта на элемент, что у
+    /// f32; тип буфера на бэкендах без U32-варианта остаётся f32.
+    fn to_cpu_u32(&self, _t: &Tensor) -> Result<Vec<u32>, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "to_cpu_u32: бэкенд не умеет u32-буферы".into(),
+        ))
+    }
+
+    /// Загрузить u32-буфер (индексы: id экспертов MoE, тесты). Дефолт —
+    /// не поддержано: бэкенд без u32-буферов обязан сказать об этом.
+    fn from_cpu_u32(&self, _data: &[u32], _shape: Vec<usize>) -> Result<Tensor, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "from_cpu_u32: бэкенд не умеет u32-буферы".into(),
+        ))
+    }
+
     fn from_cpu_i8(
         &self,
         data: &[i8],
@@ -710,14 +887,31 @@ pub trait Backend: Send + Sync {
     fn supports_f16_weights(&self) -> bool {
         false
     }
+
+    /// KV storage format this backend's KV KERNELS actually implement.
+    ///
+    /// [`KvCache`](crate::nn::KvCache) coerces the requested format through
+    /// this: the storage dtype must match the memory layout the kernels read
+    /// and write, or every `kv_update` lays the values out in one dtype while
+    /// `attn_ar` reads them in another. Metal is the case in point — its KV
+    /// kernels are f32-only (`kv_update_f32`/`attn_ar_f32`; the true f16
+    /// kernels are CUDA's `attn_ar_v4_f16f16`), so an f16-typed allocation
+    /// left the f32 data with HALF the bytes it needs, and the attention ran
+    /// off the end of the buffer past ~cap/2 rows. Default: as requested.
+    fn supported_kv_format(&self, fmt: crate::dtype::KvFormat) -> crate::dtype::KvFormat {
+        fmt
+    }
     /// Стандартный rotate-half RoPE (HF/Qwen3): X (1, T, D) → Y, позиции
     /// pos..pos+T. CPU-референс — прямое вычисление; Metal — кернел.
+    /// `yarn` — коррекция YaRN/линейного скалирования (см. [`crate::rope`]);
+    /// `None`/тождество — прежний путь (частоты theta^(-2i/hd)).
     fn rope_standard(
         &self,
         x: &Tensor,
         pos: usize,
         hd: usize,
         theta: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
         let xd = self.to_cpu_f32(x)?;
@@ -727,11 +921,15 @@ pub trait Backend: Send + Sync {
             let p = (pos + tt) as f32;
             for h in 0..d / hd {
                 for i in 0..half {
-                    let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let c = (p * inv).cos();
-                    let s = (p * inv).sin();
+                    let (c, s) = match yarn {
+                        Some(y) if !y.is_identity() => y.cos_sin(p, i),
+                        _ => {
+                            let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
+                            ((p * inv).cos(), (p * inv).sin())
+                        }
+                    };
                     // NEOX/halves (HF rotate-half): пары (i, i + hd/2)
-                    let idx = (tt * d + h * hd + i) as usize;
+                    let idx = tt * d + h * hd + i;
                     let (x0, x1) = (xd[idx], xd[idx + hd / 2]);
                     yd[idx] = x0 * c - x1 * s;
                     yd[idx + hd / 2] = x1 * c + x0 * s;
@@ -740,6 +938,63 @@ pub trait Backend: Send + Sync {
         }
         self.from_cpu_f32(&yd, x.shape().to_vec())
     }
+    /// Частичный RoPE с выбором парности: вращаются первые `n_rot` компонент
+    /// каждой головы (частоты theta^(-2k/n_rot), k — индекс пары), хвост
+    /// [n_rot, hd) копируется как есть. `n_rot == hd` — полный поворот.
+    ///
+    /// * `RopePairing::Halves` — пары (k, k+n_rot/2): llama.cpp
+    ///   NEOX/MROPE/IMROPE (Qwen3/3.5, GLM-4.5), HF rotate_half;
+    /// * `RopePairing::Adjacent` — пары (2k, 2k+1): llama.cpp
+    ///   ROPE_TYPE_NORM (GLM-4/chatglm, GPT-J-стиль).
+    ///
+    /// Default — CPU-референс (CUDA наследует до пересборки PTX); Metal —
+    /// кернел `rope_std_part_f32`.
+    fn rope_partial(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        n_rot: usize,
+        theta: f32,
+        pairing: RopePairing,
+    ) -> Result<Tensor, BackendError> {
+        if pairing == RopePairing::Halves && (n_rot == 0 || n_rot == hd) {
+            return self.rope_standard(x, pos, hd, theta, None);
+        }
+        if n_rot > hd || !n_rot.is_multiple_of(2) {
+            return Err(BackendError::Shape(format!(
+                "rope_partial: n_rot={n_rot} не согласован с hd={hd}"
+            )));
+        }
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if d % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_partial: hd={hd} не делит d={d}"
+            )));
+        }
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = xd.clone();
+        let half = n_rot / 2;
+        for tt in 0..tq {
+            let p = (pos + tt) as f32;
+            for h in 0..d / hd {
+                let base = tt * d + h * hd;
+                for k in 0..half {
+                    let inv = 1.0 / theta.powf(2.0 * k as f32 / n_rot as f32);
+                    let (c, s) = ((p * inv).cos(), (p * inv).sin());
+                    let (i0, i1) = match pairing {
+                        RopePairing::Halves => (k, k + half),
+                        RopePairing::Adjacent => (2 * k, 2 * k + 1),
+                    };
+                    let (x0, x1) = (xd[base + i0], xd[base + i1]);
+                    yd[base + i0] = x0 * c - x1 * s;
+                    yd[base + i1] = x0 * s + x1 * c;
+                }
+            }
+        }
+        self.from_cpu_f32(&yd, x.shape().to_vec())
+    }
+
     /// M-RoPE text (Qwen3-VL IMROPE, ТОЛЬКО текст): пары HALVES (i, i+hd/2),
     /// но e-секция (4-я позиция = 0 для текста) не ротируется. Категория
     /// пары i по llama.cpp IMROPE: sector = i % sum(sections):
@@ -772,7 +1027,7 @@ pub trait Backend: Send + Sync {
                         || (sector % 3 == 1 && sector < 3 * s1)
                         || (sector % 3 == 2 && sector < 3 * s2));
                     let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let idx = (tt * d + h * hd + i) as usize;
+                    let idx = tt * d + h * hd + i;
                     if is_e {
                         yd[idx] = xd[idx];
                         yd[idx + half] = xd[idx + half];
@@ -835,7 +1090,7 @@ pub trait Backend: Send + Sync {
                         (true, 0.0)
                     };
                     let inv = 1.0 / theta.powf(2.0 * i as f32 / hd as f32);
-                    let idx = (tt * d + h * hd + i) as usize;
+                    let idx = tt * d + h * hd + i;
                     if is_e {
                         yd[idx] = xd[idx];
                         yd[idx + half] = xd[idx + half];
@@ -868,8 +1123,314 @@ pub trait Backend: Send + Sync {
         self.from_cpu_f32(&y, vec![b, t, d])
     }
 
+    // ── Ф9.4: гибрид Qwen3.5/3.8 (Gated DeltaNet) ──
+    // Эталон — llama.cpp (qwen35.cpp, delta-net-base.cpp, CPU-опы ggml
+    // ssm_conv / gated_delta_net). Default-реализации — CPU-референс
+    // (оракул юнит-тестов кернелов); Metal переопределяет кернелами.
+
+    /// Causal depthwise conv1d со стейтом (ggml_ssm_conv над [state | x] по
+    /// времени канала). x [T, C] (любой ранг с последней осью C), w [C, K],
+    /// state [C, K-1] (слот j — токен t-(K-1)+j) → (y [T, C], новый state).
+    fn gdn_conv(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (c, k) = (w.shape()[0], w.shape()[1]);
+        let t = x.numel() / c;
+        let (xv, wv, sv) = (
+            self.to_cpu_f32(x)?,
+            self.to_cpu_f32(w)?,
+            self.to_cpu_f32(state)?,
+        );
+        let at = |ch: usize, p: usize| -> f32 {
+            if p < k - 1 {
+                sv[ch * (k - 1) + p]
+            } else {
+                xv[(p - (k - 1)) * c + ch]
+            }
+        };
+        let mut y = vec![0.0f32; t * c];
+        for tt in 0..t {
+            for ch in 0..c {
+                y[tt * c + ch] = (0..k).map(|j| wv[ch * k + j] * at(ch, tt + j)).sum();
+            }
+        }
+        let mut ns = vec![0.0f32; c * (k - 1)];
+        for ch in 0..c {
+            for j in 0..k - 1 {
+                ns[ch * (k - 1) + j] = at(ch, t + j);
+            }
+        }
+        Ok((
+            self.from_cpu_f32(&y, x.shape().to_vec())?,
+            self.from_cpu_f32(&ns, vec![c, k - 1])?,
+        ))
+    }
+
+    /// L2-нормировка голов (build_gdn_l2_norm): y = x / sqrt(Σx² + eps) по
+    /// каждому отрезку длины `hd` последней оси.
+    fn gdn_l2norm(&self, x: &Tensor, hd: usize, eps: f32) -> Result<Tensor, BackendError> {
+        let xv = self.to_cpu_f32(x)?;
+        let mut y = vec![0.0f32; xv.len()];
+        for (row, out) in xv.chunks_exact(hd).zip(y.chunks_exact_mut(hd)) {
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            for (o, v) in out.iter_mut().zip(row) {
+                *o = v * inv;
+            }
+        }
+        self.from_cpu_f32(&y, x.shape().to_vec())
+    }
+
+    /// Fused GDN-хвост decode-шага (t=1): causal conv (K тапов из
+    /// [state | x]) → silu → split [q | k | v], где q и k нормированы по
+    /// головам длины `hd` (v — без нормировки), + сдвиг conv-стейта.
+    /// Возврат — (y [C] = q|k|v, new_state [C, K-1]). Арифметика каждого
+    /// выхода побитово равна цепочке gdn_conv → silu → slice → gdn_l2norm.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv_silu_split_norm(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        c: usize,
+        k: usize,
+        hd: usize,
+        qk: usize,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (xv, wv, sv) = (
+            self.to_cpu_f32(x)?,
+            self.to_cpu_f32(w)?,
+            self.to_cpu_f32(state)?,
+        );
+        let mut y = vec![0.0f32; c];
+        let mut ns = vec![0.0f32; c * (k - 1)];
+        for ch in 0..c {
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                let v = if j < k - 1 {
+                    sv[ch * (k - 1) + j]
+                } else {
+                    xv[ch]
+                };
+                acc += wv[ch * k + j] * v;
+            }
+            y[ch] = acc / (1.0 + (-acc).exp());
+            for j in 0..k - 1 {
+                ns[ch * (k - 1) + j] = if j + 1 < k - 1 {
+                    sv[ch * (k - 1) + j + 1]
+                } else {
+                    xv[ch]
+                };
+            }
+        }
+        for hbase in (0..2 * qk).step_by(hd) {
+            let row = &y[hbase..hbase + hd];
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            for i in 0..hd {
+                y[hbase + i] *= inv;
+            }
+        }
+        Ok((
+            self.from_cpu_f32(&y, vec![c])?,
+            self.from_cpu_f32(&ns, vec![c, k - 1])?,
+        ))
+    }
+
+    /// Гейты GDN: BA [T, 2Hv] — склеенный выход одной GEMM (alpha = BA[t·2H+h],
+    /// beta = BA[t·2H+H+h]); g = softplus(alpha + dt_bias)·a (a = −exp(A_log)
+    /// уже в GGUF), beta = sigmoid(beta_raw).
+    fn gdn_gates(
+        &self,
+        ba: &Tensor,
+        dt_bias: &Tensor,
+        a: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let bav = self.to_cpu_f32(ba)?;
+        let (dv, aa) = (self.to_cpu_f32(dt_bias)?, self.to_cpu_f32(a)?);
+        let h = dv.len();
+        let mut g = vec![0.0f32; bav.len() / 2];
+        let mut b = vec![0.0f32; bav.len() / 2];
+        for i in 0..g.len() {
+            let (t, hh) = (i / h, i % h);
+            let row = &bav[t * 2 * h..];
+            let x = row[hh] + dv[hh];
+            let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+            g[i] = sp * aa[hh];
+            b[i] = 1.0 / (1.0 + (-row[h + hh]).exp());
+        }
+        let mut gs = ba.shape().to_vec();
+        let l = gs.len();
+        gs[l - 1] = h;
+        Ok((
+            self.from_cpu_f32(&g, gs.clone())?,
+            self.from_cpu_f32(&b, gs)?,
+        ))
+    }
+
+    /// Рекуррентный gated delta rule (ggml_gated_delta_net). q/k [T, Hk, S],
+    /// v [T, Hv, S], g/b [T, Hv]; state [Hv, S, S] ТРАНСПОНИРОВАН как в ggml
+    /// (s[j·S + i] = S[i][j]). Голова q/k для v-головы h — h % Hk. Возврат —
+    /// (out [T, Hv, S], новый state); Metal обновляет стейт на месте.
+    fn gdn_delta_rule(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        b: &Tensor,
+        state: &Tensor,
+        hk: usize,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (hv, s) = (state.shape()[0], state.shape()[1]);
+        let t = v.numel() / (hv * s);
+        let (qv, kv, vv) = (
+            self.to_cpu_f32(q)?,
+            self.to_cpu_f32(k)?,
+            self.to_cpu_f32(v)?,
+        );
+        let (gv, bv) = (self.to_cpu_f32(g)?, self.to_cpu_f32(b)?);
+        let mut st = self.to_cpu_f32(state)?;
+        let mut out = vec![0.0f32; t * hv * s];
+        let scale = 1.0 / (s as f32).sqrt();
+        let mut delta = vec![0.0f32; s];
+        for h in 0..hv {
+            let hq = h % hk;
+            let m = &mut st[h * s * s..(h + 1) * s * s];
+            for tt in 0..t {
+                let qd = &qv[(tt * hk + hq) * s..(tt * hk + hq + 1) * s];
+                let kd = &kv[(tt * hk + hq) * s..(tt * hk + hq + 1) * s];
+                let vd = &vv[(tt * hv + h) * s..(tt * hv + h + 1) * s];
+                let eg = gv[tt * hv + h].exp();
+                let beta = bv[tt * hv + h];
+                m.iter_mut().for_each(|x| *x *= eg);
+                for j in 0..s {
+                    let dot: f32 = (0..s).map(|i| m[j * s + i] * kd[i]).sum();
+                    delta[j] = (vd[j] - dot) * beta;
+                }
+                for j in 0..s {
+                    for i in 0..s {
+                        m[j * s + i] += kd[i] * delta[j];
+                    }
+                }
+                for j in 0..s {
+                    let dot: f32 = (0..s).map(|i| m[j * s + i] * qd[i]).sum();
+                    out[(tt * hv + h) * s + j] = dot * scale;
+                }
+            }
+        }
+        Ok((
+            self.from_cpu_f32(&out, vec![t, hv, s])?,
+            self.from_cpu_f32(&st, state.shape().to_vec())?,
+        ))
+    }
+
+    /// Bulk-хвост GDN на B слотов (`t=1`, декод): conv+silu со стейтами
+    /// на месте → l2norm q/k по головам → delta-rule, всё за минимум
+    /// запусков, стейты слотов — массивом указателей.
+    ///
+    /// Default — `Ok(false)`: вызывающий идёт по-слотовым путём. CUDA
+    /// переопределяет (три запуска на слой вместо 2·B мелких).
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_batch_tail(
+        &self,
+        _qkv: &Tensor,
+        _conv_w: &Tensor,
+        _conv_states: &[&Tensor],
+        _ssm_states: &[&Tensor],
+        _gate: &Tensor,
+        _beta: &Tensor,
+        _out: &Tensor,
+        _geom: &GdnBatchGeom,
+    ) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    /// Гейтовая RMS-норма GDN: y = rmsnorm(x)·w·silu(z) по отрезкам длины
+    /// hd = w.len() последней оси (x и z одной формы).
+    fn gdn_norm_gated(
+        &self,
+        x: &Tensor,
+        z: &Tensor,
+        w: &Tensor,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let (xv, zv, wv) = (
+            self.to_cpu_f32(x)?,
+            self.to_cpu_f32(z)?,
+            self.to_cpu_f32(w)?,
+        );
+        let hd = wv.len();
+        let mut y = vec![0.0f32; xv.len()];
+        for r in 0..xv.len() / hd {
+            let row = &xv[r * hd..(r + 1) * hd];
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps).sqrt();
+            for i in 0..hd {
+                let zz = zv[r * hd + i];
+                y[r * hd + i] = row[i] * inv * wv[i] * (zz / (1.0 + (-zz).exp()));
+            }
+        }
+        self.from_cpu_f32(&y, x.shape().to_vec())
+    }
+
+    /// IMROPE для текста с ЧАСТИЧНОЙ ротацией (Qwen3.5/3.8: n_rot = 64 из
+    /// hd = 256): пары NEOX (i, i + n_rot/2) первых n_rot измерений, частота
+    /// theta^(−2i/n_rot), сектор пары i % Σsections выбирает t/h/w (для текста
+    /// все = pos) или e (позиция 0); хвост головы [n_rot..hd) не трогается.
+    /// X [1, T, D] → Y. n_rot = hd совпадает с [`Backend::rope_mrope_text`].
+    fn rope_imrope_text(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+        n_rot: usize,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        let xd = self.to_cpu_f32(x)?;
+        let mut yd = xd.clone();
+        let half = n_rot / 2;
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let (s0, s1, s2) = (sections[0], sections[1], sections[2]);
+        for tt in 0..tq {
+            for h in 0..d / hd {
+                for i in 0..half {
+                    let sector = i % sect_dims;
+                    let is_e = !((sector % 3 == 0 && sector < 3 * s0)
+                        || (sector % 3 == 1 && sector < 3 * s1)
+                        || (sector % 3 == 2 && sector < 3 * s2));
+                    let p = if is_e { 0.0 } else { (pos + tt) as f32 };
+                    let inv = theta.powf(-2.0 * i as f32 / n_rot as f32);
+                    let (c, s) = ((p * inv).cos(), (p * inv).sin());
+                    let idx = tt * d + h * hd + i;
+                    let (x0, x1) = (xd[idx], xd[idx + half]);
+                    yd[idx] = x0 * c - x1 * s;
+                    yd[idx + half] = x0 * s + x1 * c;
+                }
+            }
+        }
+        self.from_cpu_f32(&yd, x.shape().to_vec())
+    }
+
     /// Download a tensor to host memory.
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError>;
+
+    /// Download fp16 storage to host memory (the f16 KV cache; f16 weights).
+    ///
+    /// `to_cpu_f32` cannot be reused for this: it REFUSES f16 storage by
+    /// design (reading the buffer as f32 returns garbage), and backends whose
+    /// `from_cpu_f16` widens to f32 (CPU) never report an f16 tensor anyway.
+    /// Default: unsupported — backends that keep true f16 storage override it.
+    /// The KV-roll defaults ([`kv_shifted`](Backend::kv_shifted) /
+    /// [`kv_rerotated`](Backend::kv_rerotated)) are the only consumers.
+    fn to_cpu_f16(&self, _t: &Tensor) -> Result<Vec<half::f16>, BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "to_cpu_f16: backend does not expose fp16 storage".into(),
+        ))
+    }
 
     /// Activation compute dtype for GEMMs (the plan's activation axis:
     /// `TTS_ACTIVATION`/`STT_ACTIVATION` = fp32 | fp16 | bf16, default fp32).
@@ -889,6 +1450,13 @@ pub trait Backend: Send + Sync {
     /// Defaults are no-ops — only backends with per-op GPU sync (Metal)
     /// implement this.
     fn begin_batch(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Дождаться завершения всей очереди устройства. Нужен диагностике
+    /// (секции профайлера без него показывают только время запусков) и
+    /// тестам; default — no-op для бэкендов без асинхронной очереди.
+    fn synchronize(&self) -> Result<(), BackendError> {
         Ok(())
     }
 
@@ -1025,7 +1593,10 @@ pub trait Backend: Send + Sync {
         // Q26: reject unsupported formats HERE with an Err — the old path
         // fell into dequant_f32's `unimplemented!()` (a panic from a pub
         // path reachable with a malformed checkpoint).
-        if matches!(format, crate::dtype::WeightFormat::Int4 | crate::dtype::WeightFormat::Nf4) {
+        if matches!(
+            format,
+            crate::dtype::WeightFormat::Int4 | crate::dtype::WeightFormat::Nf4
+        ) {
             return Err(BackendError::UnsupportedFormat(format!(
                 "from_quantized: {format:?} dequant not implemented"
             )));
@@ -1059,6 +1630,91 @@ pub trait Backend: Send + Sync {
     fn div(&self, a: &Tensor, b: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn add_scalar(&self, x: &Tensor, y: &Tensor, c: f32) -> Result<(), BackendError>;
     fn scale(&self, x: &Tensor, y: &Tensor, c: f32) -> Result<(), BackendError>;
+    /// Аргмакс по строкам логитов [T, V] и logsumexp каждой строки:
+    /// `ids[t]` — первый максимум строки (порядок сравнений как у
+    /// [`crate::inference::sampling::greedy_next`]: строго больше, не-конечные
+    /// логиты → −∞), `lse[t] = log Σ exp(x − max)` по полному ряду.
+    /// `history` + `penalty` — тот же штраф за повторы (один раз на уникальный
+    /// токен), что у `greedy_next`; `None` — без штрафа (быстрый путь:
+    /// ни одна строка логитов не скачивается на хост). Реализация по
+    /// умолчанию — хостовая, побитово равная greedy_next.
+    fn argmax_rows(
+        &self,
+        logits: &Tensor,
+        history: Option<(&[u32], f32)>,
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
+        let shape = logits.shape().to_vec();
+        let v = *shape.last().unwrap_or(&0);
+        let t = logits.numel() / v.max(1);
+        let rows = self.to_cpu_f32(logits)?;
+        let mut ids = Vec::with_capacity(t);
+        let mut lse = Vec::with_capacity(t);
+        let mut pen: Vec<f32> = Vec::new();
+        for r in 0..t {
+            let mut row = rows[r * v..(r + 1) * v].to_vec();
+            if let Some((hist, penalty)) = history {
+                crate::inference::sampling::apply_repetition_penalty_vec_unique(
+                    &mut row, hist, penalty,
+                );
+            }
+            let mut best: Option<(usize, f32)> = None;
+            for (i, l) in row.iter().enumerate() {
+                let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
+                if best.is_none_or(|(_, bl)| l > bl) {
+                    best = Some((i, l));
+                }
+            }
+            let (bi, bv) = best.unwrap_or((0, f32::NEG_INFINITY));
+            let mut sum = 0.0f32;
+            if bv > f32::NEG_INFINITY {
+                for l in &row {
+                    if l.is_finite() {
+                        sum += (l - bv).exp();
+                    }
+                }
+            }
+            pen.clear();
+            ids.push(bi as u32);
+            lse.push(if bv > f32::NEG_INFINITY {
+                sum.ln()
+            } else {
+                f32::NEG_INFINITY
+            });
+        }
+        Ok((ids, lse))
+    }
+
+    /// Построчная копия fp32 со сдвигом и шагом:
+    /// `dst[(dst_row0+r)·dst_stride + dst_col0 + c] = src[r·cols + c]`.
+    /// Сборка выходов extract-слоёв по блокам префилла и конкат фич драфтера
+    /// (5 слоёв по последней оси) — на GPU. `src` читается как [rows, cols]
+    /// от начала буфера (лишние строки не трогаются). Реализация по
+    /// умолчанию — через хост (CPU-бэкенд): корректно, но медленно.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_rows_into(
+        &self,
+        src: &Tensor,
+        rows: usize,
+        cols: usize,
+        dst: Tensor,
+        dst_row0: usize,
+        dst_col0: usize,
+        dst_stride: usize,
+    ) -> Result<Tensor, BackendError> {
+        if src.dtype() != Dtype::F32 {
+            return Err(BackendError::UnsupportedFormat(
+                "copy_rows_into: только fp32".into(),
+            ));
+        }
+        let sv = self.to_cpu_f32(src)?;
+        let mut dv = self.to_cpu_f32(&dst)?;
+        for r in 0..rows {
+            let s0 = r * cols;
+            let d0 = (dst_row0 + r) * dst_stride + dst_col0;
+            dv[d0..d0 + cols].copy_from_slice(&sv[s0..s0 + cols]);
+        }
+        self.from_cpu_f32(&dv, dst.shape().to_vec())
+    }
     fn add_bias(&self, x: &Tensor, bias: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn sqrt(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     fn log(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
@@ -1099,20 +1755,28 @@ pub trait Backend: Send + Sync {
     /// к стораджу) — см. историю мёртвого `let _ = &yt`.
     fn gelu_erf(&self, x: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
-    /// Complex magnitude: X [..., 2n] (re | im row-major halves) → new
-    /// Y [..., n] with y[i] = sqrt(x[i]² + x[i+n]²) (silero STFT). The
-    /// default is the exact host math (Metal/CPU parity); CUDA fuses it
-    /// into one kernel.
+    /// Complex magnitude по ПОСЛЕДНЕЙ оси: X [..., 2n] (половина re, затем
+    /// половина im В КАЖДОЙ строке) → Y [..., n], y[r, c] = sqrt(x[r, c]² +
+    /// x[r, n+c]²). Silero STFT даёт [1, T, 258] = T строк по (re|im) на
+    /// кадр — прежняя реализация (и CUDA-кернел) брали половины ВСЕГО
+    /// тензора (x[i] ↔ x[i + numel/2]), то есть складывали кадры 0–1 с
+    /// кадрами 2–3: вероятности VAD расходились с официальной моделью
+    /// (сверка tests/silero_vad_golden.rs; |Δ| до 0.9).
     fn magnitude_sqrt(&self, x: &Tensor) -> Result<Tensor, BackendError> {
         let mut shape = x.shape().to_vec();
-        let n = x.numel() / 2;
+        let last = *shape.last().unwrap_or(&2);
+        let n = last / 2;
+        let rows = x.numel() / last.max(1);
         let xh = self.to_cpu_f32(x)?;
-        let mut yh = Vec::with_capacity(n);
-        for i in 0..n {
-            let (re, im) = (xh[i], xh[i + n]);
-            yh.push((re * re + im * im).sqrt());
+        let mut yh = Vec::with_capacity(rows * n);
+        for r in 0..rows {
+            let row = &xh[r * last..(r + 1) * last];
+            for c in 0..n {
+                let (re, im) = (row[c], row[n + c]);
+                yh.push((re * re + im * im).sqrt());
+            }
         }
-        *shape.last_mut().unwrap() /= 2;
+        *shape.last_mut().unwrap() = n;
         self.from_cpu_f32(&yh, shape)
     }
 
@@ -1395,6 +2059,14 @@ pub trait Backend: Send + Sync {
     /// Gather rows of `table` (V, D) by `idx` → Y (len(idx), D). f32-compute.
     fn embedding(&self, idx: &[u32], table: &Tensor, y: &Tensor) -> Result<(), BackendError>;
 
+    /// Эмбеддинги из таблицы, загруженной через [`Backend::from_quantized`]
+    /// (Ф9.4): Metal держит её в родном формате GGUF и деквантует строку на
+    /// лету; бэкенды, у которых from_quantized — деквант в f32 (CPU/CUDA-
+    /// фоллбэк), читают таблицу обычным [`Backend::embedding`].
+    fn embedding_quant(&self, idx: &[u32], table: &Tensor, y: &Tensor) -> Result<(), BackendError> {
+        self.embedding(idx, table, y)
+    }
+
     /// Embedding with vision-token override (Ф1.11): токены == override_id
     /// заменяются строками из `vision` (по порядку появления). Всё на GPU.
     fn embedding_override(
@@ -1472,10 +2144,50 @@ pub trait Backend: Send + Sync {
         theta: f32,
         h: usize,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
         let tmp = self.zeros(x.shape().to_vec())?;
         self.rmsnorm_head(x, w, &tmp, h, eps)?;
-        self.rope_standard(&tmp, pos, hd, theta)
+        self.rope_standard(&tmp, pos, hd, theta, yarn)
+    }
+    /// Разбор fused-qkv decode-шага (Ф8.2b): qkv [T, (H+2·KVH)·HD] →
+    /// q = rope(rmsnorm_head(q)) — возвращается [1, T, H·HD];
+    /// k = rope(rmsnorm_head(k)) и v — пишутся прямо в строки [pos_kv..pos_kv+T)
+    /// KV-буферов kbuf/vbuf [1, cap, KVH·HD] (f32). Заменяет slice ×3 +
+    /// norm/rope ×2 + kv_update ×2 одним проходом. Default — составной путь
+    /// из тех же примитивов; Metal — один кернел.
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_norm_rope_kv(
+        &self,
+        qkv: &Tensor,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+        kbuf: &Tensor,
+        vbuf: &Tensor,
+        h: usize,
+        kvh: usize,
+        hd: usize,
+        rope_pos: usize,
+        pos_kv: usize,
+        theta: f32,
+        eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
+    ) -> Result<Tensor, BackendError> {
+        let t = qkv.numel() / ((h + 2 * kvh) * hd);
+        let rows = qkv.view(vec![t, (h + 2 * kvh) * hd]);
+        let part = |width: usize, off: usize| -> Result<Tensor, BackendError> {
+            let y = self.zeros(vec![t, width])?;
+            self.slice_last(&rows, &y, off)?;
+            Ok(y.view(vec![1, t, width]))
+        };
+        let q = part(h * hd, 0)?;
+        let k = part(kvh * hd, h * hd)?;
+        let v = part(kvh * hd, (h + kvh) * hd)?;
+        let q = self.rmsnorm_head_rope(&q, q_norm, rope_pos, hd, theta, h, eps, yarn)?;
+        let k = self.rmsnorm_head_rope(&k, k_norm, rope_pos, hd, theta, kvh, eps, yarn)?;
+        self.kv_update(kbuf, &k, pos_kv)?;
+        self.kv_update(vbuf, &v, pos_kv)?;
+        Ok(q)
     }
     /// LayerNorm applied per head: X (rows, h·hd), w/b per head-dim (hd).
     fn layernorm_head(
@@ -1494,6 +2206,141 @@ pub trait Backend: Send + Sync {
     fn mul_rows(&self, x: &Tensor, w: &Tensor, y: &Tensor) -> Result<(), BackendError>;
     /// Column-wise scale: X (rows, D) · w (D,) → Y (rows, D).
     fn mul_vec(&self, x: &Tensor, w: &Tensor, y: &Tensor) -> Result<(), BackendError>;
+
+    /// Сумма групп подряд идущих строк: X (rows, D) → Y (rows/groups, D),
+    /// `y[i] = Σ_{c<groups} x[i*groups + c]`. Опора hyper-connections
+    /// qwen4exp: остаточный поток — hc строк [hc, dim] на токен, свёртка
+    /// потоков в один и есть эта сумма.
+    ///
+    /// Дефолт — не поддержано: у hyper.rs есть честный host-фолбэк, а
+    /// CUDA/Metal-ядра добавятся вместе с fused-HC (Э3.3).
+    fn sum_rows_grouped(
+        &self,
+        _x: &Tensor,
+        _y: &Tensor,
+        _groups: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "sum_rows_grouped: бэкенд не умеет".into(),
+        ))
+    }
+
+    /// Раскладка выхода блока по потокам hyper-connections:
+    /// block (T, D) × w (T, groups) → Y (T, groups·D),
+    /// `y[t, c·D + k] = block[t, k] · w[t, c]`.
+    fn hc_scatter(&self, _block: &Tensor, _w: &Tensor, _y: &Tensor) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "hc_scatter: бэкенд не умеет".into(),
+        ))
+    }
+
+    /// Роутер MoE НА УСТРОЙСТВЕ: softmax по всем экспертам, top-k (ничьи —
+    /// меньший индекс), при `norm` — нормировка top-k (clamp 6.1e-5), затем
+    /// масштаб. Пишет `ids` (u32 [T, k]) и `weights` (f32 [T, k]).
+    ///
+    /// Зачем: host-роутинг требует чтения логитов на CPU — по одной
+    /// синхронизации GPU→CPU на слой на токен, и декод MoE упирается в это.
+    /// Дефолт — не поддержано (тогда остаётся честный host-путь).
+    fn moe_route(
+        &self,
+        _logits: &Tensor,
+        _ids: &Tensor,
+        _weights: &Tensor,
+        _k: usize,
+        _norm: bool,
+        _scale: f32,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_route: бэкенд не умеет роутер на устройстве".into(),
+        ))
+    }
+
+    /// MoE-проекция по идентификаторам экспертов (порт идеи llama.cpp
+    /// `mul_mat_id`, декод): один вызов обслуживает все слоты top-k вместо
+    /// отдельного matvec на эксперта.
+    ///
+    /// * `a` — активации: `[K]` при `per_slot = false` (проекции up/gate,
+    ///   строка общая для всех слотов) или `[k, K]` при `per_slot = true`
+    ///   (проекция down: у каждого слота свой вход);
+    /// * `ids` — идентификаторы выбранных экспертов (u32, len = k),
+    ///   `weights` — их веса роутера (f32; используются при `per_slot = true`);
+    /// * `b` — плоские веса экспертов `[n_expert * n_rows, K]` (нативный
+    ///   квант), `c` — выход: `[k, n_rows]` при `per_slot = false` или
+    ///   `[n_rows]` (сумма `Σ w_j · dot_j`) при `per_slot = true`.
+    ///
+    /// Дефолт — не поддержано: MoE-путь обязан падать громко на бэкенде без
+    /// реализации, а не считать по одному эксперту молча.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_mv(
+        &self,
+        _a: &Tensor,
+        _ids: &Tensor,
+        _weights: &Tensor,
+        _b: &Tensor,
+        _c: &Tensor,
+        _n_rows: usize,
+        _per_slot: bool,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_experts_mv: бэкенд не умеет mul_mat_id".into(),
+        ))
+    }
+
+    /// Непрямой sgemm `mul_mat_id` — путь ЭТАЛОНА при ≥32 токенах ubatch
+    /// (ggml_metal_op_mul_mat_id_use_mm: has_simdgroup_mm && ne00>=64 &&
+    /// ne21>=32). Порядок суммирования отличается от mv_id ⇒ для побитового
+    /// паритета префилла MoE обязателен.
+    ///
+    /// * `a` — src1: `[t, K]` при `ne11 = 1` (вещание по слотам, gate/up) или
+    ///   `[t*k, ffn]` при `ne11 = k` (down); `nb11`/`nb12` — байтовые шаги
+    ///   слота и токена;
+    /// * `ids` — `[t*k]` u32 (слот быстрее токена, как `nb21 = k` у оркала);
+    /// * `b` — плоские веса экспертов `[E, n_rows, K]`;
+    /// * `c` — выход `[t, k, n_rows]` f32 БЕЗ весов (веса — `moe_acc_slots`).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_mm(
+        &self,
+        _a: &Tensor,
+        _ids: &Tensor,
+        _b: &Tensor,
+        _c: &Tensor,
+        _n_rows: usize,
+        _n_expert: usize,
+        _t: usize,
+        _k: usize,
+        _ne11: usize,
+        _nb11: u64,
+        _nb12: u64,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_experts_mm: бэкенд не умеет mul_mm_id".into(),
+        ))
+    }
+
+    /// Взвешенная сумма слотов: `acc[t, d] += Σ_j w[t*k + j] · src[(t*k + j), d]`.
+    /// Порядок сложения — слоты по возрастанию из нуля (тот же, что
+    /// последовательных `add_scaled` в по-слотовом пути).
+    fn moe_acc_slots(
+        &self,
+        _src: &Tensor,
+        _w: &Tensor,
+        _acc: &Tensor,
+        _t: usize,
+        _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "moe_acc_slots: бэкенд не умеет".into(),
+        ))
+    }
+
+    /// SwiGLU оркального графа MoE: `y = (x / (1 + exp(-x))) · u` ОДНИМ
+    /// кернелом (ggml GGML_OP_GLU/SWIGLU). Двухпроходный silu+mul не битуется
+    /// из-за регистровой свёртки деления в кернеле оркала.
+    fn swiglu(&self, _x: &Tensor, _u: &Tensor, _y: &Tensor) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedFormat(
+            "swiglu: бэкенд не умеет".into(),
+        ))
+    }
 
     // ── GLU ──
     /// Gated linear unit: X (rows, 2d) → Y (rows, d), y = a·sigmoid(b).
@@ -1603,6 +2450,62 @@ pub trait Backend: Send + Sync {
     /// dequantizes inline on read (per-component KV config).
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError>;
 
+    /// Пакетный шаг (слоты): строка `row` приёмника DST (1, cap, D) ← SRC
+    /// (1, 1, D). Сборка строк разных слотов в один батч-тензор.
+    ///
+    /// Отдельный оп, а не `scale` по `view_offset`: на CPU `view_offset`
+    /// КОПИРУЕТ (запись через него теряется), поэтому CPU-ветка пишет в
+    /// хранилище напрямую. f32-only: строки пакета — активации.
+    fn row_write(&self, dst: &Tensor, src: &Tensor, row: usize) -> Result<(), BackendError> {
+        let d = dst.shape()[2];
+        if src.shape() != [1, 1, d] {
+            return Err(BackendError::Shape(format!(
+                "row_write: src {:?} не (1,1,{d})",
+                src.shape()
+            )));
+        }
+        if row * d + d > dst.shape()[1] * d {
+            return Err(BackendError::Shape(format!(
+                "row_write: строка {row} за пределами (1,{},{d})",
+                dst.shape()[1]
+            )));
+        }
+        #[cfg(feature = "cpu")]
+        if matches!(dst.inner, TensorInner::Cpu(_)) {
+            let s = self.to_cpu_f32(src)?;
+            dst.cpu_write()[row * d..row * d + d].copy_from_slice(&s);
+            return Ok(());
+        }
+        // Metal: view_offset — реальный вид на буфер, запись попадает по
+        // смещению. CUDA упадёт громко в view_offset (нужен свой оп — Ф9).
+        self.scale(src, &dst.view_offset(vec![1, 1, d], row * d), 1.0)
+    }
+
+    /// Read row `row` of a (rows, d) activation tensor as (1, 1, d).
+    ///
+    /// Read-only counterpart of `row_write`: CPU/Metal take a `view_offset`,
+    /// while CUDA has no offset views (a nonzero `elem_offset` panics), so its
+    /// impl copies the row device-side. Used by the chunked prefill's last-row
+    /// logits and by the batch MTP hidden-row feed.
+    fn row_view(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        d: usize,
+        row: usize,
+    ) -> Result<Tensor, BackendError> {
+        let n: usize = x.shape().iter().product();
+        if n != rows * d || row >= rows {
+            return Err(BackendError::Shape(format!(
+                "row_view: {:?} is not ({rows}, {d}) or row {row} out of range",
+                x.shape()
+            )));
+        }
+        // view_offset takes the shape and the offset itself; a plain `view`
+        // first would demand the same numel and panic (CPU 1024 != 9216).
+        Ok(x.view_offset(vec![1, 1, d], row * d))
+    }
+
     /// KV compaction shift (plan 1.6): rows [shift..pos) of the (B, cap, D)
     /// buffer → a NEW tensor with them at [0..pos−shift) (the rest zeroed),
     /// storage-dtype-preserving (f32 / f16 / q8_0 with the per-32-block
@@ -1611,7 +2514,7 @@ pub trait Backend: Send + Sync {
     /// impossible — no storage access); CUDA shifts in place.
     fn kv_shifted(&self, buf: &Tensor, shift: usize, pos: usize) -> Result<Tensor, BackendError> {
         let (b, cap, d) = (buf.shape()[0], buf.shape()[1], buf.shape()[2]);
-        let xh = self.to_cpu_f32(buf)?;
+        let xh = download_in_dtype(self, buf)?;
         let n = (pos - shift) * d;
         let mut yh = vec![0.0f32; b * cap * d];
         for bi in 0..b {
@@ -1640,7 +2543,7 @@ pub trait Backend: Send + Sync {
         let (b, cap, d) = (k.shape()[0], k.shape()[1], k.shape()[2]);
         let nheads = d / head_dim;
         let pairs = head_dim / 2;
-        let mut xh = self.to_cpu_f32(k)?;
+        let mut xh = download_in_dtype(self, k)?;
         let sect_dims = mrope_sections.map(|s| s[0] + s[1] + s[2]).unwrap_or(0);
         let rotates = |pi: usize| -> bool {
             if sect_dims == 0 {
@@ -1651,7 +2554,7 @@ pub trait Backend: Send + Sync {
                 (s[0], s[1], s[2])
             };
             let sector = pi % sect_dims;
-            (sector % 3 == 0 && sector < 3 * s0)
+            (sector.is_multiple_of(3) && sector < 3 * s0)
                 || (sector % 3 == 1 && sector < 3 * s1)
                 || (sector % 3 == 2 && sector < 3 * s2)
         };
@@ -1664,9 +2567,15 @@ pub trait Backend: Send + Sync {
                     }
                     let ang = -(shift as f32) * theta.powf(-2.0 * pi as f32 / head_dim as f32);
                     let (c, s) = (ang.cos(), ang.sin());
-                    let (x, y) = (xh[hbase + 2 * pi], xh[hbase + 2 * pi + 1]);
-                    xh[hbase + 2 * pi] = x * c - y * s;
-                    xh[hbase + 2 * pi + 1] = x * s + y * c;
+                    // HALVES layout — mirror of `rope_standard`, `rope_mrope_text`
+                    // and the CUDA/Metal rerotate kernels: pair `pi` is
+                    // (elem pi, elem pi + hd/2). The previous adjacent-pair
+                    // access (2*pi, 2*pi+1) rotated a different pairing than
+                    // the forward rope, so it was not the inverse operation.
+                    let half = head_dim / 2;
+                    let (x, y) = (xh[hbase + pi], xh[hbase + pi + half]);
+                    xh[hbase + pi] = x * c - y * s;
+                    xh[hbase + pi + half] = x * s + y * c;
                 }
             }
         }

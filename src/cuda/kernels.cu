@@ -202,18 +202,26 @@ extern "C" __global__ void bias_norm_zipformer_f32(
     for (int j = 0; j < d; ++j) yr[j] = xr[j] * sc;
 }
 
-// Silero VAD complex magnitude: X [..., 2n] (re | im halves) →
-// Y [..., n]: y[i] = sqrt(x[i]^2 + x[i+n]^2) (the re/im interleave is
-// row-major with the im half immediately after the re half).
+// Silero VAD complex magnitude по последней оси: X [rows, 2n] (в КАЖДОЙ
+// строке сначала re, затем im) → Y [rows, n]:
+//   y[r*n + c] = sqrt(x[r*2n + c]^2 + x[r*2n + n + c]^2).
+// Прежняя версия складывала половины ВСЕГО тензора (x[i] и x[i+n*rows]) —
+// для [1, T, 258] это кадры 0–1 против кадров 2–3 (неверно). PTX в
+// репозитории — пересобрать на машине с nvcc; до этого хостовая реализация
+// (Backend::magnitude_sqrt по умолчанию) даёт верный результат.
 extern "C" __global__ void magnitude_sqrt_f32(
     const float* __restrict__ x,
     float* __restrict__ y,
-    int n)
+    int n,
+    int rows)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float re = x[i];
-    float im = x[i + n];
+    if (i >= n * rows) return;
+    int r = i / n;
+    int c = i % n;
+    const float* row = x + (long)r * 2 * n;
+    float re = row[c];
+    float im = row[n + c];
     y[i] = sqrtf(re * re + im * im);
 }
 
@@ -314,8 +322,8 @@ extern "C" __global__ void kv_shift_q8(
 
 // KV re-rotation (plan 1.6): the kept keys were stored rotated for their
 // ORIGINAL absolute positions [shift..pos); after the compaction shift they
-// must carry the rotations of [0..pos-shift). Every pair (2i, 2i+1) of
-// every head rotates by -shift * theta^(-2i/hd). The cos/sin table (hd/2
+// must carry the rotations of [0..pos-shift). Every HALVES pair pi of every
+// head rotates by -shift * theta^(-2pi/hd). The cos/sin table (hd/2
 // entries) is passed in.
 // The mrope-text pair filter (mirror of rope_mrope_text_f32): with
 // sections the pairs in the "empty" (t) sector carry NO position rotation
@@ -686,6 +694,48 @@ extern "C" __global__ void rope_mrope_text_f32(
     float x1 = x[base + n_pairs];
     y[base] = x0 * c - x1 * s;
     y[base + n_pairs] = x1 * c + x0 * s;
+}
+
+/// IMROPE для текста с ЧАСТИЧНОЙ ротацией (Qwen3.5/3.8): в голове ширины
+/// `hd` ротируется только первые `n_rot` элементов, пары (i, i + n_rot/2),
+/// частота theta^(-2i/n_rot); сектор i % sect_dims выбирает ось (для текста
+/// все позиции = pos), хвост [n_rot..hd) копируется как есть.
+/// Один поток на элемент: элемент либо первый в паре (i < n_rot/2), либо
+/// второй (n_rot/2 <= i < n_rot), либо хвост (копия).
+extern "C" __global__ void rope_imrope_text_f32(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int tq, int d, int hd, int n_rot, int pos, float theta,
+    int s0, int s1, int s2, int sect_dims)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tq * d) return;
+    int t = i / d;
+    int rem = i - t * d;
+    int head = rem / hd;
+    int e = rem - head * hd;
+    int half = n_rot / 2;
+    if (e >= n_rot) {                 // хвост головы не ротируется
+        y[i] = x[i];
+        return;
+    }
+    int pair = (e < half) ? e : e - half;
+    int sector = pair % sect_dims;
+    bool is_e = !((sector % 3 == 0 && sector < 3 * s0)
+               || (sector % 3 == 1 && sector < 3 * s1)
+               || (sector % 3 == 2 && sector < 3 * s2));
+    int base = t * d + head * hd + pair;
+    if (is_e) {
+        y[i] = x[i];
+        return;
+    }
+    float p = (float)(pos + t);
+    float inv = 1.0f / powf(theta, 2.0f * (float)pair / (float)n_rot);
+    float c = cosf(p * inv);
+    float s = sinf(p * inv);
+    float x0 = x[base];
+    float x1 = x[base + half];
+    y[i] = (e < half) ? (x0 * c - x1 * s) : (x1 * c + x0 * s);
 }
 
 /// M-RoPE per-token 4D (Qwen3-VL IMROPE): pos4d [tq·4] = (t, h, w, e) as
@@ -1247,10 +1297,17 @@ extern "C" __global__ void maxpool2d_f32(
 
 /// Transposed 1D conv (stride upsample): w (cin, cout, k), x (b, t, cin),
 /// y (b, (t-1)·stride + k, cout) — sparse scatter (matches the Metal kernel).
+/// Детерминированная транспонированная свёртка (candle-раскладка W[Cin,Cout,K]):
+/// поток на выход, аккумулятор в регистре, фиксированный порядок (k по
+/// возрастанию, внутри — ci) — та же схема, что у Metal conv_transpose1d_f32,
+/// так что два бэкенда совпадают и побитово. Прежний scatter через atomicAdd
+/// давал разные младшие биты на каждом прогоне (TTS-вокодер невоспроизводим,
+/// аудит 2026-10-13).
 extern "C" __global__ void conv_transpose1d_f32(
     const float* __restrict__ x,
     const float* __restrict__ w,
     const float* __restrict__ bias,
+    int has_bias,
     float* __restrict__ y,
     int b,
     int t,
@@ -1261,30 +1318,24 @@ extern "C" __global__ void conv_transpose1d_f32(
     int tout)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= b * t * cin) return;
-    int bi = i / (t * cin);
-    int rem = i % (t * cin);
-    int ti = rem / cin;
-    int ci = rem % cin;
-    float xv = x[i];
-    for (int co = 0; co < cout; ++co) {
-        for (int kk = 0; kk < k; ++kk) {
-            int to = ti * stride + kk;
-            atomicAdd(&y[(bi * tout + to) * cout + co], xv * w[(ci * cout + co) * k + kk]);
+    const int per = tout * cout;
+    if (i >= b * per) return;
+    const int bi = i / per;
+    const int rem = i % per;
+    const int n = rem / cout;
+    const int co = rem % cout;
+    float acc = has_bias ? bias[co] : 0.0f;
+    // k ≡ n (mod stride), k < K, m = (n - k)/stride in [0, T)
+    const int k0 = n % stride;
+    for (int kk = k0; kk < k; kk += stride) {
+        const int m = (n - kk) / stride;
+        if (m >= t) continue;
+        const float* xrow = x + (bi * t + m) * cin;
+        for (int ci = 0; ci < cin; ++ci) {
+            acc += xrow[ci] * w[(ci * cout + co) * k + kk];
         }
     }
-}
-
-/// bias add for transposed conv output (separate pass to avoid atomics on bias).
-extern "C" __global__ void conv_transpose_bias_f32(
-    float* __restrict__ y,
-    const float* __restrict__ bias,
-    int n,
-    int cout)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    y[i] += bias[i % cout];
+    y[i] = acc;
 }
 
 // ── fused attention ──────────────────────────────────────────────────────
@@ -1521,6 +1572,230 @@ ATTN_K(f16, __half, 1)
 ATTN_K(q8, signed char, 2)
 
 ATTN_AR_V4_COMBINE(attn_ar_v4_combine)
+
+// ─────────── префилл-внимание через тензорные ядра (cuBLAS) ───────────
+// Тайловое ядро на FMA-ядрах даёт ~2 TFLOPS — в 50 раз ниже bf16-тензорных
+// ядер. Поэтому оценка/сумма разложены на два cuBLAS-GEMM (f16×f16 → f32) с
+// материализацией score: для чанков ≤ 2048 токенов буфер (tq×tkv×4 Б) влезает
+// в VRAM и это дешевле, чем перечитывать K/V по головам.
+//
+// Softmax по строке с аддитивной маской → вероятности в f16 (вход второго
+// GEMM). Блок — одна строка (запрос одной головы), 256 потоков.
+extern "C" __global__ void attn_softmax_mask_f16(const float* __restrict__ sc,
+                                                 const float* __restrict__ mask,
+                                                 __half* __restrict__ p,
+                                                 int tkv, int has_mask,
+                                                 long long sc_off, long long p_off,
+                                                 int stride) {
+    extern __shared__ float red[];
+    const int row = blockIdx.x;          // строка = запрос (одна голова)
+    // stride — ведущая размерность буфера (tkv, выровненный до 8 под cuBLAS);
+    // значимых столбцов — tkv.
+    const float* r = sc + sc_off + (size_t)row * stride;
+    __half* o = p + p_off + (size_t)row * stride;
+    // Маска [tq, tkv]: строка маски — номер запроса (= blockIdx.x).
+    const int qrow = (int)blockIdx.x;
+    const float* mk = has_mask ? mask + (size_t)qrow * tkv : nullptr;
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < tkv; i += blockDim.x) {
+        float s = r[i];
+        if (s > -INFINITY && mk) s += mk[i];
+        mx = fmaxf(mx, (s > -INFINITY) ? s : -INFINITY);
+    }
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < tkv; i += blockDim.x) {
+        float s = r[i];
+        if (mk) s += mk[i];
+        sum += (s > -INFINITY) ? __expf(s - mx) : 0.0f;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = (red[0] > 0.0f) ? 1.0f / red[0] : 0.0f;
+    for (int i = threadIdx.x; i < tkv; i += blockDim.x) {
+        float s = r[i];
+        if (mk) s += mk[i];
+        o[i] = __float2half((s > -INFINITY) ? __expf(s - mx) * inv : 0.0f);
+    }
+}
+
+// Копия выхода головы [tq, hd] в срез y[.., hoff..hoff+hd] (y — [tq, ystride]).
+extern "C" __global__ void copy_head_f32(float* __restrict__ y,
+                                         const float* __restrict__ src,
+                                         int tq, int hd, int ystride, int hoff,
+                                         long long src_off) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (i >= hd || row >= tq) return;
+    y[(size_t)row * ystride + (size_t)hoff + i] = src[src_off + (size_t)row * hd + i];
+}
+
+// ───────── префилл-внимание тайлами (8 запросов × 64 ключа) ─────────
+// attn_ar_v4 написан под декод: каждая пара (запрос, голова) перечитывает
+// ВЕСЬ KV-кэш из глобальной памяти — на префилле 4.8K это O(K²) трафика
+// (~6 с из 9 с TTFT). Здесь блок = 8 запросов ОДНОЙ головы (8 warp'ов),
+// K/V-тайл 64 ключей лежит в shared, softmax онлайн в регистрах:
+//   score(lane) = Σ_dim q[dim]·Kt[dim][lane]   (q — broadcast из shared)
+//   p = exp(s − m), acc[dim] += p·V[key][dim]  (dim = lane + 32e)
+// Kt хранится транспонированным с шагом TK+2: и запись при транспозиции,
+// и чтение в скалярном произведении идут без банк-конфликтов.
+// Динамическая shared: Kt (hd·(TK+2)·2) + Vt (TK·hd·2); Qs/Ps — статика.
+#define ATTN_TK 64
+#define ATTN_TQ 16
+#define ATTN_QW 2
+extern "C" __global__ void attn_prefill_tiled_f16(
+    const float* __restrict__ q,      // [tq, nh·hd] f32
+    const __half* __restrict__ kc,    // [cap, nkv·hd] f16
+    const __half* __restrict__ vc,    // [cap, nkv·hd] f16
+    const float* __restrict__ mask,   // [tq, tkv] аддитивная или null
+    float* __restrict__ y,            // [tq, nh·hd]
+    int tq, int tkv, int nh, int nkv, int hd,
+    int q_stride, int kv_stride, int has_mask)
+{
+    extern __shared__ __half smem[];
+    __half* Kt = smem;                          // [hd][TK+2]
+    __half* Vt = smem + hd * (ATTN_TK + 2);     // [TK][hd]
+    __shared__ float Qs[ATTN_TQ * 256];         // строки запросов (broadcast)
+    __shared__ float Ps[ATTN_TQ * ATTN_TK];     // вероятности тайла
+    const int h = blockIdx.y;
+    const int g = h / (nh / nkv);
+    const int q0 = blockIdx.x * ATTN_TQ;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nd = hd >> 5;                     // значений на lane (≤ 8)
+    // Два запроса на warp: K/V-тайл в shared читается один раз на ОБА.
+    const int qa = q0 + warp * ATTN_QW;
+
+    for (int i = tid; i < ATTN_TQ * hd; i += blockDim.x) {
+        const int w = i / hd, d = i - w * hd;
+        const int r = q0 + w;
+        Qs[w * 256 + d] = (r < tq) ? q[(size_t)r * q_stride + h * hd + d] : 0.0f;
+    }
+    __syncthreads();
+
+    float acc[ATTN_QW][8];
+    float m[ATTN_QW], l[ATTN_QW];
+    for (int qi = 0; qi < ATTN_QW; ++qi) {
+        m[qi] = -INFINITY;
+        l[qi] = 0.0f;
+        for (int e = 0; e < 8; ++e) acc[qi][e] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < tkv; k0 += ATTN_TK) {
+        // ── загрузка тайлов: uint4 (8 halfs) на поток — 8× меньше
+        // инструкций, чем по одному элементу, и полные 128-Б линии.
+        {
+            const int nvec = (ATTN_TK * hd) >> 3;   // hd кратно 8 (инвариант)
+            for (int i = tid; i < nvec; i += blockDim.x) {
+                const int base = i * 8;
+                const int kk = base / hd;
+                const int d0 = base - kk * hd;
+                const int key = k0 + kk;
+                uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = kv4;
+                if (key < tkv) {
+                    kv4 = *(const uint4*)(kc + (size_t)key * kv_stride + g * hd + d0);
+                    vv4 = *(const uint4*)(vc + (size_t)key * kv_stride + g * hd + d0);
+                }
+                const __half* kh = (const __half*)&kv4;
+                const __half* vh = (const __half*)&vv4;
+                for (int e = 0; e < 8; ++e) {
+                    Kt[(d0 + e) * (ATTN_TK + 2) + kk] = kh[e];
+                    Vt[kk * hd + d0 + e] = vh[e];
+                }
+            }
+        }
+        __syncthreads();
+        if (qa < tq) {
+            const float scale = 1.0f / sqrtf((float)hd);
+            const int k1 = k0 + lane, k2 = k0 + lane + 32;
+            const bool in1 = k1 < tkv, in2 = k2 < tkv;
+            for (int qi = 0; qi < ATTN_QW; ++qi) {
+                const int qt = qa + qi;
+                if (qt >= tq) break;
+                // ── скалярные произведения: lane = ключ (два ключа на lane),
+                // 4 независимых аккумулятора на ключ (ILP против латентности). ──
+                float s0a = 0.0f, s0b = 0.0f, s0c = 0.0f, s0d = 0.0f;
+                float s1a = 0.0f, s1b = 0.0f, s1c = 0.0f, s1d = 0.0f;
+                const float* qr = Qs + (warp * ATTN_QW + qi) * 256;
+                const int lane2 = lane + 32;
+                for (int d = 0; d < hd; d += 4) {
+                    const int a1 = d * (ATTN_TK + 2);
+                    const int a2 = a1 + (ATTN_TK + 2);
+                    const int a3 = a2 + (ATTN_TK + 2);
+                    const int a4 = a3 + (ATTN_TK + 2);
+                    const float q0v = qr[d], q1v = qr[d + 1], q2v = qr[d + 2], q3v = qr[d + 3];
+                    s0a += q0v * __half2float(Kt[a1 + lane]);
+                    s0b += q1v * __half2float(Kt[a2 + lane]);
+                    s0c += q2v * __half2float(Kt[a3 + lane]);
+                    s0d += q3v * __half2float(Kt[a4 + lane]);
+                    s1a += q0v * __half2float(Kt[a1 + lane2]);
+                    s1b += q1v * __half2float(Kt[a2 + lane2]);
+                    s1c += q2v * __half2float(Kt[a3 + lane2]);
+                    s1d += q3v * __half2float(Kt[a4 + lane2]);
+                }
+                float s0 = ((s0a + s0b) + (s0c + s0d)) * scale;
+                float s1 = ((s1a + s1b) + (s1c + s1d)) * scale;
+                if (!in1) s0 = -INFINITY;
+                else if (has_mask) s0 += mask[(size_t)qt * tkv + k1];
+                if (!in2) s1 = -INFINITY;
+                else if (has_mask) s1 += mask[(size_t)qt * tkv + k2];
+                // ── онлайн-softmax ──
+                float mx = fmaxf(s0, s1);
+                for (int off = 16; off > 0; off >>= 1)
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+                const float m_new = fmaxf(m[qi], mx);
+                const float sc = (m[qi] > -INFINITY) ? __expf(m[qi] - m_new) : 0.0f;
+                const float p0 = (s0 > -INFINITY) ? __expf(s0 - m_new) : 0.0f;
+                const float p1 = (s1 > -INFINITY) ? __expf(s1 - m_new) : 0.0f;
+                float ps = p0 + p1;
+                for (int off = 16; off > 0; off >>= 1)
+                    ps += __shfl_xor_sync(0xffffffff, ps, off);
+                Ps[(warp * ATTN_QW + qi) * ATTN_TK + lane] = p0;
+                Ps[(warp * ATTN_QW + qi) * ATTN_TK + lane + 32] = p1;
+                l[qi] = l[qi] * sc + ps;
+                m[qi] = m_new;
+                for (int e = 0; e < nd; ++e) acc[qi][e] *= sc;
+            }
+            __syncwarp();
+            // ── взвешенная сумма V по своим dim (V читается один раз на
+            // ATTN_QW запросов) ──
+            for (int kk = 0; kk < ATTN_TK; ++kk) {
+                float pv[ATTN_QW];
+                bool any = false;
+                for (int qi = 0; qi < ATTN_QW; ++qi) {
+                    pv[qi] = Ps[(warp * ATTN_QW + qi) * ATTN_TK + kk];
+                    any |= pv[qi] != 0.0f;
+                }
+                if (!any) continue;
+                const __half* vrow = Vt + kk * hd + lane;
+                for (int e = 0; e < nd; ++e) {
+                    const float vv = __half2float(vrow[32 * e]);
+                    for (int qi = 0; qi < ATTN_QW; ++qi) acc[qi][e] += pv[qi] * vv;
+                }
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+    for (int qi = 0; qi < ATTN_QW; ++qi) {
+        const int qt = qa + qi;
+        if (qt >= tq) return;
+        const float inv = (l[qi] > 0.0f) ? 1.0f / l[qi] : 0.0f;
+        for (int e = 0; e < nd; ++e)
+            y[(size_t)qt * q_stride + h * hd + lane + 32 * e] = acc[qi][e] * inv;
+    }
+}
 
 // ─────────────────── relative-position attention (NeMo/Zipformer) ───────
 // Bidirectional MHSA with relative position scores:
@@ -1859,6 +2134,34 @@ __device__ inline float q5k_weight(const unsigned char* blk, int j) {
 /// qs[128] (@16..144, chunk-major). Dequant (ggml dequantize_row_q4_K):
 /// w = d·sc·q − dmin·m, q = 4-bit nibble. N (iter-10): GGUF Q4_K tensors
 /// previously ran dequantized to f32 (7x DRAM); this feeds the v2 GEMM.
+/// 32 значения ОДНОГО K-субблока Q4_K с вынесенными константами: у декода
+/// скейл/мин/d/dmin постоянны внутри субблока, поэтому на вес остаётся
+/// «извлечь ниббл + 2 умножения», а не ~20 операций по-элементного декода
+/// (это и держало decode на 22 tok/s при полосе 1.8 ТБ/с).
+__device__ inline void q4kc_subblock(const unsigned char* blk, int jg, float* out) {
+    const int b = jg;   // 0..7
+    int sc, mn;
+    if (b < 4) {
+        sc = blk[4 + b] & 63;
+        mn = blk[8 + b] & 63;
+    } else {
+        sc = (blk[4 + b + 4] & 0xF) | ((blk[4 + b - 4] >> 6) << 4);
+        mn = (blk[4 + b + 4] >> 4) | ((blk[4 + b] >> 6) << 4);
+    }
+    const float cd = __half2float(*(const __half*)(blk)) * (float)sc;
+    const float cm = __half2float(*(const __half*)(blk + 2)) * (float)mn;
+    // qs: байт 16 + 32c + r держит w[64c + r] в младшем ниббле и
+    // w[64c + 32 + r] в старшем; для субблока b: c = b>>1, ниббл = b&1.
+    const unsigned char* qb = blk + 16 + 32 * (b >> 1);
+    if (b & 1) {
+        _Pragma("unroll")
+        for (int r = 0; r < 32; ++r) out[r] = cd * (float)(qb[r] >> 4) - cm;
+    } else {
+        _Pragma("unroll")
+        for (int r = 0; r < 32; ++r) out[r] = cd * (float)(qb[r] & 0xF) - cm;
+    }
+}
+
 __device__ inline float q4kc_weight(const unsigned char* blk, int j) {
     int b = j >> 5;   // 0..7 (32-weight sub-blocks)
     int l = j & 31;
@@ -1931,6 +2234,18 @@ __device__ inline float q3k_weight(const unsigned char* blk, int j) {
     int h = (blk[hbase + l] & mbit) ? 0 : 4;
     return d * (float)(scs - 32) * (float)(q2 - h);
 }
+
+/// Субблок из 32 значений для форматов без вынесенных констант (q6k/q5k/q3k):
+/// просто 32 вызова по-элементного декода — контракт тот же, что у
+/// q4kc_subblock (её ускорение — в выносе скейла/мина из цикла).
+#define DEFINE_GENERIC_SUB(NAME, WREAD)                                       \
+__device__ inline void NAME##_subblock(const unsigned char* blk, int jg, float* out) { \
+    _Pragma("unroll")                                                         \
+    for (int r = 0; r < 32; ++r) out[r] = WREAD(blk, jg * 32 + r);            \
+}
+DEFINE_GENERIC_SUB(q6k, q6k_weight)
+DEFINE_GENERIC_SUB(q5k, q5k_weight)
+DEFINE_GENERIC_SUB(q3k, q3k_weight)
 
 /// Q4_0 packed-weight dequant, 18 bytes per 32-weight block: f16 d (bytes
 /// 0..2) + 16 bytes of 4-bit nibbles. NOTE (iter-10): this is the SPEECH-
@@ -2408,7 +2723,7 @@ DEFINE_Q8K_TILED(bf16, __nv_bfloat16)
 // tile 32 KB fits the 48 KB static-shared budget. The A operand follows
 // the activation axis: the activation tile As is stored AT (f32/f16/bf16 —
 // the half widths halve the shared traffic and the (float) conversions).
-#define DEFINE_K_SPLITK(NAME, SUF, AT, BLK, WREAD)                             \
+#define DEFINE_K_SPLITK(NAME, SUF, AT, BLK, WSUB)                             \
 extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
     const AT* __restrict__ A,        /* (m, k) — activation axis */          \
     const unsigned char* __restrict__ B,/* packed blocks, (col·nsuper + kb)·BLK */ \
@@ -2422,6 +2737,7 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
     __shared__ unsigned char Bs[BN * BLK];                                    \
     __shared__ float T[256][BN];                                              \
     __shared__ AT As[256];                                                    \
+    __shared__ float part[8][33];                                             \
     int tid = threadIdx.x;                                                    \
     int bx = blockIdx.x;                                                      \
     int row = bx % m;                                                         \
@@ -2456,31 +2772,39 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
         }                                                                     \
         __syncthreads();                                                      \
         /* Dequant pass: thread (col, jg) → TILE[j][col] (transposed —       \
-           conflict-free writes and reads). */                                \
+           conflict-free writes and reads). Субблок jg собирается разом:     \
+           у Q4_K это выносит скейл/мин/d/dmin из цикла (см. q4kc_subblock). */\
         int col = tid & 31;                                                   \
         int jg = tid >> 5;                                                    \
         {                                                                     \
             const unsigned char* blk = Bs + col * BLK;                        \
-            for (int r = 0; r < 32; ++r) {                                    \
-                int j = jg * 32 + r;                                          \
-                T[j][col] = WREAD(blk, j);                                    \
-            }                                                                 \
+            float vals[32];                                                   \
+            WSUB(blk, jg, vals);                                              \
+            for (int r = 0; r < 32; ++r) T[jg * 32 + r][col] = vals[r];       \
         }                                                                     \
         __syncthreads();                                                      \
-        /* Compute: 32 threads (one per column), pure FMA over the f32 tile.\
-           N (iter-10): 4 accumulators — the old single-acc 256-FMA chain    \
-           (4-cycle latency ≈ 1 K cycles per k-block) was the kernel's       \
-           dependency stall; 4-way ILP hides it (the v2 kernel was ~3-5x     \
-           slower than fp16, mostly this). */                                 \
-        if (tid < BN && col0 + tid < n) {                                     \
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;         \
-            for (int j = 0; j < 256; j += 4) {                               \
-                acc0 += (float)As[j + 0] * T[j + 0][tid];                     \
-                acc1 += (float)As[j + 1] * T[j + 1][tid];                     \
-                acc2 += (float)As[j + 2] * T[j + 2][tid];                     \
-                acc3 += (float)As[j + 3] * T[j + 3][tid];                     \
+        /* Compute: раньше FMA делали 32 потока из 256 (7/8 блока
+           простаивали). Теперь каждый из 8 warp'ов (jg) суммирует свою
+           восьмую часть k-блока в part[jg][col], затем потоки tid<BN
+           складывают восемь частичных. Порядок суммирования отличается от
+           прежнего (f32-шум ~1e-6), точность не страдает. */              \
+        {                                                                     \
+            const int j0 = jg * 32;                                           \
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;                 \
+            for (int j = j0; j < j0 + 32; j += 4) {                           \
+                a0 += (float)As[j + 0] * T[j + 0][col];                       \
+                a1 += (float)As[j + 1] * T[j + 1][col];                       \
+                a2 += (float)As[j + 2] * T[j + 2][col];                       \
+                a3 += (float)As[j + 3] * T[j + 3][col];                       \
             }                                                                 \
-            acc += (acc0 + acc1) + (acc2 + acc3);                             \
+            part[jg][col] = (a0 + a1) + (a2 + a3);                            \
+        }                                                                     \
+        __syncthreads();                                                      \
+        if (tid < BN && col0 + tid < n) {                                     \
+            float p0 = part[0][tid], p1 = part[1][tid], p2 = part[2][tid];    \
+            float p3 = part[3][tid], p4 = part[4][tid], p5 = part[5][tid];    \
+            float p6 = part[6][tid], p7 = part[7][tid];                       \
+            acc += (((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));       \
         }                                                                     \
         __syncthreads();                                                      \
     }                                                                         \
@@ -2489,17 +2813,124 @@ extern "C" __global__ void gemm_##NAME##_splitk_v2_##SUF(                      \
     }                                                                         \
 }
 
-DEFINE_K_SPLITK(q6k, f32, float, 210, q6k_weight)
-DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_weight)
-DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_weight)
-DEFINE_K_SPLITK(q5k, f32, float, 176, q5k_weight)
-DEFINE_K_SPLITK(q3k, f32, float, 110, q3k_weight)
+DEFINE_K_SPLITK(q6k, f32, float, 210, q6k_subblock)
+DEFINE_K_SPLITK(q6k, f16, __half, 210, q6k_subblock)
+DEFINE_K_SPLITK(q6k, bf16, __nv_bfloat16, 210, q6k_subblock)
+DEFINE_K_SPLITK(q5k, f32, float, 176, q5k_subblock)
+DEFINE_K_SPLITK(q3k, f32, float, 110, q3k_subblock)
 // N (iter-10): canonical Q4_K (GGUF) — 144 B/256, the same v2 structure as
 // q6k (dequant-amortized f32 tile). Previously GGUF Q4_K was dequantized to
 // f32 on the host (7x DRAM traffic); this kernel is fed by from_cpu_q4kc.
-DEFINE_K_SPLITK(q4kc, f32, float, 144, q4kc_weight)
-DEFINE_K_SPLITK(q4kc, f16, __half, 144, q4kc_weight)
-DEFINE_K_SPLITK(q4kc, bf16, __nv_bfloat16, 144, q4kc_weight)
+DEFINE_K_SPLITK(q4kc, f32, float, 144, q4kc_subblock)
+DEFINE_K_SPLITK(q4kc, f16, __half, 144, q4kc_subblock)
+DEFINE_K_SPLITK(q4kc, bf16, __nv_bfloat16, 144, q4kc_subblock)
+
+// Split-k с НЕСКОЛЬКИМИ строками активаций в одном блоке (m = 2..8): B-тайл
+// k-среза и его dequant в T[256][32] оплачиваются один раз на все строки,
+// а не на каждую (по-строчный m=1 split-k читает вес m раз — именно он и был
+// «2× дороже за строку» на пакетном шаге). Частичные суммы по 8 варпам
+// лежат отдельно на строку: part[8][MMAX][33].
+#define DEFINE_K_SPLITK_MB(NAME, SUF, AT, BLK, WSUB, MMAX)                     \
+extern "C" __global__ void gemm_##NAME##_splitk_v2m_##SUF(                     \
+    const AT* __restrict__ A,        /* (m, k) — активации */                 \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ Cpart,       /* (S·m, n) */                           \
+    int k,                                                                    \
+    int n,                                                                    \
+    int S,                                                                    \
+    int m)                                                                    \
+{                                                                             \
+    const int BN = 32;                                                        \
+    extern __shared__ float gmb_sm[];                                           \
+    float* T = gmb_sm;                          /* [256][BN] */                 \
+    float* part = T + 256 * BN;               /* [8][MMAX][33] */             \
+    AT* As = (AT*)(part + 8 * MMAX * 33);     /* [MMAX][256] */               \
+    unsigned char* Bs = (unsigned char*)(As + MMAX * 256); /* [BN][BLK] */    \
+    int tid = threadIdx.x;                                                    \
+    int nb = blockIdx.x;                                                      \
+    int col0 = nb * BN;                                                       \
+    int nsup = k >> 8;                                                        \
+    int nblk_s = (k / S) >> 8;                                                \
+    int kb0 = blockIdx.y * nblk_s;                                            \
+    float acc[MMAX];                                                          \
+    _Pragma("unroll")                                                         \
+    for (int r = 0; r < MMAX; ++r) acc[r] = 0.0f;                             \
+    int col = tid & 31;                                                       \
+    int jg = tid >> 5;                                                        \
+    for (int t = 0; t < nblk_s; ++t) {                                        \
+        int kb = kb0 + t;                                                     \
+        for (int i = tid; i < MMAX * 256; i += 256) {                         \
+            int r = i >> 8;                                                   \
+            int j = i & 255;                                                  \
+            As[i] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : (AT)0;        \
+        }                                                                     \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK;         \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * BLK) / 16; i += 256) {                \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+            }                                                                 \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * BLK;             \
+                unsigned char* d = Bs + tid * BLK;                            \
+                for (int i = 0; i < BLK; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < BLK; ++i) Bs[tid * BLK + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * BLK;                        \
+            float vals[32];                                                   \
+            WSUB(blk, jg, vals);                                              \
+            for (int r = 0; r < 32; ++r) T[(jg * 32 + r) * BN + col] = vals[r];\
+        }                                                                     \
+        __syncthreads();                                                      \
+        const int j0 = jg * 32;                                               \
+        for (int r = 0; r < MMAX; ++r) {                                      \
+            if (r >= m) break;                                                \
+            const AT* ar = As + r * 256;                                      \
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;                 \
+            for (int j = j0; j < j0 + 32; j += 4) {                           \
+                a0 += (float)ar[j + 0] * T[(j + 0) * BN + col];               \
+                a1 += (float)ar[j + 1] * T[(j + 1) * BN + col];               \
+                a2 += (float)ar[j + 2] * T[(j + 2) * BN + col];               \
+                a3 += (float)ar[j + 3] * T[(j + 3) * BN + col];               \
+            }                                                                 \
+            part[(jg * MMAX + r) * 33 + col] = (a0 + a1) + (a2 + a3);         \
+        }                                                                     \
+        __syncthreads();                                                      \
+        if (tid < BN && col0 + tid < n) {                                     \
+            for (int r = 0; r < MMAX; ++r) {                                  \
+                if (r >= m) break;                                            \
+                float p0 = part[(0 * MMAX + r) * 33 + tid];                   \
+                float p1 = part[(1 * MMAX + r) * 33 + tid];                   \
+                float p2 = part[(2 * MMAX + r) * 33 + tid];                   \
+                float p3 = part[(3 * MMAX + r) * 33 + tid];                   \
+                float p4 = part[(4 * MMAX + r) * 33 + tid];                   \
+                float p5 = part[(5 * MMAX + r) * 33 + tid];                   \
+                float p6 = part[(6 * MMAX + r) * 33 + tid];                   \
+                float p7 = part[(7 * MMAX + r) * 33 + tid];                   \
+                acc[r] += (((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));\
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (tid < BN && col0 + tid < n) {                                         \
+        for (int r = 0; r < MMAX; ++r) {                                      \
+            if (r >= m) break;                                                \
+            Cpart[(blockIdx.y * m + r) * n + col0 + tid] = acc[r];            \
+        }                                                                     \
+    }                                                                         \
+}
+
+DEFINE_K_SPLITK_MB(q6k, f32, float, 210, q6k_subblock, 8)
+DEFINE_K_SPLITK_MB(q6k, f16, __half, 210, q6k_subblock, 8)
+DEFINE_K_SPLITK_MB(q6k, bf16, __nv_bfloat16, 210, q6k_subblock, 8)
+DEFINE_K_SPLITK_MB(q4kc, f32, float, 144, q4kc_subblock, 8)
+DEFINE_K_SPLITK_MB(q4kc, f16, __half, 144, q4kc_subblock, 8)
+DEFINE_K_SPLITK_MB(q4kc, bf16, __nv_bfloat16, 144, q4kc_subblock, 8)
 
 /// K-quant GEMM, m > 1 (TTS prefill chunks + STT one-shot frames): block per
 /// (32 rows × 64 cols), 256 threads = 64 columns × 4 rows each. The
@@ -2583,6 +3014,211 @@ DEFINE_K_TILED(q6k, 210, q6k_weight)
 DEFINE_K_TILED(q5k, 176, q5k_weight)
 DEFINE_K_TILED(q3k, 110, q3k_weight)
 DEFINE_K_TILED(q4kc, 144, q4kc_weight)
+
+// ─────────── K-quant tiled GEMM v4 (m > 1, LLM prefill) ───────────
+// v3 деquant'ит вес ЗАНОВО на каждую из 4 rq-групп строк одной колонки:
+// ~20 ALU на вес при 8 FMA → у 27B prefill шёл на ~2.4 TFLOPS (8.6 мс/токен).
+// v4 деquant'ит колонку ОДИН раз в общий f32-тайл T[256][33] и считает
+// по нему 32 строки: ~0.6 ALU/вес + 1 FMA, активации читаются из shared
+// broadcast'ом (все 32 потока warp'а — один адрес As[r][j]).
+// Dynamic shared: T 33.8 KB + As 32×256 f32 32 KB = 65 KB (+ static Bs 4.6 KB)
+// — сверх 48 KB, поэтому launcher обязан выставить
+// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES (sm_89 предел 99 KB,
+// sm_120 — 227 KB). S=1: результат пишется прямо в C, без reduce-прохода.
+#define DEFINE_K_TILED_V4(NAME, BLK, WREAD)                                   \
+extern "C" __global__ void gemm_##NAME##_tiled_v4(                            \
+    const float* __restrict__ A,                                              \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ C,                                                    \
+    int m,                                                                    \
+    int k,                                                                    \
+    int n)                                                                    \
+{                                                                             \
+    const int BM = 32, BN = 32, BP = 33;                                      \
+    extern __shared__ float sm[];                                             \
+    float* T = sm;                      /* [256][BP] — dequant-тайл */       \
+    float* As = sm + 256 * BP;          /* [BM][256] — активации */           \
+    __shared__ unsigned char Bs[BN * BLK];                                    \
+    int tid = threadIdx.x;                                                    \
+    int col = tid & 31;                                                       \
+    int jg = tid >> 5;                  /* warp → группа из 4 строк */        \
+    int col0 = blockIdx.x * BN;                                               \
+    int r0 = blockIdx.y * BM;                                                 \
+    int nsup = k >> 8;                                                        \
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;                     \
+    for (int kb = 0; kb < nsup; ++kb) {                                       \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK;         \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * BLK) / 16; i += 256)                  \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * BLK;             \
+                unsigned char* d = Bs + tid * BLK;                            \
+                for (int i = 0; i < BLK; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < BLK; ++i) Bs[tid * BLK + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        for (int i = tid; i < BM * 256; i += 256) {                           \
+            int j = i & 255;                                                  \
+            int rr = i >> 8;                                                  \
+            int r = r0 + rr;                                                  \
+            As[rr * 256 + j] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : 0.f;\
+        }                                                                     \
+        __syncthreads();                                                      \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * BLK;                        \
+            for (int r = 0; r < 32; ++r) {                                    \
+                int j = jg * 32 + r;                                          \
+                T[j * BP + col] = WREAD(blk, j);                              \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        for (int j = 0; j < 256; ++j) {                                       \
+            float w = T[j * BP + col];                                        \
+            acc0 += As[jg * 256 + j] * w;                                     \
+            acc1 += As[(jg + 8) * 256 + j] * w;                               \
+            acc2 += As[(jg + 16) * 256 + j] * w;                              \
+            acc3 += As[(jg + 24) * 256 + j] * w;                              \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (col0 + col < n) {                                                     \
+        int c = col0 + col;                                                   \
+        if (r0 + jg < m)      C[(size_t)(r0 + jg) * n + c] = acc0;            \
+        if (r0 + jg + 8 < m)  C[(size_t)(r0 + jg + 8) * n + c] = acc1;        \
+        if (r0 + jg + 16 < m) C[(size_t)(r0 + jg + 16) * n + c] = acc2;       \
+        if (r0 + jg + 24 < m) C[(size_t)(r0 + jg + 24) * n + c] = acc3;       \
+    }                                                                         \
+}
+
+DEFINE_K_TILED_V4(q6k, 210, q6k_weight)
+DEFINE_K_TILED_V4(q4kc, 144, q4kc_weight)
+
+// Малая m: тот же dequant-тайл, но строк в блоке меньше (8·ROWG). v4 всегда
+// считает 32 строки, из них при m=2..16 полезны единицы — на пакетном шаге
+// 27B это и была цена строки. Деquant веса (T[256][33]) от ROWG не зависит:
+// он на 32 столбца B, поэтому блок на 8 строк стоит почти столько же, сколько
+// на 32, и при m<8 выигрывает у 32-строчного в ~4 раза.
+#define DEFINE_K_TILED_V4R(NAME, SUF, BLK, WREAD, ROWG)                        \
+extern "C" __global__ void gemm_##NAME##_tiled_##SUF(                          \
+    const float* __restrict__ A,                                              \
+    const unsigned char* __restrict__ B,                                      \
+    float* __restrict__ C,                                                    \
+    int m,                                                                    \
+    int k,                                                                    \
+    int n)                                                                    \
+{                                                                             \
+    const int BM = 8 * ROWG, BN = 32, BP = 33;                                \
+    extern __shared__ float sm[];                                             \
+    float* T = sm;                      /* [256][BP] — dequant-тайл */        \
+    float* As = sm + 256 * BP;          /* [BM][256] — активации */           \
+    __shared__ unsigned char Bs[BN * BLK];                                    \
+    int tid = threadIdx.x;                                                    \
+    int col = tid & 31;                                                       \
+    int jg = tid >> 5;                  /* warp → строка jg+8·g */            \
+    int col0 = blockIdx.x * BN;                                               \
+    int r0 = blockIdx.y * BM;                                                 \
+    int nsup = k >> 8;                                                        \
+    float acc[ROWG];                                                          \
+    _Pragma("unroll")                                                         \
+    for (int g = 0; g < ROWG; ++g) acc[g] = 0.f;                              \
+    for (int kb = 0; kb < nsup; ++kb) {                                       \
+        const unsigned char* src = B + (size_t)(kb * n + col0) * BLK;         \
+        if (col0 + BN <= n && (n & 7) == 0) {                                 \
+            for (int i = tid; i < (BN * BLK) / 16; i += 256)                  \
+                *(uint4*)(Bs + i * 16) = *(const uint4*)(src + i * 16);       \
+        } else if (tid < BN) {                                                \
+            int c = col0 + tid;                                               \
+            if (c < n) {                                                      \
+                const unsigned char* s = src + (size_t)tid * BLK;             \
+                unsigned char* d = Bs + tid * BLK;                            \
+                for (int i = 0; i < BLK; ++i) d[i] = s[i];                    \
+            } else {                                                          \
+                for (int i = 0; i < BLK; ++i) Bs[tid * BLK + i] = 0;          \
+            }                                                                 \
+        }                                                                     \
+        for (int i = tid; i < BM * 256; i += 256) {                           \
+            int j = i & 255;                                                  \
+            int rr = i >> 8;                                                  \
+            int r = r0 + rr;                                                  \
+            As[rr * 256 + j] = (r < m) ? A[(size_t)r * k + kb * 256 + j] : 0.f;\
+        }                                                                     \
+        __syncthreads();                                                      \
+        {                                                                     \
+            const unsigned char* blk = Bs + col * BLK;                        \
+            for (int r = 0; r < 32; ++r) {                                    \
+                int j = jg * 32 + r;                                          \
+                T[j * BP + col] = WREAD(blk, j);                              \
+            }                                                                 \
+        }                                                                     \
+        __syncthreads();                                                      \
+        _Pragma("unroll")                                                     \
+        for (int g = 0; g < ROWG; ++g) {                                      \
+            const float* Ar = As + (jg + 8 * g) * 256;                        \
+            float a = acc[g];                                                 \
+            for (int j = 0; j < 256; ++j) a += Ar[j] * T[j * BP + col];       \
+            acc[g] = a;                                                       \
+        }                                                                     \
+        __syncthreads();                                                      \
+    }                                                                         \
+    if (col0 + col < n) {                                                     \
+        _Pragma("unroll")                                                     \
+        for (int g = 0; g < ROWG; ++g) {                                      \
+            int r = r0 + jg + 8 * g;                                          \
+            if (r < m) C[(size_t)r * n + col0 + col] = acc[g];                \
+        }                                                                     \
+    }                                                                         \
+}
+
+DEFINE_K_TILED_V4R(q6k, v4r1, 210, q6k_weight, 1)
+DEFINE_K_TILED_V4R(q6k, v4r2, 210, q6k_weight, 2)
+DEFINE_K_TILED_V4R(q4kc, v4r1, 144, q4kc_weight, 1)
+DEFINE_K_TILED_V4R(q4kc, v4r2, 144, q4kc_weight, 2)
+
+// ─────── dequant в плотный bf16 (prefill через tensor cores) ───────
+// На больших m (prefill-чанки) квантовый GEMM на FMA-ядрах упирается в
+// ~25 TFLOPS, а bf16-тензорные ядра дают ×4-8. Поэтому для m ≥ 32 вес
+// раскладывается в плотный bf16 (один проход, ~0.1 мс на матрицу 5120×17408)
+// и считается cuBLAS gemm_ex (bf16×bf16 → f32 accumulate). Раскладка
+// (col·nsuper + kb)·BLK → out[col·k + kb·256 + j].
+#define DEFINE_DEQUANT_BF16(NAME, BLK, WREAD)                                 \
+extern "C" __global__ void dequant_##NAME##_bf16(                             \
+    const unsigned char* __restrict__ B,                                      \
+    __nv_bfloat16* __restrict__ out,                                          \
+    int n, int k)                                                             \
+{                                                                             \
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;         \
+    long long total = (long long)n * (long long)k;                            \
+    if (idx >= total) return;                                                 \
+    int col = (int)(idx / k);                                                 \
+    int r = (int)(idx - (long long)col * k);                                  \
+    int kb = r >> 8;                                                          \
+    int j = r & 255;                                                          \
+    out[idx] = (__nv_bfloat16)WREAD(B + (size_t)(kb * n + col) * BLK, j);     \
+}
+
+DEFINE_DEQUANT_BF16(q4kc, 144, q4kc_weight)
+DEFINE_DEQUANT_BF16(q6k, 210, q6k_weight)
+
+// Q8_0 (наша kb-major упаковка: блок (kb, col) = 32 i8 по (kb·n+col)·32,
+// масштаб wsc[kb·n+col]) → плотный bf16 (n, k) row-major.
+extern "C" __global__ void dequant_q8k_bf16(const signed char* __restrict__ B,
+                                            const float* __restrict__ wsc,
+                                            __nv_bfloat16* __restrict__ out,
+                                            int n, int k) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n * (long long)k;
+    if (idx >= total) return;
+    int col = (int)(idx / k);
+    int r = (int)(idx - (long long)col * k);
+    int kb = r >> 5;
+    int j = r & 31;
+    size_t blk = (size_t)kb * n + col;
+    out[idx] = (__nv_bfloat16)((float)B[blk * 32 + j] * wsc[blk]);
+}
 
 // ─────────────────────── im2col (conv → GEMM) ───────────────────────
 //
@@ -2859,5 +3495,405 @@ extern "C" __global__ void tts_topk_merge_f32(
             taken |= (1u << best_slot);
         }
         __syncthreads();
+    }
+}
+
+// ── Row copy without an offset view (CUDA has no nonzero elem_offset views) ──
+// copy_tail_f32: dst[0..d) = src[off..off+d) — the read-only row_view.
+extern "C" __global__ void copy_tail_f32(const float* __restrict__ src,
+                                         float* __restrict__ dst,
+                                         int off, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < d) dst[i] = src[off + i];
+}
+
+// copy_into_f32: dst[off..off+d) = src[0..d) — row_write into a batch tensor.
+extern "C" __global__ void copy_into_f32(const float* __restrict__ src,
+                                         float* __restrict__ dst,
+                                         int off, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < d) dst[off + i] = src[i];
+}
+
+// ─────────────── GDN (gated delta net) ───────────────
+// Три операции qwen35 до этого исполнялись дефолтными CPU-реализациями
+// Backend (to_cpu_f32 → хост-циклы → from_cpu_f32) на КАЖДОМ слое: у 27B
+// 48 GDN-слоёв из 64, и профиль дал 97 мс из 142 мс на токен (68 %) только
+// на них. Семантика повторяет CPU-эталон (см. backend.rs).
+
+// Гейты: BA [T, 2Hv] → g = softplus(alpha + dt_bias)·a, beta = sigmoid(beta_raw).
+extern "C" __global__ void gdn_gates_f32(const float* __restrict__ ba,
+                                         const float* __restrict__ dt_bias,
+                                         const float* __restrict__ a,
+                                         float* __restrict__ g,
+                                         float* __restrict__ b,
+                                         int n, int h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int hh = i % h;
+    const float x = ba[i] + dt_bias[hh];
+    const float sp = x > 20.0f ? x : log1pf(expf(x));
+    g[i] = sp * a[hh];
+    b[i] = 1.0f / (1.0f + expf(-ba[n + i]));
+}
+
+// conv1d (k) + SiLU по каналам + сдвиг свёрточного стейта (k-1).
+// Bulk-вариант предыдущего: B строк за ОДИН запуск (grid.z = строка),
+// состояние свёртки стопкой [b, c, K−1]. Нужен пакетному шагу: по-слотовые
+// мелкие ядра стоили 164 мс из 170 мс шага (см. docs/plugin-platform-plan.md,
+// раздел bulk-пакета).
+extern "C" __global__ void gdn_conv_silu_rows_f32(const float* __restrict__ x,
+                                                  const float* __restrict__ w,
+                                                  const float* __restrict__ state,
+                                                  float* __restrict__ y,
+                                                  float* __restrict__ ns,
+                                                  int c, int k) {
+    const int row = blockIdx.z;
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const float* wch = w + (size_t)ch * k;
+    const float* st = state + (size_t)row * c * (k - 1) + (size_t)ch * (k - 1);
+    const float xr = x[(size_t)row * c + ch];
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float v = (j < k - 1) ? st[j] : xr;
+        acc += wch[j] * v;
+    }
+    y[(size_t)row * c + ch] = acc / (1.0f + expf(-acc));
+    float* nsch = ns + (size_t)row * c * (k - 1) + (size_t)ch * (k - 1);
+    for (int j = 0; j < k - 1; ++j) {
+        nsch[j] = (j + 1 < k - 1) ? st[j + 1] : xr;
+    }
+}
+
+extern "C" __global__ void gdn_conv_silu_f32(const float* __restrict__ x,
+                                             const float* __restrict__ w,
+                                             const float* __restrict__ state,
+                                             float* __restrict__ y,
+                                             float* __restrict__ ns,
+                                             int c, int k) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const float* wch = w + (size_t)ch * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float v = (j < k - 1) ? state[(size_t)ch * (k - 1) + j] : x[ch];
+        acc += wch[j] * v;
+    }
+    y[ch] = acc / (1.0f + expf(-acc));
+    float* nsch = ns + (size_t)ch * (k - 1);
+    for (int j = 0; j < k - 1; ++j) {
+        nsch[j] = (j + 1 < k - 1) ? state[(size_t)ch * (k - 1) + j + 1] : x[ch];
+    }
+}
+
+// L2-нормировка сегментов длины hd (первый 2·qk выходa conv).
+extern "C" __global__ void gdn_l2norm_seg_f32(float* __restrict__ y, float eps,
+                                              int hd) {
+    extern __shared__ float ssum[];
+    const int seg = blockIdx.x;
+    float* row = y + (size_t)seg * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += row[i] * row[i];
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) row[i] *= inv;
+}
+
+// GDN causal depthwise conv для префилла (t>1): y[t,c] = Σ_j w[c,j]·at(c,t+j),
+// at(c,p) = p < K−1 ? state[c·(K−1)+p] : x[(p−(K−1))·C + c]. Один поток на
+// (t, c). Раньше этой операции не было на CUDA — дефолтный Backend гонял
+// 37 МБ на слой через хост (23 мс/слой из 48, весь префилл упирался в это).
+extern "C" __global__ void gdn_conv_seq_f32(const float* __restrict__ x,
+                                            const float* __restrict__ w,
+                                            const float* __restrict__ state,
+                                            float* __restrict__ y,
+                                            int t, int c, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= t * c) return;
+    int tt = idx / c;
+    int ch = idx - tt * c;
+    const float* wch = w + (size_t)ch * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        int p = tt + j;
+        float v = (p < k - 1) ? state[(size_t)ch * (k - 1) + p]
+                              : x[(size_t)(p - (k - 1)) * c + ch];
+        acc += wch[j] * v;
+    }
+    y[idx] = acc;
+}
+
+// Новый conv-стейт = последние K−1 входов окна.
+extern "C" __global__ void gdn_conv_state_f32(const float* __restrict__ x,
+                                              const float* __restrict__ state,
+                                              float* __restrict__ ns,
+                                              int t, int c, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= c * (k - 1)) return;
+    int ch = idx / (k - 1);
+    int j = idx - ch * (k - 1);
+    int p = t + j;
+    ns[idx] = (p < k - 1) ? state[(size_t)ch * (k - 1) + p]
+                          : x[(size_t)(p - (k - 1)) * c + ch];
+}
+
+// L2-нормировка out-of-place (префилл): y = x / sqrt(Σx² + eps) по отрезкам
+// длины hd. Та же редукция и тот же 1/sqrtf, что у in-place версии.
+extern "C" __global__ void gdn_l2norm_out_f32(const float* __restrict__ x,
+                                              float* __restrict__ y,
+                                              float eps, int hd) {
+    extern __shared__ float ssum[];
+    const int seg = blockIdx.x;
+    const float* row = x + (size_t)seg * hd;
+    float* out = y + (size_t)seg * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += row[i] * row[i];
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) out[i] = row[i] * inv;
+}
+
+// Gated delta rule для S=128: state [Hv,128,128] (транспонирован как в ggml),
+// один token-блок 16 токенов в shared один раз на блок. Схема повторяет
+// Metal gdn_delta_rule_chunk_f32: s *= e^g; delta = (v − s·k)·β;
+// s += k·delta; out = s·q/√S. Строка стейта — warp (lane = 0..31,
+// элементы lane + e·32), строки блока — threadIdx.y.
+#define GDN_S 128
+#define GDN_C 16
+#define GDN_ROWS 16
+extern "C" __global__ void gdn_delta_rule_chunk_f32(
+    const float* __restrict__ Q, const float* __restrict__ Kx,
+    const float* __restrict__ V, const float* __restrict__ G,
+    const float* __restrict__ B, float* __restrict__ STATE,
+    float* __restrict__ OUT, int T, int Hk, int Hv) {
+    __shared__ float kt[GDN_C * GDN_S];
+    __shared__ float qt[GDN_C * GDN_S];
+    __shared__ float gb[2 * GDN_C];
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * 32 + lane;
+    const int h = blockIdx.y;
+    const int row = blockIdx.x * GDN_ROWS + ty;
+    if (h >= Hv || row >= GDN_S) return;
+    const int hk = h % Hk;
+    const float scale = 1.0f / sqrtf((float)GDN_S);
+    float* srow = STATE + ((size_t)h * GDN_S + row) * GDN_S;
+    float ls0 = srow[lane], ls1 = srow[lane + 32], ls2 = srow[lane + 64],
+          ls3 = srow[lane + 96];
+    for (int t0 = 0; t0 < T; t0 += GDN_C) {
+        const int c = min(GDN_C, T - t0);
+        for (int i = tid; i < GDN_C * GDN_S; i += 32 * GDN_ROWS) {
+            const int tt = i / GDN_S, rest = i % GDN_S;
+            const int l = rest % 32, ee = rest / 32;
+            const int off = tt * GDN_S + l + ee * 32;
+            if (tt < c) {
+                kt[off] = Kx[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+                qt[off] = Q[((size_t)(t0 + tt) * Hk + hk) * GDN_S + ee * 32 + l];
+            } else {
+                kt[off] = 0.0f;
+                qt[off] = 0.0f;
+            }
+        }
+        if (tid < GDN_C) {
+            gb[tid] = (tid < c) ? G[(t0 + tid) * Hv + h] : 0.0f;
+            gb[GDN_C + tid] = (tid < c) ? B[(t0 + tid) * Hv + h] : 0.0f;
+        }
+        __syncthreads();
+        for (int tt = 0; tt < c; ++tt) {
+            const float eg = expf(gb[tt]);
+            const float beta = gb[GDN_C + tt];
+            const int tb = tt * GDN_S;
+            ls0 *= eg; ls1 *= eg; ls2 *= eg; ls3 *= eg;
+            float kv = ls0 * kt[tb + lane] + ls1 * kt[tb + lane + 32] +
+                       ls2 * kt[tb + lane + 64] + ls3 * kt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                kv += __shfl_down_sync(0xffffffffu, kv, off);
+            kv = __shfl_sync(0xffffffffu, kv, 0);
+            const float delta =
+                (V[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] - kv) * beta;
+            ls0 += kt[tb + lane] * delta;
+            ls1 += kt[tb + lane + 32] * delta;
+            ls2 += kt[tb + lane + 64] * delta;
+            ls3 += kt[tb + lane + 96] * delta;
+            float y = ls0 * qt[tb + lane] + ls1 * qt[tb + lane + 32] +
+                      ls2 * qt[tb + lane + 64] + ls3 * qt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                y += __shfl_down_sync(0xffffffffu, y, off);
+            if (lane == 0)
+                OUT[((size_t)(t0 + tt) * Hv + h) * GDN_S + row] = y * scale;
+        }
+        __syncthreads();
+    }
+    srow[lane] = ls0;
+    srow[lane + 32] = ls1;
+    srow[lane + 64] = ls2;
+    srow[lane + 96] = ls3;
+}
+
+// Bulk-вариант delta-rule: B слотов за ОДИН запуск (grid.z = слот).
+// Входы — ОДИН пакетный буфер QKV [b, cq]: q/k/v берутся срезами по
+// смещениям (q_off/k_off/v_off), шаг строки — in_stride. Стейты слотов
+// передаются массивом указателей (как grouped-GEMM): у слотов свои тензоры,
+// переделывать владельца состояния не нужно, а по-слотовые запуски исчезают.
+extern "C" __global__ void gdn_delta_rule_slots_f32(
+    const float* __restrict__ QKV, int q_off, int k_off, int v_off,
+    int in_stride, const float* __restrict__ G, const float* __restrict__ B,
+    float* __restrict__ OUT, int out_stride,
+    const float* const* __restrict__ STATES, int T, int Hk, int Hv) {
+    __shared__ float kt[GDN_C * GDN_S];
+    __shared__ float qt[GDN_C * GDN_S];
+    __shared__ float gb[2 * GDN_C];
+    const int slot = blockIdx.z;
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * 32 + lane;
+    const int h = blockIdx.y;
+    const int row = blockIdx.x * GDN_ROWS + ty;
+    if (h >= Hv || row >= GDN_S) return;
+    const float* Qs = QKV + q_off + (size_t)slot * in_stride;
+    const float* Ks = QKV + k_off + (size_t)slot * in_stride;
+    const float* Vs = QKV + v_off + (size_t)slot * in_stride;
+    const float* Gs = G + (size_t)slot * T * Hv;
+    const float* Bs = B + (size_t)slot * T * Hv;
+    float* Os = OUT + (size_t)slot * out_stride;
+    const int hk = h % Hk;
+    const float scale = 1.0f / sqrtf((float)GDN_S);
+    float* srow = const_cast<float*>(STATES[slot]) + ((size_t)h * GDN_S + row) * GDN_S;
+    float ls0 = srow[lane], ls1 = srow[lane + 32], ls2 = srow[lane + 64],
+          ls3 = srow[lane + 96];
+    for (int t0 = 0; t0 < T; t0 += GDN_C) {
+        const int c = min(GDN_C, T - t0);
+        for (int i = tid; i < GDN_C * GDN_S; i += 32 * GDN_ROWS) {
+            const int tt = i / GDN_S, rest = i % GDN_S;
+            const int l = rest % 32, ee = rest / 32;
+            const int off = tt * GDN_S + l + ee * 32;
+            if (tt < c) {
+                kt[off] = Ks[(size_t)(t0 + tt) * in_stride + hk * GDN_S + ee * 32 + l];
+                qt[off] = Qs[(size_t)(t0 + tt) * in_stride + hk * GDN_S + ee * 32 + l];
+            } else {
+                kt[off] = 0.0f;
+                qt[off] = 0.0f;
+            }
+        }
+        if (tid < GDN_C) {
+            gb[tid] = (tid < c) ? Gs[(t0 + tid) * Hv + h] : 0.0f;
+            gb[GDN_C + tid] = (tid < c) ? Bs[(t0 + tid) * Hv + h] : 0.0f;
+        }
+        __syncthreads();
+        for (int tt = 0; tt < c; ++tt) {
+            const float eg = expf(gb[tt]);
+            const float beta = gb[GDN_C + tt];
+            const int tb = tt * GDN_S;
+            ls0 *= eg; ls1 *= eg; ls2 *= eg; ls3 *= eg;
+            float kv = ls0 * kt[tb + lane] + ls1 * kt[tb + lane + 32] +
+                       ls2 * kt[tb + lane + 64] + ls3 * kt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                kv += __shfl_down_sync(0xffffffffu, kv, off);
+            kv = __shfl_sync(0xffffffffu, kv, 0);
+            const float delta =
+                (Vs[(size_t)(t0 + tt) * in_stride + h * GDN_S + row] - kv) * beta;
+            ls0 += kt[tb + lane] * delta;
+            ls1 += kt[tb + lane + 32] * delta;
+            ls2 += kt[tb + lane + 64] * delta;
+            ls3 += kt[tb + lane + 96] * delta;
+            float y = ls0 * qt[tb + lane] + ls1 * qt[tb + lane + 32] +
+                      ls2 * qt[tb + lane + 64] + ls3 * qt[tb + lane + 96];
+            for (int off = 16; off > 0; off >>= 1)
+                y += __shfl_down_sync(0xffffffffu, y, off);
+            if (lane == 0)
+                Os[(size_t)(t0 + tt) * out_stride + h * GDN_S + row] = y * scale;
+        }
+        __syncthreads();
+    }
+    srow[lane] = ls0;
+    srow[lane + 32] = ls1;
+    srow[lane + 64] = ls2;
+    srow[lane + 96] = ls3;
+}
+
+// conv+silu по строкам пакета; состояние свёртки каждого слота — НА МЕСТЕ
+// (массив указателей, как в delta-rule выше).
+extern "C" __global__ void gdn_conv_silu_slots_f32(const float* __restrict__ x,
+                                                   const float* __restrict__ w,
+                                                   const float* const* __restrict__ STATES,
+                                                   float* __restrict__ y,
+                                                   int c, int k) {
+    const int slot = blockIdx.z;
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const float* wch = w + (size_t)ch * k;
+    float* st = const_cast<float*>(STATES[slot]) + (size_t)ch * (k - 1);
+    const float xr = x[(size_t)slot * c + ch];
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const float v = (j < k - 1) ? st[j] : xr;
+        acc += wch[j] * v;
+    }
+    y[(size_t)slot * c + ch] = acc / (1.0f + expf(-acc));
+    for (int j = 0; j < k - 1; ++j) {
+        st[j] = (j + 1 < k - 1) ? st[j + 1] : xr;
+    }
+}
+
+// L2-нормировка по строкам: каждая строка — `segs` отрезков длины hd.
+extern "C" __global__ void gdn_l2norm_rows_f32(const float* __restrict__ x,
+                                               float* __restrict__ y,
+                                               int hd, int segs, int stride,
+                                               float eps) {
+    extern __shared__ float ssum[];
+    const int row = blockIdx.y;
+    const int seg = blockIdx.x;
+    if (seg >= segs) return;
+    const size_t base = (size_t)row * stride + (size_t)seg * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float v = x[base + i];
+        acc += v * v;
+    }
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) y[base + i] = x[base + i] * inv;
+}
+
+// Гейтовая RMS-норма GDN: y = x·inv·w·silu(z), inv = 1/√(mean(x²)+eps) по
+// отрезкам hd. Один блок на строку (hd ≤ 1024).
+extern "C" __global__ void gdn_norm_gated_f32(const float* __restrict__ x,
+                                              const float* __restrict__ z,
+                                              const float* __restrict__ w,
+                                              float* __restrict__ y, int hd,
+                                              float eps) {
+    extern __shared__ float ssum[];
+    const size_t base = (size_t)blockIdx.x * hd;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float v = x[base + i];
+        acc += v * v;
+    }
+    ssum[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) ssum[threadIdx.x] += ssum[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(ssum[0] / (float)hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float zz = z[base + i];
+        y[base + i] = x[base + i] * inv * w[i] * (zz / (1.0f + expf(-zz)));
     }
 }

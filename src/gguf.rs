@@ -132,6 +132,34 @@ pub enum GgmlType {
     Q5K,
     Q6K,
     Q8K,
+    /// i-кванты (A4): пока только IQ4_XS — код 23 в GGUF (ggml.h эталонного
+    /// коммита). 256 элементов на суперблок, 136 байт, 4.25 бита на вес.
+    Iq4Xs,
+    /// IQ4_NL — код 20: 32-эл. блок, 18 Б (f16 d + 16 байт нибблов), 4.5 бита.
+    Iq4Nl,
+    /// MXFP4 (OCP microscaling) — код 39: 32-эл. блок, 17 Б (E8M0 + E2M1).
+    Mxfp4,
+    /// TQ1_0 — код 34: 256-эл. суперблок, 54 Б (тернарные, 3^5 в байте + qh).
+    Tq1_0,
+    /// TQ2_0 — код 35: 256-эл. суперблок, 66 Б (2 бита на значение).
+    Tq2_0,
+    /// Q1_0 — код 41: 128-эл. блок, 18 Б (биты → ±d).
+    Q1_0,
+    /// Q2_0 — код 42: 64-эл. блок, 18 Б (2 бита → (q−1)·d).
+    Q2_0,
+    /// i-кванты с сеточным кодбуком: IQ2_XXS (16, 66 Б), IQ2_XS (17, 74),
+    /// IQ3_XXS (18, 98), IQ1_S (19, 50), IQ3_S (21, 110), IQ2_S (22, 82),
+    /// IQ1_M (29, 56). 256-эл. суперблоки (IQ1_M — без отдельного d).
+    Iq2Xxs,
+    Iq2Xs,
+    Iq3Xxs,
+    Iq1S,
+    Iq3S,
+    Iq2S,
+    Iq1M,
+    /// NVFP4 — код 40: 64-эл. блок, 36 Б (4 UE4M3-скейла на подблоки по 16
+    /// + 32 Б нибблов E2M1).
+    Nvfp4,
 }
 
 impl GgmlType {
@@ -151,7 +179,22 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
-            27 => Self::Bf16,
+            20 => Self::Iq4Nl,
+            23 => Self::Iq4Xs,
+            30 => Self::Bf16,
+            34 => Self::Tq1_0,
+            35 => Self::Tq2_0,
+            39 => Self::Mxfp4,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
+            16 => Self::Iq2Xxs,
+            17 => Self::Iq2Xs,
+            18 => Self::Iq3Xxs,
+            19 => Self::Iq1S,
+            21 => Self::Iq3S,
+            22 => Self::Iq2S,
+            29 => Self::Iq1M,
+            40 => Self::Nvfp4,
             _ => return None,
         })
     }
@@ -174,7 +217,24 @@ impl GgmlType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
-            Self::Bf16 => 27,
+            Self::Iq4Nl => 20,
+            Self::Iq4Xs => 23,
+            // BF16 = 30 по ggml.h эталонного коммита (27 — это I64);
+            // сверено с реальным llama.cpp-файлом (huihui-ai BF16-шейды).
+            Self::Bf16 => 30,
+            Self::Mxfp4 => 39,
+            Self::Nvfp4 => 40,
+            Self::Tq1_0 => 34,
+            Self::Tq2_0 => 35,
+            Self::Q1_0 => 41,
+            Self::Q2_0 => 42,
+            Self::Iq2Xxs => 16,
+            Self::Iq2Xs => 17,
+            Self::Iq3Xxs => 18,
+            Self::Iq1S => 19,
+            Self::Iq3S => 21,
+            Self::Iq2S => 22,
+            Self::Iq1M => 29,
         }
     }
 
@@ -183,7 +243,21 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Iq4Nl | Self::Mxfp4 => 32,
+            Self::Nvfp4 => 64,
+            Self::Q1_0 => 128,
+            Self::Q2_0 => 64,
+            Self::Tq1_0 | Self::Tq2_0 => 256,
+            Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq3Xxs
+            | Self::Iq1S
+            | Self::Iq3S
+            | Self::Iq2S
+            | Self::Iq1M => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::Iq4Xs => {
+                256
+            }
         }
     }
 
@@ -198,13 +272,39 @@ impl GgmlType {
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
             Self::Q8_0 => 34,
-            Self::Q8_1 => 40,
+            // Q8_1: d(f16) + s(f16) + int8[32] = 36 Б (было 40 — ошибка:
+            // в эталоне block_q8_1 36 Б, QK8_1=32).
+            Self::Q8_1 => 36,
             Self::Q2K => 84,
             Self::Q3K => 110,
             Self::Q4K => 144,
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 292,
+            // IQ4_XS: f16-масштаб d + 2 Б (scales_h) + 4 Б (scales_l) + 128 Б
+            // нибблов = 136 Б на 256 весов (4.25 бита); раскладка ggml
+            // block_iq4_xs, сверка с llama-quantize/dequant — в тестах.
+            Self::Iq4Xs => 136,
+            // IQ4_NL: f16 d + 16 байт нибблов = 18 Б/32 (4.5 бита).
+            Self::Iq4Nl => 18,
+            // MXFP4: E8M0-скейл (1 Б) + 16 байт нибблов E2M1 = 17 Б/32.
+            Self::Mxfp4 => 17,
+            // NVFP4: 4 UE4M3-скейла (по подблоку 16) + 32 Б нибблов = 36 Б/64.
+            Self::Nvfp4 => 36,
+            // Q1_0: d + 16 Б битов на 128; Q2_0: d + 16 Б на 64.
+            Self::Q1_0 | Self::Q2_0 => 18,
+            // TQ1_0: qs[48] + qh[4] + d = 54; TQ2_0: qs[64] + d = 66.
+            Self::Tq1_0 => 54,
+            Self::Tq2_0 => 66,
+            // i-кванты: IQ2_XXS 66, IQ2_XS 74, IQ3_XXS 98, IQ1_S 50,
+            // IQ3_S 110, IQ2_S 82, IQ1_M 56 (ggml-common.h).
+            Self::Iq2Xxs => 66,
+            Self::Iq2Xs => 74,
+            Self::Iq3Xxs => 98,
+            Self::Iq1S => 50,
+            Self::Iq3S => 110,
+            Self::Iq2S => 82,
+            Self::Iq1M => 56,
         }
     }
 
@@ -213,6 +313,42 @@ impl GgmlType {
         let elems = self.block_elems() as u64;
         let bytes = self.block_bytes() as u64;
         numel.div_ceil(elems).saturating_mul(bytes)
+    }
+
+    /// Имя типа в нотации ggml (для отчётов и логов: "Q4_K", "Q6_K", …).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2K => "Q2_K",
+            Self::Q3K => "Q3_K",
+            Self::Q4K => "Q4_K",
+            Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
+            Self::Q8K => "Q8_K",
+            Self::Iq4Xs => "IQ4_XS",
+            Self::Iq4Nl => "IQ4_NL",
+            Self::Mxfp4 => "MXFP4",
+            Self::Nvfp4 => "NVFP4",
+            Self::Tq1_0 => "TQ1_0",
+            Self::Tq2_0 => "TQ2_0",
+            Self::Q1_0 => "Q1_0",
+            Self::Q2_0 => "Q2_0",
+            Self::Iq2Xxs => "IQ2_XXS",
+            Self::Iq2Xs => "IQ2_XS",
+            Self::Iq3Xxs => "IQ3_XXS",
+            Self::Iq1S => "IQ1_S",
+            Self::Iq3S => "IQ3_S",
+            Self::Iq2S => "IQ2_S",
+            Self::Iq1M => "IQ1_M",
+        }
     }
 }
 
@@ -389,7 +525,16 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
 
     // Tensor infos: оффсеты в GGUF ОТНОСИТЕЛЬНЫ начала секции данных
     // (llama.cpp: data_offset + tensor.offset). Секция данных начинается
-    // сразу после таблицы тензоров, с выравниванием 32.
+    // сразу после таблицы тензоров, с выравниванием `general.alignment`
+    // (32 по умолчанию). Файл, собранный с 64, читался со смещением: парсер
+    // отдавал zero-padding вместо весов, и модель деградировала молча.
+    let align = metadata
+        .iter()
+        .find(|(k, _)| k == "general.alignment")
+        .and_then(|(_, v)| v.as_u32())
+        .map(u64::from)
+        .filter(|a| *a > 0 && a.is_power_of_two())
+        .unwrap_or(TENSOR_ALIGN);
     struct RawInfo {
         name: String,
         dims: Vec<u64>,
@@ -419,7 +564,7 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
         });
     }
     let mut data_base = pos as u64;
-    while data_base % TENSOR_ALIGN != 0 {
+    while !data_base.is_multiple_of(align) {
         data_base += 1;
     }
 
@@ -460,7 +605,9 @@ pub fn parse(buf: &[u8]) -> Result<GgufFile<'_>, GgufError> {
                 offset,
                 size,
             })?;
-        if rel_offset % TENSOR_ALIGN != 0 {
+        // The RELATIVE offset must respect the SAME alignment the data section
+        // uses (it used to hard-code 32, so a 64-aligned file was rejected).
+        if rel_offset % align != 0 {
             return Err(GgufError::UnalignedTensor { name, offset });
         }
         tensors.push(GgufTensor {
@@ -569,6 +716,38 @@ mod tests {
         assert_eq!(f.tensors[1].ggml_type, GgmlType::Q6K);
     }
 
+    /// Коды типов ПРИБИТЫ к ggml.h эталонного коммита 5266f24da75d
+    /// (F32=0 F16=1 Q4_0=2 Q8_0=8 Q4_K=12 Q5_K=13 Q6_K=14 IQ4_XS=23 BF16=30).
+    /// BF16=27 был нашей самописной ошибкой (27 — I64): реальные llama.cpp
+    /// BF16-файлы (huihui-ai) пишут 30. Менять код можно ТОЛЬКО вместе со
+    /// сменой эталонного коммита и перегенерацией фикстур.
+    #[test]
+    fn raw_codes_pinned_to_reference() {
+        assert_eq!(GgmlType::F32.raw(), 0);
+        assert_eq!(GgmlType::F16.raw(), 1);
+        assert_eq!(GgmlType::Bf16.raw(), 30);
+        assert_eq!(GgmlType::Q4_0.raw(), 2);
+        assert_eq!(GgmlType::Q8_0.raw(), 8);
+        assert_eq!(GgmlType::Q4K.raw(), 12);
+        assert_eq!(GgmlType::Q5K.raw(), 13);
+        assert_eq!(GgmlType::Q6K.raw(), 14);
+        assert_eq!(GgmlType::Iq4Xs.raw(), 23);
+        for t in [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Bf16,
+            GgmlType::Q4_0,
+            GgmlType::Q8_0,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Iq4Xs,
+        ] {
+            assert_eq!(GgmlType::from_raw(t.raw()), Some(t));
+        }
+        assert_eq!(GgmlType::from_raw(27), None); // I64 — не поддерживаем
+    }
+
     #[test]
     fn bad_magic_rejected() {
         assert_eq!(parse(b"NOTGGUF...."), Err(GgufError::BadMagic));
@@ -607,7 +786,6 @@ mod tests {
         }
     }
 }
-
 
 // ── Painter (1.6b): минимальный GGUF v2 writer ─────────────────────────────
 
@@ -702,13 +880,21 @@ pub fn write_gguf(
         patch_pos.push(out.len());
         w_u64(out, 0); // offset-плейсхолдер (RELATIVE к началу данных)
     }
-    // Данные: выравнивание 32; оффсеты в таблице — относительно начала
-    // секции данных (как в llama.cpp), не абсолютные.
-    const ALIGN: usize = 32;
-    let mut pos = (out.len() + ALIGN - 1) & !(ALIGN - 1);
+    // Данные: выравнивание берётся из `general.alignment` (32 по умолчанию) —
+    // ровно то, что использует парсер. Жёсткая 32 при ключе 64 в metadata
+    // делала файл нечитаемым собственным round-trip'ом. Оффсеты в таблице —
+    // относительно начала секции данных (как в llama.cpp), не абсолютные.
+    let align = metadata
+        .iter()
+        .find(|(k, _)| k == "general.alignment")
+        .and_then(|(_, v)| v.as_u32())
+        .map(|a| a as usize)
+        .filter(|a| *a > 0 && a.is_power_of_two())
+        .unwrap_or(32);
+    let mut pos = (out.len() + align - 1) & !(align - 1);
     let data_base = pos;
     for (i, t) in tensors.iter().enumerate() {
-        let aligned = (pos + ALIGN - 1) & !(ALIGN - 1);
+        let aligned = (pos + align - 1) & !(align - 1);
         let off_bytes = ((aligned - data_base) as u64).to_le_bytes();
         let pp = patch_pos[i];
         out[pp..pp + 8].copy_from_slice(&off_bytes);
@@ -720,10 +906,88 @@ pub fn write_gguf(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests51 {
     use super::*;
+
+    /// Builds a minimal GGUFv2 by hand so the data section can be aligned to an
+    /// arbitrary `general.alignment` (the writer's own default is 32).
+    fn hand_rolled_gguf(align: u64, payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        b.extend_from_slice(&V2.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
+        b.extend_from_slice(&2u64.to_le_bytes()); // kv count
+        w_str(&mut b, "general.architecture");
+        w_u32(&mut b, gguf_type_of(&GgufValue::String(String::new())));
+        w_str(&mut b, "test");
+        w_str(&mut b, "general.alignment");
+        w_u32(&mut b, gguf_type_of(&GgufValue::U32(0)));
+        w_u32(&mut b, align as u32);
+        // tensor info
+        w_str(&mut b, "w");
+        w_u32(&mut b, 2);
+        w_u64(&mut b, 4);
+        w_u64(&mut b, 1);
+        w_u32(&mut b, GgmlType::F32.raw());
+        w_u64(&mut b, 0); // relative offset
+        while !(b.len() as u64).is_multiple_of(align) {
+            b.push(0);
+        }
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// A file whose data section is aligned to 64 must read back EXACTLY: the
+    /// parser hard-coded a 32-byte alignment, so it started reading 32 bytes of
+    /// zero padding early and every weight came out as zeros (silently).
+    #[test]
+    fn non_default_alignment_is_honoured() {
+        let data: Vec<f32> = vec![1.5, -2.25, 3.75, 0.5];
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let buf = hand_rolled_gguf(64, &bytes);
+        let f = parse(&buf).unwrap();
+        let t = &f.tensors[0];
+        let back: Vec<f32> = t
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(back, data, "weights must survive a 64-byte alignment");
+    }
+
+    /// The writer must agree with the parser: a file written with an explicit
+    /// `general.alignment` has to be readable by the same crate.
+    #[test]
+    fn writer_honours_declared_alignment() {
+        let data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0];
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut buf = Vec::new();
+        write_gguf(
+            &mut buf,
+            &[
+                (
+                    "general.architecture".to_string(),
+                    GgufValue::String("qwen3".into()),
+                ),
+                ("general.alignment".to_string(), GgufValue::U32(64)),
+            ],
+            &[GgufWriteTensor {
+                name: "w".into(),
+                dims: vec![2, 2],
+                ggml_type: GgmlType::F32,
+                data: bytes,
+            }],
+        )
+        .unwrap();
+        let f = parse(&buf).unwrap();
+        let back: Vec<f32> = f.tensors[0]
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(back, data);
+    }
 
     #[test]
     fn writer_roundtrip_v2() {
@@ -732,12 +996,16 @@ mod tests51 {
         let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
         write_gguf(
             &mut buf,
-            &vec![
-                ("general.architecture".to_string(), GgufValue::String("qwen3".into())),
+            &[
+                (
+                    "general.architecture".to_string(),
+                    GgufValue::String("qwen3".into()),
+                ),
                 ("qwen3.vocab_size".to_string(), GgufValue::U32(151936)),
-                ("misc.array".to_string(), GgufValue::Array(vec![
-                    GgufValue::U32(1), GgufValue::U32(2),
-                ])),
+                (
+                    "misc.array".to_string(),
+                    GgufValue::Array(vec![GgufValue::U32(1), GgufValue::U32(2)]),
+                ),
             ],
             &[GgufWriteTensor {
                 name: "token_embd.weight".into(),
@@ -750,14 +1018,20 @@ mod tests51 {
         // read-back
         let f = parse(&buf).unwrap();
         assert_eq!(f.architecture(), Some("qwen3"));
-        assert_eq!(f.get("qwen3.vocab_size").and_then(GgufValue::as_u32), Some(151936));
+        assert_eq!(
+            f.get("qwen3.vocab_size").and_then(GgufValue::as_u32),
+            Some(151936)
+        );
         assert_eq!(f.tensors.len(), 1);
         let t = &f.tensors[0];
         assert_eq!(t.name, "token_embd.weight");
         assert_eq!(t.numel(), 4);
         let raw = t.data;
         assert_eq!(raw.len(), 16);
-        let back: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let back: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         assert_eq!(back, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
@@ -767,7 +1041,10 @@ mod tests51 {
     fn writer_roundtrip_multi_and_value_types() {
         let mut buf = Vec::new();
         let f16_bytes: Vec<u8> = (0u16..6).flat_map(|x| x.to_le_bytes()).collect();
-        let f32_bytes: Vec<u8> = vec![1.0f32, -2.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let f32_bytes: Vec<u8> = [1.0f32, -2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
         write_gguf(
             &mut buf,
             &[
@@ -781,10 +1058,13 @@ mod tests51 {
                 ("a.u64".into(), GgufValue::U64(u64::MAX / 3)),
                 ("a.i64".into(), GgufValue::I64(-(i64::MAX / 3))),
                 ("a.f64".into(), GgufValue::F64(1.5)),
-                ("a.strs".into(), GgufValue::Array(vec![
-                    GgufValue::String("x".into()),
-                    GgufValue::String("yz".into()),
-                ])),
+                (
+                    "a.strs".into(),
+                    GgufValue::Array(vec![
+                        GgufValue::String("x".into()),
+                        GgufValue::String("yz".into()),
+                    ]),
+                ),
             ],
             &[
                 GgufWriteTensor {

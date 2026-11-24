@@ -22,7 +22,7 @@ fn bench<F: Fn(&CudaBackend)>(gpu: &CudaBackend, name: &str, reps: usize, f: F) 
 fn ops_bench_suite() {
     let gpu = CudaBackend::new(0).unwrap();
     let w = gpu.from_cpu_f32(&vec![0.1f32; 2048], vec![2048]).unwrap();
-    let w8 = gpu.from_cpu_f32(&vec![0.1f32; 8192], vec![8192]).unwrap();
+    let _w8 = gpu.from_cpu_f32(&vec![0.1f32; 8192], vec![8192]).unwrap();
     let x1 = gpu.zeros(vec![1, 2048]).unwrap();
     let x8 = gpu.zeros(vec![1, 8192]).unwrap();
     let x3 = gpu.zeros(vec![1, 6144]).unwrap();

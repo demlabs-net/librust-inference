@@ -26,7 +26,11 @@ fn sequential_halfw_gemms() {
     let cpu = CpuBackend;
     // Two alternating real shapes (gigaam layer: linear_q [768,768] and
     // ffn1 [3072,768] with m=~90) — 32 GEMMs, like a 16-layer encoder.
-    let shapes = [(90usize, 768usize, 768usize), (90, 768, 3072), (90, 3072, 768)];
+    let shapes = [
+        (90usize, 768usize, 768usize),
+        (90, 768, 3072),
+        (90, 3072, 768),
+    ];
     for round in 0..3 {
         let mut worst_rel = 0.0f32;
         for i in 0..32 {
@@ -56,6 +60,9 @@ fn sequential_halfw_gemms() {
             }
             worst_rel = worst_rel.max(rel);
         }
-        assert!(worst_rel < 0.05, "round {round}: sequential halfw GEMMs diverged (pool-reuse bug): {worst_rel:.4}");
+        assert!(
+            worst_rel < 0.05,
+            "round {round}: sequential halfw GEMMs diverged (pool-reuse bug): {worst_rel:.4}"
+        );
     }
 }

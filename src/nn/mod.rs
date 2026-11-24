@@ -262,13 +262,26 @@ impl ConvTranspose1d {
 /// wqkv (3D, D), wo (D, D), optional QK-norms (D).
 #[derive(Debug, Clone)]
 pub struct Attention {
-    pub wqkv: Tensor,
+    /// Склеенная q/k/v-проекция [q+2kv, d] — когда форматы совпали и fuse
+    /// возможен без декванта. `None` — только вместе с `Some` у `wqkv_split`.
+    pub wqkv: Option<Tensor>,
+    /// Раздельные q/k/v в РОДНЫХ квантах (OLMoE: q/k Q4_K + v Q6_K). Склейка
+    /// при смешанных форматах деквантит всё в F32 — а F32-GEMM округляет не
+    /// так, как эталонный mul_mv по каждому кванту (расхождение ~5e-5 на
+    /// скаляр → разрыв паритета текста). Тогда — три gemm_nt в отдельные
+    /// выходы, ровно как три ggml_mul_mat у llama.cpp.
+    pub wqkv_split: Option<[Tensor; 3]>,
     pub wo: Tensor,
     /// Опциональный bias q/k/v (Qwen2.5-Omni thinker: q/k/v_proj.bias,
     /// [3·D] после fuse). None = классический Qwen3 без bias.
     pub qkv_bias: Option<Tensor>,
     pub q_norm: Option<Tensor>,
     pub k_norm: Option<Tensor>,
+    /// Область применения QK-норм: None — по голове (Qwen3: q_norm имеет
+    /// длину head_dim, кернел нормирует каждую голову отдельно); Some(eps) —
+    /// по всей проекции q/k (OLMoE: вес длиной n_embd, llama.cpp нормирует
+    /// q/k ДО reshape в головы, eps — из конфига модели).
+    pub qk_norm_whole_eps: Option<f32>,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -288,7 +301,8 @@ impl Attention {
         head_dim: usize,
     ) -> Result<Self, BackendError> {
         Ok(Self {
-            wqkv: backend.from_cpu_f32(&wqkv, vec![3 * dim, dim])?,
+            wqkv: Some(backend.from_cpu_f32(&wqkv, vec![3 * dim, dim])?),
+            wqkv_split: None,
             wo: backend.from_cpu_f32(&wo, vec![dim, dim])?,
             qkv_bias: None,
             q_norm: q_norm
@@ -297,6 +311,7 @@ impl Attention {
             k_norm: k_norm
                 .map(|w| backend.from_cpu_f32(&w, vec![dim]))
                 .transpose()?,
+            qk_norm_whole_eps: None,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -318,19 +333,41 @@ impl Attention {
         let (b, tq, _) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let q_size = self.n_heads * self.head_dim;
         let kv_size = self.n_kv_heads * self.head_dim;
-        let qkv = Linear {
-            w: self.wqkv.clone(),
-            b: None,
-        }
-        .forward(backend, x)?;
-        let q = slice_last(backend, &qkv, q_size, 0)?;
-        let k = slice_last(backend, &qkv, kv_size, q_size)?;
-        let v = slice_last(backend, &qkv, kv_size, q_size + kv_size)?;
-        let (q, k) = if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
+        let (q, k, v) = if let Some([wq, wk, wv]) = &self.wqkv_split {
+            let x2 = view2(x);
+            let yq = backend.zeros(vec![b * tq, q_size])?;
+            let yk = backend.zeros(vec![b * tq, kv_size])?;
+            let yv = backend.zeros(vec![b * tq, kv_size])?;
+            backend.gemm_nt(&x2, wq, &yq)?;
+            backend.gemm_nt(&x2, wk, &yk)?;
+            backend.gemm_nt(&x2, wv, &yv)?;
+            (yq, yk, yv)
+        } else {
+            let qkv = Linear {
+                w: self.wqkv.clone().expect("wqkv или wqkv_split"),
+                b: None,
+            }
+            .forward(backend, x)?;
             (
-                rmsnorm_head(backend, &q, qn, self.n_heads)?,
-                rmsnorm_head(backend, &k, kn, self.n_kv_heads)?,
+                slice_last(backend, &qkv, q_size, 0)?,
+                slice_last(backend, &qkv, kv_size, q_size)?,
+                slice_last(backend, &qkv, kv_size, q_size + kv_size)?,
             )
+        };
+        let (q, k) = if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
+            match self.qk_norm_whole_eps {
+                // Норма по ВСЕЙ проекции q/k (OLMoE: llama.cpp olmoe.cpp зовёт
+                // build_norm ДО reshape в головы, вес — [n_embd]): масштаб
+                // зависит от суммы по всем головам, а не по одной.
+                Some(eps) => (
+                    rmsnorm_last(backend, &q, qn, eps)?,
+                    rmsnorm_last(backend, &k, kn, eps)?,
+                ),
+                None => (
+                    rmsnorm_head(backend, &q, qn, self.n_heads)?,
+                    rmsnorm_head(backend, &k, kn, self.n_kv_heads)?,
+                ),
+            }
         } else {
             (q, k)
         };
@@ -368,6 +405,27 @@ impl Attention {
 /// Storage format: `KvFormat::F32` (default) or `KvFormat::F16` — f16 is
 /// quantized on write (kv_update) and dequantized inline in the fused
 /// attention kernels (CUDA); the CPU reference and Metal keep fp32.
+/// Состояние одного KV-кэша (7.8): строки [0..pos) в f32 + позиция. Формат
+/// хранения значений нормализован к f32 — перенос между нодами/бэкендами не
+/// зависит от того, чем кэш был на исходной ноде (f16/f32/q8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvState {
+    pub pos: usize,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
+/// Геометрия кэша: импортёр собирает такой же (или отказывается).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KvGeometry {
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_theta: f32,
+    pub mrope_sections: Option<[usize; 4]>,
+    pub k_format: crate::dtype::KvFormat,
+    pub v_format: crate::dtype::KvFormat,
+}
+
 pub struct KvCache {
     k: Tensor,
     v: Tensor,
@@ -402,7 +460,7 @@ fn make_kv_tensor(
             backend.from_cpu_f16(&zeros, vec![1, cap, d])
         }
         crate::dtype::KvFormat::Q8_0 => {
-            if d % 32 != 0 {
+            if !d.is_multiple_of(32) {
                 return Err(BackendError::Shape(format!(
                     "KV q8_0 requires d % 32 == 0, got d={d}"
                 )));
@@ -433,6 +491,11 @@ impl KvCache {
     ) -> Result<Self, BackendError> {
         let cap = KV_CACHE_INIT_CAPACITY;
         let d = n_kv_heads * head_dim;
+        // Формат хранилища приводится к тому, что реально умеют KV-кернелы
+        // бэкенда (Metal: только f32 — f16-типизированная аллокация оставляла
+        // f32-данным половину нужных байт).
+        let k_format = backend.supported_kv_format(k_format);
+        let v_format = backend.supported_kv_format(v_format);
         Ok(Self {
             k: make_kv_tensor(backend, k_format, cap, d)?,
             v: make_kv_tensor(backend, v_format, cap, d)?,
@@ -447,6 +510,85 @@ impl KvCache {
         })
     }
 
+    /// KV-объект (7.8): геометрия кэша — нужна импортёру, чтобы собрать
+    /// такой же кэш (и отказаться, если KV от другой модели).
+    /// Форматы, в которых k и v лежат РЕАЛЬНО (после `supported_kv_format`):
+    /// f16-запрос на бэкенде без f16-кернелов деградировал бы к f32 молча —
+    /// геттер делает это видимым снаружи (тесты/сервис).
+    pub fn stored_formats(&self) -> (crate::dtype::KvFormat, crate::dtype::KvFormat) {
+        (self.k_format, self.v_format)
+    }
+
+    /// Байты, занятые хранилищем k+v ЦЕЛИКОМ (по ёмкости, не по pos):
+    /// отчёт о памяти под контекст (f16 вдвое меньше f32) и проверка формата.
+    pub fn storage_bytes(&self) -> usize {
+        let bpe = |f: crate::dtype::KvFormat| f.bytes_per_elem() as f64;
+        (self.k.numel() as f64 * bpe(self.k_format) + self.v.numel() as f64 * bpe(self.v_format))
+            as usize
+    }
+
+    pub fn geometry(&self) -> KvGeometry {
+        KvGeometry {
+            n_kv_heads: self.k.shape()[2] / self.head_dim,
+            head_dim: self.head_dim,
+            rope_theta: self.rope_theta,
+            mrope_sections: self.mrope_sections,
+            k_format: self.k_format,
+            v_format: self.v_format,
+        }
+    }
+
+    /// Экспорт состояния (7.8): только строки [0..pos) в f32 — переносимая
+    /// часть KV. Кэш остаётся рабочим (чтение, не перемещение).
+    pub fn export_state(&self, backend: &dyn Backend) -> Result<KvState, BackendError> {
+        let k = if self.pos == 0 {
+            Vec::new()
+        } else {
+            crate::backend::download_in_dtype(backend, &self.view())?
+        };
+        let v = if self.pos == 0 {
+            Vec::new()
+        } else {
+            crate::backend::download_in_dtype(backend, &self.view_v())?
+        };
+        Ok(KvState {
+            pos: self.pos,
+            k,
+            v,
+        })
+    }
+
+    /// Импорт состояния (7.8): кэш приводится к присланному состоянию —
+    /// прежнее содержимое сбрасывается. Длина проверяется жёстко: молча
+    /// усечённый KV испортил бы продолжение диалога.
+    pub fn import_state(
+        &mut self,
+        backend: &dyn Backend,
+        st: &KvState,
+    ) -> Result<(), BackendError> {
+        self.shrink_to_init(backend)?;
+        if st.pos == 0 {
+            return Ok(());
+        }
+        let d = self.k.shape()[2];
+        let expect = st.pos * d;
+        if st.k.len() != expect || st.v.len() != expect {
+            return Err(BackendError::Shape(format!(
+                "импорт KV: строк {} × d {d} = {expect}, прислано k={} v={}",
+                st.pos,
+                st.k.len(),
+                st.v.len()
+            )));
+        }
+        let k = backend.from_cpu_f32(&st.k, vec![1, st.pos, d])?;
+        let v = backend.from_cpu_f32(&st.v, vec![1, st.pos, d])?;
+        self.ensure(backend, st.pos)?;
+        backend.kv_update(&self.k, &k, 0)?;
+        backend.kv_update(&self.v, &v, 0)?;
+        self.pos = st.pos;
+        Ok(())
+    }
+
     /// Roll the window NOW if `pos + tq` would exceed the cap (plan 1.6):
     /// the caller must do this BEFORE computing the current token's rope
     /// and the causal mask — the compact resets the absolute positions,
@@ -457,11 +599,11 @@ impl KvCache {
         backend: &dyn Backend,
         tq: usize,
     ) -> Result<bool, BackendError> {
-        if let Some(max) = self.max_cap {
-            if self.pos + tq > max {
-                self.compact(backend)?;
-                return Ok(true);
-            }
+        if let Some(max) = self.max_cap
+            && self.pos + tq > max
+        {
+            self.compact(backend)?;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -550,16 +692,66 @@ impl KvCache {
     ) -> Result<(), BackendError> {
         let tq = k.shape()[1];
         // Context-window roll: drop the oldest half before it overflows.
-        if let Some(max) = self.max_cap {
-            if self.pos + tq > max {
-                self.compact(backend)?;
-            }
+        if let Some(max) = self.max_cap
+            && self.pos + tq > max
+        {
+            self.compact(backend)?;
         }
         self.ensure(backend, self.pos + tq)?;
         backend.kv_update(&self.k, k, self.pos)?;
         backend.kv_update(&self.v, v, self.pos)?;
         self.pos += tq;
         Ok(())
+    }
+
+    /// Подготовить дозапись `tq` строк на текущую позицию, когда k/v пишет
+    /// сам вызывающий (fused-кернел `Backend::qkv_norm_rope_kv`): откат окна
+    /// при переполнении и рост ёмкости — как в [`Self::update`]. Возвращает
+    /// позицию первой строки; сами буферы читаются через [`Self::k_ref`] /
+    /// [`Self::v_ref`], после записи — [`Self::advance`].
+    ///
+    /// НЕ отдаёт буферы по значению: `Tensor` у CUDA fp16/q8/bf16 (и
+    /// `CudaSlice` внутри) клонируется ГЛУБОКОЙ копией, так что `self.k.clone()`
+    /// давал отсоединённый буфер — fused-путь писал в копию, а настоящий
+    /// f16-KV оставался нулевым (вырожденный вывод Qwen3 0.6B/8B на CUDA).
+    pub(crate) fn begin_append(
+        &mut self,
+        backend: &dyn Backend,
+        tq: usize,
+    ) -> Result<usize, BackendError> {
+        if let Some(max) = self.max_cap
+            && self.pos + tq > max
+        {
+            self.compact(backend)?;
+        }
+        self.ensure(backend, self.pos + tq)?;
+        Ok(self.pos)
+    }
+
+    /// The k/v buffers for a fused append (borrow, never a clone — see
+    /// [`Self::begin_append`]).
+    pub(crate) fn k_ref(&self) -> &Tensor {
+        &self.k
+    }
+
+    pub(crate) fn v_ref(&self) -> &Tensor {
+        &self.v
+    }
+
+    /// Зафиксировать `tq` строк, записанных после [`Self::begin_append`].
+    pub(crate) fn advance(&mut self, tq: usize) {
+        self.pos += tq;
+    }
+
+    /// Хранилище k и v — f32 (прямая запись fused-кернелом допустима).
+    pub(crate) fn is_f32(&self) -> bool {
+        self.k_format == crate::dtype::KvFormat::F32 && self.v_format == crate::dtype::KvFormat::F32
+    }
+
+    /// Ф8.2f: оба хранилища — f16 (у Metal свой fused-кернел записи и свои
+    /// кернелы внимания; см. `MetalBackend::supported_kv_format`).
+    pub(crate) fn is_f16(&self) -> bool {
+        self.k_format == crate::dtype::KvFormat::F16 && self.v_format == crate::dtype::KvFormat::F16
     }
 
     /// View of the first `pos` rows (same buffer, restricted shape).
@@ -732,6 +924,18 @@ fn rmsnorm_head(
 ) -> Result<Tensor, BackendError> {
     let y = backend.zeros(x.shape().to_vec())?;
     backend.rmsnorm_head(x, w, &y, n_heads, 1e-6)?;
+    Ok(y)
+}
+
+/// RMSNorm по последней оси (вся проекция q/k разом) — OLMoE-путь.
+fn rmsnorm_last(
+    backend: &dyn Backend,
+    x: &Tensor,
+    w: &Tensor,
+    eps: f32,
+) -> Result<Tensor, BackendError> {
+    let y = backend.zeros(x.shape().to_vec())?;
+    backend.rmsnorm(x, w, &y, eps)?;
     Ok(y)
 }
 

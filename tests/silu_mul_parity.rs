@@ -74,11 +74,17 @@ fn parity_case(rows: usize, ffn: usize, seed: u64) {
         if !ok {
             bad += 1;
             if bad < 5 {
-                eprintln!("r={rows} ffn={ffn} [{i}]: gpu {} != reference {}", got[i], want[i]);
+                eprintln!(
+                    "r={rows} ffn={ffn} [{i}]: gpu {} != reference {}",
+                    got[i], want[i]
+                );
             }
         }
     }
-    assert_eq!(bad, 0, "silu_mul_fused {rows}x{ffn}: {bad} elements off (tol {tol})");
+    assert_eq!(
+        bad, 0,
+        "silu_mul_fused {rows}x{ffn}: {bad} elements off (tol {tol})"
+    );
 
     // And the CPU backend itself must agree with the same input (both
     // backends share the trait contract).
@@ -86,9 +92,15 @@ fn parity_case(rows: usize, ffn: usize, seed: u64) {
     let y_c = cpu.zeros(vec![rows, ffn]).unwrap();
     cpu.silu_mul_fused(&x_c, &y_c, ffn).unwrap();
     let cpu_out = cpu.to_cpu_f32(&y_c).unwrap();
-    assert_eq!(cpu_out, want, "cpu backend diverged from the row-major formula");
+    assert_eq!(
+        cpu_out, want,
+        "cpu backend diverged from the row-major formula"
+    );
 
-    println!("silu_mul_fused rows={rows} ffn={ffn}: gpu == reference ({} elems)", got.len());
+    println!(
+        "silu_mul_fused rows={rows} ffn={ffn}: gpu == reference ({} elems)",
+        got.len()
+    );
 }
 
 #[test]
@@ -105,7 +117,7 @@ fn silu_mul_fused_rejects_bad_ffn() {
     // ffn=0 / non-multiple numel must Err (mirror of the CPU oracle's
     // guard), not divide by zero or mis-slice the last row in the kernel.
     let Some(gpu) = make_gpu() else { return };
-    let x_g = gpu.from_cpu_f32(&vec![0f32; 8], vec![2, 4]).unwrap();
+    let x_g = gpu.from_cpu_f32(&[0f32; 8], vec![2, 4]).unwrap();
     let y_g = gpu.zeros(vec![2, 2]).unwrap();
     assert!(gpu.silu_mul_fused(&x_g, &y_g, 0).is_err());
     assert!(gpu.silu_mul_fused(&x_g, &y_g, 3).is_err());

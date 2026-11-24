@@ -114,8 +114,7 @@ impl ToolCallParser {
                 .rev()
                 .find(|&len| {
                     let start = self.pending.len() - len;
-                    self.pending.is_char_boundary(start)
-                        && OPEN.starts_with(&self.pending[start..])
+                    self.pending.is_char_boundary(start) && OPEN.starts_with(&self.pending[start..])
                 })
                 .unwrap_or(0);
             let text_len = self.pending.len() - keep;

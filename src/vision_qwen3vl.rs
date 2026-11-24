@@ -77,7 +77,7 @@ impl VisionQwen3Vl {
                 .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
             let data = crate::weights_map::dequant_f32(tensor);
             let shape: Vec<usize> = tensor.shape.iter().map(|&d| d as usize).collect();
-            Ok(backend.from_cpu_f32(&data, shape)?)
+            backend.from_cpu_f32(&data, shape)
         };
         // patch_embd.weight: GGUF dims (16,16,3,1024) = kernel (ph,pw,c,out),
         // файловый flat — ne0(ph) быстрейший. Нам нужен [out, c·P·P] c-major
@@ -101,7 +101,7 @@ impl VisionQwen3Vl {
                     }
                 }
             }
-            Ok(backend.from_cpu_f32(&flat, vec![out, c * p * p])?)
+            backend.from_cpu_f32(&flat, vec![out, c * p * p])
         };
         let p0 = patch("v.patch_embd.weight")?;
         let p1 = patch("v.patch_embd.weight.1")?;
@@ -233,9 +233,9 @@ impl VisionQwen3Vl {
             eprintln!("DBG conv row0[0..4]: {:?}", &dv[..4]);
         }
         // 3) merge 2×2 + patch_bias + position_embd — одним кернелом (GPU)
-        let per = per; // сетка патчей (per² = 2304)
+        // сетка патчей: per² = 2304
         let mut x = backend.zeros(vec![per * per, n_embd])?;
-        backend.merge2x2_add(&conv, &self.patch_bias, &self.pos_embd, &mut x, per)?;
+        backend.merge2x2_add(&conv, &self.patch_bias, &self.pos_embd, &x, per)?;
         if std::env::var("VISION_DBG").is_ok() {
             let dv = backend.to_cpu_f32(&x)?;
             eprintln!("DBG after merge+pos row0[0..4]: {:?}", &dv[..4]);

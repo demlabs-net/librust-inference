@@ -20,7 +20,7 @@ use crate::dtype::{Dtype, WeightFormat};
 use crate::error::BackendError;
 use crate::nn::Linear;
 use crate::qwen3::{Qwen3Config, Qwen3Model};
-use crate::weights::{F32Tensors, read_safetensors_f32};
+use crate::weights::F32Tensors;
 use crate::weights_map::{WeightTensor, WeightsMap};
 
 // ─────────────────────────── конфиг ───────────────────────────
@@ -36,6 +36,16 @@ pub struct OmniAudioConfig {
     /// Полу-окно: чанки по n_window·2 кадров.
     pub n_window: usize,
     pub max_source_positions: usize,
+}
+
+/// Один ход диалога для [`OmniModel::build_audio_input_multi`].
+pub struct AudioTurn {
+    /// ChatML-роль: "system" | "user" | "assistant".
+    pub role: String,
+    /// Some — аудио-вставка (audio_bos + N×audio_token + audio_eos) ПЕРЕД
+    /// текстом хода; ходов с аудио может быть несколько (мультитурн).
+    pub wav: Option<Vec<f32>>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -325,7 +335,7 @@ impl OmniAudioTower {
         }
         backend.gelu_erf(&h1, &h1)?;
         // conv2 (stride 2) → GELU (l2 вычислен и проверен выше)
-        let mut h = backend.zeros(vec![1, l2, d])?;
+        let h = backend.zeros(vec![1, l2, d])?;
         backend.conv1d(&h1, &self.conv2_w, Some(&self.conv2_b), 2, 1, 1, 1, &h)?;
         backend.gelu_erf(&h, &h)?;
         if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
@@ -337,8 +347,8 @@ impl OmniAudioTower {
         // + синусоидальные позиции [0..l2)
         let pos = self.pos_emb.view_offset(vec![1, l2, d], 0);
         let mut h = {
-            let mut y = backend.zeros(vec![1, l2, d])?;
-            backend.add(&h, &pos, &mut y)?;
+            let y = backend.zeros(vec![1, l2, d])?;
+            backend.add(&h, &pos, &y)?;
             y
         };
         if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
@@ -346,7 +356,7 @@ impl OmniAudioTower {
             eprintln!("OMNI_REF our_pos[0,:8]={:?}", &hv[..8.min(hv.len())]);
         }
 
-        for (li, layer) in self.layers.iter().enumerate() {
+        for layer in self.layers.iter() {
             // self-attn (полный, mask=None)
             let hn = backend.zeros(vec![1, l2, d])?;
             backend.layernorm(&h, &layer.attn_ln_w, &layer.attn_ln_b, &hn, 1e-5)?;
@@ -368,8 +378,8 @@ impl OmniAudioTower {
             // attn-выход: h = h + o (переприсваивание ВНЕШНЕЙ mut h —
             // `let h =` в цикле создал бы тень и ПОТЕРЯЛ результат между итерациями)
             h = {
-                let mut y = backend.zeros(vec![1, l2, d])?;
-                backend.add(&h, &o, &mut y)?;
+                let y = backend.zeros(vec![1, l2, d])?;
+                backend.add(&h, &o, &y)?;
                 y
             };
             if cfg!(debug_assertions) && std::env::var("OMNI_REF").is_ok() {
@@ -391,8 +401,8 @@ impl OmniAudioTower {
                 eprintln!("OMNI_REF t_after_ffn[0,:8]={:?}", &hv[..8.min(hv.len())]);
             }
             h = {
-                let mut y = backend.zeros(vec![1, l2, d])?;
-                backend.add(&h, &f, &mut y)?;
+                let y = backend.zeros(vec![1, l2, d])?;
+                backend.add(&h, &f, &y)?;
                 y
             };
         }
@@ -468,32 +478,63 @@ fn map_thinker_name(name: &str) -> Option<String> {
     Some(mapped)
 }
 
+/// Нужен ли тензор thinker'у при потенциальном чтении: мапится
+/// map_thinker_name и не отбрасывается фильтром bias в load_thinker.
+/// Держится в синхроне с отбором load_thinker — расхождение молча потеряло
+/// бы вес (или читало лишнее).
+fn thinker_wants(name: &str) -> bool {
+    match map_thinker_name(name) {
+        Some(m) => {
+            let is_attn_bias = m.ends_with(".bias")
+                && (m.contains("attn_q.") || m.contains("attn_k.") || m.contains("attn_v."));
+            !(m.ends_with(".bias") && !is_attn_bias)
+        }
+        None => false,
+    }
+}
+
 /// Собрать WeightsMap (f32) из прочитанных safetensors-тензоров thinker'а и
 /// загрузить Qwen3Model. raw-хранилище живёт в этой функции — Qwen3Model::load
 /// копирует всё в GPU до возврата.
 fn load_thinker(
     backend: &dyn Backend,
-    t: &F32Tensors,
+    t: &mut F32Tensors,
     cfg: &OmniThinkerConfig,
 ) -> Result<Qwen3Model, BackendError> {
     let mut raw: Vec<(String, Vec<u8>, Vec<u64>)> = Vec::new();
-    for (name, (data, shape)) in t {
-        if let Some(mapped) = map_thinker_name(name) {
-            // attn_q/k/v.bias обрабатывает Qwen3Model::load (qkv_bias);
-            // остальные bias в Qwen3-архитектуре не используются.
-            let is_attn_bias = mapped.ends_with(".bias")
-                && (mapped.contains("attn_q.")
-                    || mapped.contains("attn_k.")
-                    || mapped.contains("attn_v."));
-            if mapped.ends_with(".bias") && !is_attn_bias {
+    // remove() вместо клонов: F32-данные освобождаются по мере сборки raw —
+    // одновременное удержание обеих копий thinker'а (~24 ГБ на Omni-3B)
+    // разоряло память вместе с GPU-заливкой. Порядок детерминирован
+    // (сортировка имён): накопительные офсеты ниже этого не требуют,
+    // лишь бы были непрерывны.
+    let mut names: Vec<String> = t.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        let mapped = match map_thinker_name(&name) {
+            Some(m) => m,
+            None => {
+                t.remove(&name);
                 continue;
             }
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for v in data {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            raw.push((mapped, bytes, shape.iter().map(|&d| d as u64).collect()));
+        };
+        let (data, shape) = match t.remove(&name) {
+            Some(v) => v,
+            None => continue,
+        };
+        // attn_q/k/v.bias обрабатывает Qwen3Model::load (qkv_bias);
+        // остальные bias в Qwen3-архитектуре не используются.
+        let is_attn_bias = mapped.ends_with(".bias")
+            && (mapped.contains("attn_q.")
+                || mapped.contains("attn_k.")
+                || mapped.contains("attn_v."));
+        if mapped.ends_with(".bias") && !is_attn_bias {
+            continue;
         }
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        raw.push((mapped, bytes, shape.iter().map(|&d| d as u64).collect()));
     }
     // Реальные (накопительные) офсеты: tied_aliases в Qwen3Model::load
     // сравнивает offset+len — при offset=0 у всех тензоров output.weight
@@ -521,6 +562,8 @@ fn load_thinker(
     };
     eprintln!("thinker weights: {} tensors", wm.tensors.len());
     let thinker_cfg = Qwen3Config {
+        moe: None,
+        rope_yarn: None,
         dim: cfg.dim,
         n_layers: cfg.n_layers,
         n_heads: cfg.n_heads,
@@ -542,28 +585,67 @@ impl OmniModel {
     /// dir — каталог с config.json + model-0000{i}-of-00003.safetensors.
     pub fn load(backend: &dyn Backend, dir: &Path) -> Result<Self, BackendError> {
         let cfg = config_from_json(dir)?;
+        // Потенциальный план (фикс памяти): прежний путь читал ВСЕ шейды
+        // read_safetensors_f32 — F32-копия всего стека (~22 ГБ для Omni-3B
+        // thinker+talker+vision) плюс байтовый дубль thinker'а в
+        // load_thinker — пик под 46 ГБ, jetsam убивал процесс (exit 137)
+        // ещё на заливке весов. Теперь: имена и их шейды — из
+        // model.safetensors.index.json (fallback — заголовки шардов),
+        // читаем ТОЛЬКО нужные (audio tower + мапящиеся thinker) по одному
+        // тензору (range-чтение), а load_thinker освобождает F32-данные по
+        // мере сборки raw.
         let mut all: F32Tensors = HashMap::new();
-        let mut i = 1;
-        loop {
-            let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
-            if !p.exists() {
-                break;
+        let mut read = 0usize;
+        let index_path = dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            let mut name_file: HashMap<String, String> = HashMap::new();
+            for (file, names) in crate::weights::load_safetensors_index(&index_path)
+                .map_err(|e| BackendError::Shape(format!("index: {e}")))?
+            {
+                for n in names {
+                    name_file.insert(n, file.clone());
+                }
             }
-            let loaded = read_safetensors_f32(&p)
-                .map_err(|e| BackendError::Shape(format!("{}: {e}", p.display())))?;
-            let n = loaded.len();
-            all.extend(loaded);
-            eprintln!("loaded shard {i}: {n} tensors");
-            i += 1;
+            for (name, file) in &name_file {
+                if !name.starts_with("thinker.audio_tower.") && !thinker_wants(name) {
+                    continue;
+                }
+                let (data, shape) =
+                    crate::weights::read_safetensors_tensor_f32(&dir.join(file), name)
+                        .map_err(|e| BackendError::Shape(format!("{name}: {e}")))?;
+                all.insert(name.clone(), (data, shape));
+                read += 1;
+            }
+        } else {
+            let mut i = 1;
+            loop {
+                let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
+                if !p.exists() {
+                    break;
+                }
+                for name in crate::weights::safetensors_tensor_names(&p)
+                    .map_err(|e| BackendError::Shape(format!("{}: {e}", p.display())))?
+                {
+                    if !name.starts_with("thinker.audio_tower.") && !thinker_wants(&name) {
+                        continue;
+                    }
+                    let (data, shape) = crate::weights::read_safetensors_tensor_f32(&p, &name)
+                        .map_err(|e| BackendError::Shape(format!("{name}: {e}")))?;
+                    all.insert(name, (data, shape));
+                    read += 1;
+                }
+                i += 1;
+            }
+            if i == 1 {
+                return Err(BackendError::Shape(format!(
+                    "no safetensors shards in {}",
+                    dir.display()
+                )));
+            }
         }
-        if i == 1 {
-            return Err(BackendError::Shape(format!(
-                "no safetensors shards in {}",
-                dir.display()
-            )));
-        }
+        eprintln!("omni: прочитано тензоров по одному: {read}");
         let tower = OmniAudioTower::load(backend, &all, &cfg.audio)?;
-        let thinker = load_thinker(backend, &all, &cfg.thinker)?;
+        let thinker = load_thinker(backend, &mut all, &cfg.thinker)?;
         Ok(Self {
             cfg,
             tower,
@@ -581,34 +663,84 @@ impl OmniModel {
         text_after: &str,
         tokenizer: &crate::tokenizer::Tokenizer,
     ) -> Result<(Vec<u32>, Tensor, Vec<u32>, usize), BackendError> {
-        let (mel, t) = audio::log_mel_spectrogram(wav);
-        // mel — [128, T] row-major (m*T+i); tower ждёт time-major [T, 128] —
-        // транспонируем (перестановка, не reshape!)
-        let mut mel_tm = vec![0.0f32; t * 128];
-        for i in 0..t {
-            for m in 0..128 {
-                mel_tm[i * 128 + m] = mel[m * t + i];
+        self.build_audio_input_multi(
+            backend,
+            &[AudioTurn {
+                role: "user".into(),
+                wav: Some(wav.to_vec()),
+                text: text_after.into(),
+            }],
+            tokenizer,
+        )
+    }
+
+    /// Мультитурн-вход (ChatML): system (явный ход или дефолт) → ходы
+    /// (user/assistant; user с `wav` — аудио-вставка перед текстом) →
+    /// генерационный префикс assistant. Аудио-куски гонятся через башню
+    /// КАЖДЫЙ отдельно (mel-фронтенд на свой контекст), их фичи
+    /// конкатенируются в один [Σn_i, 2048]: embedding_override заменяет
+    /// ВСЕ audio_token'ы ids по порядку, так что разрывные блоки ходят
+    /// одним prefill_with_vision.
+    pub fn build_audio_input_multi(
+        &self,
+        backend: &dyn Backend,
+        turns: &[AudioTurn],
+        tokenizer: &crate::tokenizer::Tokenizer,
+    ) -> Result<(Vec<u32>, Tensor, Vec<u32>, usize), BackendError> {
+        let sys = turns
+            .iter()
+            .find(|t| t.role == "system")
+            .map(|t| t.text.clone())
+            .unwrap_or_else(|| "You are a helpful assistant.".into());
+        let mut ids = tokenizer.encode(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+        let mut feats: Vec<Tensor> = Vec::new();
+        let mut total_feat_rows = 0usize;
+        for t in turns.iter().filter(|t| t.role != "system") {
+            ids.extend(tokenizer.encode(&format!("<|im_start|>{}\n", t.role)));
+            if let Some(wav) = &t.wav {
+                let (mel, tm) = audio::log_mel_spectrogram(wav);
+                // mel — [128, T] row-major (m*T+i); tower ждёт time-major
+                // [T, 128] — транспонируем (перестановка, не reshape!)
+                let mut mel_tm = vec![0.0f32; tm * 128];
+                for i in 0..tm {
+                    for m in 0..128 {
+                        mel_tm[i * 128 + m] = mel[m * tm + i];
+                    }
+                }
+                let mel_t = backend.from_cpu_f32(&mel_tm, vec![1, tm, 128])?;
+                let f = self.tower.forward(backend, &mel_t)?;
+                total_feat_rows += f.shape()[0];
+                ids.push(self.cfg.thinker.audio_bos_id);
+                ids.extend(std::iter::repeat_n(
+                    self.cfg.thinker.audio_token_id,
+                    f.shape()[0],
+                ));
+                ids.push(self.cfg.thinker.audio_eos_id);
+                feats.push(f);
             }
+            ids.extend(tokenizer.encode(&format!("{}<|im_end|>\n", t.text)));
         }
-        let mel_t = backend.from_cpu_f32(&mel_tm, vec![1, t, 128])?;
-        let audio_tokens = self.tower.forward(backend, &mel_t)?;
-        let n = audio_tokens.shape()[0];
-        let ids = {
-            let mut ids = tokenizer.encode(
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
-                 <|im_start|>user\n",
-            );
-            ids.push(self.cfg.thinker.audio_bos_id);
-            ids.extend(std::iter::repeat(self.cfg.thinker.audio_token_id).take(n));
-            ids.push(self.cfg.thinker.audio_eos_id);
-            ids.extend(
-                tokenizer.encode(&format!("{text_after}<|im_end|>\n<|im_start|>assistant\n")),
-            );
-            ids
+        ids.extend(tokenizer.encode("<|im_start|>assistant\n"));
+        // Фичи одним тензором: единственное аудио — без копий; несколько —
+        // copy_rows_into (строки ложатся подряд, порядок = порядок токенов).
+        let vemb = match feats.len() {
+            0 => backend.zeros(vec![0, self.cfg.thinker.dim])?,
+            1 => feats.remove(0),
+            _ => {
+                let d = self.cfg.thinker.dim;
+                let mut out = backend.zeros(vec![total_feat_rows, d])?;
+                let mut row = 0usize;
+                for f in &feats {
+                    let n = f.shape()[0];
+                    out = backend.copy_rows_into(f, n, d, out, row, 0, d)?;
+                    row += n;
+                }
+                out
+            }
         };
         let pos4d: Vec<u32> = (0..ids.len() as u32).flat_map(|p| [p, p, p, 0]).collect();
         let n_ids = ids.len();
-        Ok((ids, audio_tokens, pos4d, n_ids))
+        Ok((ids, vemb, pos4d, n_ids))
     }
 }
 
@@ -626,10 +758,14 @@ pub fn tokenizer_from_json(dir: &Path) -> Result<crate::tokenizer::Tokenizer, Ba
     let norm = |s: &str| -> Vec<u8> {
         // HF byte_fallback: «<0xXX>» → сырой байт
         let b = s.as_bytes();
-        if b.len() == 6 && b[0] == b'<' && b[1] == b'0' && b[2] == b'x' && b[5] == b'>' {
-            if let Ok(n) = u8::from_str_radix(&s[3..5], 16) {
-                return vec![n];
-            }
+        if b.len() == 6
+            && b[0] == b'<'
+            && b[1] == b'0'
+            && b[2] == b'x'
+            && b[5] == b'>'
+            && let Ok(n) = u8::from_str_radix(&s[3..5], 16)
+        {
+            return vec![n];
         }
         s.as_bytes().to_vec()
     };
@@ -689,13 +825,24 @@ pub fn tokenizer_from_json(dir: &Path) -> Result<crate::tokenizer::Tokenizer, Ba
 
     let mut tok = crate::tokenizer::Tokenizer::from_parts(pieces, merges, None, None, None);
     // спец-токены (added_tokens special=true) — едиными кусками до BPE
+    let mut eog_candidates: Vec<(String, u32)> = Vec::new();
     if let Some(arr) = v["added_tokens"].as_array() {
         for t in arr {
             if t["special"].as_bool().unwrap_or(false) {
                 let id = t["id"].as_u64().unwrap_or(0) as u32;
                 let content = t["content"].as_str().unwrap_or("");
                 tok.add_special(norm(content), id);
+                eog_candidates.push((content.to_string(), id));
             }
+        }
+    }
+    // EOG (как special_eog_ids llama.cpp для Qwen-семейства): from_parts
+    // строил набор БЕЗ eos, is_eog всегда был false — генерация никогда не
+    // останавливалась на конце ответа и продолжала «Human: …» до лимита
+    // (нечестное ограничение, поймано HTTP-приёмкой). im_end + endoftext.
+    for (content, id) in &eog_candidates {
+        if content == "<|im_end|>" || content == "<|endoftext|>" {
+            tok.add_eog(*id);
         }
     }
     Ok(tok)
@@ -831,9 +978,9 @@ mod tests {
         let hd = 8;
         let heads = 2;
         let d = heads * hd;
-        let q: Vec<f32> = rand_vec(1 * tq * d, &mut rng);
-        let k: Vec<f32> = rand_vec(1 * tq * d, &mut rng);
-        let v: Vec<f32> = rand_vec(1 * tq * d, &mut rng);
+        let q: Vec<f32> = rand_vec(tq * d, &mut rng);
+        let k: Vec<f32> = rand_vec(tq * d, &mut rng);
+        let v: Vec<f32> = rand_vec(tq * d, &mut rng);
 
         let mb = MetalBackend::new().expect("metal backend");
         let cpu = CpuBackend;
@@ -926,7 +1073,10 @@ mod tests {
     /// реальным mel-входом (vassista_live.wav) — метал vs CPU.
     #[test]
     fn conv1d_real_weights_matches_cpu() {
-        let dir = std::path::Path::new("/Users/dmitriygerasimov/.vassista-models/omni3b");
+        // Абсолютный путь на машину автора ломал тест у всех остальных:
+        // каталог моделей — из env (INFER_MODELS_DIR/…), подкаталог omni3b.
+        let dir = &crate::models_dir().join("omni3b");
+        let dir = dir.as_path();
         if !dir.join("config.json").exists() {
             eprintln!("skip: omni3b не скачан");
             return;
@@ -935,7 +1085,7 @@ mod tests {
         let mut all: F32Tensors = std::collections::HashMap::new();
         for i in 1..=3 {
             let p = dir.join(format!("model-{i:05}-of-00003.safetensors"));
-            let t = read_safetensors_f32(&p).unwrap();
+            let t = crate::weights::read_safetensors_f32(&p).unwrap();
             all.extend(t);
         }
         let mb = MetalBackend::new().expect("metal backend");
@@ -961,7 +1111,7 @@ mod tests {
         let cwv = mb.to_cpu_f32(&m_tower.conv1_w).unwrap();
         eprintln!(
             "conv1d real: w[1,5,:3]={:?}",
-            &cwv[(1 * 128 + 5) * 3..(1 * 128 + 5) * 3 + 3]
+            &cwv[(128 + 5) * 3..(128 + 5) * 3 + 3]
         );
         eprintln!("conv1d real: w[0,0,:3]={:?}", &cwv[..3]);
 
@@ -1069,7 +1219,7 @@ mod tests {
     #[test]
     fn conv1d_metal_matches_cpu() {
         let mut rng = rng_u64(3);
-        let x: Vec<f32> = rand_vec(1 * 20 * 8, &mut rng);
+        let x: Vec<f32> = rand_vec(20 * 8, &mut rng);
         let w: Vec<f32> = rand_vec(16 * 8 * 3, &mut rng);
         let b: Vec<f32> = rand_vec(16, &mut rng);
 

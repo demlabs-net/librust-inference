@@ -170,13 +170,19 @@ pub fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Vec<f32>
 /// RIFF-заголовок разбирается вручную (без внешних зависимостей).
 pub fn read_wav_pcm16(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
     let bytes = std::fs::read(path)?;
+    parse_wav_pcm16_bytes(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+}
+
+/// Парсинг WAV (PCM16, mono) ИЗ ПАМЯТИ — HTTP/IPC-путь (input_audio):
+/// base64-часть приходит байтами, файла нет. Тот же RIFF-разбор, что у
+/// [`read_wav_pcm16`].
+pub fn parse_wav_pcm16_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32)> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        anyhow::bail!("not a RIFF/WAVE file: {}", path.display());
+        anyhow::bail!("not a RIFF/WAVE file");
     }
     let mut fmt_ok = false;
     let mut sample_rate = 0u32;
     let mut channels = 0u16;
-    let mut bits = 0u16;
     let mut pcm: Option<&[u8]> = None;
     let mut off = 12;
     while off + 8 <= bytes.len() {
@@ -191,7 +197,7 @@ pub fn read_wav_pcm16(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
                 let fmt = u16::from_le_bytes(bytes[body..body + 2].try_into().unwrap());
                 channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap());
                 sample_rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
-                bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
+                let bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
                 fmt_ok = fmt == 1 && bits == 16;
             }
             b"data" => {

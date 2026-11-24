@@ -22,3 +22,29 @@ fn dump_q8_first_block() {
     let vals: Vec<f32> = raw[2..34].iter().map(|&b| (b as i8) as f32 * d).collect();
     println!("d={d:.8} vals={vals:?}");
 }
+
+/// Независимая сверка раскладки квант-блоков с python-разбором GGUF по
+/// спецификации (scripts/gguf_block_ref.py): первый блок тензора.
+/// Запуск: QWEN_GGUF=path QWEN_TENSOR=name cargo test --features metal \
+///   --test dequant_dump -- --ignored --nocapture dump_quant_first_block
+#[test]
+#[ignore]
+fn dump_quant_first_block() {
+    let path = std::env::var("QWEN_GGUF").expect("QWEN_GGUF");
+    let name = std::env::var("QWEN_TENSOR").expect("QWEN_TENSOR");
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let parsed = gguf::parse(&mmap).unwrap();
+    let wm = WeightsMap::from_gguf(&parsed).unwrap();
+    let t = wm.get(&name).expect("tensor");
+    let vals = rust_inference::weights_map::dequant_f32(t);
+    println!("tensor={name} shape={:?} format={:?}", t.shape, t.format);
+    println!(
+        "first 8 values: {}",
+        vals[..8]
+            .iter()
+            .map(|v| format!("{v:.8}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}

@@ -451,7 +451,6 @@ impl BertEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::default_backend;
 
     /// Детерминированный LCG-генератор весов (от стабильного сида).
     struct Lcg(u64);
@@ -506,15 +505,11 @@ mod tests {
             let p = format!("encoder.layer.{i}");
             for part in ["query", "key", "value"] {
                 put(
-                    format!("{p}.attention.self.{part}.weight").into(),
+                    format!("{p}.attention.self.{part}.weight"),
                     t(d, d),
                     vec![d, d],
                 );
-                put(
-                    format!("{p}.attention.self.{part}.bias").into(),
-                    t(d, 1),
-                    vec![d],
-                );
+                put(format!("{p}.attention.self.{part}.bias"), t(d, 1), vec![d]);
             }
             put(
                 format!("{p}.attention.output.dense.weight"),
@@ -733,7 +728,7 @@ mod tests {
     #[test]
     fn cpu_matches_gpu() {
         let (w, config) = mini_weights();
-        let b = default_backend().unwrap();
+        let b = crate::train::default_backend().unwrap();
         let out = run_on(b.as_ref(), &w, &config);
         assert_eq!(out.len(), 2);
         for (i, v) in out.iter().enumerate() {

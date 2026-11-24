@@ -21,6 +21,11 @@ pub enum BackendError {
     #[error("device init failed: {0}")]
     DeviceInit(String),
 
+    /// Операция остановлена по явному запросу (флаг отмены: таймаут TTS,
+    /// стоп-кнопка). Не ошибка устройства — вызывающий сам решил прервать.
+    #[error("cancelled")]
+    Cancelled,
+
     /// GPU memory allocation failed. Pools must translate this into the
     /// NO_RESOURCES / Waiting semantics, never panic.
     #[error("out of memory: {0}")]

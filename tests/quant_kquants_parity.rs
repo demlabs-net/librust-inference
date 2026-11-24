@@ -84,9 +84,7 @@ fn parity_case(quant: WeightQuant, rows: usize, per: usize, seed: u64) {
                 if g != c {
                     bad += 1;
                     if bad < 5 {
-                        eprintln!(
-                            "{quant:?} r={r} sb={sb} j={j}: gpu {g} != reference {c}",
-                        );
+                        eprintln!("{quant:?} r={r} sb={sb} j={j}: gpu {g} != reference {c}",);
                     }
                 }
             }

@@ -12,7 +12,12 @@ tracing = "0.1"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+# Чат-шаблоны (Jinja из tokenizer.chat_template): полноценный движок вместо
+# своего подмножества — реальные шаблоны Qwen3/Qwen3.5/Qwen3-VL используют
+# namespace, macro, loop.*, срезы, методы строк (pycompat из contrib).
+minijinja = { version = "2", features = ["json", "preserve_order", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 once_cell = "1"
 cudarc = { version = "0.19.9", default-features = false, optional = true }
 half = "2"
@@ -42,10 +47,52 @@ cpu = []
 # `cpu` now in default, plain `cargo test` must not try to build them
 # (they are LLM-zone demos, not part of the bridge's test surface).
 [[example]]
+name = "glm_probe"
+required-features = ["metal"]
+[[example]]
+name = "glm_chat"
+required-features = ["metal"]
+[[example]]
+name = "train_logits_check"
+required-features = ["metal"]
+[[example]]
+name = "dflash_env_matrix"
+required-features = ["metal"]
+[[example]]
+name = "dflash_block_dump"
+required-features = ["metal"]
+[[example]]
 name = "audio_chat"
 required-features = ["metal"]
 [[example]]
 name = "llm_chat"
+required-features = ["metal"]
+[[example]]
+name = "qwen35_chat"
+required-features = ["metal"]
+[[example]]
+name = "mv_bench"
+required-features = ["metal"]
+[[example]]
+name = "prefill_probe"
+required-features = ["metal"]
+[[example]]
+name = "llm_bench"
+required-features = ["metal"]
+[[example]]
+name = "decode_breakdown"
+required-features = ["metal"]
+[[example]]
+name = "verify_cost"
+required-features = ["metal"]
+[[example]]
+name = "gemm_small_m"
+required-features = ["metal"]
+[[example]]
+name = "layer_gpu_probe"
+required-features = ["metal"]
+[[example]]
+name = "prefill_breakdown"
 required-features = ["metal"]
 [[example]]
 name = "vision_chat"
@@ -58,6 +105,12 @@ name = "dflash_probe"
 required-features = ["metal"]
 [[example]]
 name = "dflash_probe2"
+required-features = ["metal"]
+# nan_probe imports rust_inference::metal directly. Without this gate a plain
+# `cargo test` on a non-macOS host failed to COMPILE the example (E0432), so no
+# integration test in this crate ran at all on Linux/CUDA hosts.
+[[example]]
+name = "nan_probe"
 required-features = ["metal"]
 
 # The Metal engine (our own MSL kernels + buffers) — behind the `metal`
@@ -82,3 +135,103 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+[[example]]
+name = "attn_bench"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_generate"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_longctx"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_overflow"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_serve"
+required-features = ["metal"]
+
+[[example]]
+name = "batch_step"
+required-features = ["metal"]
+
+[[example]]
+name = "bench_iq4xs"
+required-features = ["metal"]
+
+[[example]]
+name = "gdn_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "mtp_check"
+required-features = ["metal"]
+
+[[example]]
+name = "orc_vec_run"
+required-features = ["metal"]
+
+[[example]]
+name = "prefill_hidden_check"
+required-features = ["metal"]
+
+[[example]]
+name = "prefix_cache"
+required-features = ["metal"]
+
+[[example]]
+name = "slot_switch"
+required-features = ["metal"]
+
+[[example]]
+name = "spec_oracle_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "spec_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "spec_slot_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "window_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_tile_glm_inputs"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_vec_check"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_vec_decode_long"
+required-features = ["metal"]
+
+[[example]]
+name = "fa_vec_glm_inputs"
+required-features = ["metal"]
+
+[[example]]
+name = "iq4_mm_check"
+required-features = ["metal"]
+
+[[example]]
+name = "mv_q4k_check"
+required-features = ["metal"]
+
+[[example]]
+name = "mv_q50_synth"
+required-features = ["metal"]
+
+[[example]]
+name = "swiglu_check"
+required-features = ["metal"]

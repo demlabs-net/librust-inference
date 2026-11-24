@@ -165,21 +165,37 @@ fn f16_to_f32(h: u16) -> f32 {
 
 // ─────────────────── по-тензорный доступ (конверсия Ф4.12) ───────────────────
 
-/// Строка заголовка safetensors: (имя, dtype, shape, смещение в data-секции).
-type StTensorInfo = (String, String, Vec<usize>, usize);
+/// Строка заголовка safetensors: (имя, dtype, shape, начало и КОНЕЦ диапазона
+/// в файле). Конец обязателен: без него читатель доверял только shape и мог
+/// молча выйти за пределы своего тензора.
+type StTensorInfo = (String, String, Vec<usize>, usize, usize);
 
 /// Парсинг заголовка safetensors (имена + оффсеты, без данных).
 fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 8 {
-        anyhow::bail!("safetensors: file too short ({} bytes)", bytes.len());
+    // Только заголовок (8 байт длины + JSON-шапка), НЕ весь файл: эта
+    // функция зовётся на каждый тензор при потоковой загрузке, и прежний
+    // std::fs::read перечитывал 5-гигабайтный шард ради 200 КБ заголовка —
+    // 924 тензора Omni-3B = 4.6 ТБ чтений (загрузка 832 с вместо минут).
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    use std::io::Read as _;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf)
+        .with_context(|| format!("{}: чтение длины заголовка", path.display()))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    // Разумный потолок (битый/враждебный файл не превратится в аллокацию
+    // на гигабайты): реальные шапки — сотни КБ.
+    if header_len > 256 * 1024 * 1024 {
+        anyhow::bail!(
+            "safetensors: заголовок {} подозрительно велик ({} B)",
+            path.display(),
+            header_len
+        );
     }
-    let header_len = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
-    let header_end = 8usize
-        .checked_add(header_len)
-        .filter(|&e| e <= bytes.len())
-        .ok_or_else(|| anyhow::anyhow!("safetensors: header len {header_len} exceeds file size"))?;
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..header_end])?;
+    let mut buf = vec![0u8; header_len];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("{}: чтение заголовка", path.display()))?;
+    let header: serde_json::Value = serde_json::from_slice(&buf)?;
     let map = header
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid safetensors header"))?;
@@ -211,12 +227,28 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
         let raw = offsets
             .first()
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))? as usize;
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets for {name}"))?
+            as usize;
         let start = raw
             .checked_add(8)
             .and_then(|s| s.checked_add(header_len))
             .ok_or_else(|| anyhow::anyhow!("data offset overflow for {name}"))?;
-        out.push((name.clone(), dtype, shape, start));
+        // Конец диапазона тоже нужен: без него читатель брал размер из shape
+        // и не сверял его с заголовком, поэтому лживый/битый заголовок
+        // приводил к молчаливому чтению ЧУЖИХ байтов (соседнего тензора).
+        let raw_end = offsets
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("bad data_offsets[1] for {name}"))?
+            as usize;
+        let end = raw_end
+            .checked_add(8)
+            .and_then(|e| e.checked_add(header_len))
+            .ok_or_else(|| anyhow::anyhow!("data offset overflow for {name}"))?;
+        if end < start {
+            anyhow::bail!("tensor {name}: data_offsets[1] < data_offsets[0]");
+        }
+        out.push((name.clone(), dtype, shape, start, end));
     }
     Ok(out)
 }
@@ -225,7 +257,7 @@ fn safetensors_header(path: &Path) -> anyhow::Result<Vec<StTensorInfo>> {
 pub fn safetensors_tensor_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(safetensors_header(path)?
         .into_iter()
-        .map(|(n, _, _, _)| n)
+        .map(|(n, _, _, _, _)| n)
         .collect())
 }
 
@@ -233,8 +265,8 @@ pub fn safetensors_tensor_names(path: &Path) -> anyhow::Result<Vec<String>> {
 pub fn safetensors_tensor_numel(path: &Path, name: &str) -> anyhow::Result<usize> {
     let h = safetensors_header(path)?;
     h.into_iter()
-        .find(|(n, _, _, _)| n == name)
-        .map(|(_, _, shape, _)| {
+        .find(|(n, _, _, _, _)| n == name)
+        .map(|(_, _, shape, _, _)| {
             shape
                 .iter()
                 .try_fold(1usize, |acc, &d| acc.checked_mul(d))
@@ -251,11 +283,10 @@ pub fn read_safetensors_tensor_f32(
     name: &str,
 ) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
     let h = safetensors_header(path)?;
-    let (_, dtype, shape, start) = h
+    let (_, dtype, shape, start, declared_end) = h
         .into_iter()
-        .find(|(n, _, _, _)| n == name)
+        .find(|(n, _, _, _, _)| n == name)
         .ok_or_else(|| anyhow::anyhow!("tensor {name} not found"))?;
-    let bytes = std::fs::read(path)?;
     // checked product (битый shape в заголовке → чистый Err, не wrap).
     let numel: usize = shape
         .iter()
@@ -274,9 +305,31 @@ pub fn read_safetensors_tensor_f32(
     let end = start
         .checked_add(nbytes)
         .ok_or_else(|| anyhow::anyhow!("overflow for {name}"))?;
-    let data = bytes
-        .get(start..end)
-        .ok_or_else(|| anyhow::anyhow!("tensor {name}: byte range out of bounds"))?;
+    // Сверяем вычисленный размер с границей из заголовка: shape/dtype могут
+    // не соответствовать data_offsets, и тогда чтение ушло бы в соседний
+    // тензор, не вызвав ни одной ошибки.
+    if end > declared_end {
+        anyhow::bail!(
+            "tensor {name}: {nbytes} B по shape/dtype не влезает в диапазон заголовка              ({} B)",
+            declared_end.saturating_sub(start)
+        );
+    }
+    // Диапазонное чтение (seek+read_exact), а не весь файл: шард Omni-3B —
+    // 5 ГБ, и прежний std::fs::read держал его в RAM целиком РАДИ одного
+    // тензора — при потоковой загрузке модели это разоряло память
+    // (jetsam kill 137 на загрузке omni3b).
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(
+        start
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("tensor {name}: offset overflow"))?,
+    ))?;
+    let mut buf = vec![0u8; nbytes];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("reading tensor {name} ({} B)", nbytes))?;
+    let data = &buf[..];
     let mut vec = Vec::with_capacity(numel);
     match dtype.as_str() {
         "F32" => {

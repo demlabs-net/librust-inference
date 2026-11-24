@@ -63,6 +63,61 @@ pub enum WeightFormat {
     Q8_0,
     Q4_K,
     Q6_K,
+    Q5_K,
+    Q5_0,
+    /// IQ4_XS: i-квант (A4) — 256-эл. суперблок, 136 Б, 4.25 бита; ниббл —
+    /// индекс в нелинейном кодбуке `kvalues_iq4nl` (ggml), плюс 6-битные
+    /// масштабы подблоков (ls - 32, знак возможен).
+    Iq4Xs,
+    /// IQ4_NL: 32-эл. блок, 18 Б (f16 d + 16 байт нибблов), 4.5 бита;
+    /// ниббл — индекс в том же нелинейном кодбуке kvalues_iq4nl, что у
+    /// IQ4_XS, но без супер-блочных 6-битных масштабов (d на весь блок).
+    Iq4Nl,
+    /// MXFP4 (OCP): 32-эл. блок, 17 Б (E8M0-скейл + 16 байт нибблов E2M1),
+    /// 4.25 бита. Значения — kvalues_fp4 («удвоенные» E2M1), d = 2^(e−128).
+    Mxfp4,
+    /// NVFP4: 64-эл. блок, 36 Б (4 UE4M3-скейла на подблоки по 16 + 32 Б
+    /// нибблов E2M1), 4.5 бита. См. ggml block_nvfp4 / dequantize_row_nvfp4.
+    Nvfp4,
+    /// Q2_K: 256-эл. суперблок, 84 Б (scales[16] 4-бит scale/min, qs[64]
+    /// по 2 бита, d, dmin), 2.625 бита.
+    Q2_K,
+    /// Q3_K: 256-эл. суперблок, 110 Б (hmask[32], qs[64] по 2 бита,
+    /// scales[12] — 6-бит со знаком через −32, d), 3.4375 бита.
+    Q3_K,
+    /// Q4_1: 32-эл. блок, 20 Б (d, m, 16 Б нибблов), значение d·q + m.
+    Q4_1,
+    /// Q5_1: 32-эл. блок, 24 Б (d, m, qh[4], 16 Б нибблов), 5-й бит в qh.
+    Q5_1,
+    /// Q8_1: 32-эл. блок, 40 Б (d, s, int8[32]) — активационный формат.
+    Q8_1,
+    /// Q8_K: 256-эл. суперблок, 292 Б (f32 d, int8[256], int16 bsums[16]).
+    Q8_K,
+    /// Q1_0: 128-эл. блок, 18 Б (d + 16 Б битов), значения ±d.
+    Q1_0,
+    /// Q2_0: 64-эл. блок, 18 Б (d + 16 Б по 2 бита), значения (q−1)·d.
+    Q2_0,
+    /// TQ1_0: 256-эл. суперблок, 54 Б (qs[48] по 5 троичных в байте через
+    /// 3^n, qh[4] по 4, d), 1.6875 бита.
+    TQ1_0,
+    /// TQ2_0: 256-эл. суперблок, 66 Б (qs[64] по 4 двухбитных, d), 2.0625.
+    TQ2_0,
+    /// IQ2_XXS: 256-эл. суперблок, 66 Б (d + qs[32] u16), 2.0625 бита;
+    /// 2-битные коды — индексы в сетке iq2xxs_grid, знаки — ksigns_iq2xs.
+    Iq2Xxs,
+    /// IQ3_XXS: 256-эл. суперблок, 98 Б (d + qs[64] индексов сетки
+    /// iq3xxs_grid + 32 Б scales_and_signs), 3.0625 бита.
+    Iq3Xxs,
+    /// IQ2_XS: 74 Б (d + 32 u16 индексов + scales[8]), 2.3125.
+    Iq2Xs,
+    /// IQ2_S: 82 Б (d + qs[64] + qh[8] + scales[8]), 2.5625.
+    Iq2S,
+    /// IQ3_S: 110 Б (d + qs[64] + qh[8] + signs[32] + scales[4]), 3.4375.
+    Iq3S,
+    /// IQ1_S: 50 Б (d + qs[32] + qh[16] u16), 1.5625.
+    Iq1S,
+    /// IQ1_M: 56 Б (qs[32] + qh[16] + scales[8]), 1.75.
+    Iq1M,
     Int4,
     Nf4,
 }
@@ -78,6 +133,29 @@ impl WeightFormat {
             // neither the old 148 B nor the canonical 144 B layout).
             WeightFormat::Q4_K => 4.5, // 256-elem super-block: 144 B (canonical ggml)
             WeightFormat::Q6_K => 6.5625, // 256-elem super-block: 210 B (canonical ggml)
+            WeightFormat::Q5_K => 5.5, // 256-elem super-block: 176 B (canonical ggml)
+            WeightFormat::Q5_0 => 5.5, // 32-elem block: 22 B (canonical ggml)
+            WeightFormat::Iq4Xs => 4.25, // 256-elem super-block: 136 B (ggml)
+            WeightFormat::Iq4Nl => 4.5, // 32-elem block: 18 B (ggml block_iq4_nl)
+            WeightFormat::Mxfp4 => 4.25, // 32-elem block: 17 B (ggml block_mxfp4)
+            WeightFormat::Nvfp4 => 4.5, // 64-elem block: 36 B (ggml block_nvfp4)
+            WeightFormat::Q2_K => 2.625, // 256-elem super-block: 84 B
+            WeightFormat::Q3_K => 3.4375, // 256-elem super-block: 110 B
+            WeightFormat::Q4_1 => 5.0, // 32-elem block: 20 B
+            WeightFormat::Q5_1 => 6.0, // 32-elem block: 24 B
+            WeightFormat::Q8_1 => 9.0, // 32-elem block: 36 B (d+s+int8[32])
+            WeightFormat::Q8_K => 9.125, // 256-elem super-block: 292 B
+            WeightFormat::Q1_0 => 1.125, // 128-elem block: 18 B
+            WeightFormat::Q2_0 => 2.25, // 64-elem block: 18 B
+            WeightFormat::TQ1_0 => 1.6875, // 256-elem super-block: 54 B
+            WeightFormat::TQ2_0 => 2.0625, // 256-elem super-block: 66 B
+            WeightFormat::Iq2Xxs => 2.0625, // 256-elem super-block: 66 B (i-quant)
+            WeightFormat::Iq3Xxs => 3.0625, // 256-elem super-block: 98 B (i-quant)
+            WeightFormat::Iq2Xs => 2.3125, // 74 B
+            WeightFormat::Iq2S => 2.5625, // 82 B
+            WeightFormat::Iq3S => 3.4375, // 110 B
+            WeightFormat::Iq1S => 1.5625, // 50 B
+            WeightFormat::Iq1M => 1.75, // 56 B
             WeightFormat::Int4 => 4.5, // group 128: 4 bit + f32 scale/offset
             WeightFormat::Nf4 => 4.5,
         }
@@ -87,6 +165,49 @@ impl WeightFormat {
         !matches!(self, WeightFormat::Plain(_))
     }
 
+    /// (элементов в блоке, байт в блоке) для блочно-квантованных форматов
+    /// (раскладки ggml); None — формат не блочный (Plain/Int4/Nf4).
+    ///
+    /// Нужно там, где тензор режется ПО СТРОКАМ без копии (эксперты MoE):
+    /// смещение среза считается в блоках, а не в элементах.
+    pub fn block(self) -> Option<(usize, usize)> {
+        match self {
+            WeightFormat::Plain(_) | WeightFormat::Int4 | WeightFormat::Nf4 => None,
+            WeightFormat::Q4_0 => Some((32, 18)),
+            WeightFormat::Q5_0 => Some((32, 22)),
+            WeightFormat::Iq4Nl => Some((32, 18)),
+            WeightFormat::Mxfp4 => Some((32, 17)),
+            WeightFormat::Nvfp4 => Some((64, 36)),
+            WeightFormat::Q2_K => Some((256, 84)),
+            WeightFormat::Q3_K => Some((256, 110)),
+            WeightFormat::Q4_1 => Some((32, 20)),
+            WeightFormat::Q5_1 => Some((32, 24)),
+            WeightFormat::Q8_1 => Some((32, 36)),
+            WeightFormat::Q8_K => Some((256, 292)),
+            WeightFormat::Q1_0 => Some((128, 18)),
+            WeightFormat::Q2_0 => Some((64, 18)),
+            WeightFormat::TQ1_0 => Some((256, 54)),
+            WeightFormat::TQ2_0 => Some((256, 66)),
+            WeightFormat::Iq2Xxs => Some((256, 66)),
+            WeightFormat::Iq3Xxs => Some((256, 98)),
+            WeightFormat::Iq2Xs => Some((256, 74)),
+            WeightFormat::Iq2S => Some((256, 82)),
+            WeightFormat::Iq3S => Some((256, 110)),
+            WeightFormat::Iq1S => Some((256, 50)),
+            WeightFormat::Iq1M => Some((256, 56)),
+            WeightFormat::Iq4Xs => Some((256, 136)),
+            WeightFormat::Q8_0 => Some((32, 34)),
+            WeightFormat::Q4_K => Some((256, 144)),
+            WeightFormat::Q5_K => Some((256, 176)),
+            WeightFormat::Q6_K => Some((256, 210)),
+        }
+    }
+
+    /// Байт в строке из `cols` элементов для блочного формата; None — не блочный.
+    pub fn block_row_bytes(self, cols: usize) -> Option<usize> {
+        self.block().map(|(be, bb)| cols.div_ceil(be) * bb)
+    }
+
     pub fn name(self) -> String {
         match self {
             WeightFormat::Plain(d) => d.name().to_string(),
@@ -94,6 +215,29 @@ impl WeightFormat {
             WeightFormat::Q8_0 => "q8_0".into(),
             WeightFormat::Q4_K => "q4_k".into(),
             WeightFormat::Q6_K => "q6_k".into(),
+            WeightFormat::Q5_K => "q5_k".into(),
+            WeightFormat::Q5_0 => "q5_0".into(),
+            WeightFormat::Iq4Xs => "iq4_xs".into(),
+            WeightFormat::Iq4Nl => "iq4_nl".into(),
+            WeightFormat::Mxfp4 => "mxfp4".into(),
+            WeightFormat::Nvfp4 => "nvfp4".into(),
+            WeightFormat::Q2_K => "q2_k".into(),
+            WeightFormat::Q3_K => "q3_k".into(),
+            WeightFormat::Q4_1 => "q4_1".into(),
+            WeightFormat::Q5_1 => "q5_1".into(),
+            WeightFormat::Q8_1 => "q8_1".into(),
+            WeightFormat::Q8_K => "q8_k".into(),
+            WeightFormat::Q1_0 => "q1_0".into(),
+            WeightFormat::Q2_0 => "q2_0".into(),
+            WeightFormat::TQ1_0 => "tq1_0".into(),
+            WeightFormat::TQ2_0 => "tq2_0".into(),
+            WeightFormat::Iq2Xxs => "iq2_xxs".into(),
+            WeightFormat::Iq3Xxs => "iq3_xxs".into(),
+            WeightFormat::Iq2Xs => "iq2_xs".into(),
+            WeightFormat::Iq2S => "iq2_s".into(),
+            WeightFormat::Iq3S => "iq3_s".into(),
+            WeightFormat::Iq1S => "iq1_s".into(),
+            WeightFormat::Iq1M => "iq1_m".into(),
             WeightFormat::Int4 => "int4".into(),
             WeightFormat::Nf4 => "nf4".into(),
         }

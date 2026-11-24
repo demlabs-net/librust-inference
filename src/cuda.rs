@@ -25,7 +25,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::backend::{Backend, Tensor};
+use crate::backend::{Backend, GdnBatchGeom, Tensor};
 use crate::error::BackendError;
 
 /// Elementwise op codes — mirror `elementwise_f32` switch in kernels.cu.
@@ -84,6 +84,10 @@ fn lock_poison_resilient<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// to the backend's size-keyed pool when the last `Arc` reference drops —
 /// inference allocates hundreds of temporaries per token, so avoiding
 /// `cuMemAlloc` per op is a launch-budget win.
+/// Счётчики пула (диагностика QWEN35_POOL_STATS): промах = cudaMalloc.
+static POOL_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static POOL_MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Debug)]
 pub struct CudaBuffer {
     slice: Option<CudaSlice<f32>>,
@@ -103,7 +107,7 @@ impl CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if let (Some(s), Some(pool)) = (self.slice.take(), &self.pool) {
-            let mut pool = lock_poison_resilient(&pool);
+            let mut pool = lock_poison_resilient(pool);
             let bucket = pool.entry(s.len()).or_default();
             // Cap the pool per bucket AND by byte size: without the byte
             // cap, grown KV buffers (~16 MB+ per cache row) returned by
@@ -111,8 +115,28 @@ impl Drop for CudaBuffer {
             // never free (18 GB of dead KV after a few calls — the live
             // VRAM creep). Small hot buffers (activations, cpart) stay.
             const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
-            const MAX_PER_BUCKET: usize = 8;
-            if bucket.len() < MAX_PER_BUCKET && s.len() * 4 <= MAX_POOL_BYTES {
+            // Мелкие буферы (активации, строки пакета) в шаге живут десятками
+            // одновременно: при капе 8 девятый запрос размера 1024 уходил в
+            // cudaMalloc, а тот синхронизирует устройство. Замер пакетного
+            // шага: по-слотовая секция 21 мс при B=2 против 3.8 при B=1 —
+            // это была не арифметика, а промахи пула.
+            // 2 МБ: сюда попадает scratch внимания (b·tq·nh·nchunks·nwarps·34
+            // f32 — на 27B это сотни КБ на слой) и прочие рабочие буферы слоя.
+            // Кап по классу размера: промах = alloc (на живой очереди это
+            // ожидание), а в по-слотовом цикле внимания одновременно живут
+            // десятки буферов одного размера. Замер с QWEN35_POOL_STATS:
+            // 5-8 % промахов при капах 32/8 — как раз они и съедали
+            // по-слотовую секцию пакетного шага.
+            const SMALL_BYTES: usize = 64 * 1024;
+            const MEDIUM_BYTES: usize = 2 * 1024 * 1024;
+            let cap = if s.len() * 4 <= SMALL_BYTES {
+                256
+            } else if s.len() * 4 <= MEDIUM_BYTES {
+                64
+            } else {
+                8
+            };
+            if bucket.len() < cap && s.len() * 4 <= MAX_POOL_BYTES {
                 bucket.push(s);
             }
             // else: drop — the cudaMalloc'd memory is released.
@@ -131,7 +155,7 @@ fn push_capped<T>(
 ) {
     const MAX_POOL_BYTES: usize = 8 * 1024 * 1024;
     const MAX_PER_BUCKET: usize = 8;
-    let mut pool = lock_poison_resilient(&pool);
+    let mut pool = lock_poison_resilient(pool);
     let bucket = pool.entry(sl.len()).or_default();
     if bucket.len() < MAX_PER_BUCKET && sl.len() * elem_bytes <= MAX_POOL_BYTES {
         bucket.push(sl);
@@ -158,6 +182,14 @@ pub struct CudaBackend {
     pool_f16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::f16>>>>>,
     /// bf16 scratch pool (activations cast for the bf16 activation axis).
     pool_bf16: Arc<Mutex<HashMap<usize, Vec<cudarc::driver::CudaSlice<half::bf16>>>>>,
+    /// Большой bf16-скретч под раскладку квантового веса (prefill через
+    /// tensor cores): 178 МБ на матрицу 5120×17408, поэтому он живёт одним
+    /// буфером «не меньше нужного», а не в пуле мелких (тот режет 8 МБ).
+    bf16_scratch: Mutex<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    /// Скретчи префилл-внимания на cuBLAS: score/выход головы (f32) и
+    /// Q/вероятности (f16). Растут по требованию, один буфер на каждый тип.
+    attn_f32: Mutex<Option<cudarc::driver::CudaSlice<f32>>>,
+    attn_f16: Mutex<Option<cudarc::driver::CudaSlice<half::f16>>>,
     /// Activation compute dtype for GEMM A-operands (the plan's activation
     /// axis — `set_activation_dtype`; 0=f32, 1=f16, 2=bf16).
     activation: std::sync::atomic::AtomicU8,
@@ -181,6 +213,9 @@ impl CudaBackend {
             cublas: Mutex::new(None),
             pool_f16: Arc::new(Mutex::new(HashMap::new())),
             pool_bf16: Arc::new(Mutex::new(HashMap::new())),
+            bf16_scratch: Mutex::new(None),
+            attn_f32: Mutex::new(None),
+            attn_f16: Mutex::new(None),
             activation: std::sync::atomic::AtomicU8::new(0),
         })
     }
@@ -198,10 +233,10 @@ impl CudaBackend {
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<half::f16>, BackendError> {
         let mut pool = lock_poison_resilient(&self.pool_f16);
-        if let Some(bucket) = pool.get_mut(&n) {
-            if let Some(s) = bucket.pop() {
-                return Ok(s);
-            }
+        if let Some(bucket) = pool.get_mut(&n)
+            && let Some(s) = bucket.pop()
+        {
+            return Ok(s);
         }
         unsafe { self.stream.alloc::<half::f16>(n) }.map_err(map_err)
     }
@@ -211,10 +246,10 @@ impl CudaBackend {
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<half::bf16>, BackendError> {
         let mut pool = lock_poison_resilient(&self.pool_bf16);
-        if let Some(bucket) = pool.get_mut(&n) {
-            if let Some(s) = bucket.pop() {
-                return Ok(s);
-            }
+        if let Some(bucket) = pool.get_mut(&n)
+            && let Some(s) = bucket.pop()
+        {
+            return Ok(s);
         }
         unsafe { self.stream.alloc::<half::bf16>(n) }.map_err(map_err)
     }
@@ -255,11 +290,28 @@ impl CudaBackend {
     /// blocks; the full-nblk grid (1 k-block per split) measured slightly
     /// worse — 2 k-blocks per split balances grid density vs per-block work.
     fn pick_split(&self, nblk: usize, m: usize, n: usize, grid_x: usize) -> usize {
+        // Экспериментальный рычаг: INFER_GEMM_SPLITK=N фиксирует число
+        // k-делений (0 — не сплитить). Эвристика ниже выбирает максимум,
+        // но при коротком k (2 блока на поток) может быть выгоднее меньше
+        // делений — решается замером.
+        if let Some(v) = std::env::var("INFER_GEMM_SPLITK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if v == 0 {
+                return 1;
+            }
+            if v > 0 && nblk.is_multiple_of(v) {
+                return v;
+            }
+        }
         let cap_cpart = 16 * 1024 * 1024 / 4; // elements (f32)
         let cap_grid = 8192;
         (1..=nblk / 2)
             .rev()
-            .find(|&s| nblk % s == 0 && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid)
+            .find(|&s| {
+                nblk.is_multiple_of(s) && s * m * n <= cap_cpart && grid_x * m * s <= cap_grid
+            })
             .unwrap_or(1)
     }
 
@@ -282,7 +334,7 @@ impl CudaBackend {
             // "reducing stale data is fine" license.
             return 1;
         }
-        let nkz = (nsup + 15) / 16;
+        let nkz = nsup.div_ceil(16);
         nsup.div_ceil(nkz).max(1)
     }
 
@@ -307,7 +359,7 @@ impl CudaBackend {
         let s32 = s as i32;
         let f = self.function("gemm_i8_reduce")?;
         let cfg = LaunchConfig {
-            grid_dim: (((m * n + 255) / 256) as u32, 1, 1),
+            grid_dim: ((m * n).div_ceil(256) as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -368,7 +420,7 @@ impl CudaBackend {
         n: usize,
         b_suf: &'static str,
     ) -> Result<(), BackendError> {
-        if k % 32 != 0 {
+        if !k.is_multiple_of(32) {
             // Shapes like the DAC codec's (1, 8, 1024) carry raw row-major
             // half weights (k%32!=0 tensors are not kb-major packed) — the
             // naive elementwise kernel covers any k (the split-k/tiled paths
@@ -398,7 +450,7 @@ impl CudaBackend {
         let n32 = n as i32;
         let m32 = m as i32;
         let c = c.as_cuda_mut();
-        let grid_x = (n + 255) / 256;
+        let grid_x = n.div_ceil(256);
         let act = self.activation_dtype();
         let (tiled_name, splitk_name): (&'static str, &'static str) = match (b_suf, act) {
             ("bf16", crate::dtype::Dtype::F16) => {
@@ -437,7 +489,7 @@ impl CudaBackend {
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled_name)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                grid_dim: (grid_x as u32, m.div_ceil(32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -464,7 +516,7 @@ impl CudaBackend {
         // already hides the latency).
         let s = [32usize, 16, 8, 4, 2, 1]
             .into_iter()
-            .find(|&s| nblk % s == 0)
+            .find(|&s| nblk.is_multiple_of(s))
             .unwrap_or(1);
         let cpart = self.take_pooled(s * m * n)?;
         let f = self.function(splitk_name)?;
@@ -509,6 +561,14 @@ impl CudaBackend {
         if std::env::var_os("CUDA_NO_CUBLAS").is_some() {
             return Ok(false);
         }
+        // Reject aliased operands BEFORE creating the &mut below: C = A·B with
+        // C sharing storage with A or B is not a valid GEMM, and the aliased
+        // mutable reference would be undefined behaviour.
+        if c.shares_buffer_with(x) || c.shares_buffer_with(y) {
+            return Err(BackendError::Shape(
+                "gemm: output buffer aliases an input; use a distinct output tensor".into(),
+            ));
+        }
         let mut guard = lock_poison_resilient(&self.cublas);
         if guard.is_none() {
             match CudaBlas::new(self.stream.clone()) {
@@ -540,6 +600,507 @@ impl CudaBackend {
         })
     }
 
+    /// Префилл-внимание на f16-тензорных ядрах: score = Q·Kᵀ (gemm_ex),
+    /// softmax+маска (ядро), out = P·V (gemm_ex). Материализует score
+    /// (tq×tkv) — под чанки ≤ 2048 это дешевле тайлового FMA-ядра.
+    /// `false` — не взялись (нет cuBLAS, бюджет буфера, не тот формат).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prefill_blas(
+        &self,
+        q: &Tensor,
+        k16: &cudarc::driver::CudaSlice<half::f16>,
+        v16: &cudarc::driver::CudaSlice<half::f16>,
+        mask: Option<&Tensor>,
+        y: &Tensor,
+        tq: usize,
+        tkv: usize,
+        n_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Result<bool, BackendError> {
+        if std::env::var_os("CUDA_NO_CUBLAS").is_some()
+            || std::env::var_os("CUDA_NO_ATTN_BLAS").is_some()
+        {
+            return Ok(false);
+        }
+        let rows = tq * tkv;
+        // Ведущие размерности cuBLAS для 16/32-бит должны быть кратны 8/4 —
+        // выравниваем tkv (значимых столбцов остаётся tkv, k-размерность не
+        // меняется, поэтому математика та же).
+        let tkv_pad = (tkv + 7) & !7usize;
+        let rows_pad = tq * tkv_pad;
+        // score f32 + вероятности f16: бюджет 512 МБ, длинный контекст
+        // уходит тайловому ядру.
+        if rows_pad.saturating_mul(6) > 512 * 1024 * 1024 {
+            return Ok(false);
+        }
+        let mut guard = lock_poison_resilient(&self.cublas);
+        if guard.is_none() {
+            match CudaBlas::new(self.stream.clone()) {
+                Ok(b) => *guard = Some(Arc::new(b)),
+                Err(_) => return Ok(false),
+            }
+        }
+        let blas = guard.as_ref().expect("cuBLAS инициализирован").clone();
+        let q16_len = tq * n_heads * hd;
+        let need_f16 = q16_len + rows_pad;
+        let need_f32 = rows_pad;
+        let mut f16s = lock_poison_resilient(&self.attn_f16);
+        if !f16s.as_ref().is_some_and(|s| s.len() >= need_f16) {
+            *f16s = Some(unsafe { self.stream.alloc::<half::f16>(need_f16) }.map_err(map_err)?);
+        }
+        let mut f32s = lock_poison_resilient(&self.attn_f32);
+        if !f32s.as_ref().is_some_and(|s| s.len() >= need_f32) {
+            *f32s = Some(unsafe { self.stream.alloc::<f32>(need_f32) }.map_err(map_err)?);
+        }
+        let f16buf = f16s.as_mut().expect("f16 скретч");
+        let f32buf = f32s.as_mut().expect("f32 скретч");
+        // Q → f16 в начало f16-скретча (один раз на все головы).
+        {
+            let f = self.function("cast_f32_f16")?;
+            let cfg = LaunchConfig::for_num_elems(q16_len as u32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(q.as_cuda());
+            la.arg(&mut *f16buf);
+            let n32 = q16_len as i32;
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+        }
+        use cudarc::driver::DevicePtr;
+        // Указатели берём и сразу отпускаем guard'ы: работа идёт на том же
+        // потоке, буферы живут в скретче до конца вызова.
+        let f16_base = {
+            let (p, _g) = f16buf.device_ptr(&self.stream);
+            p
+        };
+        let f32_base = {
+            let (p, _g) = f32buf.device_ptr(&self.stream);
+            p
+        };
+        let k_base = {
+            let (p, _g) = k16.device_ptr(&self.stream);
+            p
+        };
+        let v_base = {
+            let (p, _g) = v16.device_ptr(&self.stream);
+            p
+        };
+        // Выход голов писать прямо в y (см. шаг 3 ниже) — берём его базу.
+        let y_base = {
+            let (p, _g) =
+                cudarc::driver::DevicePtrMut::device_ptr_mut(y.as_cuda_mut(), &self.stream);
+            p
+        };
+        let q_stride = q.shape()[2] as i32;
+        let kv_stride = (kv_heads * hd) as i32;
+        let q16_off = q16_len as u64 * 2;
+        let (tq32, tkv32, hd32) = (tq as i32, tkv as i32, hd as i32);
+        let tkvpad32 = tkv_pad as i32;
+        let (nh32, nkv32) = (n_heads as i32, kv_heads as i32);
+        let has_mask = if mask.is_some() { 1i32 } else { 0i32 };
+        let (mslice, _) = match mask {
+            Some(m) => (m.as_cuda(), ()),
+            None => (q.as_cuda(), ()),
+        };
+        // Маска — в f32-буфере? Нет: отдельный тензор, берём срез как есть.
+        for h in 0..n_heads {
+            let g = h / (n_heads / kv_heads);
+            // 1) score[tq, tkv] = Q_h · K_gᵀ · 1/√hd (col-major: m=tkv, n=tq, k=hd)
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            self.gemm_ex_f16(
+                &blas,
+                k_base + (g * hd * 2) as u64,
+                kv_stride,
+                f16_base + (h * hd * 2) as u64,
+                q_stride,
+                f32_base,
+                tkvpad32,
+                tkv32,
+                tq32,
+                hd32,
+                scale,
+                true,
+                false,
+            )?;
+            // 2) softmax + маска → вероятности f16
+            {
+                let f = self.function("attn_softmax_mask_f16")?;
+                let cfg = LaunchConfig {
+                    grid_dim: (tq as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 256 * 4,
+                };
+                let sc_off = 0i64;
+                // p_off — смещение вероятностей в f16-буфере В ЭЛЕМЕНТАХ
+                // (q16 занимает q16_len элементов).
+                let p_off = q16_len as i64;
+                let stride32 = tkvpad32;
+                let mut la = self.stream.launch_builder(&f);
+                la.arg(&*f32buf);
+                la.arg(mslice);
+                la.arg(&mut *f16buf);
+                la.arg(&tkv32);
+                la.arg(&has_mask);
+                la.arg(&sc_off);
+                la.arg(&p_off);
+                la.arg(&stride32);
+                unsafe { la.launch(cfg) }.map_err(map_err)?;
+            }
+            // 3) out[q, d] = Σ_k P[q,k]·V[k,d] — пишем СРАЗУ в срез y головы h:
+            // y row-major [tq][q_stride], значит col-major C (hd, tq) с
+            // ldc = q_stride и базой y + h·hd — ровно раскладка y. Копия
+            // выхода головы отдельным ядром больше не нужна.
+            self.gemm_ex_f16(
+                &blas,
+                v_base + (g * hd * 2) as u64,
+                kv_stride,
+                f16_base + q16_off,
+                tkvpad32,
+                y_base + (h * hd * 4) as u64,
+                q_stride,
+                hd32,
+                tq32,
+                tkv32,
+                1.0,
+                false,
+                false,
+            )?;
+        }
+        let _ = (nh32, nkv32);
+        Ok(true)
+    }
+
+    /// Массив device-указателей на тензоры (один clone_htod) — форма
+    /// передачи стейтов слотов в bulk-ядра без переделки владельца.
+    fn ptr_array(&self, ts: &[&Tensor]) -> Result<cudarc::driver::CudaSlice<u64>, BackendError> {
+        let mut ptrs = Vec::with_capacity(ts.len());
+        for t in ts {
+            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(t.as_cuda(), &self.stream);
+            ptrs.push(p);
+        }
+        self.stream.clone_htod(&ptrs).map_err(map_err)
+    }
+
+    /// Bulk-fused GDN (conv → silu → split → l2norm) на B строк: состояние
+    /// свёртки стопкой [b, c, K-1], один запуск на все строки. Снимает
+    /// по-слотовые мелкие запуски, которые при B=2 съедали 164 мс из 170 мс
+    /// пакетного шага (docs/plugin-platform-plan.md, раздел bulk-пакета).
+    pub fn gdn_conv_silu_rows(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        rows: usize,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let c = w.shape()[0];
+        let k = w.shape()[1];
+        let y = self.zeros(vec![rows, c])?;
+        let ns = self.zeros(vec![rows, c, k - 1])?;
+        let f = self.function("gdn_conv_silu_rows_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (c.div_ceil(256) as u32, 1, rows as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c32, k32) = (c as i32, k as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(state.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(ns.as_cuda_mut());
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok((y, ns))
+    }
+
+    /// Bulk delta-rule GDN: B слотов за ОДИН запуск (`grid.z` = слот).
+    /// Вход — пакетный QKV [b, T, cq] (q/k/v срезами по смещениям), стейты
+    /// слотов — массив указателей (у слотов свои тензоры). Пишет прямо в
+    /// `out` [1, b, inner] со шагом `out_stride` — лишней копии нет.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_delta_rule_slots(
+        &self,
+        qkv: &Tensor,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        in_stride: usize,
+        gate: &Tensor,
+        beta: &Tensor,
+        states: &cudarc::driver::CudaSlice<u64>,
+        out: &Tensor,
+        out_stride: usize,
+        slots: usize,
+        t: usize,
+        hk: usize,
+        hv: usize,
+    ) -> Result<(), BackendError> {
+        if hv == 0 || t == 0 || slots == 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_delta_rule_slots: пустые размерности (slots={slots} t={t} hv={hv})"
+            )));
+        }
+        let f = self.function("gdn_delta_rule_slots_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (8, hv as u32, slots as u32),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let (qo, ko, vo) = (q_off as i32, k_off as i32, v_off as i32);
+        let (is, os) = (in_stride as i32, out_stride as i32);
+        let (t32, hk32, hv32) = (t as i32, hk as i32, hv as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(qkv.as_cuda());
+        la.arg(&qo);
+        la.arg(&ko);
+        la.arg(&vo);
+        la.arg(&is);
+        la.arg(gate.as_cuda());
+        la.arg(beta.as_cuda());
+        la.arg(out.as_cuda_mut());
+        la.arg(&os);
+        la.arg(states);
+        la.arg(&t32);
+        la.arg(&hk32);
+        la.arg(&hv32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Bulk-свёртка GDN: B строк за ОДИН запуск, состояние свёртки каждого
+    /// слота сдвигается НА МЕСТЕ (массив указателей). x [b, c] — строка
+    /// пакета, y [b, c] — conv+silu без нормировки.
+    pub fn gdn_conv_silu_slots(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        states: &cudarc::driver::CudaSlice<u64>,
+        y: &Tensor,
+        rows: usize,
+        c: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        if rows == 0 || c == 0 || k < 2 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv_silu_slots: размерности (rows={rows} c={c} k={k})"
+            )));
+        }
+        let f = self.function("gdn_conv_silu_slots_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (c.div_ceil(256) as u32, 1, rows as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (c32, k32) = (c as i32, k as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(states);
+        la.arg(y.as_cuda_mut());
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(())
+    }
+
+    /// L2-нормировка по отрезкам длины `hd` в каждой из `rows` строк шага
+    /// `stride` (x и y могут совпадать — элемент читается до записи).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_l2norm_rows(
+        &self,
+        x: &Tensor,
+        y: &Tensor,
+        rows: usize,
+        hd: usize,
+        segs: usize,
+        stride: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        if rows == 0 || hd == 0 || segs == 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_l2norm_rows: размерности (rows={rows} hd={hd} segs={segs})"
+            )));
+        }
+        let f = self.function("gdn_l2norm_rows_f32")?;
+        let block = hd.next_power_of_two().clamp(32, 256);
+        let cfg = LaunchConfig {
+            grid_dim: (segs as u32, rows as u32, 1),
+            block_dim: (block as u32, 1, 1),
+            shared_mem_bytes: (block * 4) as u32,
+        };
+        let (hd32, sg32, st32) = (hd as i32, segs as i32, stride as i32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(&hd32);
+        la.arg(&sg32);
+        la.arg(&st32);
+        la.arg(&eps);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(())
+    }
+
+    /// cuBLAS gemm_ex: C[m,n] = alpha·op(A)·op(B), A/B в f16, C в f32.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_ex_f16(
+        &self,
+        blas: &CudaBlas,
+        aptr: u64,
+        lda: i32,
+        bptr: u64,
+        ldb: i32,
+        cptr: u64,
+        ldc: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        transa_t: bool,
+        transb_t: bool,
+    ) -> Result<(), BackendError> {
+        let beta = 0.0f32;
+        unsafe {
+            cudarc::cublas::result::gemm_ex(
+                *blas.handle(),
+                if transa_t {
+                    cublasOperation_t::CUBLAS_OP_T
+                } else {
+                    cublasOperation_t::CUBLAS_OP_N
+                },
+                if transb_t {
+                    cublasOperation_t::CUBLAS_OP_T
+                } else {
+                    cublasOperation_t::CUBLAS_OP_N
+                },
+                m,
+                n,
+                k,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                aptr as *const std::ffi::c_void,
+                cudarc::cublas::sys::cudaDataType_t::CUDA_R_16F,
+                lda,
+                bptr as *const std::ffi::c_void,
+                cudarc::cublas::sys::cudaDataType_t::CUDA_R_16F,
+                ldb,
+                &beta as *const f32 as *const std::ffi::c_void,
+                cptr as *mut std::ffi::c_void,
+                cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+        .map_err(|e| BackendError::native(format!("cublas gemm_ex f16: {e}")))
+    }
+
+    /// Prefill-GEMM на bf16-тензорных ядрах: вес раскладывается в плотный
+    /// bf16 (`dequant_<name>_bf16`), активации кастуются в bf16, счёт —
+    /// cuBLAS `gemm_ex` (16F×16F → 32F accumulate). На больших m это в разы
+    /// быстрее FMA-ядер: у 27B prefill-FMA упирался в ~25 TFLOPS.
+    /// `false` — cuBLAS недоступен или пришёл не тот формат: вызывающий
+    /// идёт прежним путём.
+    fn gemm_packed_bf16(
+        &self,
+        src: PackedBf16Src<'_>,
+        a: &Tensor,
+        c: &Tensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<bool, BackendError> {
+        if std::env::var_os("CUDA_NO_CUBLAS").is_some() {
+            return Ok(false);
+        }
+        let mut guard = lock_poison_resilient(&self.cublas);
+        if guard.is_none() {
+            match CudaBlas::new(self.stream.clone()) {
+                Ok(b) => *guard = Some(Arc::new(b)),
+                Err(e) => {
+                    eprintln!("[cuda] cuBLAS недоступен, bf16-GEMM не применяется: {e}");
+                    return Ok(false);
+                }
+            }
+        }
+        let blas = guard.as_ref().expect("cuBLAS инициализирован выше").clone();
+
+        // Раскладка веса в плотный bf16 (n×k). Буфер — один растущий скретч.
+        {
+            let mut slot = lock_poison_resilient(&self.bf16_scratch);
+            if !slot.as_ref().is_some_and(|s| s.len() >= n * k) {
+                *slot = Some(unsafe { self.stream.alloc::<half::bf16>(n * k) }.map_err(map_err)?);
+            }
+            let w = slot.as_mut().expect("скретч выделен выше");
+            let (fname, has_scale): (&'static str, Option<&cudarc::driver::CudaSlice<f32>>) =
+                match &src {
+                    PackedBf16Src::K { name, .. } => (
+                        if *name == "gemm_q6k" {
+                            "dequant_q6k_bf16"
+                        } else {
+                            "dequant_q4kc_bf16"
+                        },
+                        None,
+                    ),
+                    PackedBf16Src::I8 { wscale, .. } => ("dequant_q8k_bf16", Some(wscale)),
+                };
+            let f = self.function(fname)?;
+            let cfg = LaunchConfig::for_num_elems((n * k) as u32);
+            let (n32, k32) = (n as i32, k as i32);
+            let mut la = self.stream.launch_builder(&f);
+            match &src {
+                PackedBf16Src::K { bpack, .. } => la.arg(*bpack),
+                PackedBf16Src::I8 { data, .. } => la.arg(*data),
+            };
+            if let Some(ws) = has_scale {
+                la.arg(ws);
+            }
+            la.arg(&mut *w);
+            la.arg(&n32);
+            la.arg(&k32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+
+            let a_bf = self.cast_bf16(a)?;
+            let alpha = 1.0f32;
+            let beta = 0.0f32;
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            // Указатели и вызов — в отдельном блоке: guard'ы SyncOnDrop
+            // держат заём на буферы, а a_bf после GEMM возвращается в пул.
+            let res = {
+                let (wptr, _w_guard) = w.device_ptr(&self.stream);
+                let (aptr, _a_guard) = a_bf.device_ptr(&self.stream);
+                let c_slice = c.as_cuda_mut();
+                let (cptr, _c_guard) = c_slice.device_ptr_mut(&self.stream);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *blas.handle(),
+                        cublasOperation_t::CUBLAS_OP_T,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        n as i32,
+                        m as i32,
+                        k as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        wptr as *const std::ffi::c_void,
+                        cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF,
+                        k as i32,
+                        aptr as *const std::ffi::c_void,
+                        cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF,
+                        k as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        cptr as *mut std::ffi::c_void,
+                        cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
+                        n as i32,
+                        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                }
+            };
+            self.pool_a_scratch(KernA::BF16(a_bf));
+            res.map_err(|e| BackendError::native(format!("cublas gemm_ex bf16: {e}")))?;
+        }
+        Ok(true)
+    }
+
     /// Block until all queued work on the backend stream completes.
     pub fn synchronize(&self) -> Result<(), BackendError> {
         self.stream.synchronize().map_err(map_err)
@@ -547,9 +1108,18 @@ impl CudaBackend {
 
     fn take_pooled(&self, n: usize) -> Result<CudaSlice<f32>, BackendError> {
         let mut pool = lock_poison_resilient(&self.pool);
-        if let Some(bucket) = pool.get_mut(&n) {
-            if let Some(s) = bucket.pop() {
-                return Ok(s);
+        if let Some(bucket) = pool.get_mut(&n)
+            && let Some(s) = bucket.pop()
+        {
+            POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(s);
+        }
+        POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var_os("QWEN35_POOL_STATS").is_some() {
+            let m = POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+            if m.is_multiple_of(256) {
+                let h = POOL_HITS.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!("POOL: промахов {m} из {} ({} элементов)", h + m, n);
             }
         }
         self.stream.alloc_zeros::<f32>(n).map_err(map_err)
@@ -575,6 +1145,25 @@ impl CudaBackend {
         c: f32,
     ) -> Result<(), BackendError> {
         let n = x.numel();
+        // Length guards: the kernel indexes `x[i]`, `y[i]` and writes `out[i]`
+        // for i in 0..n, but `n` is taken from `x` alone. A short `out` (or a
+        // short `y`) therefore produced a device out-of-bounds write/read —
+        // reachable through the safe public API, e.g. scale(&x[4096], &out[1]).
+        // Sizes must agree exactly; aliasing `out` with `x` stays allowed.
+        if out.numel() != n {
+            return Err(BackendError::Shape(format!(
+                "elementwise: output has {} elements, input has {n}",
+                out.numel()
+            )));
+        }
+        if let Some(y) = y
+            && y.numel() != n
+        {
+            return Err(BackendError::Shape(format!(
+                "elementwise: second operand has {} elements, first has {n}",
+                y.numel()
+            )));
+        }
         let xd = x.as_cuda();
         let yd = y.map(|t| t.as_cuda()).unwrap_or(xd);
         let od = out.as_cuda();
@@ -641,6 +1230,28 @@ impl Backend for CudaBackend {
         let blk_bytes = match format {
             crate::dtype::WeightFormat::Q6_K => 210usize,
             crate::dtype::WeightFormat::Q4_K => 144usize,
+            // GGUF Q8_0: 34 Б/32 (f16 scale + коды) → int8-ядро (коды + f32
+            // scale). Раньше падал в f32-fallback: 4 байта/вес ломали
+            // загрузку 27B Q4_K_M (7.2 ГБ Q8_0 → 28.6 ГБ VRAM, CUDA OOM).
+            crate::dtype::WeightFormat::Q8_0 => {
+                // 2D GEMM-веса: kb-major раскладка int8-ядра.
+                if shape.len() == 2 {
+                    let (rows, cols) = (shape[0], shape[1]);
+                    if let Some((codes, scales)) = crate::weights_map::q8_0_to_i8(data, rows, cols)
+                    {
+                        return self.from_cpu_i8(&codes, &scales, shape);
+                    }
+                }
+                let tmp = crate::weights_map::WeightTensor {
+                    name: "q".into(),
+                    shape: shape.iter().map(|&d| d as u64).collect(),
+                    format,
+                    offset: 0,
+                    data,
+                };
+                let f = crate::weights_map::dequant_f32(&tmp);
+                return self.from_cpu_f32(&f, shape);
+            }
             _ => {
                 // Fall back to the reference path (dequant → f32).
                 let tmp = crate::weights_map::WeightTensor {
@@ -707,7 +1318,6 @@ impl Backend for CudaBackend {
         }
     }
 
-
     fn from_cpu_f16(&self, data: &[half::f16], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let n: usize = shape.iter().product();
         if data.len() != n {
@@ -724,7 +1334,7 @@ impl Backend for CudaBackend {
         // Non-2D tensors and k%32!=0 shapes (biases, non-GEMM uses) stay
         // raw row-major — consumers must agree on the layout.
         let packed: std::borrow::Cow<[half::f16]> =
-            if shape.len() == 2 && n > 0 && shape[1] % 32 == 0 {
+            if shape.len() == 2 && n > 0 && shape[1].is_multiple_of(32) {
                 let (rows, per) = (shape[0], shape[1]);
                 let nblk = per / 32;
                 let mut p = vec![half::f16::default(); n];
@@ -759,7 +1369,7 @@ impl Backend for CudaBackend {
             )));
         }
         let packed: std::borrow::Cow<[half::bf16]> =
-            if shape.len() == 2 && n > 0 && shape[1] % 32 == 0 {
+            if shape.len() == 2 && n > 0 && shape[1].is_multiple_of(32) {
                 let (rows, per) = (shape[0], shape[1]);
                 let nblk = per / 32;
                 let mut p = vec![half::bf16::default(); n];
@@ -803,7 +1413,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q6k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q6k: per-dim {per} not a multiple of 256 (Q6_K super-blocks)"
             )));
@@ -822,7 +1432,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q4k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 32 != 0 {
+        if !per.is_multiple_of(32) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q4k: per-dim {per} not a multiple of 32 (Q4_0 blocks)"
             )));
@@ -841,7 +1451,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q4kc(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q4kc: per-dim {per} not a multiple of 256 (Q4_K super-blocks)"
             )));
@@ -860,7 +1470,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q5k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q5k: per-dim {per} not a multiple of 256 (Q5_K super-blocks)"
             )));
@@ -879,7 +1489,7 @@ impl Backend for CudaBackend {
 
     fn from_cpu_q3k(&self, data: &[u8], shape: Vec<usize>) -> Result<Tensor, BackendError> {
         let per: usize = shape[1..].iter().product();
-        if per % 256 != 0 {
+        if !per.is_multiple_of(256) {
             return Err(BackendError::Shape(format!(
                 "from_cpu_q3k: per-dim {per} not a multiple of 256 (Q3_K super-blocks)"
             )));
@@ -896,6 +1506,17 @@ impl Backend for CudaBackend {
         Ok(Tensor::from_cuda_q3k(s, shape))
     }
 
+    /// fp16 storage download (f16 KV caches, half weights). Signed-off
+    /// counterpart of `to_cpu_f32`: the roll/parity diagnostics download KV in
+    /// its storage dtype instead of widening, so a real f16 cache can be
+    /// compared bit-for-bit with the reference.
+    fn to_cpu_f16(&self, t: &Tensor) -> Result<Vec<half::f16>, BackendError> {
+        if let crate::backend::TensorInner::CudaF16(b) = &t.inner {
+            return self.stream.clone_dtoh(b).map_err(map_err);
+        }
+        let f = self.to_cpu_f32(t)?;
+        Ok(f.into_iter().map(half::f16::from_f32).collect())
+    }
 
     fn to_cpu_f32(&self, t: &Tensor) -> Result<Vec<f32>, BackendError> {
         // Half-precision storage (f16/bf16 KV, fp16 weights) downloads the
@@ -907,7 +1528,7 @@ impl Backend for CudaBackend {
             crate::backend::TensorInner::CudaF16(b) => {
                 let raw: Vec<half::f16> = self.stream.clone_dtoh(b).map_err(map_err)?;
                 let shape = t.shape();
-                if shape.len() == 2 && !raw.is_empty() && shape[1] % 32 == 0 {
+                if shape.len() == 2 && !raw.is_empty() && shape[1].is_multiple_of(32) {
                     let (rows, per) = (shape[0], shape[1]);
                     let nblk = per / 32;
                     let mut out = vec![0f32; raw.len()];
@@ -920,13 +1541,13 @@ impl Backend for CudaBackend {
                     }
                     Ok(out)
                 } else {
-                    Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                    Ok(raw.into_iter().map(f32::from).collect())
                 }
             }
             crate::backend::TensorInner::CudaBF16(b) => {
                 let raw: Vec<half::bf16> = self.stream.clone_dtoh(b).map_err(map_err)?;
                 let shape = t.shape();
-                if shape.len() == 2 && !raw.is_empty() && shape[1] % 32 == 0 {
+                if shape.len() == 2 && !raw.is_empty() && shape[1].is_multiple_of(32) {
                     let (rows, per) = (shape[0], shape[1]);
                     let nblk = per / 32;
                     let mut out = vec![0f32; raw.len()];
@@ -939,7 +1560,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(out)
                 } else {
-                    Ok(raw.into_iter().map(|v| f32::from(v)).collect())
+                    Ok(raw.into_iter().map(f32::from).collect())
                 }
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
@@ -985,15 +1606,14 @@ impl Backend for CudaBackend {
                                 let sc1 = blk[192 + nchunk * 8 + (lane >> 4) + 2] as i8 as f32;
                                 let sc2 = blk[192 + nchunk * 8 + (lane >> 4) + 4] as i8 as f32;
                                 let sc3 = blk[192 + nchunk * 8 + (lane >> 4) + 6] as i8 as f32;
-                                let q1 =
-                                    (((ql0 & 0xF) | (((qh >> 0) & 3) << 4)) as i32 - 32) as f32;
+                                let q1 = (((ql0 & 0xF) | ((qh & 3) << 4)) as i32 - 32) as f32;
                                 let q2 =
                                     (((ql1 & 0xF) | (((qh >> 2) & 3) << 4)) as i32 - 32) as f32;
                                 let q3 = ((((ql0 >> 4) & 0xF) | (((qh >> 4) & 3) << 4)) as i32 - 32)
                                     as f32;
                                 let q4 = ((((ql1 >> 4) & 0xF) | (((qh >> 6) & 3) << 4)) as i32 - 32)
                                     as f32;
-                                out[base + 0] = d * sc0 * q1;
+                                out[base] = d * sc0 * q1;
                                 out[base + 32] = d * sc1 * q2;
                                 out[base + 64] = d * sc2 * q3;
                                 out[base + 96] = d * sc3 * q4;
@@ -1013,8 +1633,10 @@ impl Backend for CudaBackend {
                     for sb in 0..nsuper {
                         // kb-major: block (sb, r) at (sb·rows + r)·176.
                         let blk = &raw[(sb * rows + r) * 176..(sb * rows + r + 1) * 176];
-                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
-                        let mn = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
+                        let d =
+                            f32::from(half::f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])));
+                        let mn =
+                            f32::from(half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])));
                         for j in 0..256 {
                             let b = j >> 5;
                             let l = j & 31;
@@ -1038,7 +1660,11 @@ impl Backend for CudaBackend {
                             // `blk[16 + l]` read chunk 0's bytes for blocks
                             // 2..7 (kernel-parity fix).
                             let qsb = 32 * (b >> 1);
-                            let mut q = if half == 0 { blk[16 + qsb + l] & 0xF } else { blk[16 + qsb + l] >> 4 };
+                            let mut q = if half == 0 {
+                                blk[16 + qsb + l] & 0xF
+                            } else {
+                                blk[16 + qsb + l] >> 4
+                            };
                             let u = 1 << (2 * (b >> 1) + half);
                             if blk[144 + l] & u != 0 {
                                 q += 16;
@@ -1059,22 +1685,36 @@ impl Backend for CudaBackend {
                     for sb in 0..nsuper {
                         // kb-major: block (sb, r) at (sb·rows + r)·110.
                         let blk = &raw[(sb * rows + r) * 110..(sb * rows + r + 1) * 110];
-                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([blk[108], blk[109]])));
+                        let d = f32::from(half::f16::from_bits(u16::from_le_bytes([
+                            blk[108], blk[109],
+                        ])));
                         // scales[12] → 16 int8 via the ggml aux permutation.
                         let a0 = u32::from_le_bytes([blk[96], blk[97], blk[98], blk[99]]);
                         let a1 = u32::from_le_bytes([blk[100], blk[101], blk[102], blk[103]]);
                         let tmp = u32::from_le_bytes([blk[104], blk[105], blk[106], blk[107]]);
                         let k1 = 0x03030303u32;
                         let k2 = 0x0f0f0f0fu32;
-                        let b0 = (a0 & k2) | (((tmp >> 0) & k1) << 4);
+                        let b0 = (a0 & k2) | ((tmp & k1) << 4);
                         let b1 = (a1 & k2) | (((tmp >> 2) & k1) << 4);
                         let b2 = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
                         let b3 = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
                         let scs: [i8; 16] = [
-                            b0 as i8, (b0 >> 8) as i8, (b0 >> 16) as i8, (b0 >> 24) as i8,
-                            b1 as i8, (b1 >> 8) as i8, (b1 >> 16) as i8, (b1 >> 24) as i8,
-                            b2 as i8, (b2 >> 8) as i8, (b2 >> 16) as i8, (b2 >> 24) as i8,
-                            b3 as i8, (b3 >> 8) as i8, (b3 >> 16) as i8, (b3 >> 24) as i8,
+                            b0 as i8,
+                            (b0 >> 8) as i8,
+                            (b0 >> 16) as i8,
+                            (b0 >> 24) as i8,
+                            b1 as i8,
+                            (b1 >> 8) as i8,
+                            (b1 >> 16) as i8,
+                            (b1 >> 24) as i8,
+                            b2 as i8,
+                            (b2 >> 8) as i8,
+                            (b2 >> 16) as i8,
+                            (b2 >> 24) as i8,
+                            b3 as i8,
+                            (b3 >> 8) as i8,
+                            (b3 >> 16) as i8,
+                            (b3 >> 24) as i8,
                         ];
                         for j in 0..256 {
                             let s = j >> 4;
@@ -1198,6 +1838,22 @@ impl Backend for CudaBackend {
                     "int8 gemm_nt: k={k} not a multiple of 32"
                 )));
             }
+            // Prefill: bf16-тензорные ядра (тот же приём, что у K-квантов) —
+            // Q8_0-тензоры у 27B это 7.16 ГБ (GDN-проекции), и FMA-путь на
+            // них был основным остатком prefill-времени.
+            if m >= 32 && k >= 1024 {
+                let c_tensor = c;
+                if self.gemm_packed_bf16(
+                    PackedBf16Src::I8 { data: b8, wscale },
+                    a,
+                    c_tensor,
+                    m,
+                    k,
+                    n,
+                )? {
+                    return Ok(());
+                }
+            }
             // Q8_0-style int8 GEMM: per-32-block weight scales, the A
             // operand follows the activation axis (f32 default, fp16/bf16
             // cast). kb-major packed weights feed the own kernels: m=1
@@ -1209,7 +1865,7 @@ impl Backend for CudaBackend {
             let n32 = n as i32;
             let m32 = m as i32;
             let c = c.as_cuda_mut();
-            let grid_x = (n + 255) / 256;
+            let grid_x = n.div_ceil(256);
             let act = self.activation_dtype();
             let (tiled_name, splitk_name): (&'static str, &'static str) = match act {
                 crate::dtype::Dtype::F16 => ("gemm_q8k_tiled_f16", "gemm_q8k_splitk_f16"),
@@ -1226,7 +1882,7 @@ impl Backend for CudaBackend {
                 let cpart = self.take_pooled(s16 * m * n)?;
                 let f = self.function(tiled_name)?;
                 let cfg = LaunchConfig {
-                    grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                    grid_dim: (grid_x as u32, m.div_ceil(32) as u32, 16),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 };
@@ -1343,7 +1999,7 @@ impl Backend for CudaBackend {
         // Mirror of the CPU oracle's guard: cols == 0 divides by zero in the
         // kernel (i % cols) and a non-multiple n would bias the wrong
         // columns / run off the tail.
-        if cols == 0 || n % cols as usize != 0 {
+        if cols == 0 || !n.is_multiple_of(cols as usize) {
             return Err(BackendError::Shape(format!(
                 "add_bias: bias {} does not divide x {n}",
                 cols
@@ -1419,21 +2075,11 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg).map_err(map_err)? };
         Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
     }
-    fn magnitude_sqrt(&self, x: &Tensor) -> Result<Tensor, BackendError> {
-        let mut shape = x.shape().to_vec();
-        let n = x.numel() / 2;
-        let mut s = self.take_pooled(n)?;
-        let f = self.function("magnitude_sqrt_f32")?;
-        let cfg = LaunchConfig::for_num_elems(n as u32);
-        let mut la = self.stream.launch_builder(&f);
-        la.arg(x.as_cuda());
-        la.arg(&mut s);
-        let ni = n as i32;
-        la.arg(&ni);
-        unsafe { la.launch(cfg).map_err(map_err)? };
-        *shape.last_mut().unwrap() /= 2;
-        Ok(Tensor::from_cuda(self.wrap_pooled(s), shape))
-    }
+    // CUDA-кернел magnitude_sqrt_f32 переписан на построчную семантику
+    // (см. kernels.cu), но PTX в репозитории собран из старой версии —
+    // оверрайд снят до пересборки PTX на машине с nvcc: хостовая
+    // реализация верна для любой раскладки, а тензор VAD мал (T×258).
+    // Вернуть оверрайд после `cargo build --features cuda` с nvcc.
 
     fn lstm_cell(
         &self,
@@ -1516,7 +2162,7 @@ impl Backend for CudaBackend {
         // Mirror of the CPU oracle's guard: the row-major kernel computes
         // row = i / ffn, col = i % ffn — ffn == 0 divides by zero and a
         // non-multiple numel would mis-slice the last row.
-        if ffn == 0 || numel % ffn != 0 {
+        if ffn == 0 || !numel.is_multiple_of(ffn) {
             return Err(BackendError::Shape(format!(
                 "silu_mul_fused: ffn={ffn} does not divide y numel {numel}"
             )));
@@ -1592,7 +2238,7 @@ impl Backend for CudaBackend {
         // (x.numel() / c — host and kernel); c not dividing x.numel() would
         // truncate the tail. (a == 0 is fine — the kernel treats it as the
         // sin²(ax)/a → 0 limit.)
-        if c == 0 || x.numel() % c as usize != 0 {
+        if c == 0 || !x.numel().is_multiple_of(c as usize) {
             return Err(BackendError::Shape(format!(
                 "snake: channel count {c} does not divide x ({})",
                 x.numel()
@@ -1605,7 +2251,7 @@ impl Backend for CudaBackend {
         la.arg(x.as_cuda());
         la.arg(a.as_cuda());
         la.arg(y.as_cuda());
-        let __a1 = n as i32;
+        let __a1 = n;
         la.arg(&__a1);
         la.arg(&c);
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
@@ -1896,15 +2542,21 @@ impl Backend for CudaBackend {
         let (b, t, cin) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (_, cout, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
         let tout = (t - 1) * stride + k;
-        // Zero the output in place first (scatter with atomics accumulates).
-        self.stream.memset_zeros(y.as_cuda_mut()).map_err(map_err)?;
-        let n = b * t * cin;
+        // Детерминированный вариант (аудит 2026-10-13): поток на выход,
+        // аккумулятор в регистре, bias слит — без memset и без atomicAdd.
+        let n = b * tout * cout;
         let f = self.function("conv_transpose1d_f32")?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let mut la = self.stream.launch_builder(&f);
         la.arg(x.as_cuda());
         la.arg(w.as_cuda());
-        la.arg(x.as_cuda()); // dummy — the kernel never reads bias (separate pass)
+        let hb = bias.is_some() as i32;
+        if let Some(bi) = bias {
+            la.arg(bi.as_cuda());
+        } else {
+            la.arg(x.as_cuda()); // dummy — kernel guards via has_bias
+        }
+        la.arg(&hb);
         la.arg(y.as_cuda());
         let __a32 = b as i32;
         la.arg(&__a32);
@@ -1921,19 +2573,6 @@ impl Backend for CudaBackend {
         let __a38 = tout as i32;
         la.arg(&__a38);
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
-        if let Some(bi) = bias {
-            let nb = b * tout * cout;
-            let f = self.function("conv_transpose_bias_f32")?;
-            let cfg = LaunchConfig::for_num_elems(nb as u32);
-            let mut la = self.stream.launch_builder(&f);
-            la.arg(y.as_cuda());
-            la.arg(bi.as_cuda());
-            let __a39 = nb as i32;
-            la.arg(&__a39);
-            let __a40 = cout as i32;
-            la.arg(&__a40);
-            unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)?;
-        }
         Ok(())
     }
 
@@ -2012,7 +2651,7 @@ impl Backend for CudaBackend {
         // Mirror of the CPU oracle's guard: off + d0 past D (or a mismatched
         // y) would read/write OOB device memory — the GPU has no panic to
         // catch it.
-        if off + d0 > d || y.shape() != &[rows, d0] {
+        if off + d0 > d || y.shape() != [rows, d0] {
             return Err(BackendError::Shape(format!(
                 "slice_last: x {:?} y {:?} off {off}",
                 x.shape(),
@@ -2044,7 +2683,7 @@ impl Backend for CudaBackend {
         if u > t {
             return Err(BackendError::Shape(format!("slice_time: u={u} > t={t}")));
         }
-        if y.shape() != &[b, t - u, c] {
+        if y.shape() != [b, t - u, c] {
             return Err(BackendError::Shape(
                 "slice_time: output shape mismatch".into(),
             ));
@@ -2247,18 +2886,20 @@ impl Backend for CudaBackend {
         h: usize,
         eps: f32,
     ) -> Result<(), BackendError> {
-        let rows = x.shape()[0];
-        // h == 0 divides by zero (x.shape()[1] / h) and would launch a
-        // degenerate (rows, 0) grid; a non-multiple x dim silently truncates
-        // hd and mis-addresses rows — strict divisibility, same as the CPU
-        // reference.
-        if h == 0 || x.shape()[1] % h != 0 {
+        // Как CPU-эталон: X может быть 2D/3D (батч токенов) — нормируем по
+        // последней оси, строки = все ведущие измерения. Раньше здесь брались
+        // shape()[0]/shape()[1], и 3D-активации qwen35 ([1, T, nh*hd]) падали
+        // «h=24 does not divide x dim T» на первом же forward 27B.
+        let last = x.shape().len() - 1;
+        let dim = x.shape()[last];
+        if h == 0 || !dim.is_multiple_of(h) {
             return Err(BackendError::Shape(format!(
-                "rmsnorm_head: head count h={h} does not divide x dim {}",
-                x.shape()[1]
+                "rmsnorm_head: head count h={h} does not divide x dim {dim} (shape {:?})",
+                x.shape()
             )));
         }
-        let hd = x.shape()[1] / h;
+        let hd = dim / h;
+        let rows = x.numel() / (h * hd);
         let f = self.function("rmsnorm_head_f32")?;
         // One block per (row, head) — kernel indexes via blockIdx.(x, y).
         let cfg = LaunchConfig {
@@ -2293,9 +2934,19 @@ impl Backend for CudaBackend {
         pos: usize,
         hd: usize,
         theta: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
+        // YaRN в CUDA-кернеле — Ф9; честная ошибка вместо молчаливого игнора
+        if let Some(y) = yarn {
+            if !y.is_identity() {
+                return Err(BackendError::Shape(
+                    "rope_standard: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)"
+                        .into(),
+                ));
+            }
+        }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+        if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
                 "rope_standard: hd={hd} does not divide d={d} (and must be even)"
             )));
@@ -2326,9 +2977,19 @@ impl Backend for CudaBackend {
         theta: f32,
         h: usize,
         eps: f32,
+        yarn: Option<&crate::rope::RopeYarn>,
     ) -> Result<Tensor, BackendError> {
+        // YaRN в CUDA-кернеле — Ф9; честная ошибка вместо молчаливого игнора
+        if let Some(y) = yarn {
+            if !y.is_identity() {
+                return Err(BackendError::Shape(
+                    "rmsnorm_head_rope: YaRN/линейное скалирование в CUDA ещё не реализовано (Ф9)"
+                        .into(),
+                ));
+            }
+        }
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        if h == 0 || d != h * hd || hd % 2 != 0 {
+        if h == 0 || d != h * hd || !hd.is_multiple_of(2) {
             return Err(BackendError::Shape(format!(
                 "rmsnorm_head_rope: h={h}, hd={hd} vs d={d}"
             )));
@@ -2361,7 +3022,7 @@ impl Backend for CudaBackend {
         sections: [usize; 4],
     ) -> Result<Tensor, BackendError> {
         let (tq, d) = (x.shape()[1], x.shape()[2]);
-        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+        if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
                 "rope_mrope_text: hd={hd} does not divide d={d}"
             )));
@@ -2390,6 +3051,49 @@ impl Backend for CudaBackend {
         Ok(y)
     }
 
+    /// IMROPE текста с частичной ротацией (n_rot из hd): раньше шёл
+    /// CPU-дефолтом через хост — в пакетном шаге это 4 синхронизации на
+    /// слой и на строку (замер: 10 мс на слой при B=2 против 0.1 у attn).
+    fn rope_imrope_text(
+        &self,
+        x: &Tensor,
+        pos: usize,
+        hd: usize,
+        theta: f32,
+        sections: [usize; 4],
+        n_rot: usize,
+    ) -> Result<Tensor, BackendError> {
+        let (tq, d) = (x.shape()[1], x.shape()[2]);
+        if hd == 0 || n_rot == 0 || !n_rot.is_multiple_of(2) || n_rot > hd || d % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "rope_imrope_text: hd={hd} n_rot={n_rot} d={d}"
+            )));
+        }
+        let sect_dims = sections.iter().sum::<usize>().max(1);
+        let y = self.zeros(vec![1, tq, d])?;
+        let f = self.function("rope_imrope_text_f32")?;
+        let cfg = LaunchConfig::for_num_elems((tq * d) as u32);
+        let (tq32, d32, hd32, nr32, pos32) =
+            (tq as i32, d as i32, hd as i32, n_rot as i32, pos as i32);
+        let (s0, s1, s2) = (sections[0] as i32, sections[1] as i32, sections[2] as i32);
+        let sd = sect_dims as i32;
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda());
+        la.arg(&tq32);
+        la.arg(&d32);
+        la.arg(&hd32);
+        la.arg(&nr32);
+        la.arg(&pos32);
+        la.arg(&theta);
+        la.arg(&s0);
+        la.arg(&s1);
+        la.arg(&s2);
+        la.arg(&sd);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
     fn rope_mrope(
         &self,
         x: &Tensor,
@@ -2406,7 +3110,7 @@ impl Backend for CudaBackend {
                 tq * 4
             )));
         }
-        if d % hd != 0 || hd % 2 != 0 || hd == 0 {
+        if d % hd != 0 || !hd.is_multiple_of(2) || hd == 0 {
             return Err(BackendError::Shape(format!(
                 "rope_mrope: hd={hd} does not divide d={d}"
             )));
@@ -2457,7 +3161,9 @@ impl Backend for CudaBackend {
         let v = logits.shape()[logits.shape().len() - 1];
         let kk = k.clamp(1, 32);
         if v == 0 {
-            return Err(BackendError::Shape("penalized_topk: empty logits row".into()));
+            return Err(BackendError::Shape(
+                "penalized_topk: empty logits row".into(),
+            ));
         }
         let h = history.len();
         // History + histogram counts (u32).
@@ -2689,6 +3395,293 @@ impl Backend for CudaBackend {
         unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
     }
 
+    // ── GDN: свои ядра вместо CPU-фолбэка ────────────────────────────────
+    // Дефолтные реализации Backend гоняли тензоры на хост и обратно на
+    // каждом GDN-слое (48 из 64 у 27B): профиль дал 97 мс из 142 мс на
+    // токен. Семантика — как у CPU-эталона в backend.rs.
+
+    fn gdn_gates(
+        &self,
+        ba: &Tensor,
+        dt_bias: &Tensor,
+        a: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let shape = ba.shape().to_vec();
+        let last = *shape
+            .last()
+            .ok_or_else(|| BackendError::Shape("gdn_gates: пустой вход".into()))?;
+        if last % 2 != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_gates: последняя ось {last} не 2·Hv"
+            )));
+        }
+        let h = last / 2;
+        let n = ba.numel() / 2;
+        let mut out_shape = shape;
+        let l = out_shape.len();
+        out_shape[l - 1] = h;
+        let g = self.zeros(out_shape.clone())?;
+        let b = self.zeros(out_shape)?;
+        let f = self.function("gdn_gates_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(ba.as_cuda());
+        la.arg(dt_bias.as_cuda());
+        la.arg(a.as_cuda());
+        la.arg(g.as_cuda_mut());
+        la.arg(b.as_cuda_mut());
+        let (n32, h32) = (n as i32, h as i32);
+        la.arg(&n32);
+        la.arg(&h32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok((g, b))
+    }
+
+    /// GDN causal depthwise conv (составной путь t>1: conv → silu → split →
+    /// l2norm). На CUDA раньше не было — дефолтный Backend гонял 37 МБ на
+    /// слой через хост, и весь префилл упирался в 23 мс/слой.
+    fn gdn_conv(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let c = w.shape()[0];
+        let k = w.shape()[1];
+        if k < 2 {
+            return Err(BackendError::Shape(format!("gdn_conv: свёртка k={k} < 2")));
+        }
+        let t = x.numel() / c;
+        let y = self.zeros(x.shape().to_vec())?;
+        let ns = self.zeros(vec![c, k - 1])?;
+        let f = self.function("gdn_conv_seq_f32")?;
+        let cfg = LaunchConfig::for_num_elems((t * c) as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(state.as_cuda());
+        la.arg(y.as_cuda_mut());
+        let (t32, c32, k32) = (t as i32, c as i32, k as i32);
+        la.arg(&t32);
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        let f2 = self.function("gdn_conv_state_f32")?;
+        let cfg2 = LaunchConfig::for_num_elems((c * (k - 1)) as u32);
+        let mut la2 = self.stream.launch_builder(&f2);
+        la2.arg(x.as_cuda());
+        la2.arg(state.as_cuda());
+        la2.arg(ns.as_cuda_mut());
+        la2.arg(&t32);
+        la2.arg(&c32);
+        la2.arg(&k32);
+        unsafe { la2.launch(cfg2) }.map_err(map_err)?;
+        Ok((y, ns))
+    }
+
+    /// Дождаться очереди устройства (inherent `CudaBackend::synchronize`).
+    fn synchronize(&self) -> Result<(), BackendError> {
+        CudaBackend::synchronize(self)
+    }
+
+    /// Bulk-хвост GDN на B слотов: conv+silu со стейтами на месте (в самом
+    /// пакетном буфере) → l2norm q/k по головам → delta-rule со стейтами
+    /// массивом указателей. Три запуска на слой на весь пакет вместо
+    /// 2·B мелких (замер: по-слотовая секция при B=2 164 мс против 26 мс).
+    fn gdn_batch_tail(
+        &self,
+        qkv: &Tensor,
+        conv_w: &Tensor,
+        conv_states: &[&Tensor],
+        ssm_states: &[&Tensor],
+        gate: &Tensor,
+        beta: &Tensor,
+        out: &Tensor,
+        geom: &GdnBatchGeom,
+    ) -> Result<bool, BackendError> {
+        let b = conv_states.len();
+        // S=128 — геометрия ядра; остальное уходит на по-слотовый путь.
+        if b == 0 || ssm_states.len() != b || geom.s != 128 {
+            return Ok(false);
+        }
+        let y = qkv.view(vec![b, geom.cq]);
+        let conv_ptrs = self.ptr_array(conv_states)?;
+        let ssm_ptrs = self.ptr_array(ssm_states)?;
+        self.gdn_conv_silu_slots(&y, conv_w, &conv_ptrs, &y, b, geom.cq, geom.k)?;
+        self.gdn_l2norm_rows(&y, &y, b, geom.s, 2 * geom.hk, geom.cq, geom.eps)?;
+        self.gdn_delta_rule_slots(
+            &y,
+            0,
+            geom.qk,
+            2 * geom.qk,
+            geom.cq,
+            gate,
+            beta,
+            &ssm_ptrs,
+            out,
+            geom.inner,
+            b,
+            1,
+            geom.hk,
+            geom.hv,
+        )?;
+        Ok(true)
+    }
+
+    /// L2-нормировка по отрезкам длины hd (out-of-place, как CPU-эталон).
+    fn gdn_l2norm(&self, x: &Tensor, hd: usize, eps: f32) -> Result<Tensor, BackendError> {
+        let n = x.numel();
+        if hd == 0 || n % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_l2norm: hd={hd} не делит numel={n}"
+            )));
+        }
+        let y = self.zeros(x.shape().to_vec())?;
+        let f = self.function("gdn_l2norm_out_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n / hd) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(&eps);
+        let hd32 = hd as i32;
+        la.arg(&hd32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
+    fn gdn_conv_silu_split_norm(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        c: usize,
+        k: usize,
+        hd: usize,
+        qk: usize,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        if k < 2 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv_silu_split_norm: свёртка k={k} < 2"
+            )));
+        }
+        if hd == 0 || (2 * qk) % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_conv_silu_split_norm: hd={hd} не делит 2·qk={}",
+                2 * qk
+            )));
+        }
+        let y = self.zeros(vec![c])?;
+        let ns = self.zeros(vec![c, k - 1])?;
+        let f = self.function("gdn_conv_silu_f32")?;
+        let cfg = LaunchConfig::for_num_elems(c as u32);
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(state.as_cuda());
+        la.arg(y.as_cuda_mut());
+        la.arg(ns.as_cuda_mut());
+        let (c32, k32) = (c as i32, k as i32);
+        la.arg(&c32);
+        la.arg(&k32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // L2-нормировка по сегментам длины hd (первый 2·qk выходa).
+        let segs = (2 * qk) / hd;
+        let f2 = self.function("gdn_l2norm_seg_f32")?;
+        let cfg2 = LaunchConfig {
+            grid_dim: (segs as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let mut la2 = self.stream.launch_builder(&f2);
+        la2.arg(y.as_cuda_mut());
+        la2.arg(&eps);
+        let hd32 = hd as i32;
+        la2.arg(&hd32);
+        unsafe { la2.launch(cfg2) }.map_err(map_err)?;
+        Ok((y, ns))
+    }
+
+    fn gdn_delta_rule(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        b: &Tensor,
+        state: &Tensor,
+        hk: usize,
+    ) -> Result<(Tensor, Tensor), BackendError> {
+        let (hv, s) = (state.shape()[0], state.shape()[1]);
+        if s != 128 {
+            return Err(BackendError::Shape(format!(
+                "gdn_delta_rule: CUDA-ядро реализовано для S=128 (state {s}); \
+                 модель с другой геометрией GDN на CUDA пока не поддержана"
+            )));
+        }
+        let t = v.numel() / (hv * s);
+        let out = self.zeros(vec![t, hv, s])?;
+        let f = self.function("gdn_delta_rule_chunk_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((s / 16) as u32, hv as u32, 1),
+            block_dim: (32, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(q.as_cuda());
+        la.arg(k.as_cuda());
+        la.arg(v.as_cuda());
+        la.arg(g.as_cuda());
+        la.arg(b.as_cuda());
+        la.arg(state.as_cuda_mut());
+        la.arg(out.as_cuda_mut());
+        let (t32, hk32, hv32) = (t as i32, hk as i32, hv as i32);
+        la.arg(&t32);
+        la.arg(&hk32);
+        la.arg(&hv32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        // f32-тензор клонируется по Arc — это тот же буфер с обновлённым стейтом.
+        Ok((out, state.clone()))
+    }
+
+    fn gdn_norm_gated(
+        &self,
+        x: &Tensor,
+        z: &Tensor,
+        w: &Tensor,
+        eps: f32,
+    ) -> Result<Tensor, BackendError> {
+        let hd = w.numel();
+        if hd == 0 || x.numel() % hd != 0 {
+            return Err(BackendError::Shape(format!(
+                "gdn_norm_gated: hd={hd} не делит {} элементов",
+                x.numel()
+            )));
+        }
+        let rows = x.numel() / hd;
+        let y = self.zeros(x.shape().to_vec())?;
+        let f = self.function("gdn_norm_gated_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * 4,
+        };
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(z.as_cuda());
+        la.arg(w.as_cuda());
+        la.arg(y.as_cuda_mut());
+        let hd32 = hd as i32;
+        la.arg(&hd32);
+        la.arg(&eps);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(y)
+    }
+
     fn attn_ar(
         &self,
         q: &Tensor,
@@ -2706,13 +3699,13 @@ impl Backend for CudaBackend {
         // D8 (mirror of the CPU oracle): the mask is indexed as [tq, tkv] —
         // a too-small mask would read OOB device memory (garbage bias, no
         // panic to catch it on the GPU).
-        if let Some(m) = mask {
-            if m.numel() < tq * tkv {
-                return Err(BackendError::Shape(format!(
-                    "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
-                    m.numel()
-                )));
-            }
+        if let Some(m) = mask
+            && m.numel() < tq * tkv
+        {
+            return Err(BackendError::Shape(format!(
+                "attn_ar: mask numel {} < tq·tkv {tq}·{tkv}",
+                m.numel()
+            )));
         }
         // Q20: the v4 kernel stages one warp per 32 columns in an 8-warp
         // block — hd > 256 would overflow sh_p[8][64] (and nwarps > 8).
@@ -2730,7 +3723,7 @@ impl Backend for CudaBackend {
         // Two-kernel warp-chunked attention (attn_ar_v4): each (chunk, warp)
         // writes a 34-f32 partial (max, sum-exp, weighted-V[32]) with ZERO
         // block-level syncs in the hot loop; attn_ar_v4_combine merges them.
-        let nwarps = (hd + 31) / 32;
+        let nwarps = hd.div_ceil(32);
         let nchunks = tkv.div_ceil(64).max(1);
         // CUDA grid.z is limited to 65535 — a huge batch × chunk product
         // would fail the launch with CUDA_ERROR_INVALID_VALUE (or be
@@ -2770,6 +3763,72 @@ impl Backend for CudaBackend {
             return Err(BackendError::UnsupportedFormat(
                 "attn_ar: bf16 KV storage is not supported on CUDA (no bf16 kernel — the f16 kernels would decode bf16 bits as f16)".into(),
             ));
+        }
+        // Префилл на f16-тензорных ядрах: score материализуется, но GEMM идёт
+        // на tensor cores. Основной путь; отключается CUDA_NO_ATTN_BLAS.
+        // Не взялись (бюджет/формат/нет cuBLAS) — падаем на тайловое ядро.
+        if tq >= 32
+            && std::env::var_os("CUDA_NO_ATTN_BLAS").is_none()
+            && hd <= 256
+            && hd % 8 == 0
+            && n_heads % kv_heads == 0
+            && let (
+                crate::backend::TensorInner::CudaF16(k16),
+                crate::backend::TensorInner::CudaF16(v16),
+            ) = (&k.inner, &v.inner)
+            && self.attn_prefill_blas(q, k16, v16, mask, y, tq, tkv, n_heads, kv_heads, hd)?
+        {
+            return Ok(());
+        }
+        // Префилл: тайловое внимание (8 запросов одной головы, K/V в shared,
+        // онлайн-softmax) — attn_ar_v4 перечитывает весь KV на каждую пару
+        // (запрос, голова), на 4.8K это O(K²) глобального трафика.
+        if tq >= 8
+            && hd <= 256
+            && hd % 32 == 0
+            && n_heads % kv_heads == 0
+            && std::env::var_os("CUDA_NO_ATTN_TILED").is_none()
+            && let (
+                crate::backend::TensorInner::CudaF16(k16),
+                crate::backend::TensorInner::CudaF16(v16),
+            ) = (&k.inner, &v.inner)
+        {
+            let f = self.function("attn_prefill_tiled_f16")?;
+            // Kt (hd·66 f16) + Vt (64·hd f16) — dynamic shared.
+            let smem = (hd * (64 + 2) + 64 * hd) * 2;
+            let _ = f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (tq.div_ceil(16) as u32, n_heads as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem as u32,
+            };
+            let (mslice, has_mask) = match mask {
+                Some(m) => (m.as_cuda(), 1i32),
+                None => (q.as_cuda(), 0i32),
+            };
+            let q_stride = q.shape()[2] as i32;
+            let kv_stride = (kv_heads * hd) as i32;
+            let (tq32, tkv32) = (tq as i32, tkv as i32);
+            let (nh32, nkv32, hd32) = (n_heads as i32, kv_heads as i32, hd as i32);
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(q.as_cuda());
+            la.arg(k16);
+            la.arg(v16);
+            la.arg(mslice);
+            la.arg(y.as_cuda_mut());
+            la.arg(&tq32);
+            la.arg(&tkv32);
+            la.arg(&nh32);
+            la.arg(&nkv32);
+            la.arg(&hd32);
+            la.arg(&q_stride);
+            la.arg(&kv_stride);
+            la.arg(&has_mask);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            return Ok(());
         }
         let fname: &'static str = match (kfmt, vfmt) {
             (0, 0) => "attn_ar_v4_f32f32",
@@ -2922,13 +3981,13 @@ impl Backend for CudaBackend {
         let hd = d / h;
         // D8 (mirror of the CPU oracle): the mask is indexed as [t, t] — a
         // too-small mask would read OOB device memory.
-        if let Some(m) = mask {
-            if m.numel() < t * t {
-                return Err(BackendError::Shape(format!(
-                    "mhsa: mask numel {} < t·t {t}·{t}",
-                    m.numel()
-                )));
-            }
+        if let Some(m) = mask
+            && m.numel() < t * t
+        {
+            return Err(BackendError::Shape(format!(
+                "mhsa: mask numel {} < t·t {t}·{t}",
+                m.numel()
+            )));
         }
         let f = self.function("mhsa_f32")?;
         // 3D grid: (b, h, t) — one block per (batch, head, query).
@@ -3027,7 +4086,7 @@ impl Backend for CudaBackend {
         }
         let f = self.function("mhsa_rel_pos_f32")?;
         let cfg = LaunchConfig {
-            grid_dim: (((t + 3) / 4) as u32, h as u32, 1),
+            grid_dim: (t.div_ceil(4) as u32, h as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -3112,7 +4171,7 @@ impl Backend for CudaBackend {
 
     fn kv_shifted(&self, buf: &Tensor, shift: usize, pos: usize) -> Result<Tensor, BackendError> {
         let (b, cap, d) = (buf.shape()[0], buf.shape()[1], buf.shape()[2]);
-        let shape = buf.shape().to_vec();
+        let _shape = buf.shape().to_vec();
         let (bi, si, pi, di, ci) = (b as i32, shift as i32, pos as i32, d as i32, cap as i32);
         // In-place shift on the same buffer (the regions are disjoint;
         // the kernels write through the handle — the returned tensor is a
@@ -3129,7 +4188,7 @@ impl Backend for CudaBackend {
                 la.arg(&di);
                 la.arg(&ci);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(buf.clone());
+                Ok(buf.clone())
             }
             crate::backend::TensorInner::CudaF16(s) => {
                 let f = self.function("kv_shift_f16")?;
@@ -3142,7 +4201,7 @@ impl Backend for CudaBackend {
                 la.arg(&di);
                 la.arg(&ci);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(buf.clone());
+                Ok(buf.clone())
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
                 let f = self.function("kv_shift_q8")?;
@@ -3156,7 +4215,7 @@ impl Backend for CudaBackend {
                 la.arg(&di);
                 la.arg(&ci);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(buf.clone());
+                Ok(buf.clone())
             }
             _ => Err(BackendError::Shape(format!(
                 "kv_shifted: unsupported storage {:?}",
@@ -3176,7 +4235,7 @@ impl Backend for CudaBackend {
         let (b, cap, d) = (k.shape()[0], k.shape()[1], k.shape()[2]);
         let nheads = d / head_dim;
         let pairs = head_dim / 2;
-        let shape = k.shape().to_vec();
+        let _shape = k.shape().to_vec();
         // The rotation table (hd/2 entries): angle_i = −shift·theta^(−2i/hd).
         let mut cos_tab = vec![0.0f32; pairs];
         let mut sin_tab = vec![0.0f32; pairs];
@@ -3197,7 +4256,14 @@ impl Backend for CudaBackend {
             pairs as i32,
         );
         let (s0, s1, s2, sect_dims) = mrope_sections
-            .map(|s| (s[0] as i32, s[1] as i32, s[2] as i32, (s[0] + s[1] + s[2]) as i32))
+            .map(|s| {
+                (
+                    s[0] as i32,
+                    s[1] as i32,
+                    s[2] as i32,
+                    (s[0] + s[1] + s[2]) as i32,
+                )
+            })
             .unwrap_or((0, 0, 0, 0));
         match &k.inner {
             crate::backend::TensorInner::Cuda(_) => {
@@ -3218,7 +4284,7 @@ impl Backend for CudaBackend {
                 la.arg(&s2);
                 la.arg(&sect_dims);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(k.clone());
+                Ok(k.clone())
             }
             crate::backend::TensorInner::CudaF16(s) => {
                 let f = self.function("kv_rerotate_f16")?;
@@ -3238,7 +4304,7 @@ impl Backend for CudaBackend {
                 la.arg(&s2);
                 la.arg(&sect_dims);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(k.clone());
+                Ok(k.clone())
             }
             crate::backend::TensorInner::CudaI8 { data, scale } => {
                 let f = self.function("kv_rerotate_q8")?;
@@ -3258,13 +4324,82 @@ impl Backend for CudaBackend {
                 la.arg(&s2);
                 la.arg(&sect_dims);
                 unsafe { la.launch(cfg).map_err(map_err)? };
-                return Ok(k.clone());
+                Ok(k.clone())
             }
             _ => Err(BackendError::Shape(format!(
                 "kv_rerotated: unsupported storage {:?}",
                 k.dtype
             ))),
         }
+    }
+
+    /// CUDA has no nonzero-offset views (`view_offset` panics by design), so
+    /// the row read/write pair copies device-side instead. Both are tiny
+    /// (one head row per call) and only the offset differs from Metal.
+    fn row_view(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        d: usize,
+        row: usize,
+    ) -> Result<Tensor, BackendError> {
+        let n: usize = x.shape().iter().product();
+        if n != rows * d || row >= rows {
+            return Err(BackendError::Shape(format!(
+                "row_view: {:?} is not ({rows}, {d}) or row {row} out of range",
+                x.shape()
+            )));
+        }
+        let crate::backend::TensorInner::Cuda(_) = &x.inner else {
+            return Err(BackendError::UnsupportedFormat(
+                "row_view: non-CUDA tensor on the CUDA backend".into(),
+            ));
+        };
+        let dst = self.take_pooled(d)?;
+        let f = self.function("copy_tail_f32")?;
+        let cfg = LaunchConfig::for_num_elems(d as u32);
+        let off = (row * d) as i32;
+        let d32 = d as i32;
+        let mut la = self.stream.launch_builder(&f);
+        la.arg(x.as_cuda());
+        la.arg(&dst);
+        la.arg(&off);
+        la.arg(&d32);
+        unsafe { la.launch(cfg) }.map_err(map_err)?;
+        Ok(Tensor::from_cuda(self.wrap_pooled(dst), vec![1, 1, d]))
+    }
+
+    fn row_write(&self, dst: &Tensor, src: &Tensor, row: usize) -> Result<(), BackendError> {
+        let d = dst.shape()[2];
+        if src.shape() != [1, 1, d] {
+            return Err(BackendError::Shape(format!(
+                "row_write: src {:?} is not (1, 1, {d})",
+                src.shape()
+            )));
+        }
+        let cap = dst.shape()[1];
+        if row >= cap {
+            return Err(BackendError::Shape(format!(
+                "row_write: row {row} outside (1, {cap}, {d})"
+            )));
+        }
+        if let (crate::backend::TensorInner::Cuda(_), crate::backend::TensorInner::Cuda(_)) =
+            (&dst.inner, &src.inner)
+        {
+            let f = self.function("copy_into_f32")?;
+            let cfg = LaunchConfig::for_num_elems(d as u32);
+            let off = (row * d) as i32;
+            let d32 = d as i32;
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(src.as_cuda());
+            la.arg(dst.as_cuda());
+            la.arg(&off);
+            la.arg(&d32);
+            return unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err);
+        }
+        Err(BackendError::UnsupportedFormat(
+            "row_write: non-CUDA tensor on the CUDA backend".into(),
+        ))
     }
 
     fn kv_update(&self, dst: &Tensor, src: &Tensor, pos: usize) -> Result<(), BackendError> {
@@ -3401,9 +4536,9 @@ impl Backend for CudaBackend {
                 la.arg(&c32);
                 unsafe { la.launch(cfg) }.map(|_| ()).map_err(map_err)
             }
-            _ => Err(BackendError::Shape(format!(
-                "kv_update: unsupported format pair"
-            ))),
+            _ => Err(BackendError::Shape(
+                "kv_update: unsupported format pair".to_string(),
+            )),
         }
     }
 
@@ -3458,6 +4593,21 @@ impl Backend for CudaBackend {
     }
 }
 
+/// Источник квантованного веса для bf16-раскладки (prefill через tensor
+/// cores): раскладчик зависит от формата, GEMM общий.
+enum PackedBf16Src<'a> {
+    /// Q4_K / Q6_K (GGUF-блоки 144/210 Б на 256 весов).
+    K {
+        name: &'a str,
+        bpack: &'a cudarc::driver::CudaSlice<u8>,
+    },
+    /// Q8_0 в нашей kb-major упаковке (32 i8 на блок + масштаб на блок).
+    I8 {
+        data: &'a cudarc::driver::CudaSlice<i8>,
+        wscale: &'a cudarc::driver::CudaSlice<f32>,
+    },
+}
+
 impl CudaBackend {
     /// Fused-dequant GEMM for packed weights (Q6_K / Q4_0). `nsup_shift`:
     /// weights per packed block (8 → 256, 5 → 32); `blk_bytes`: 210 / 18;
@@ -3480,9 +4630,12 @@ impl CudaBackend {
         let k32 = k as i32;
         let n32 = n as i32;
         let m32 = m as i32;
+        // bf16-путь берёт ТЕНЗОР выхода (нужен для cuBLAS gemm_ex), поэтому
+        // его запоминаем до затенения срезом.
+        let c_tensor = c;
         let c = c.as_cuda_mut();
         let nblk = k >> nsup_shift;
-        let grid_x = (n + bn - 1) / bn;
+        let grid_x = n.div_ceil(bn);
         // Split-k for m == 1 (decode): the dequant-amortized f32-tile kernel.
         // For m > 1 the tiled kernel stages B once per 32-row chunk and the
         // activation tile in shared (the split-k re-reads B per row AND
@@ -3528,6 +4681,29 @@ impl CudaBackend {
             (_, "gemm_q4kc") => ("gemm_q4kc_splitk_v2_f32", "gemm_q4kc_tiled_v3"),
             _ => unreachable!("gemm_packed_nt: name/activation combo"),
         };
+        // m = 2..7 у форматов БЕЗ v4-семейства (q5k/q3k/q4_0): 16 z-слайсов
+        // с cpart и reduce деquant'ят вес за 32 строки при 2-7 полезных.
+        // Гоним m=1 split-k по строке: вес читается заново, зато нет пустых
+        // строк и reduce. q4kc/q6k идут ниже v4r1/v4r2 (8/16 строк в блоке).
+        let has_v4 = matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32;
+        if (2..8).contains(&m) && !has_v4 {
+            let c3 = c_tensor.view(vec![1, m, n]);
+            for r in 0..m {
+                let a_r = self.row_view(a, m, k, r)?;
+                let c_r = self.zeros(vec![1, n])?;
+                self.gemm_packed_nt(&a_r, bpack, &c_r, 1, k, n, nsup_shift, blk_bytes, bn, name)?;
+                let src3 = c_r.view(vec![1, 1, n]);
+                self.row_write(&c3, &src3, r)?;
+            }
+            return Ok(());
+        }
+        if m >= 32
+            && k >= 1024
+            && matches!(name, "gemm_q4kc" | "gemm_q6k")
+            && self.gemm_packed_bf16(PackedBf16Src::K { name, bpack }, a, c_tensor, m, k, n)?
+        {
+            return Ok(());
+        }
         if m == 1 {
             if s > 1 {
                 let cpart = self.take_pooled(s * m * n)?;
@@ -3574,12 +4750,106 @@ impl CudaBackend {
                 la.arg(&m32);
                 unsafe { la.launch(cfg) }.map_err(map_err)?;
             }
+        } else if matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32 && m <= 8 {
+            // m = 2..8: split-k с НЕСКОЛЬКИМИ строками в блоке — B-тайл и его
+            // dequant оплачены один раз на весь блок (по-строчный m=1 читает
+            // вес по разу на строку). MMAX=8 в ядре, m — рантайм.
+            let s = self.pick_split(nblk, 1, n, grid_x);
+            let nmb = if name == "gemm_q6k" {
+                match act {
+                    crate::dtype::Dtype::F16 => "gemm_q6k_splitk_v2m_f16",
+                    crate::dtype::Dtype::BF16 => "gemm_q6k_splitk_v2m_bf16",
+                    _ => "gemm_q6k_splitk_v2m_f32",
+                }
+            } else {
+                match act {
+                    crate::dtype::Dtype::F16 => "gemm_q4kc_splitk_v2m_f16",
+                    crate::dtype::Dtype::BF16 => "gemm_q4kc_splitk_v2m_bf16",
+                    _ => "gemm_q4kc_splitk_v2m_f32",
+                }
+            };
+            let cpart = self.take_pooled(s * m * n)?;
+            let f = self.function(nmb)?;
+            // T[256][32] + part[8][8][33] + As[8][256] + Bs[32][BLK]:
+            // 32.8+8.4+4+4.6 КБ — только динамическая shared.
+            let asz = match act {
+                crate::dtype::Dtype::F32 => 4,
+                _ => 2,
+            };
+            let smb: u32 = (256 * 32 * 4 + 8 * 8 * 33 * 4 + 8 * 256 * asz + 32 * blk_bytes) as u32;
+            let _ = f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smb as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x as u32, s as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smb,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            match &a_arg {
+                KernA::F32(t) => la.arg(t.as_cuda()),
+                KernA::F16(sl) => la.arg(sl),
+                KernA::BF16(sl) => la.arg(sl),
+            };
+            la.arg(bpack);
+            la.arg(&cpart);
+            la.arg(&k32);
+            la.arg(&n32);
+            let s32 = s as i32;
+            la.arg(&s32);
+            la.arg(&m32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
+            self.reduce_and_pool(cpart, c, m, n, s, s * m * n)?;
+        } else if matches!(name, "gemm_q4kc" | "gemm_q6k") && k >= 512 && n >= 32 && m >= 2 {
+            // v4 (prefill-чанки LLM): деquant колонки ОДИН раз в общий
+            // f32-тайл, им считаются строки блока. v3 dequant'ил заново на
+            // каждую из 4 rq-групп строк — на 27B prefill упирался в
+            // ~2.4 TFLOPS (8.6 мс/токен).
+            // Малая m (2..16): строк в блоке меньше (8/16), иначе блок считает
+            // 32 строки при 2 полезных — на пакетном шаге 27B это была вся
+            // цена строки (замер: m=2 вдвое дороже двух m=1).
+            let (suf, bm) = match m {
+                0..=8 => ("tiled_v4r1", 8usize),
+                9..=16 => ("tiled_v4r2", 16),
+                _ => ("tiled_v4", 32),
+            };
+            // Имена функций статические (`function` кэширует по &'static str).
+            let fname: &'static str = match (name, suf) {
+                ("gemm_q6k", "tiled_v4r1") => "gemm_q6k_tiled_v4r1",
+                ("gemm_q6k", "tiled_v4r2") => "gemm_q6k_tiled_v4r2",
+                ("gemm_q6k", _) => "gemm_q6k_tiled_v4",
+                (_, "tiled_v4r1") => "gemm_q4kc_tiled_v4r1",
+                (_, "tiled_v4r2") => "gemm_q4kc_tiled_v4r2",
+                _ => "gemm_q4kc_tiled_v4",
+            };
+            let f = self.function(fname)?;
+            // T[256][33] + As[bm][256] f32 (42..66 KB dynamic): без явного
+            // атрибута драйвер отклоняет пуск свыше 48 KB.
+            let v4_smem: u32 = ((256 * 33 + bm * 256) * 4) as u32;
+            let _ = f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                v4_smem as i32,
+            );
+            let cfg = LaunchConfig {
+                grid_dim: (n.div_ceil(32) as u32, m.div_ceil(bm) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: v4_smem,
+            };
+            let mut la = self.stream.launch_builder(&f);
+            la.arg(a.as_cuda());
+            la.arg(bpack);
+            la.arg(c);
+            la.arg(&m32);
+            la.arg(&k32);
+            la.arg(&n32);
+            unsafe { la.launch(cfg) }.map_err(map_err)?;
         } else {
             let s16 = 16usize;
             let cpart = self.take_pooled(s16 * m * n)?;
             let f = self.function(tiled)?;
             let cfg = LaunchConfig {
-                grid_dim: (grid_x as u32, ((m + 31) / 32) as u32, 16),
+                grid_dim: (grid_x as u32, m.div_ceil(32) as u32, 16),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -3607,6 +4877,540 @@ impl CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tiled GEMMs write ceil(nsup/nkz) of the 16 z-slices; reducing
+    /// Полный путь `attn_prefill_blas` на минимальной конфигурации (одна
+    /// голова, без GQA и маски) против наивного эталона — с печатью первых
+    /// значений выхода, чтобы видеть характер ошибки (нули/перестановка).
+    #[test]
+    fn attn_prefill_blas_minimal() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (tq, tkv, hd) = (32usize, 9usize, 8usize);
+        let q: Vec<f32> = (0..tq * hd).map(|i| ((i as f32) * 0.29).sin()).collect();
+        let k: Vec<f32> = (0..tkv * hd).map(|i| ((i as f32) * 0.41).cos()).collect();
+        let v: Vec<f32> = (0..tkv * hd).map(|i| ((i as f32) * 0.17).sin()).collect();
+        let qt = be.from_cpu_f32(&q, vec![1, tq, hd]).unwrap();
+        let tk = be.from_cpu_f32(&k, vec![1, tkv, hd]).unwrap();
+        let tv = be.from_cpu_f32(&v, vec![1, tkv, hd]).unwrap();
+        let zeros = vec![half::f16::from_f32(0.0); tkv * hd];
+        let ck = be.from_cpu_f16(&zeros, vec![1, tkv, hd]).unwrap();
+        let cv = be.from_cpu_f16(&zeros, vec![1, tkv, hd]).unwrap();
+        be.kv_update(&ck, &tk, 0).unwrap();
+        be.kv_update(&cv, &tv, 0).unwrap();
+        let out = be.zeros(vec![1, tq, hd]).unwrap();
+        let (crate::backend::TensorInner::CudaF16(k16), crate::backend::TensorInner::CudaF16(v16)) =
+            (&ck.inner, &cv.inner)
+        else {
+            panic!("cache не f16");
+        };
+        let took = be
+            .attn_prefill_blas(&qt, k16, v16, None, &out, tq, tkv, 1, 1, hd)
+            .unwrap();
+        assert!(took, "BLAS-путь не взялся");
+        let got = be.to_cpu_f32(&out).unwrap();
+        let h = |x: f32| half::f16::from_f32(x).to_f32();
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let mut worst = 0.0f32;
+        for qi in 0..tq {
+            for d in 0..hd {
+                // наивный эталон: softmax по ключам от score·scale
+                let mut mx = f32::NEG_INFINITY;
+                let mut sc = vec![0.0f32; tkv];
+                for key in 0..tkv {
+                    let mut a = 0.0f32;
+                    for j in 0..hd {
+                        a += h(q[qi * hd + j]) * h(k[key * hd + j]);
+                    }
+                    sc[key] = a * scale;
+                    mx = mx.max(sc[key]);
+                }
+                let mut den = 0.0f32;
+                for s in &sc {
+                    den += (s - mx).exp();
+                }
+                let mut want = 0.0f32;
+                for key in 0..tkv {
+                    want += ((sc[key] - mx).exp() / den) * h(v[key * hd + d]);
+                }
+                let diff = (got[qi * hd + d] - want).abs();
+                if diff > worst {
+                    worst = diff;
+                    if worst > 1e-2 {
+                        eprintln!(
+                            "q={qi} d={d}: got {:.4} want {:.4} (first scores {:?})",
+                            got[qi * hd + d],
+                            want,
+                            &sc[..3]
+                        );
+                    }
+                }
+            }
+        }
+        assert!(worst < 1e-2, "attn_prefill_blas расходится: {worst}");
+    }
+
+    /// Bulk delta-rule (слоты в grid.z, стейты массивом указателей) обязан
+    /// совпасть с поштучным вызовом на каждом слоте — иначе пакетный шаг
+    /// поедет по другому состоянию, чем одиночный декод.
+    /// Цена по-слотовых опа модели (B=2): где именно 50 мкс на вызов.
+    #[test]
+    #[ignore]
+    fn attn_row_ops_probe() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        // Геометрия 27B (Qwen3.8-27B-Q4_K_M): nh=24, nkv=4, hd=256, n_rot=64.
+        let (nh, nkv, hd, tkv) = (24usize, 4usize, 256usize, 120usize);
+        let q = be.zeros(vec![1, 1, nh * hd]).unwrap();
+        let wq = be.zeros(vec![hd]).unwrap();
+        let zeros = vec![half::f16::from_f32(0.0); tkv * nkv * hd];
+        let kf = be.from_cpu_f16(&zeros, vec![1, tkv, nkv * hd]).unwrap();
+        let vf = be.from_cpu_f16(&zeros, vec![1, tkv, nkv * hd]).unwrap();
+        let y = be.zeros(vec![1, 1, nh * hd]).unwrap();
+        let kn = be.zeros(vec![1, 1, nh * hd]).unwrap();
+        let x = be.zeros(vec![2, 2 * nh * hd]).unwrap();
+        let time = |label: &str, reps: usize, f: &mut dyn FnMut()| {
+            for _ in 0..3 {
+                f();
+            }
+            be.synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                f();
+            }
+            be.synchronize().unwrap();
+            eprintln!(
+                "{label}: {:.1} мкс/вызов",
+                t0.elapsed().as_secs_f64() * 1e6 / reps as f64
+            );
+        };
+        time("row_view(1024)", 200, &mut || {
+            let _ = be.row_view(&x, 2, 2 * nh * hd, 1).unwrap();
+        });
+        time("rmsnorm_head", 200, &mut || {
+            be.rmsnorm_head(&q, &wq, &y, nh, 1e-6).unwrap();
+        });
+        time("rope_imrope(n_rot=64)", 200, &mut || {
+            let _ = be
+                .rope_imrope_text(&q, 120, hd, 1e7, [11, 11, 10, 0], 64)
+                .unwrap();
+        });
+        time("attn_ar(tkv=120,f16)", 200, &mut || {
+            be.attn_ar(&q, &kf, &vf, None, &y, nh, nkv, hd).unwrap();
+        });
+        let kvrow = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        time("kv_update(1 row)", 200, &mut || {
+            be.kv_update(&kf, &kvrow, 118).unwrap();
+        });
+        // Цепочка как в attn_forward_batch: 13 опа подряд, зависимости есть,
+        // синхронизации нет — цена «слоя» на строку.
+        let qg = be.zeros(vec![1, 2 * nh * hd]).unwrap();
+        let krow = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        let vrow = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+        let wq = be.zeros(vec![hd]).unwrap();
+        let wk = be.zeros(vec![hd]).unwrap();
+        let gated = be.zeros(vec![1, 2, nh * hd]).unwrap();
+        let mut chain = || {
+            for row in 0..2usize {
+                let qg_j =
+                    be.row_view(&qg, 1, 2 * nh * hd, 0)
+                        .unwrap()
+                        .view(vec![1, 1, 2 * nh * hd]);
+                let q = crate::nn::slice_last(&be, &qg_j, nh * hd, 0).unwrap();
+                let gate = crate::nn::slice_last(&be, &qg_j, nh * hd, nh * hd).unwrap();
+                let qn = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.rmsnorm_head(&q, &wq, &qn, nh, 1e-6).unwrap();
+                let qr = be
+                    .rope_imrope_text(&qn, 120, hd, 1e7, [11, 11, 10, 0], 64)
+                    .unwrap();
+                let kn2 = be.zeros(vec![1, 1, nkv * hd]).unwrap();
+                be.rmsnorm_head(&krow, &wk, &kn2, nkv, 1e-6).unwrap();
+                let kr2 = be
+                    .rope_imrope_text(&kn2, 120, hd, 1e7, [11, 11, 10, 0], 64)
+                    .unwrap();
+                be.kv_update(&kf, &kr2, 118).unwrap();
+                be.kv_update(&vf, &vrow, 118).unwrap();
+                let out = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.attn_ar(&qr, &kf, &vf, None, &out, nh, nkv, hd).unwrap();
+                let sg = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.sigmoid(&gate, &sg).unwrap();
+                let row_out = be.zeros(vec![1, 1, nh * hd]).unwrap();
+                be.mul(&out, &sg, &row_out).unwrap();
+                let g3 = gated.view(vec![1, 2, nh * hd]);
+                be.row_write(&g3, &row_out, row).unwrap();
+            }
+        };
+        time("цепочка attn (2 строки)", 60, &mut chain);
+        // Та же цепочка, но за спиной стоит длинная очередь (как в шаге
+        // модели, где перед по-слотовой секцией уже поставлены все проекции).
+        be.synchronize().unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..60 {
+            for _ in 0..100 {
+                drop(be.zeros(vec![4096]).unwrap());
+            }
+            chain();
+        }
+        let with_q = t1.elapsed().as_secs_f64() * 1e6 / 60.0;
+        let t2 = std::time::Instant::now();
+        for _ in 0..60 {
+            for _ in 0..100 {
+                drop(be.zeros(vec![4096]).unwrap());
+            }
+        }
+        let base = t2.elapsed().as_secs_f64() * 1e6 / 60.0;
+        eprintln!(
+            "цепочка при глубокой очереди: {:.1} мкс/итерация (фон {:.1})",
+            with_q - base,
+            base
+        );
+    }
+
+    /// Цена одного запуска с хоста (без синхронизации) — от неё зависит,
+    /// сколько мелких ядер в шаге вообще имеет смысл запускать.
+    #[test]
+    #[ignore]
+    fn launch_cost_probe() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let x = be.zeros(vec![4096]).unwrap();
+        let y = be.zeros(vec![4096]).unwrap();
+        let f = be.function("elementwise_f32").unwrap();
+        let cfg = LaunchConfig::for_num_elems(4096);
+        let (n32, op) = (4096i32, 0i32);
+        let reps = 10_000;
+        // прогрев: кэш функций, пул, контекст
+        for _ in 0..100 {
+            let mut la = be.stream.launch_builder(&f);
+            la.arg(x.as_cuda());
+            la.arg(x.as_cuda());
+            la.arg(y.as_cuda_mut());
+            la.arg(&n32);
+            la.arg(&op);
+            la.arg(&0.0f32);
+            unsafe { la.launch(cfg) }.unwrap();
+        }
+        be.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let mut la = be.stream.launch_builder(&f);
+            la.arg(x.as_cuda());
+            la.arg(x.as_cuda());
+            la.arg(y.as_cuda_mut());
+            la.arg(&n32);
+            la.arg(&op);
+            la.arg(&0.0f32);
+            unsafe { la.launch(cfg) }.unwrap();
+        }
+        let host = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        // То же, но очередью глубиной 20k: если очередь переполняется, цена
+        // запуска падает до скорости GPU (наблюдаем излом).
+        let t1 = std::time::Instant::now();
+        for _ in 0..20_000 {
+            let mut la = be.stream.launch_builder(&f);
+            la.arg(x.as_cuda());
+            la.arg(x.as_cuda());
+            la.arg(y.as_cuda_mut());
+            la.arg(&n32);
+            la.arg(&op);
+            la.arg(&0.0f32);
+            unsafe { la.launch(cfg) }.unwrap();
+        }
+        let deep = t1.elapsed().as_secs_f64() * 1e6 / 20_000.0;
+        eprintln!("очередь 20k: {deep:.2} мкс/запуск");
+        be.synchronize().unwrap();
+        be.synchronize().unwrap();
+        let total = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        eprintln!("launch: хост {host:.2} мкс/запуск, с синхронизацией {total:.2} мкс");
+    }
+
+    /// Кривая GEMM по m (Q4_K, как в модели): где ломается цена строки.
+    /// `cargo test --release --features cuda --lib gemm_small_m_curve -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gemm_small_m_curve() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        for (k, n) in [(5120usize, 5120usize), (5120, 17408)] {
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.001).sin()) * 0.4)
+                .collect();
+            let packed = crate::quant::quantize(&w, crate::quant::QuantFormat::Q4_K_M);
+            let bt = be.from_cpu_q4kc(&packed, vec![n, k]).unwrap();
+            for m in [1usize, 2, 4, 8, 16, 32] {
+                let a: Vec<f32> = (0..m * k)
+                    .map(|i| ((i as f32 * 0.01).cos()) * 0.5)
+                    .collect();
+                let at = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+                let c = be.zeros(vec![m, n]).unwrap();
+                be.gemm_nt(&at, &bt, &c).unwrap();
+                be.synchronize().unwrap();
+                let reps = 20;
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    be.gemm_nt(&at, &bt, &c).unwrap();
+                    be.synchronize().unwrap();
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                eprintln!(
+                    "k={k} n={n} m={m}: {ms:.3} ms  ({:.1} ms/строка)",
+                    ms / m as f64
+                );
+            }
+        }
+    }
+
+    /// Малая m (2..7) идёт по строке тем же m=1 split-k: строки обязаны
+    /// совпасть с отдельным m=1 прогоном побитово. Иначе пакетный шаг молча
+    /// считает не то (проверяем и раскладку строк A/C, и смещения).
+    #[test]
+    fn gemm_nt_small_m_matches_m1_rows() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (k, n, m) = (512usize, 48usize, 6usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.013).sin()) * 0.5 + 0.1)
+            .collect();
+        let packed = crate::quant::quantize(&w, crate::quant::QuantFormat::Q6_K);
+        let bt = be.from_cpu_q6k(&packed, vec![n, k]).unwrap();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.007).cos()) * 0.8)
+            .collect();
+        let at = be.from_cpu_f32(&a, vec![m, k]).unwrap();
+        let c = be.zeros(vec![m, n]).unwrap();
+        be.gemm_nt(&at, &bt, &c).unwrap();
+        let got = be.to_cpu_f32(&c).unwrap();
+        for r in 0..m {
+            let a_r = be.from_cpu_f32(&a[r * k..(r + 1) * k], vec![1, k]).unwrap();
+            let c_r = be.zeros(vec![1, n]).unwrap();
+            be.gemm_nt(&a_r, &bt, &c_r).unwrap();
+            let want = be.to_cpu_f32(&c_r).unwrap();
+            for j in 0..n {
+                assert_eq!(
+                    got[r * n + j],
+                    want[j],
+                    "m={m} строка {r} столбец {j}: {} против {} у m=1",
+                    got[r * n + j],
+                    want[j]
+                );
+            }
+        }
+    }
+
+    /// CUDA-IMROPE текста сверяется с CPU-дефолтом (тот — эталон для
+    /// хвоста головы, секторов-«пустышек» и частичной ротации n_rot < hd).
+    #[test]
+    fn rope_imrope_text_matches_cpu() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        use crate::backend::Backend as _;
+        let cpu = crate::cpu::CpuBackend;
+        let (tq, nh, hd, n_rot) = (3usize, 2usize, 16usize, 8usize);
+        let x: Vec<f32> = (0..tq * nh * hd)
+            .map(|i| ((i as f32 * 0.37).sin()) * 1.5)
+            .collect();
+        for (sections, pos) in [
+            ([2usize, 2, 2, 0], 0usize),
+            ([2, 2, 2, 0], 7),
+            ([0, 0, 0, 0], 5),
+        ] {
+            let want = cpu
+                .rope_imrope_text(
+                    &cpu.from_cpu_f32(&x, vec![1, tq, nh * hd]).unwrap(),
+                    pos,
+                    hd,
+                    1e6,
+                    sections,
+                    n_rot,
+                )
+                .unwrap();
+            let want = cpu.to_cpu_f32(&want).unwrap();
+            let xt = be.from_cpu_f32(&x, vec![1, tq, nh * hd]).unwrap();
+            let got = be
+                .rope_imrope_text(&xt, pos, hd, 1e6, sections, n_rot)
+                .unwrap();
+            let got = be.to_cpu_f32(&got).unwrap();
+            let mut worst = 0.0f32;
+            for (a, b) in got.iter().zip(&want) {
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst < 1e-5,
+                "sections {sections:?} pos {pos}: расхождение {worst}"
+            );
+        }
+    }
+
+    /// Bulk-хвост GDN на B слотов сверяется с по-слотовой цепочкой
+    /// (conv+silu+split+norm → delta-rule): и выход, и сдвинутые стейты
+    /// свёртки, и стейты delta-rule (они меняются на месте, поэтому эталон
+    /// берёт свои копии).
+    #[test]
+    fn gdn_batch_tail_matches_per_slot() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        use crate::backend::GdnBatchGeom;
+        let (slots, hk, hv, s, k) = (2usize, 1usize, 2usize, 128usize, 4usize);
+        let (qk, inner, cq) = (hk * s, hv * s, 2 * hk * s + hv * s);
+        let eps = 1e-5f32;
+        let mk = |n: usize, seed: f32, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32 * 0.11 + seed).sin()) * amp)
+                .collect()
+        };
+        let x = mk(slots * cq, 1.0, 0.4);
+        let w: Vec<f32> = (0..cq * k)
+            .map(|i| ((i as f32 * 0.017).sin()) * 0.4 + 0.6)
+            .collect();
+        let conv0 = mk(slots * cq * (k - 1), 2.0, 0.3);
+        let ssm0 = mk(slots * hv * s * s, 3.0, 0.3);
+        // gate — уже exp-аргумент (в модели softplus·a < 0), beta — уже сигмоид.
+        let gate = mk(slots * hv, 4.0, 0.03);
+        let gate: Vec<f32> = gate.iter().map(|v| v - 0.06).collect();
+        let beta: Vec<f32> = mk(slots * hv, 5.0, 0.25).iter().map(|v| 0.5 + v).collect();
+
+        let x_t = be.from_cpu_f32(&x, vec![slots, cq]).unwrap();
+        let w_t = be.from_cpu_f32(&w, vec![cq, k]).unwrap();
+        let gate_t = be.from_cpu_f32(&gate, vec![slots, hv]).unwrap();
+        let beta_t = be.from_cpu_f32(&beta, vec![slots, hv]).unwrap();
+        // bulk пишет стейты на месте — эталону свои копии.
+        let mut conv_bulk = Vec::with_capacity(slots);
+        let mut conv_ref = Vec::with_capacity(slots);
+        let mut ssm_bulk = Vec::with_capacity(slots);
+        let mut ssm_ref = Vec::with_capacity(slots);
+        for i in 0..slots {
+            let c = &conv0[i * cq * (k - 1)..(i + 1) * cq * (k - 1)];
+            conv_bulk.push(be.from_cpu_f32(c, vec![cq, k - 1]).unwrap());
+            conv_ref.push(be.from_cpu_f32(c, vec![cq, k - 1]).unwrap());
+            let m = &ssm0[i * hv * s * s..(i + 1) * hv * s * s];
+            ssm_bulk.push(be.from_cpu_f32(m, vec![hv, s, s]).unwrap());
+            ssm_ref.push(be.from_cpu_f32(m, vec![hv, s, s]).unwrap());
+        }
+        let conv_b: Vec<&Tensor> = conv_bulk.iter().collect();
+        let ssm_b: Vec<&Tensor> = ssm_bulk.iter().collect();
+        let out = be.zeros(vec![1, slots, inner]).unwrap();
+        let geom = GdnBatchGeom {
+            cq,
+            qk,
+            inner,
+            hk,
+            hv,
+            s,
+            k,
+            eps,
+        };
+        let done = be
+            .gdn_batch_tail(&x_t, &w_t, &conv_b, &ssm_b, &gate_t, &beta_t, &out, &geom)
+            .unwrap();
+        assert!(done, "bulk-путь GDN не взят");
+        // qkv обновился на месте (conv+silu+norm) — это и есть вход delta-rule
+        let y_bulk = be.to_cpu_f32(&x_t).unwrap();
+        let o_bulk = be.to_cpu_f32(&out).unwrap();
+
+        for i in 0..slots {
+            let xt = be.from_cpu_f32(&x[i * cq..(i + 1) * cq], vec![cq]).unwrap();
+            let (y, ns) = be
+                .gdn_conv_silu_split_norm(&xt, &w_t, &conv_ref[i], cq, k, s, qk, eps)
+                .unwrap();
+            let yh = be.to_cpu_f32(&y).unwrap();
+            let mut worst = 0.0f32;
+            for j in 0..cq {
+                worst = worst.max((yh[j] - y_bulk[i * cq + j]).abs());
+            }
+            assert!(worst < 1e-5, "слот {i}: conv+norm {worst}");
+            let ns_h = be.to_cpu_f32(&ns).unwrap();
+            let st_h = be.to_cpu_f32(&conv_bulk[i]).unwrap();
+            let mut worst = 0.0f32;
+            for j in 0..cq * (k - 1) {
+                worst = worst.max((ns_h[j] - st_h[j]).abs());
+            }
+            assert!(worst < 1e-7, "слот {i}: сдвиг conv-стейта {worst}");
+
+            let gr = gate[i * hv..(i + 1) * hv].to_vec();
+            let br = beta[i * hv..(i + 1) * hv].to_vec();
+            let (o, _) = be
+                .gdn_delta_rule(
+                    &be.from_cpu_f32(&yh[..qk], vec![1, qk]).unwrap(),
+                    &be.from_cpu_f32(&yh[qk..2 * qk], vec![1, qk]).unwrap(),
+                    &be.from_cpu_f32(&yh[2 * qk..], vec![1, inner]).unwrap(),
+                    &be.from_cpu_f32(&gr, vec![1, hv]).unwrap(),
+                    &be.from_cpu_f32(&br, vec![1, hv]).unwrap(),
+                    &ssm_ref[i],
+                    hk,
+                )
+                .unwrap();
+            let single = be.to_cpu_f32(&o).unwrap();
+            let mut worst = 0.0f32;
+            for j in 0..inner {
+                worst = worst.max((single[j] - o_bulk[i * inner + j]).abs());
+            }
+            assert!(worst < 1e-5, "слот {i}: delta-rule {worst}");
+        }
+    }
+
+    /// Конвенция QK-GEMM из `attn_prefill_blas`: score[q·tkv + key] =
+    /// Σ_d Q[q,d]·K[key,d]. Проверяем самим GEMM'ом на f16-входах — так
+    /// отладка внимания отделяется от softmax и копирования.
+    #[test]
+    fn gemm_ex_f16_qk_convention() {
+        let Ok(be) = CudaBackend::new(0) else {
+            eprintln!("no CUDA — skipping");
+            return;
+        };
+        let (tq, tkv, hd) = (5usize, 7usize, 8usize);
+        let q: Vec<f32> = (0..tq * hd).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let k: Vec<f32> = (0..tkv * hd).map(|i| ((i as f32) * 0.51).cos()).collect();
+        let qt = be.from_cpu_f32(&q, vec![1, tq, hd]).unwrap();
+        let kt = be.from_cpu_f32(&k, vec![1, tkv, hd]).unwrap();
+        let q16 = be.cast_f16(&qt).unwrap();
+        let k16 = be.cast_f16(&kt).unwrap();
+        let mut sc = unsafe { be.stream.alloc::<f32>(tq * tkv) }.unwrap();
+        let blas = CudaBlas::new(be.stream.clone()).unwrap();
+        let kb = {
+            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&k16, &be.stream);
+            p
+        };
+        let qb = {
+            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&q16, &be.stream);
+            p
+        };
+        let cb = {
+            let (p, _g) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut sc, &be.stream);
+            p
+        };
+        be.gemm_ex_f16(
+            &blas, kb, hd as i32, qb, hd as i32, cb, tkv as i32, tkv as i32, tq as i32, hd as i32,
+            1.0, true, false,
+        )
+        .unwrap();
+        let got = be.stream.clone_dtoh(&sc).unwrap();
+        let h = |x: f32| half::f16::from_f32(x).to_f32();
+        let mut worst = 0.0f32;
+        for qi in 0..tq {
+            for key in 0..tkv {
+                let mut want = 0.0f32;
+                for d in 0..hd {
+                    want += h(q[qi * hd + d]) * h(k[key * hd + d]);
+                }
+                worst = worst.max((got[qi * tkv + key] - want).abs());
+            }
+        }
+        assert!(worst < 1e-3, "QK-конвенция не сходится: {worst}");
+    }
 
     /// The tiled GEMMs write ceil(nsup/nkz) of the 16 z-slices; reducing
     /// more would sum stale pool contents (the STT-garbage bug).

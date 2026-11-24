@@ -1,9 +1,11 @@
 //! DFlash-драфтер (Ф2.3/Ф2.4/Ф2.5) — по спеке llama.cpp PR #27342
 //! (см. БЗ SLC: dflash-speka-llama-pr-27342).
 //!
-//! Структура: dense-слои (Qwen3-архитектура, эмбеддинги ОБЩИЕ с таргетом!)
-//! + two-tap dynamic conv (attn/ffn_conv_base + conv_proj) + селектор (v2:
-//! predecessor/successor codebooks, top-k лэттис). Два режима:
+//! Структура: dense-слои (Qwen3-архитектура, эмбеддинги ОБЩИЕ с таргетом!),
+//! two-tap dynamic conv (attn/ffn_conv_base + conv_proj) и селектор
+//! (v2: predecessor/successor codebooks, top-k лэттис).
+//!
+//! Два режима:
 //! - инжект (embd): фичи таргета → K/V-проекции каждого слоя → кэш;
 //! - диффузия (token): [committed, MASK...] → dense+conv → логиты/скрытые.
 
@@ -88,7 +90,9 @@ impl DFlashModel {
                 WeightFormat::Q4_0
                 | WeightFormat::Q8_0
                 | WeightFormat::Q4_K
-                | WeightFormat::Q6_K => backend.from_quantized(tensor.raw(), shape, tensor.format),
+                | WeightFormat::Q6_K
+                | WeightFormat::Q5_K
+                | WeightFormat::Q5_0 => backend.from_quantized(tensor.raw(), shape, tensor.format),
                 _ => {
                     let f = dequant_f32(tensor);
                     upload_f16(backend, &f, shape)
@@ -177,9 +181,21 @@ impl DFlashModel {
             c.set_max_cap(Some(cfg.rope_max_seq));
         }
         let selector = if w.get("selector_predecessor").is_some() {
-            // rank/top_k — из метаданных драфтера (GGUF KV
-            // dflash.selector_rank / dflash.selector_top_k); задел: параметры
-            let (rank, top_k) = (4usize, 10usize);
+            // rank — из формы тензора (numel / vocab), а не константы: при
+            // файле с рангом ≠ 4 прежний хардкод давал numel-несоответствие
+            // и панику в from_cpu_f32 (ревью Ф2.9). top_k из тензоров не
+            // читается — дефолт 10, load_with_selector перезагружает из
+            // метаданных (GGUF KV dflash.selector_rank / dflash.selector_top_k).
+            let pred = w.get("selector_predecessor").expect("проверено выше");
+            let numel: usize = pred.shape.iter().map(|&d| d as usize).product();
+            let rank = numel / cfg.vocab_size.max(1);
+            if rank == 0 {
+                return Err(BackendError::Shape(format!(
+                    "DFlash: selector_predecessor numel {numel} < vocab {} — ранг не читается",
+                    cfg.vocab_size
+                )));
+            }
+            let top_k = 10usize;
             // Селектор — маленький и читается в select() на CPU (жадный путь):
             // держим в F32, чтобы to_cpu_f32 не падал на f16-тензорах.
             // ggml-порядок (row-major реверс): prev/next [n_vocab, rank]
@@ -289,6 +305,8 @@ impl DFlashModel {
             )));
         }
         let cfg = Qwen3Config {
+            moe: None,
+            rope_yarn: None,
             dim,
             n_layers,
             n_heads,
@@ -322,20 +340,41 @@ impl DFlashModel {
                 "{arch}.conv_group_size must be >= 1, got 0"
             )));
         }
-        let extract = gf
+        // GGUF target_layers — индексы ВХОДОВ слоёв таргета: конвертер
+        // llama.cpp пишет HF target_layer_ids + 1, а llama.cpp читает
+        // llama_get_embeddings_layer_inp(id) = вход слоя id = ВЫХОД слоя id−1.
+        // Наш extract собирает ВЫХОДЫ слоёв (z-lab: hidden_states[id + 1]),
+        // поэтому индекс переводится обратно (−1). Без этого фичи брались на
+        // слой глубже обученного: Qwen3.5-4B — 3% приёмки вместо рабочей.
+        // safetensors-путь (config.json z-lab) уже в индексах выходов.
+        let extract: Vec<usize> = gf
             .get(&p("target_layers"))
             .and_then(GgufValue::as_array)
             .map(|a| {
                 a.iter()
                     .filter_map(GgufValue::as_u32)
-                    .map(|v| v as usize)
+                    .map(|v| (v as usize).saturating_sub(1))
                     .collect()
             })
             .unwrap_or_default();
+        if extract.is_empty() {
+            // Молчаливый режим без инжекта: драйвер не собирает extract,
+            // драфтер «слеп» (шумовой блок без контекста) — приёмка
+            // околонулевая без единой зацепки (ревью Ф2.9).
+            tracing::warn!("dflash: target_layers отсутствуют/пусты в GGUF — инжект фич выключен");
+        }
         let mask_token = gf
             .get("tokenizer.ggml.mask_token_id")
             .and_then(GgufValue::as_u32)
-            .unwrap_or(151850);
+            .ok_or_else(|| {
+                // Молчаливый дефолт (151850 — чужое семейство) диффундировал
+                // не-MASK-входы: приёмка тихо падала без единой зацепки
+                // (ревью Ф2.9). MASK обязателен в вокабуляре диффузионного драфтера.
+                BackendError::Shape(
+                    "dflash GGUF: нет tokenizer.ggml.mask_token_id — диффузия без MASK невозможна"
+                        .into(),
+                )
+            })?;
         let sel_rank = u(&p("selector_rank")).ok();
         let sel_top_k = u(&p("selector_top_k")).ok();
         Self::load_with_selector(
@@ -389,7 +428,14 @@ impl DFlashModel {
             .get("mask_token_id")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
-            .unwrap_or(151669);
+            .ok_or_else(|| {
+                // Тихий дефолт 151669 (токен чужой семьи) диффундировал
+                // не-MASK-входы — приёмка падала молча (ревью Ф2.9; GGUF-путь
+                // уже честно ошибается).
+                BackendError::Shape(
+                    "dflash config.json: dflash_config.mask_token_id обязателен".into(),
+                )
+            })?;
         let target_layers = dflash
             .get("target_layer_ids")
             .and_then(|v| v.as_array())
@@ -413,6 +459,8 @@ impl DFlashModel {
         }
         let head_dim = g("head_dim").unwrap_or(dim / n_heads);
         let cfg = Qwen3Config {
+            moe: None,
+            rope_yarn: None,
             dim,
             n_layers,
             n_heads,
@@ -623,13 +671,38 @@ impl DFlashModel {
             extract_layers,
             mask_token,
         )?;
-        // перезагрузить селектор с метаданными, если они есть
-        if let (Some(rank), Some(top_k), Some(_)) =
-            (sel_rank, sel_top_k, w.get("selector_predecessor"))
-        {
+        // перезагрузить селектор с метаданными, если они есть. Имена в
+        // z-lab GGUF — с суффиксом ".weight" (selector_predecessor.weight),
+        // в фикстурах/тестах — без; пробуем оба. Без этого селектор DFlash2
+        // молча не загружался, и драфтер шёл v1-аргмаксом (приёмка 32%
+        // против эталонных 68%).
+        let getw = |name: &str| -> Option<&crate::weights_map::WeightTensor<'_>> {
+            w.get(name).or_else(|| w.get(&format!("{name}.weight")))
+        };
+        // Класс бага «молчаливого отката» (d511cde кусался дважды): любое
+        // несоответствие тензоров и метаданных селектора теперь ГОВОРИТ, а не
+        // уходит молча в v1-аргмакс с тихой потерей приёмки.
+        let has_tensors = getw("selector_predecessor").is_some()
+            && getw("selector_successor").is_some()
+            && getw("selector_hidden").is_some();
+        let has_meta = sel_rank.is_some() || sel_top_k.is_some();
+        if has_tensors {
+            // Дефолты z-lab (4, 10) допустимы только с явным предупреждением.
+            let rank = sel_rank.unwrap_or(4);
+            let top_k = sel_top_k.unwrap_or(10);
+            if (sel_rank.is_none() || sel_top_k.is_none()) && has_meta {
+                tracing::warn!(
+                    "DFlash: селектор найден, но метаданные неполные (rank={sel_rank:?}, top_k={sel_top_k:?}) — дефолты ({rank}, {top_k})"
+                );
+            }
+            if rank == 0 || top_k == 0 {
+                return Err(BackendError::Shape(format!(
+                    "DFlash: метаданные селектора нулевые (rank={rank}, top_k={top_k})"
+                )));
+            }
             let up_f32 = |name: &str, shape: Vec<usize>| -> Result<Tensor, BackendError> {
                 let f = dequant_f32(
-                    w.get(name)
+                    getw(name)
                         .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?,
                 );
                 backend.from_cpu_f32(&f, shape)
@@ -641,6 +714,10 @@ impl DFlashModel {
                 rank,
                 top_k,
             });
+        } else if has_meta {
+            tracing::warn!(
+                "DFlash: метаданные селектора есть, а тензоров selector_* — нет; драфтер пойдёт v1-аргмаксом (приёмка ниже)"
+            );
         }
         Ok(m)
     }
@@ -672,7 +749,7 @@ impl DFlashModel {
                 let kv_size = self.cfg.n_kv_heads * self.cfg.head_dim;
                 let q_size = self.cfg.n_heads * self.cfg.head_dim;
                 let qkv = crate::nn::Linear {
-                    w: layer.dense.attn.wqkv.clone(),
+                    w: layer.dense.attn.wqkv.clone().expect("wqkv"),
                     b: None,
                 }
                 .forward(backend, &enc)?;
@@ -693,6 +770,7 @@ impl DFlashModel {
                     t,
                     self.cfg.head_dim,
                     self.cfg.rope_theta,
+                    self.cfg.rope_yarn.as_ref(),
                 )?;
                 // кэш индексирован ПОЗИЦИЯМИ токенов (llama.cpp): инжект
                 // пишет на абсолютные позиции pos..pos+t; перезапись
@@ -732,6 +810,24 @@ impl DFlashModel {
         pos: usize,
         features: Option<&Tensor>,
     ) -> Result<DiffusionResult, BackendError> {
+        // DFLASH_DIFF_PROF=1: синхронизация после этапов — где время диффузии
+        let dprof = std::env::var("DFLASH_DIFF_PROF").is_ok();
+        // Отладочные гейты — ВНЕ цикла слоёв: env::var на каждый слой каждого
+        // блока — мусор в горячем пути (ревью Ф2.9).
+        let dbg = std::env::var("LLM_DBG_SPEC").is_ok();
+        let sync =
+            |label: &str, t0: &mut std::time::Instant, x: &Tensor| -> Result<(), BackendError> {
+                if dprof {
+                    backend.to_cpu_f32(&x.view_restricted(vec![1]))?;
+                    eprintln!(
+                        "  diffuse {label}: {:.2} мс",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                    *t0 = std::time::Instant::now();
+                }
+                Ok(())
+            };
+        let mut t0 = std::time::Instant::now();
         backend.begin_batch()?;
         let r = (|| {
             let t = ids.len();
@@ -746,7 +842,7 @@ impl DFlashModel {
                 })?
                 .clone();
             let mut x = backend.zeros(vec![1, t, self.cfg.dim])?;
-            backend.embedding(ids, &embed, &mut x)?;
+            backend.embedding(ids, &embed, &x)?;
             // фичи → fc → hidden_norm (z-lab: target_hidden = hidden_norm(fc(...)))
             let enc = match (features, &self.fc, &self.enc_norm) {
                 (Some(f), Some(fc), Some(norm)) => {
@@ -767,6 +863,9 @@ impl DFlashModel {
                 }
                 _ => None,
             };
+            if let Some(e) = &enc {
+                sync("fc+enc_norm", &mut t0, e)?;
+            }
             let ctx = enc.as_ref().map(|e| e.shape()[1]).unwrap_or(0);
             // кэш-индексы — непрерывно от past_len (длина кэша ДО диффузии;
             // z-lab: cache_position = position_ids от get_seq_length()); на
@@ -779,7 +878,7 @@ impl DFlashModel {
             // видел контекст) — приёмка деградировала.
             let kctx_pos = pos.saturating_sub(ctx);
             for (i, layer) in self.layers.iter().enumerate() {
-                if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
+                if dbg && i == 0 {
                     eprintln!(
                         "diffuse: layer0 x={:?} enc={:?}",
                         x.shape(),
@@ -787,6 +886,9 @@ impl DFlashModel {
                     );
                 }
                 // ── attn-часть (свой путь: прямая инъекция k_ctx) ──
+                if i == 0 {
+                    sync("до слоя 0", &mut t0, &x)?;
+                }
                 let mut h = layer.dense.attn_norm.forward(backend, &x)?;
                 let attn_dyn = match (&layer.attn_conv.proj, &layer.attn_conv.base) {
                     (Some(p), Some(_)) => Some(conv_dynamic(backend, p, &h)?),
@@ -796,17 +898,17 @@ impl DFlashModel {
                     h = conv_side(backend, &h, b, d, 0, self.block_size)?;
                 }
                 let attn = &layer.dense.attn;
-                if std::env::var("LLM_DBG_SPEC").is_ok() && i == 0 {
+                if dbg && i == 0 {
                     eprintln!(
                         "diffuse: layer0 h={:?} wqkv={:?}",
                         h.shape(),
-                        attn.wqkv.shape()
+                        attn.wqkv.as_ref().expect("wqkv").shape()
                     );
                 }
                 let q_size = attn.n_heads * attn.head_dim;
                 let kv_size = attn.n_kv_heads * attn.head_dim;
                 let qkv = crate::nn::Linear {
-                    w: attn.wqkv.clone(),
+                    w: attn.wqkv.clone().expect("wqkv"),
                     b: None,
                 }
                 .forward(backend, &h)?;
@@ -823,6 +925,7 @@ impl DFlashModel {
                         self.cfg.rope_theta,
                         attn.n_heads,
                         1e-6,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                     None => crate::qwen3::rope_standard(
                         backend,
@@ -831,6 +934,7 @@ impl DFlashModel {
                         t,
                         attn.head_dim,
                         self.cfg.rope_theta,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                 };
                 let k = match &attn.k_norm {
@@ -842,6 +946,7 @@ impl DFlashModel {
                         self.cfg.rope_theta,
                         attn.n_kv_heads,
                         1e-6,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                     None => crate::qwen3::rope_standard(
                         backend,
@@ -850,13 +955,14 @@ impl DFlashModel {
                         t,
                         attn.head_dim,
                         self.cfg.rope_theta,
+                        self.cfg.rope_yarn.as_ref(),
                     )?,
                 };
                 // прямая инъекция фич (z-lab: concat([k_ctx, k_noise])) —
                 // k_ctx на [pos..pos+ctx), noise следом — кэш непрерывен
                 if let Some(e) = &enc {
                     let qkv2 = crate::nn::Linear {
-                        w: attn.wqkv.clone(),
+                        w: attn.wqkv.clone().expect("wqkv"),
                         b: None,
                     }
                     .forward(backend, e)?;
@@ -871,6 +977,7 @@ impl DFlashModel {
                             self.cfg.rope_theta,
                             attn.n_kv_heads,
                             1e-6,
+                            self.cfg.rope_yarn.as_ref(),
                         )?,
                         None => crate::qwen3::rope_standard(
                             backend,
@@ -879,6 +986,7 @@ impl DFlashModel {
                             ctx,
                             attn.head_dim,
                             self.cfg.rope_theta,
+                            self.cfg.rope_yarn.as_ref(),
                         )?,
                     };
                     self.caches[i].update_at(backend, &kc, &vc, past_len)?;
@@ -906,6 +1014,7 @@ impl DFlashModel {
                     cur = conv_side(backend, &cur, b, d, 1, self.block_size)?;
                 }
                 let ffn_inp = add(backend, &cur, &x)?;
+                sync(&format!("слой {i} attn"), &mut t0, &ffn_inp)?;
                 // ── ffn-часть ──
                 let mut h = layer.dense.ffn_norm.forward(backend, &ffn_inp)?;
                 let ffn_dyn = match (&layer.ffn_conv.proj, &layer.ffn_conv.base) {
@@ -915,11 +1024,12 @@ impl DFlashModel {
                 if let (Some(d), Some(b)) = (&ffn_dyn, &layer.ffn_conv.base) {
                     h = conv_side(backend, &h, b, d, 0, self.block_size)?;
                 }
-                let mut f = crate::qwen3::ffn_forward(backend, &h, &layer.dense.ffn)?;
+                let mut f = layer.dense.ffn.forward(backend, &h)?;
                 if let (Some(d), Some(b)) = (&ffn_dyn, &layer.ffn_conv.base) {
                     f = conv_side(backend, &f, b, d, 1, self.block_size)?;
                 }
                 x = add(backend, &f, &ffn_inp)?;
+                sync(&format!("слой {i}"), &mut t0, &x)?;
             }
             let hidden = self.out_norm.forward(backend, &x)?;
             let logits = crate::nn::Linear {
@@ -927,6 +1037,7 @@ impl DFlashModel {
                 b: None,
             }
             .forward(backend, &hidden)?;
+            sync("lm_head", &mut t0, &logits)?;
             Ok(DiffusionResult { logits, hidden })
         })();
         backend.end_batch()?;
@@ -945,7 +1056,8 @@ impl DFlashModel {
 
     /// Селектор v2 (спека build_dflash2_selector): жадный путь через лэттис.
     /// logits [1, T, V] (позиция 0 — anchor, 1..T — MASK), hidden [1, T, D]
-    /// (t_embd после out_norm). Возвращает draft-токены MASK-позиций и их
+    /// (t_embd после out_norm), anchor — фактический токен позиции 0.
+    /// Возвращает draft-токены MASK-позиций и их
     /// честные q (softmax-вероятность по полному ряду logits).
     /// Лэттис-строка: [cand_ids(top_k), scores(top_k·top_k)]; score[k] для
     /// pred: Σ_r succ[r, cand[k]] · (prev[r, pred] · hidden[r, pos]) + unary[k].
@@ -954,13 +1066,16 @@ impl DFlashModel {
         backend: &dyn Backend,
         logits: &Tensor,
         hidden: &Tensor,
+        anchor: u32,
     ) -> Result<SelectResult, BackendError> {
         let sel = self
             .selector
             .as_ref()
             .ok_or_else(|| BackendError::Shape("select: у драфтера нет селектора (v1)".into()))?;
         let (t, vocab) = (logits.shape()[1], logits.shape()[2]);
-        let (rank, top_k) = (sel.rank, sel.top_k.min(vocab));
+        // top_k=0 из битых метаданных дал бы пустые cand-строки и панику на
+        // cand[pos][best] (ревью Ф2.9).
+        let (rank, top_k) = (sel.rank, sel.top_k.max(1).min(vocab));
         let lg = backend.to_cpu_f32(logits)?; // [T, V]
         let hd = backend.to_cpu_f32(hidden)?; // [T, D]
         // ggml-порядок: prev/next [vocab, rank], hidden [rank, D]
@@ -972,15 +1087,31 @@ impl DFlashModel {
         let mut unary = vec![vec![0f32; top_k]; t];
         for pos in 0..t {
             let row = &lg[pos * vocab..(pos + 1) * vocab];
-            let mut idx: Vec<usize> = (0..vocab).collect();
-            idx.sort_by(|&a, &b| {
+            // Топ-k через select_nth: полная сортировка 150–250k элементов ×
+            // t позиций на КАЖДЫЙ черновой блок была самым дорогим хвостом
+            // селектора (ревью Ф2.9). NaN-логит — Equal (устойчиво, как было).
+            let cmp = |&a: &usize, &b: &usize| {
                 row[b]
                     .partial_cmp(&row[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for k in 0..top_k {
-                cand[pos][k] = idx[k] as u32;
-                unary[pos][k] = row[idx[k]];
+            };
+            if top_k < vocab {
+                let mut idx: Vec<usize> = (0..vocab).collect();
+                let (head, pivot, _) = idx.select_nth_unstable_by(top_k - 1, cmp);
+                let mut top: Vec<usize> = head.to_vec();
+                top.push(*pivot);
+                top.sort_unstable_by(cmp);
+                for (k, &i) in top.iter().enumerate() {
+                    cand[pos][k] = i as u32;
+                    unary[pos][k] = row[i];
+                }
+            } else {
+                let mut idx: Vec<usize> = (0..vocab).collect();
+                idx.sort_unstable_by(cmp);
+                for k in 0..top_k {
+                    cand[pos][k] = idx[k] as u32;
+                    unary[pos][k] = row[idx[k]];
+                }
             }
         }
         // скрытые → ранг: hid[pos][r] = Σ_d hidden[pos,d]·hw[r,d]
@@ -994,11 +1125,13 @@ impl DFlashModel {
                 hid[pos][r] = acc;
             }
         }
-        // жадный путь: на позиции 1 предшественник — anchor (позиция 0),
-        // на позициях i>1 — выбранный кандидат i−1.
+        // жадный путь: на позиции 1 предшественник — ЯКОРЬ (фактический токен
+        // позиции 0; у эталона score_run(1, 1, anchor_ids)), на позициях i>1 —
+        // выбранный кандидат i−1. Прежний cand[0][0] (top-1 логитов якорной
+        // позиции) ломал весь путь каскадом: приёмка 32% против эталонных 68%.
         let mut tokens = Vec::with_capacity(t - 1);
         let mut probs = Vec::with_capacity(t - 1);
-        let mut pred = cand[0][0];
+        let mut pred = anchor;
         for pos in 1..t {
             let pred_col: Vec<f32> = (0..rank).map(|r| pd[pred as usize * rank + r]).collect();
             let mut best = 0usize;
@@ -1015,7 +1148,10 @@ impl DFlashModel {
                 }
             }
             tokens.push(cand[pos][best]);
-            probs.push(softmax_row_prob(&lg, pos, vocab, cand[pos][best]));
+            // Путь решётки детерминирован (жадный argmax) → дельта q=1.0.
+            // Прежняя softmax-вероятность при temperature>0 завышала приём
+            // (черновик не сэмплирован из этого распределения) — ревью Ф2.9.
+            probs.push(1.0);
             pred = cand[pos][best];
         }
         Ok(SelectResult { tokens, probs })
@@ -1028,16 +1164,8 @@ pub struct SelectResult {
     pub probs: Vec<f32>,
 }
 
-/// softmax-вероятность токена в ряду логгитов (честная q драфтера).
-fn softmax_row_prob(lg: &[f32], pos: usize, vocab: usize, tok: u32) -> f32 {
-    let row = &lg[pos * vocab..(pos + 1) * vocab];
-    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for &l in row {
-        sum += (l - max).exp();
-    }
-    ((row[tok as usize] - max).exp()) / sum
-}
+// (q драфтера — дельта 1.0, см. crate::spec::Drafter::draft; прежние
+// softmax_row_prob/softmax_row_prob_t давали нечестную скалярную q.)
 
 /// DFlash-драфтер (Ф2.5): диффузия блока [anchor, MASK×…] → селектор v2
 /// (или top-1 для v1) → γ draft-токенов с честными q. Кэш на каждый вызов
@@ -1054,6 +1182,13 @@ pub struct DFlashDrafter {
     /// Сид сэмплинга (v1-диффузия: позиции блока симметричны без conv —
     /// top-1 вырождается; спека: "sample every block position").
     pub rng: u64,
+    /// Режим выбора черновиков — задаёт петля генерации под режим проверки
+    /// (см. [`crate::spec::DraftSampling`]). По умолчанию жадный: так
+    /// работает и эталон z-lab (`dflash_generate`: argmax при temperature 0).
+    pub sampling: crate::spec::DraftSampling,
+    /// LLM_SPEC_PROF: (секунды всего, число черновиков, секунды диффузии,
+    /// секунды выбора, секунды хвоста).
+    prof: (f64, usize, f64, f64, f64),
 }
 
 impl DFlashDrafter {
@@ -1064,8 +1199,10 @@ impl DFlashDrafter {
             target_embed,
             lm_head,
             features: None,
+            prof: (0.0, 0, 0.0, 0.0, 0.0),
             committed: std::collections::VecDeque::new(),
             rng: 0x85ebca6b,
+            sampling: crate::spec::DraftSampling::Greedy,
         }
     }
 
@@ -1073,13 +1210,12 @@ impl DFlashDrafter {
     /// Сэмпл из softmax-распределения строки (LCG, как sample_modified).
     /// LLM_TOP_K=N — сэмпл только из топ-N (эксперимент: совпадение с
     /// posterior чаще, если распределения совпадают на топах).
-    fn sample_row(&mut self, row: &[f32]) -> u32 {
-        let top_k = std::env::var("LLM_TOP_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+    fn sample_row(&mut self, row: &[f32], temperature: f32, top_k: usize) -> u32 {
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut w: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+        let mut w: Vec<f32> = row
+            .iter()
+            .map(|&l| ((l - max) / temperature).exp())
+            .collect();
         if top_k > 0 && top_k < w.len() {
             // оставить топ-N по весу, остальные — 0
             let mut idx: Vec<usize> = (0..w.len()).collect();
@@ -1090,11 +1226,8 @@ impl DFlashDrafter {
             }
         }
         let total: f32 = w.iter().sum();
-        self.rng = self
-            .rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let mut r = (self.rng >> 33) as f32 / (1u64 << 33) as f32 * total;
+        self.rng = crate::inference::sampling::lcg_next(self.rng);
+        let mut r = crate::inference::sampling::lcg_unit_f32(self.rng) * total;
         for (i, v) in w.iter_mut().enumerate() {
             r -= *v;
             if r <= 0.0 {
@@ -1117,6 +1250,16 @@ impl DFlashDrafter {
 }
 
 impl crate::spec::Drafter for DFlashDrafter {
+    fn reset(&mut self) {
+        self.model.truncate_caches(0);
+        self.features = None;
+        self.committed.clear();
+    }
+
+    fn set_sampling(&mut self, mode: crate::spec::DraftSampling) {
+        self.sampling = mode;
+    }
+
     fn target_layers(&self) -> &[usize] {
         &self.model.extract_layers
     }
@@ -1135,8 +1278,24 @@ impl crate::spec::Drafter for DFlashDrafter {
             return Ok(());
         }
         if std::env::var("LLM_DBG_SPEC").is_ok() {
+            // max_abs/nonfinite фич: сравнение локального тракта с удалённым —
+            // при одинаковых shapes/accepted расхождение чисел укажет на
+            // транспорт, а совпадение — на состояние драфтера.
+            let mut mx = 0.0f32;
+            let mut nonfinite = 0usize;
+            for t in extract {
+                if let Ok(v) = _backend.to_cpu_f32(t) {
+                    for x in &v {
+                        if !x.is_finite() {
+                            nonfinite += 1;
+                        } else {
+                            mx = mx.max(x.abs());
+                        }
+                    }
+                }
+            }
             eprintln!(
-                "after_extract: n={} shapes={:?} accepted={}",
+                "after_extract: n={} shapes={:?} accepted={} max_abs={mx:.3} nonfinite={nonfinite}",
                 extract.len(),
                 extract
                     .iter()
@@ -1146,27 +1305,29 @@ impl crate::spec::Drafter for DFlashDrafter {
             );
         }
         // extract-тензоры — [1, T, D] (batch=1): строки 0..n_accepted —
-        // принятые токены; их позиции [pos+1-n_accepted .. pos+1).
+        // принятые токены; pos = context_len() ПОСЛЕ окна, значит их позиции
+        // [pos−n_accepted .. pos) (последняя строка — последний принятый,
+        // БОНУСНЫЙ токен отказа в контекст не входит: он станет якорем
+        // следующего блока на позиции pos — ровно как у оракула, где шумовой
+        // блок идёт на [n_past..), а контекст — на [n_past−ctx, n_past)).
         // ВАЖНО (4.2c): z-lab конкат по ПОСЛЕДНЕЙ оси (dim=-1) — фичи
         // строки t = [l0[t]; l1[t]; …; l4[t]] (токен-мажор!). Раньше
         // клали слой-мажор ([L0-все строки, L1-все…]) — fc получал
         // перепутанный вход и драфтер выдавал мусор (приёмка 0%).
-        let d = extract[0].shape()[2];
-        let t = extract[0].shape()[1];
-        let rows = n_accepted.min(t).min(t);
+        // Форма extract: [1, T, D] (верификационное окно) или [T, D]
+        // (промпт — буферы, собранные блоками ядром copy_rows_f32).
+        let d = *extract[0].shape().last().expect("extract: пустая форма");
+        let t = extract[0].numel() / d;
+        let rows = n_accepted.min(t);
         let n_layers = extract.len();
-        let mut feat = vec![0f32; n_layers * rows * d];
+        // Конкат по последней оси ([T, 5D]) — ядром copy_rows_f32: строки
+        // слоёв ложатся в свои столбцы. Раньше каждый слой скачивался на
+        // хост и копировался в буфер вручную, потом всё заливалось обратно —
+        // на промпте 4k это 288 МБ вниз и 288 МБ вверх (секунды).
+        let mut features = _backend.zeros(vec![rows, n_layers * d])?;
         for (li, t_) in extract.iter().enumerate() {
-            let td = t_.shape()[1];
-            let rows_ = _backend.to_cpu_f32(t_)?;
-            let n = rows.min(td);
-            for r in 0..n {
-                let src = r * d;
-                let dst = r * n_layers * d + li * d;
-                feat[dst..dst + d].copy_from_slice(&rows_[src..src + d]);
-            }
+            features = _backend.copy_rows_into(t_, rows, d, features, 0, li * d, n_layers * d)?;
         }
-        let features = _backend.from_cpu_f32(&feat, vec![rows, extract.len() * d])?;
         self.features = Some(features);
         let _ = pos;
         Ok(())
@@ -1196,7 +1357,19 @@ impl crate::spec::Drafter for DFlashDrafter {
         // строки на тех же позициях. Раньше pos = history.len() были все
         // строки блока сдвинуты на 1 — row0 (якорь) крутился на позиции
         // num+1 вместо num (у неё и verify).
-        let block = self.model.block_size;
+        // Блок v1 = якорь + γ масок, а не полный обученный block_size: так
+        // draft-dflash llama.cpp (n_block_tokens = n_draft + 1). Полный блок
+        // из 16 давал приёмку на 5–20 п.п. ниже эталона (масок больше, чем
+        // проверяется, а внимание блока двунаправленное — лишние маски
+        // размывают ранние позиции), и диффузия считала 16 строк вместо γ+1.
+        // v2 (conv/selector) обучен на полной форме блока — для него полный.
+        let v2 = self.model.selector.is_some()
+            || self.model.layers.iter().any(|l| l.attn_conv.base.is_some());
+        let block = if v2 {
+            self.model.block_size
+        } else {
+            (gamma + 1).min(self.model.block_size)
+        };
         let pos = history.len().saturating_sub(1);
         let mut ids = vec![anchor];
         ids.resize(block, self.model.mask_token);
@@ -1217,6 +1390,8 @@ impl crate::spec::Drafter for DFlashDrafter {
                 self.features.as_ref().map(|f| f.shape().to_vec())
             );
         }
+        let prof = std::env::var("LLM_SPEC_PROF").is_ok();
+        let tp = std::time::Instant::now();
         let res =
             match self
                 .model
@@ -1224,62 +1399,125 @@ impl crate::spec::Drafter for DFlashDrafter {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("DFlashDrafter: диффузия не удалась: {e}");
+                    tracing::warn!("DFlashDrafter: диффузия не удалась: {e}");
+                    // Кэш мог остаться с частичными строками блока — откат к
+                    // pos, иначе следующий дрейф пишет поверх дыры (ревью Ф2.9).
+                    self.model.truncate_caches(pos);
                     return (vec![], vec![]);
                 }
             };
+        let t_diffuse = tp.elapsed().as_secs_f64();
+        let ts = std::time::Instant::now();
         let (tokens, probs) = if self.model.selector.is_some() {
-            match self.model.select(backend, &res.logits, &res.hidden) {
+            match self.model.select(backend, &res.logits, &res.hidden, anchor) {
                 Ok(s) => (s.tokens, s.probs),
                 Err(e) => {
-                    eprintln!("DFlashDrafter: селектор не удался: {e}");
+                    tracing::warn!("DFlashDrafter: селектор не удался: {e}");
+                    self.model.truncate_caches(pos);
                     return (vec![], vec![]);
                 }
             }
         } else {
-            // v1: сэмпл каждой MASK-позиции (спека: "sample every block
-            // position on the backend") + честные q (softmax-вероятность).
-            // z-lab model.py: при temperature=0 черновики = ARGMAX строк
-            // (dflash_generate: block_output_ids[:, 1:] = argmax(draft_logits));
-            // случайный LCG-сэмпл из полного ряда даёт q≈0 и приёмку 0%
-            // независимо от качества драфтера. LLM_DRAFT_ARGMX=1 включает
-            // argmax-режим (жёсткая генерация бенча).
-            let argmx = std::env::var("LLM_DRAFT_ARGMX")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            let (t, vocab) = (res.logits.shape()[1], res.logits.shape()[2]);
-            let lg = match backend.to_cpu_f32(&res.logits) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("DFlashDrafter: logits недоступны: {e}");
-                    return (vec![], vec![]);
+            // Режим черновиков — под режим проверки (set_sampling из петли
+            // generate). z-lab model.py: при temperature=0 черновики = ARGMAX
+            // строк (dflash_generate: block_output_ids[:, 1:] =
+            // argmax(draft_logits)). Раньше argmax включался только
+            // переменной LLM_DRAFT_ARGMX, которую сервис не ставил: при
+            // жадной проверке черновики сэмплировались — приёмка 7–12%.
+            // INFER_SPEC_CPU=1 — прежний путь (argmax строк на CPU).
+            let cpu_only = std::env::var("INFER_SPEC_CPU").is_ok();
+            let (argmx, temp, top_k) = match self.sampling {
+                crate::spec::DraftSampling::Greedy => (true, 1.0, 0),
+                crate::spec::DraftSampling::Sample { temperature, top_k } => {
+                    (false, temperature.max(1e-6), top_k)
                 }
             };
+            let t = res.logits.shape()[1];
             let mut tokens = Vec::with_capacity(t - 1);
             let mut probs = Vec::with_capacity(t - 1);
-            // LM-конвенция: row i предсказывает токен i+1, якорь на позиции 0,
-            // черновики = строки 1..t (проверено: direct-вариант хуже — 0.7%).
-            for pos in 1..t {
-                let row = &lg[pos * vocab..(pos + 1) * vocab];
-                let tok = if argmx {
-                    let mut best = (0usize, f32::NEG_INFINITY);
-                    for (i, &l) in row.iter().enumerate() {
-                        if l.is_finite() && l > best.1 {
-                            best = (i, l);
-                        }
+            if argmx && !cpu_only {
+                // Жадные черновики — аргмакс строк на GPU: строка логитов
+                // [T, V] не скачивается вовсе (q при жадной верификации не
+                // используется — достаточно единиц).
+                let (ids, _lse) = match backend.argmax_rows(&res.logits, None) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("DFlashDrafter: аргмакс строк не удался: {e}");
+                        self.model.truncate_caches(pos);
+                        return (vec![], vec![]);
                     }
-                    best.0 as u32
-                } else {
-                    self.sample_row(row)
                 };
-                tokens.push(tok);
-                probs.push(softmax_row_prob(&lg, pos, vocab, tok));
+                // LM-конвенция: row i предсказывает токен i+1, якорь на
+                // позиции 0, черновики = строки 1..t.
+                for pos in 1..t {
+                    tokens.push(ids[pos]);
+                    probs.push(1.0);
+                }
+            } else {
+                let vocab = res.logits.shape()[2];
+                let lg = match backend.to_cpu_f32(&res.logits) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!("DFlashDrafter: logits недоступны: {e}");
+                        self.model.truncate_caches(pos);
+                        return (vec![], vec![]);
+                    }
+                };
+                for pos in 1..t {
+                    let row = &lg[pos * vocab..(pos + 1) * vocab];
+                    let tok = if argmx {
+                        // прежний путь (INFER_SPEC_CPU): argmax на CPU
+                        let mut best = (0usize, f32::NEG_INFINITY);
+                        for (i, &l) in row.iter().enumerate() {
+                            if l.is_finite() && l > best.1 {
+                                best = (i, l);
+                            }
+                        }
+                        best.0 as u32
+                    } else {
+                        self.sample_row(row, temp, top_k)
+                    };
+                    tokens.push(tok);
+                    // Скалярная q честна только как дельта (1.0): sample_row
+                    // усещает top-k и ренормирует, а softmax_row_prob_t
+                    // возвращал вероятность ПОЛНОГО softmax — q занижалась,
+                    // min(1,p/q) завышалась (over-acceptance, ревью Ф2.9).
+                    // Полная раскладка q в интерфейсе Drafter не ездит.
+                    probs.push(1.0);
+                }
             }
             (tokens, probs)
         };
+        let t_sample = ts.elapsed().as_secs_f64();
+        let tt = std::time::Instant::now();
         // кэш после диффузии содержит k/v блока — откат до pos (crop)
         self.model.truncate_caches(pos);
-        self.commit(&tokens);
+        // НЕ коммитим собственные черновики в committed-кольцо (мина из
+        // ревью Ф2.9): здесь они НЕПРОВЕРЕННЫЕ, а док обещал «принятые
+        // таргетом». Кольцо — только fallback якоря при пустой history
+        // (после reset()), наполнить его честно может только драйвер
+        // через pub fn commit; самостоятельно драфтер принятых не знает.
+        let t_tail = tt.elapsed().as_secs_f64();
+        if std::env::var("LLM_DBG_SPEC").is_ok() {
+            eprintln!("draft@{pos}: {tokens:?}");
+        }
+        if prof {
+            self.prof.0 += tp.elapsed().as_secs_f64();
+            self.prof.1 += 1;
+            self.prof.2 += t_diffuse;
+            self.prof.3 += t_sample;
+            self.prof.4 += t_tail;
+            if self.prof.1.is_multiple_of(8) {
+                eprintln!(
+                    "DFLASH_PROF {} черновиков: всего {:.1} мс (диффузия {:.1}, выбор {:.1}, хвост {:.1}; block={block})",
+                    self.prof.1,
+                    self.prof.0 * 1e3 / self.prof.1 as f64,
+                    self.prof.2 * 1e3 / self.prof.1 as f64,
+                    self.prof.3 * 1e3 / self.prof.1 as f64,
+                    self.prof.4 * 1e3 / self.prof.1 as f64
+                );
+            }
+        }
         (
             tokens.into_iter().take(gamma).collect(),
             probs.into_iter().take(gamma).collect(),
@@ -1316,6 +1554,11 @@ fn conv_side(
 ) -> Result<Tensor, BackendError> {
     let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let kernel = base.shape()[1];
+    // Диагностика A/B (приёмка DFlash2 против эталона): INFER_DFLASH_NO_CONV=1
+    // выключает two-tap conv (тождество) — сравнить приёмку с conv и без.
+    if std::env::var("INFER_DFLASH_NO_CONV").is_ok() {
+        return Ok(x.clone());
+    }
     // N (iter-9): degenerate conv metadata (kernel 0 / groups 0) used to
     // div-by-zero — clean error instead.
     if kernel == 0 {
@@ -1329,7 +1572,19 @@ fn conv_side(
             "dflash conv: dynamic width smaller than kernel*2 groups".into(),
         ));
     }
+    // group=0 (строк conv_proj меньше d) — деление на ноль в CPU-референсе;
+    // неделимость — тихая потеря хвостовых каналов (ревью Ф2.9).
+    if d % n_groups != 0 {
+        return Err(BackendError::Shape(format!(
+            "dflash conv: dim {d} не делится на n_groups {n_groups}"
+        )));
+    }
     let group = d / n_groups;
+    if group == 0 {
+        return Err(BackendError::Shape(
+            "dflash conv: нулевая ширина группы".into(),
+        ));
+    }
     let y = backend.zeros(x.shape().to_vec())?;
     backend.dflash2_conv(
         &x.view(vec![b * t, d]),
@@ -1361,36 +1616,45 @@ fn load_dense_layer(
             .get(name)
             .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
         match tensor.format {
-            WeightFormat::Q4_0 | WeightFormat::Q8_0 | WeightFormat::Q4_K | WeightFormat::Q6_K => {
-                backend.from_quantized(tensor.raw(), shape, tensor.format)
-            }
+            WeightFormat::Q4_0
+            | WeightFormat::Q8_0
+            | WeightFormat::Q4_K
+            | WeightFormat::Q6_K
+            | WeightFormat::Q5_K
+            | WeightFormat::Q5_0 => backend.from_quantized(tensor.raw(), shape, tensor.format),
             _ => {
                 let f = dequant_f32(tensor);
                 upload_f16(backend, &f, shape)
             }
         }
     };
-    // q/k/v fused (как Qwen3Model::load): wqkv [q_size + 2·kv_size, dim]
-    let mut wqkv = dequant_f32(
-        w.get(&p("attn_q.weight"))
-            .ok_or_else(|| BackendError::Shape("attn_q.weight missing".into()))?,
-    );
-    wqkv.extend(dequant_f32(w.get(&p("attn_k.weight")).ok_or_else(
-        || BackendError::Shape("attn_k.weight missing".into()),
-    )?));
-    wqkv.extend(dequant_f32(w.get(&p("attn_v.weight")).ok_or_else(
-        || BackendError::Shape("attn_v.weight missing".into()),
-    )?));
+    // q/k/v и gate/up — слитые матрицы, как у Qwen3Model::load
+    // (upload_fused): квантованные файлы остаются в своём кванте. Раньше
+    // они деквантовались в f16 — вдвое больше чтения весов на каждом
+    // черновом блоке (драфтер стоил больше шага декода таргета).
     let attn = Attention {
-        wqkv: upload_f16(
+        qk_norm_whole_eps: None,
+        wqkv: Some(crate::qwen3::Qwen3Model::upload_fused(
             backend,
-            &wqkv,
+            w,
+            &[
+                &p("attn_q.weight"),
+                &p("attn_k.weight"),
+                &p("attn_v.weight"),
+            ],
             vec![
                 cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim,
                 cfg.dim,
             ],
+        )?),
+        wqkv_split: None,
+        // wo [dim, n_heads·head_dim]: у драфтера Qwen3.5-4B 32·128 = 4096 ≠
+        // dim 2560 — форма [dim, dim] отвергала корректный тензор (как у
+        // Qwen3Model::load, где wo всегда [dim, n_heads·head_dim]).
+        wo: up(
+            &p("attn_output.weight"),
+            vec![cfg.dim, cfg.n_heads * cfg.head_dim],
         )?,
-        wo: up(&p("attn_output.weight"), vec![cfg.dim, cfg.dim])?,
         qkv_bias: None,
         q_norm: Some(
             backend.from_cpu_f32(
@@ -1414,16 +1678,13 @@ fn load_dense_layer(
         n_kv_heads: cfg.n_kv_heads,
         head_dim: cfg.head_dim,
     };
-    // gate/up fused (как Qwen3Model::load): w13 [2·ffn, dim]
-    let mut w13 = dequant_f32(
-        w.get(&p("ffn_gate.weight"))
-            .ok_or_else(|| BackendError::Shape("ffn_gate.weight missing".into()))?,
-    );
-    w13.extend(dequant_f32(w.get(&p("ffn_up.weight")).ok_or_else(
-        || BackendError::Shape("ffn_up.weight missing".into()),
-    )?));
     let ffn = SwiGLU {
-        w13: upload_f16(backend, &w13, vec![2 * cfg.ffn_dim, cfg.dim])?,
+        w13: crate::qwen3::Qwen3Model::upload_fused(
+            backend,
+            w,
+            &[&p("ffn_gate.weight"), &p("ffn_up.weight")],
+            vec![2 * cfg.ffn_dim, cfg.dim],
+        )?,
         w2: up(&p("ffn_down.weight"), vec![cfg.dim, cfg.ffn_dim])?,
     };
     Ok(Qwen3Layer {
@@ -1444,7 +1705,7 @@ fn load_dense_layer(
             ),
             cfg.norm_eps,
         )?,
-        ffn,
+        ffn: crate::qwen3::Ffn::Dense(ffn),
     })
 }
 
@@ -1472,6 +1733,8 @@ mod tests {
 
     fn cfg() -> Qwen3Config {
         Qwen3Config {
+            moe: None,
+            rope_yarn: None,
             dim: 16,
             n_layers: 2,
             n_heads: 2,
@@ -1662,7 +1925,7 @@ mod tests {
         // сдвиг ВНУТРИ блока (паддинг нулями на границах), coeff по группам.
         use crate::harness::Lcg;
         let backend = MetalBackend::new().unwrap();
-        let cpu = crate::cpu::CpuBackend::default();
+        let cpu = crate::cpu::CpuBackend;
         let (tokens, dim, kernel, group, block) = (9usize, 16usize, 3usize, 4usize, 4usize);
         let n_groups = dim / group; // 4
         let proj = n_groups * kernel * 2; // 24
@@ -1863,7 +2126,7 @@ mod tests {
         rng.fill(&mut hd);
         let lt = backend.from_cpu_f32(&lg, vec![1, 4, 8]).unwrap();
         let ht = backend.from_cpu_f32(&hd, vec![1, 4, 16]).unwrap();
-        let res = m.select(&backend, &lt, &ht).unwrap();
+        let res = m.select(&backend, &lt, &ht, 3).unwrap();
         assert_eq!(res.tokens.len(), 3);
         assert_eq!(res.probs.len(), 3);
         // ── CPU-референс (независимый, по спеке, ggml-порядок) ──
@@ -1890,7 +2153,8 @@ mod tests {
             }
         }
         let mut exp_tok = Vec::new();
-        let mut pred = cand[0][0];
+        // предок позиции 1 — якорь (как у эталона), далее — выбранный токен
+        let mut pred = 3u32;
         for pos in 1..t {
             let mut best = 0usize;
             let mut bs = f32::NEG_INFINITY;
@@ -1980,8 +2244,11 @@ mod tests {
         for &tok in &toks {
             assert!(tok < 8, "draft-токен вне вокабуляра");
         }
-        // committed-кольцо пополнено, кэш откатан
-        assert!(drafter.committed.len() >= toks.len());
+        // committed-кольцо НЕ пополняется собственными черновиками (ревью
+        // Ф2.9: они непроверенные; док обещал «принятые таргетом») — кольцо
+        // наполняет только драйвер через pub fn commit.
+        assert!(drafter.committed.is_empty());
+        // кэш откатан до pos
         assert!(drafter.model.caches[0].pos <= 8);
         // ещё один шаг — блок от нового anchor
         let (toks2, _) = crate::spec::Drafter::draft(&mut drafter, &backend, &[3], 2);
@@ -2136,7 +2403,7 @@ mod tests {
             "Metal: hidden-строки позиций идентичны — диффузия вырождена"
         );
         // то же на CPU-бэкенде (отделяет логику от Metal-кернелов)
-        let cpu = crate::cpu::CpuBackend::default();
+        let cpu = crate::cpu::CpuBackend;
         let wm_c = crate::weights_map::WeightsMap {
             arch: "dflash".into(),
             tensors: wm.tensors.clone(),
@@ -2216,187 +2483,11 @@ pub fn load_drafter_gguf(
             .map_err(|e| BackendError::Shape(format!("open drafter {}: {e}", path.display())))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| BackendError::Shape(format!("mmap drafter: {e}")))?;
-        let gf =
-            crate::gguf::parse(&mmap).map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
+        let gf = crate::gguf::parse(&mmap)
+            .map_err(|e| BackendError::Shape(format!("gguf parse: {e}")))?;
         let wm = crate::weights_map::WeightsMap::from_gguf(&gf)
             .map_err(|e| BackendError::Shape(format!("weights: {e}")))?;
         DFlashModel::load_gguf(backend, &gf, &wm, vocab_size)?
     };
     Ok(DFlashDrafter::new(model, target_embed, lm_head))
-}
-
-#[cfg(all(test, feature = "metal", feature = "cpu"))]
-mod real_dump_tests {
-    use super::*;
-    use crate::dflash::DFlashDrafter;
-    use crate::metal::MetalBackend;
-
-    /// 4.2c-verify: первый блок диффузии на РЕАЛЬНЫХ моделях (8B-драфтер +
-    /// Qwen3-8B-Base) — дампы features/embeds/logits для числового сравнения
-    /// с эталоном dflash/model.py (numpy). Запуск:
-    /// cargo test --features metal,cpu dflash_real_block_dump -- --ignored
-    #[test]
-    #[ignore = "реальные GGUF (~10 ГБ на GPU)"]
-    fn dflash_real_block_dump() {
-        use crate::gguf;
-        use crate::gguf::GgufValue;
-        let backend = MetalBackend::new().unwrap();
-        let home = std::env::var("HOME").unwrap();
-        // Модели переехали в метарепу: models/ (реестр + gguf). Инф-переменная
-        // для кастомного пути.
-        let mdir = std::env::var("INFER_MODELS_DIR")
-            .unwrap_or_else(|_| format!("{home}/work/ai/inference/models"));
-        let tp = format!("{mdir}/llm/Qwen3-8B-Base-Q8_0.gguf");
-        // ОРИГИНАЛ z-lab (Q8_0.gguf старше — другие веса, приёмка 0 в
-        // принципе). Требует config.json рядом в ~/models/dflash/.
-        let dp = format!("{mdir}/dflash/qwen3-8b-dflash-zlab.safetensors");
-        let tb = std::fs::read(&tp).unwrap();
-        let tgf = gguf::parse(&tb).unwrap();
-        let twm = crate::weights_map::WeightsMap::from_gguf(&tgf).unwrap();
-        let voc = crate::tokenizer::Tokenizer::from_gguf(&tgf).unwrap();
-        let vocab = voc.vocab_size();
-        let tc = crate::qwen3::Qwen3Config::from_gguf(&tgf, vocab).unwrap();
-        let mut target = crate::qwen3::Qwen3Model::load(&backend, &twm, tc.clone()).unwrap();
-        // осмысленный промпт (tg-мусор из 'a' вырождал модель в
-        // детерминированную петлю [220,170,222,107,...] — приёмка на нём
-        // бессмысленна); фичи = ВСЕ строки префилла (z-lab первый блок).
-        let ids: Vec<u32> = voc.encode(
-            "Расскажи подробно, как работает спекулятивное декодирование в трансформерах: какие есть методы и в чём их отличия?",
-        );
-        let tlayers = vec![1, 9, 17, 25, 33];
-        let (logits, extract) = target.prefill_extract(&backend, &ids, &tlayers).unwrap();
-        let lv = backend.to_cpu_f32(&logits).unwrap();
-        let v = tc.vocab_size;
-        let t_prompt = ids.len();
-        let anchor = lv
-            .chunks(v)
-            .last()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .unwrap()
-                    .0 as u32
-            })
-            .unwrap();
-        eprintln!("anchor={anchor} vocab={v} t_prompt={t_prompt}");
-        let mut dr = crate::dflash::load_drafter_gguf(
-            &backend,
-            std::path::Path::new(&dp),
-            target.token_embed_table().clone(),
-            target.output_projection().clone(),
-            vocab,
-        )
-        .expect("drafter load");
-        // фичи (t_prompt строк × 5 слоёв, выходы слоёв) — ТОКЕН-МАЖОР
-        // (z-lab: cat по последней оси): строка t = [l0[t]; l1[t]; …; l4[t]].
-        let d = tc.dim;
-        let n_layers = extract.len();
-        let mut feat: Vec<f32> = vec![0f32; n_layers * t_prompt * d];
-        for (li, t) in extract.iter().enumerate() {
-            let rows = backend.to_cpu_f32(t).unwrap();
-            for r in 0..t_prompt {
-                let src = r * d;
-                let dst = r * n_layers * d + li * d;
-                feat[dst..dst + d].copy_from_slice(&rows[src..src + d]);
-            }
-        }
-        let ft = backend.from_cpu_f32(&feat, vec![t_prompt, 5 * d]).unwrap();
-        dr.features = Some(ft.clone());
-        // блок: [anchor, MASK×15], anchor на позиции t_prompt
-        let block = dr.model.block_size;
-        let mask = dr.model.mask_token;
-        let mut bids = vec![anchor];
-        bids.resize(block, mask);
-        let pos = t_prompt;
-        let res = dr
-            .model
-            .diffuse(&backend, &bids, &dr.lm_head.clone(), pos, dr.features.as_ref())
-            .expect("diffuse");
-        // дампы
-        let write_f32 = |path: &str, data: &[f32]| {
-            let mut b: Vec<u8> = Vec::with_capacity(data.len() * 4);
-            for x in data {
-                b.extend_from_slice(&x.to_le_bytes());
-            }
-            std::fs::write(path, b).unwrap();
-        };
-        write_f32("/tmp/dump_features.bin", &feat);
-        // эмбеддинги блока (строки target_embed)
-        let emb = backend.to_cpu_f32(target.token_embed_table()).unwrap();
-        let mut bte = Vec::with_capacity(block * d);
-        for &id in &bids {
-            bte.extend_from_slice(&emb[id as usize * d..(id as usize + 1) * d]);
-        }
-        write_f32("/tmp/dump_embeds.bin", &bte);
-        let lg = backend.to_cpu_f32(&res.logits).unwrap();
-        write_f32("/tmp/dump_logits.bin", &lg);
-        // lm_head таргета в f32 — для python-эталона приёмки (top-K IOU):
-        // dequant из GGUF (тот же путь, что и загрузка движка).
-        if let Some(t) = twm.get("output.weight") {
-            let hd = crate::weights_map::dequant_f32(t);
-            if !hd.is_empty() {
-                write_f32("/tmp/dump_head.bin", &hd);
-                eprintln!("head dumped: {} f32", hd.len());
-            }
-        }
-        // Веса драфтера Q8-деквант (слой 0 q/k + fc) — сверка против bf16.
-        if let Some(t) = twm.get("blk.0.attn_q.weight") {
-            write_f32("/tmp/dump_q_attn_q.bin", &crate::weights_map::dequant_f32(t));
-        }
-        if let Some(t) = twm.get("blk.0.attn_k.weight") {
-            write_f32("/tmp/dump_q_attn_k.bin", &crate::weights_map::dequant_f32(t));
-        }
-        if let Some(t) = twm.get("fc.weight") {
-            write_f32("/tmp/dump_q_fc.bin", &crate::weights_map::dequant_f32(t));
-        }
-        eprintln!("q8 weight dumps written");
-        let hd = backend.to_cpu_f32(&res.hidden).unwrap();
-        write_f32("/tmp/dump_hidden.bin", &hd);
-        let meta = format!(
-            "{{\"vocab\":{v},\"dim\":{d},\"block\":{block},\"pos\":{pos},\"mask\":{mask},\"anchor\":{anchor},\"n_layers\":5,\"tlayers\":[1,9,17,25,33],\"t_prompt\":{t_prompt}}}"
-        );
-        std::fs::write("/tmp/dump_meta.json", meta).unwrap();
-        eprintln!("dumps written");
-        // ── приёмка первого блока: черновик vs фактические токены таргета ──
-        use crate::spec::Drafter;
-        let mut lg = logits.clone();
-        let mut actual = Vec::with_capacity(12);
-        for _ in 0..12 {
-            let rv = backend.to_cpu_f32(&lg).unwrap();
-            let row = &rv[..v];
-            let tok = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0 as u32;
-            actual.push(tok);
-            lg = target.decode(&backend, tok).unwrap();
-        }
-        eprintln!("anchor={anchor} actual(1..)={:?}", &actual[..7]);
-        // свежий драфтер, тот же контекст: draft() работает по history
-        let mut dr2 = crate::dflash::load_drafter_gguf(
-            &backend,
-            std::path::Path::new(&dp),
-            target.token_embed_table().clone(),
-            target.output_projection().clone(),
-            vocab,
-        )
-        .expect("drafter2");
-        dr2.features = Some(ft.clone());
-        dr2.commit(&[anchor]);
-        let mut history = ids.clone();
-        history.push(anchor);
-        let (tokens, probs) = dr2.draft(&backend, &history, 6);
-        eprintln!("actual  = {:?}", &actual[..7]);
-        eprintln!("draft   = {:?}", tokens);
-        eprintln!("probs   = {:?}", probs.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>());
-        let matched = tokens
-            .iter()
-            .zip(actual.iter().skip(1))
-            .filter(|(a, b)| a == b)
-            .count();
-        eprintln!("first-block acceptance: {matched}/{} (с лагом 1, как z-lab)", tokens.len());
-    }
 }

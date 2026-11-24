@@ -1,5 +1,86 @@
 //! Top-p, temperature, repetition penalty, RAS sampling (CPU vectors).
 
+/// The project-wide 64-bit LCG step (Knuth MMIX constants). Every stochastic
+/// path in the workspace shares this one step so that a single change to the
+/// generator cannot leave half the code on the old distribution.
+#[inline]
+pub fn lcg_next(state: u64) -> u64 {
+    state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
+/// Uniform `f32` in `[0, 1)` derived from a raw LCG state.
+///
+/// Uses the top 24 bits, which `f32` represents exactly: the largest value is
+/// `(2^24 - 1) / 2^24 < 1.0`. Deriving from fewer bits (the previous
+/// `state >> 33`) silently produced `[0, 0.25)`, and dividing a wider value by
+/// `2^32` could round up to exactly `1.0`.
+#[inline]
+pub fn lcg_unit_f32(state: u64) -> f32 {
+    ((state >> 40) as f32) * (1.0 / (1u64 << 24) as f32)
+}
+
+/// The LCG state a caller-supplied seed materializes to.
+///
+/// A seed is NOT a state: `lcg_unit_f32` reads the TOP 24 bits of the state, so
+/// a small integer seed (the common user choice — `seed = 42`) has zeros there
+/// and the first ~2^40 draws come back exactly `0.0`, which silently degrades
+/// temperature/top-p sampling to "always take the first candidate". One LCG
+/// step at seed time spreads the seed over all 64 bits; states materialized
+/// this way and clock-materialized ones (the `None` branch of
+/// `next_unit_f32`) are then interchangeable as stream states.
+#[inline]
+pub fn state_from_seed(seed: u64) -> u64 {
+    lcg_next(seed)
+}
+
+/// The first draw of the stream seeded with `seed` — `next_unit_f32` reading a
+/// state materialized by [`state_from_seed`]. Callers that need a seed with a
+/// property of its first draw read it here; a raw `lcg_unit_f32(seed)` is NOT
+/// that draw (see `state_from_seed`).
+pub fn seed_first_unit(seed: u64) -> f32 {
+    lcg_unit_f32(lcg_next(state_from_seed(seed)))
+}
+
+/// Draw a uniform `f32` from a mutable LCG state, seeding from the clock on the
+/// first call (`None`). The advanced state is written back, so a caller that
+/// keeps `Some(state)` gets a deterministic stream.
+pub fn next_unit_f32(state: &mut Option<u64>) -> f32 {
+    let next = match state {
+        Some(s) => lcg_next(*s),
+        None => lcg_next(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64,
+        ),
+    };
+    *state = Some(next);
+    lcg_unit_f32(next)
+}
+
+/// Следующий токен ЖАДНОГО режима: argmax со ТЕМ ЖЕ штрафом за повторы, что
+/// применяет обычный decode. Единственная реализация для всех путей —
+/// спекулятивная верификация обязана сравнивать argmax С ШТРАФОМ, иначе
+/// принимает токены, которых жадный путь не выбрал бы (на живом сервисе это
+/// давало расхождение спек- и жадной генерации: штраф 1.1 по умолчанию, а
+/// частый токен («of») есть в истории).
+pub fn greedy_next(row: &[f32], history: &[u32], repeat_penalty: f32) -> u32 {
+    let mut penalized = row.to_vec();
+    apply_repetition_penalty_vec_unique(&mut penalized, history, repeat_penalty);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, l) in penalized.iter().enumerate() {
+        // Не-конечные логиты (NaN) не должны побеждать: NaN в partial_cmp
+        // давало Equal и «залипало» в аккумуляторе (P18c/iter-9).
+        let l = if l.is_finite() { *l } else { f32::NEG_INFINITY };
+        if best.is_none_or(|(_, bl)| l > bl) {
+            best = Some((i, l));
+        }
+    }
+    best.map(|(i, _)| i as u32).unwrap_or(0)
+}
+
 /// Sampling parameters.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -9,7 +90,12 @@ pub struct SamplingParams {
     /// top-p (0 = no limit). fishaudio S2-Pro reference default is 30.
     pub top_k: usize,
     pub repetition_penalty: f32,
+    /// Пользовательский сид потока — НЕ состояние LCG: материализуется через
+    /// [`state_from_seed`] (сырое значение как состояние даёт поток нулей).
     pub seed: Option<u64>,
+    /// min-p (llama.cpp): отбрасываются токены с вероятностью меньше
+    /// `min_p × p_max` (после top-k/top-p). 0 — выключено.
+    pub min_p: f32,
 }
 
 impl Default for SamplingParams {
@@ -20,8 +106,20 @@ impl Default for SamplingParams {
             top_k: 0,
             repetition_penalty: 1.1,
             seed: None,
+            min_p: 0.0,
         }
     }
+}
+
+/// min-p поверх уже отсортированного по убыванию окна: оставить токены с
+/// p ≥ min_p · p_max (первый — всегда).
+fn apply_min_p(window: &[(usize, f32)], min_p: f32) -> &[(usize, f32)] {
+    if min_p <= 0.0 || window.is_empty() {
+        return window;
+    }
+    let thr = window[0].1 * min_p;
+    let keep = window.iter().take_while(|(_, p)| *p >= thr).count().max(1);
+    &window[..keep]
 }
 
 /// Top-p sample over a CPU logits vector (temperature + repetition penalty
@@ -81,8 +179,8 @@ pub fn top_p_sample_vec_history(
                 break;
             }
         }
-        let top_tokens: Vec<(usize, f32)> = window[..cutoff].to_vec();
-        return sample_from(&top_tokens, rng_state);
+        let top_tokens = apply_min_p(&window[..cutoff], params.min_p);
+        return sample_from(top_tokens, rng_state);
     }
 
     indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
@@ -97,8 +195,99 @@ pub fn top_p_sample_vec_history(
         }
     }
 
-    let top_tokens: Vec<(usize, f32)> = indexed[..cutoff].to_vec();
-    sample_from(&top_tokens, rng_state)
+    let top_tokens = apply_min_p(&indexed[..cutoff], params.min_p);
+    sample_from(top_tokens, rng_state)
+}
+
+/// Модифицированное целевое распределение для верификации спекулятивного
+/// декодинга: штраф по уникальной истории → температура → softmax →
+/// top-k/top-p/min-p усечение с ренормировкой (вне окна — ноль).
+///
+/// КАСКАД ЗЕРКАЛЕН [`top_p_sample_vec_history`] побайтово (тот же порядок
+/// операций, тот же select_nth+сортировка окна, то же `>=` в top-p и min-p):
+/// p в rejection-sampling обязана браться ИЗ ТОГО ЖЕ распределения, из
+/// которого `sample_next` сэмплирует обычный путь, иначе спек-выход сходится
+/// не к целевой выборке (ревью Ф2.9: верификация считала p по сырым логитам
+/// T=1 без усечений — лосслессность нарушалась при temperature>0).
+pub fn modified_probs(logits: &[f32], params: &SamplingParams, history: &[u32]) -> Vec<f32> {
+    let mut logits_vec = logits.to_vec();
+    apply_repetition_penalty_vec_unique(&mut logits_vec, history, params.repetition_penalty);
+    if params.temperature != 1.0 {
+        for l in logits_vec.iter_mut() {
+            *l /= params.temperature;
+        }
+    }
+    let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp_vals: Vec<f32> = logits_vec.iter().map(|&l| (l - max_logit).exp()).collect();
+    let sum_exp: f32 = exp_vals.iter().sum();
+    let probs_vec: Vec<f32> = if sum_exp.is_finite() && sum_exp > 0.0 {
+        exp_vals.iter().map(|&e| e / sum_exp).collect()
+    } else {
+        let n = logits_vec.len() as f32;
+        vec![1.0 / n; logits_vec.len()]
+    };
+
+    let mut indexed: Vec<(usize, f32)> =
+        probs_vec.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+    let k = if params.top_k > 0 {
+        params.top_k.min(indexed.len())
+    } else {
+        indexed.len()
+    };
+    let window: Vec<(usize, f32)> = if k < indexed.len() {
+        let (head, pivot, _) = indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        let mut w: Vec<(usize, f32)> = head.to_vec();
+        w.push(*pivot);
+        w.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        w
+    } else {
+        indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        indexed
+    };
+    let mut cumsum = 0.0f32;
+    let mut cutoff = k;
+    for (i, (_, p)) in window.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= params.top_p {
+            cutoff = i + 1;
+            break;
+        }
+    }
+    let top = apply_min_p(&window[..cutoff], params.min_p);
+    // Ренормировка окна — как в sample_from (threshold = r·Σtop).
+    let total: f32 = top.iter().map(|(_, p)| p).sum();
+    let mut out = vec![0.0f32; logits.len()];
+    if total > 0.0 {
+        for (i, p) in top {
+            out[*i] = p / total;
+        }
+    } else if let Some((i, _)) = top.first() {
+        out[*i] = 1.0;
+    }
+    out
+}
+
+/// Остаточное распределение rejection-sampling: (p − q·δ_draft)⁺ поверх
+/// модифицированного p — вычесть массу драфтера с draft-позиции, обнулить
+/// отрицательное, ренормировать, сэмплить (индексный порядок — как у
+/// прежнего sample_modified).
+pub fn sample_residual(probs: &[f32], draft_tok: u32, q: f32, rng_state: &mut Option<u64>) -> u32 {
+    let mut w: Vec<f32> = probs.to_vec();
+    if let Some(t) = w.get_mut(draft_tok as usize) {
+        *t = (*t - q).max(0.0);
+    }
+    let total: f32 = w.iter().sum();
+    if total <= 0.0 {
+        return draft_tok; // вырожденный случай — масса целиком в draft
+    }
+    let mut r = next_unit_f32(rng_state) * total;
+    for (i, v) in w.iter_mut().enumerate() {
+        r -= *v;
+        if r <= 0.0 {
+            return i as u32;
+        }
+    }
+    (w.len() - 1) as u32
 }
 
 /// Старое API (без истории) — speech-крейт и прежние вызовы. Без истории
@@ -115,26 +304,7 @@ pub fn top_p_sample_vec(
 fn sample_from(top_tokens: &[(usize, f32)], rng_state: &mut Option<u64>) -> u32 {
     let total: f32 = top_tokens.iter().map(|(_, p)| p).sum();
 
-    let r = match rng_state {
-        Some(state) => {
-            *state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (*state >> 33) as f32 / (1u64 << 33) as f32
-        }
-        None => {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos();
-            let mut state = nanos as u64;
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *rng_state = Some(state);
-            (state >> 33) as f32 / (1u64 << 33) as f32
-        }
-    };
+    let r = next_unit_f32(rng_state);
 
     let threshold = r * total;
     let mut cumsum = 0.0f32;
@@ -211,9 +381,75 @@ pub fn ras_penalty_vec(logits: &mut [f32], history: &[u32], window: usize, penal
 mod tests {
     use super::*;
 
+    /// Сид — не состояние: `lcg_unit_f32` читает биты 40..64, поэтому сырой
+    /// маленький сид (42, как в API) давал ПОТОК РОВНО НУЛЕЙ — temperature- и
+    /// top-p-сэмплинг молча вырождался в «всегда первый кандидат». Регрессия
+    /// нашлась по тесту `decode_spec_rejects_and_rolls_back`, который в цикле
+    /// подбора сида висел часами. `state_from_seed` перемешивает сид.
+    #[test]
+    fn state_from_seed_spreads_small_seeds() {
+        for s in [1u64, 7, 42, 12_345, 0xDEAD_BEEF] {
+            assert!(
+                seed_first_unit(s) > 0.0,
+                "сид {s}: первый draw ровно 0.0 — состояние не перемешано"
+            );
+            let mut rng = Some(state_from_seed(s));
+            let draws: Vec<f32> = (0..8).map(|_| next_unit_f32(&mut rng)).collect();
+            assert!(
+                draws.iter().any(|&u| u > 0.01),
+                "сид {s}: вырожденный поток {draws:?}"
+            );
+        }
+    }
+
+    /// Детерминированность: один сид — один поток (повтор даёт те же draws).
+    #[test]
+    fn seeded_stream_is_deterministic() {
+        let draws = |seed: u64| {
+            let mut rng = Some(state_from_seed(seed));
+            (0..6)
+                .map(|_| next_unit_f32(&mut rng))
+                .collect::<Vec<f32>>()
+        };
+        assert_eq!(draws(42), draws(42));
+        assert_ne!(draws(42), draws(43));
+    }
+
     /// M15 regression: the top_k path sliced head[..k] where head is k-1
     /// long (select_nth puts the k-th element in the pivot) — k=1 panicked
     /// with "range end index out of range".
+    /// min-p: токены с p < min_p · p_max не выпадают никогда; при min_p = 0
+    /// они выпадают (контроль, что тест различает режимы).
+    #[test]
+    fn min_p_cuts_low_probability_tail() {
+        // p ≈ [0.70, 0.20, 0.10·(малая доля)…]: третий токен < 0.5 · p_max
+        let logits = [2.0f32, 0.75, -0.5, -0.5, -0.5];
+        let run = |min_p: f32| -> std::collections::HashSet<u32> {
+            let params = SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                seed: None,
+                min_p,
+            };
+            let mut rng = Some(state_from_seed(11));
+            (0..400)
+                .map(|_| top_p_sample_vec(&logits, &params, &mut rng))
+                .collect()
+        };
+        let cut = run(0.25);
+        assert!(
+            cut.iter().all(|&t| t <= 1),
+            "min_p=0.25 пропустил хвост: {cut:?}"
+        );
+        let all = run(0.0);
+        assert!(
+            all.iter().any(|&t| t >= 2),
+            "без min_p хвост обязан встречаться: {all:?}"
+        );
+    }
+
     #[test]
     fn top_k_one_does_not_panic() {
         let logits = [1.0f32, 2.0, 3.0, 0.5, -1.0];
@@ -223,6 +459,7 @@ mod tests {
             top_k: 1,
             repetition_penalty: 1.0,
             seed: Some(42),
+            min_p: 0.0,
         };
         let mut rng = None;
         // Must return the argmax (index 2) and not panic.
@@ -239,21 +476,33 @@ mod tests {
             top_k,
             repetition_penalty: 1.0,
             seed: Some(7),
+            min_p: 0.0,
         };
-        // With top_p near 1.0 both paths effectively sample from the same
-        // distribution: repeated draws must stay inside the top_k window.
-        let mut rng_a = None;
+        // Three largest logits are 0.9 (id 1), 0.8 (id 6), 0.7 (id 3).
+        const TOP3: [usize; 3] = [1, 6, 3];
+        // NOTE: with top_p=0.99 the cumulative mass reaches the cutoff only on
+        // the LAST of the 8 tokens, so the unrestricted path legitimately may
+        // return any of them. The earlier version of this test asserted that
+        // the unrestricted draw always landed in the top-3 — it only ever held
+        // because the RNG could not produce a draw above 0.25.
         let mut rng_b = None;
-        for _ in 0..50 {
-            let ta = top_p_sample_vec_history(&logits, &mk(3), &[], &mut rng_a);
-            let tb = top_p_sample_vec_history(&logits, &mk(0), &[], &mut rng_b);
+        let mut outside_top3 = 0;
+        let mut rng_a = None;
+        for _ in 0..200 {
+            let ta = top_p_sample_vec_history(&logits, &mk(3), &[], &mut rng_a) as usize;
             assert!(
-                ta < 3 || ta == 2,
+                TOP3.contains(&ta),
                 "top_k=3 must stay in the top-3 window, got {ta}"
             );
-            // The full-sort path returns one of the 3 largest (0.9, 0.8, 0.7).
-            assert!([1usize, 6, 3].contains(&(tb as usize)), "unexpected {tb}");
+            let tb = top_p_sample_vec_history(&logits, &mk(0), &[], &mut rng_b) as usize;
+            if !TOP3.contains(&tb) {
+                outside_top3 += 1;
+            }
         }
+        assert!(
+            outside_top3 > 0,
+            "an unrestricted draw never left the top-3 window — the RNG is truncated"
+        );
     }
 
     /// Repetition penalty больше не no-op: токен из истории выталкивается
@@ -268,10 +517,14 @@ mod tests {
             top_k: 1,
             repetition_penalty: rp,
             seed: Some(11),
+            min_p: 0.0,
         };
         // Без истории: argmax = 0 (top_k=1 — только он в окне).
         let mut rng = None;
-        assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[], &mut rng), 0);
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &mk(1.0), &[], &mut rng),
+            0
+        );
         // Токен 0 в истории: 2.0/2 = 1.0 < 1.5 → argmax = 1 → top_k=1 окно
         // не содержит 0 → ни один draw не вернёт 0.
         let mut rng = None;
@@ -291,7 +544,10 @@ mod tests {
         );
         // penalty == 1.0 — no-op.
         let mut rng = None;
-        assert_eq!(top_p_sample_vec_history(&logits, &mk(1.0), &[0], &mut rng), 0);
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &mk(1.0), &[0], &mut rng),
+            0
+        );
     }
 
     /// Wave-8 revert: direct `apply_repetition_penalty_vec` is per-OCCURRENCE
@@ -321,10 +577,135 @@ mod tests {
             top_k: 1,
             repetition_penalty: 2.0,
             seed: Some(3),
+            min_p: 0.0,
         };
         let mut rng = None;
         // Штраф: [1.0, 1.5, 0.9, 0.1]; температура: [2.0, 3.0, 1.8, 0.2]
         // → argmax = 1.
-        assert_eq!(top_p_sample_vec_history(&logits, &params, &[0], &mut rng), 1);
+        assert_eq!(
+            top_p_sample_vec_history(&logits, &params, &[0], &mut rng),
+            1
+        );
+    }
+
+    /// The old `(state >> 33) as f32 / 2^33` derivation could only return
+    /// [0, 0.25): the top of the range was unreachable and the mean sat at
+    /// 0.125. Guard the full [0, 1) span and the mean.
+    #[test]
+    fn unit_draw_spans_full_range() {
+        let mut st = Some(1u64);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut sum = 0.0f64;
+        const N: usize = 100_000;
+        for _ in 0..N {
+            let v = next_unit_f32(&mut st);
+            assert!((0.0..1.0).contains(&v), "draw outside [0,1): {v}");
+            lo = lo.min(v);
+            hi = hi.max(v);
+            sum += v as f64;
+        }
+        assert!(hi > 0.99, "upper range unreachable, max = {hi}");
+        assert!(lo < 0.01, "lower range unreachable, min = {lo}");
+        let mean = sum / N as f64;
+        assert!((mean - 0.5).abs() < 0.01, "mean {mean} is not 0.5");
+    }
+
+    /// Regression for the truncated draw: two EQUAL logits must be selected
+    /// about equally often. Under the old formula the first candidate owned
+    /// the whole threshold range, so the second was never reachable.
+    #[test]
+    fn equal_tokens_are_selected_evenly() {
+        let logits = [0.0f32, 0.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            seed: None,
+            min_p: 0.0,
+        };
+        let mut st = Some(987_654_321u64);
+        let (mut first, mut second) = (0u32, 0u32);
+        for _ in 0..10_000 {
+            if top_p_sample_vec(&logits, &params, &mut st) == 0 {
+                first += 1;
+            } else {
+                second += 1;
+            }
+        }
+        assert!(
+            first > 4_000 && second > 4_000,
+            "biased selection: token0={first}, token1={second}"
+        );
+    }
+
+    fn sp(temperature: f32, top_p: f32, top_k: usize, min_p: f32) -> SamplingParams {
+        SamplingParams {
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty: 1.0,
+            seed: None,
+            min_p,
+        }
+    }
+
+    /// modified_probs при T=1, top_p=1, без усечений == чистый softmax.
+    #[test]
+    fn modified_probs_softmax_unit_matches_softmax() {
+        let logits = [1.0f32, 2.0, 0.5, -1.0, 3.0];
+        let p = modified_probs(&logits, &sp(1.0, 1.0, 0, 0.0), &[]);
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
+        for (i, l) in logits.iter().enumerate() {
+            let want = (l - max).exp() / sum;
+            assert!((p[i] - want).abs() < 1e-6, "p[{i}]={} vs {want}", p[i]);
+        }
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    /// modified_probs с top-k: вне окна — ноль, окно ренормировано.
+    #[test]
+    fn modified_probs_top_k_truncates_and_renormalizes() {
+        let logits = [3.0f32, 2.0, 1.0, 0.0];
+        let p = modified_probs(&logits, &sp(1.0, 1.0, 2, 0.0), &[]);
+        assert_eq!(p[2], 0.0);
+        assert_eq!(p[3], 0.0);
+        let e3 = (3.0f32).exp();
+        let e2 = 2.0f32.exp();
+        let want0 = e3 / (e3 + e2);
+        assert!((p[0] - want0).abs() < 1e-6, "p[0]={} vs {want0}", p[0]);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    /// ЯДРО фикса лосслессности (ревью Ф2.9): дельта-верификация
+    /// (принять с вероятностью p(x), отказ — ресемпл из (p−δ_x)⁺) даёт
+    /// в точности p — при ЛЮБОМ способе выбора черновика. Здесь черновик —
+    /// детерминированный top-1 (намеренно смещённый драфтер).
+    #[test]
+    fn delta_rejection_sampling_is_lossless() {
+        let logits = [2.0f32, 1.0, 0.0, -1.0, 0.5];
+        let p = modified_probs(&logits, &sp(1.0, 1.0, 0, 0.0), &[]);
+        let draft = 0u32; // всегда «топ-1» — намеренно смещённый драфтер
+        let mut st = Some(0x1234_5678u64);
+        let mut counts = vec![0u64; p.len()];
+        let n = 200_000u64;
+        for _ in 0..n {
+            let u = next_unit_f32(&mut st);
+            let out = if u <= p[draft as usize] {
+                draft
+            } else {
+                sample_residual(&p, draft, 1.0, &mut st)
+            };
+            counts[out as usize] += 1;
+        }
+        for (i, &pi) in p.iter().enumerate() {
+            let f = counts[i] as f64 / n as f64;
+            let tol = ((pi.max(1e-3) * 0.03).max(0.004)) as f64;
+            assert!(
+                (f - pi as f64).abs() < tol,
+                "token {i}: freq {f} vs p {pi} (counts {counts:?})"
+            );
+        }
     }
 }

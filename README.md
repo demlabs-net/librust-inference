@@ -103,18 +103,25 @@ If you have run out of energy or time for your project, put a note at the top of
 
 ## Performance (dev: M3 Max, Metal)
 
-decode batch=1, greedy, Qwen3-0.6B-Instruct (24 слоя, dim 1024):
+Методика: `scripts/bench_f82.py` — pp128/tg64, batch=1, прогоны ЧЕРЕДУЮТСЯ
+(наш, llama.cpp, наш, …), медиана по раундам; одна и та же GGUF-модель у
+обеих сторон. Текст при этом совпадает с llama.cpp байт-в-байт
+(`scripts/text_parity.py`) — иначе числа сравнивать нечестно.
 
-| формат | веса | decode, tok/s | bandwidth-потолок | % потолка |
-|---|---|---|---|---|
-| F16 (dequant из GGUF-Q8_0) | 1.2 GB | 29.5 | ~250 tok/s | 12% |
-| Q8_0 (нативный, 283caa1) | 0.6 GB | 44.3 | ~500 tok/s | 9% |
+Замер 2026-10-06 (машина под нагрузкой — есть фоновые процессы):
 
-TTFT (28 токенов): 0.60s. Omni3b аудио-e2e (safetensors→f16): 9.8 tok/s.
+| модель | pp128 наш | pp128 llama.cpp | pp % | tg64 наш | tg64 llama.cpp | tg % |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B-official-Q8_0 | 3909 | 5192 | 75% | 140.7 | 202.2 | 70% |
+| Qwen3-8B-Base-Q8_0 | 299 | 388 | 77% | 24.9 | 25.7 | 96% |
 
-Узкое место decode — НЕ bandwidth: ~219 command buffers/шаг (CB-объекты +
-ObjC-dispatch ~17мс/шаг) против GPU-кернелов ~5мс. Дальнейшие шаги:
-rmsnorm+gemm fusion (−24 кернела), решение view-бага q/k/v (−72 кернела),
-Q4_0/Q4_K/Q6_K e2e (путь и кернелы готовы — нужны GGUF-модели, иначе Ф9).
+Ранее на той же методике (2026-09-29, свободная машина) выходило
+pp 83–91%, tg 87–104% — разброс объясняется фоновой нагрузкой/троттлингом,
+поэтому в скрипте и сделано чередование прогонов.
 
-Замер: `cargo run --release --features metal --example llm_chat -- <model.gguf> "<prompt>"`
+Ускорение против первой версии README (Q8_0 0.6B: 44.3 tok/s) — трёхкратное
+по decode: малобатчевые Q8_0-кернелы, блочный префилл, mma-путь для hd=256,
+`no_logits` на промежуточных блоках префилла, f16-KV.
+
+Запуск: `cargo run --release --features metal --example llm_chat -- <model.gguf> "<prompt>"`
+или стенд против llama.cpp: `python3 ../scripts/bench_f82.py`.

@@ -4,7 +4,7 @@
 //!
 //! Pipeline: resize (bilinear, host — входной препроцессинг как
 //! токенизация) → normalize → patchify → patch_embd (+pos_embd) →
-//! transformer blocks (pre-norm MHA, fused qkv, GELU FFN) → norm →
+//! transformer blocks (pre-norm MHA, fused qkv, GELU / quick-GELU FFN) → norm →
 //! projector. All tensor math runs on the backend (GPU).
 
 use crate::backend::{Backend, Tensor};
@@ -79,6 +79,27 @@ impl VisionConfig {
     }
 }
 
+/// FFN-активация CLIP-энкодера: GELU (`clip.use_gelu=true`) или quick-GELU
+/// (`false`, как в llama.cpp clip для ViT-L/14): x·σ(1.702·x). Раньше вторая
+/// ветка была ошибкой «not implemented yet» — такой mmproj не грузился.
+fn clip_ffn_activation(
+    backend: &dyn Backend,
+    up: &Tensor,
+    use_gelu: bool,
+) -> Result<Tensor, BackendError> {
+    let g = backend.zeros(up.shape().to_vec())?;
+    if use_gelu {
+        backend.gelu_tanh(up, &g)?;
+    } else {
+        let scaled = backend.zeros(up.shape().to_vec())?;
+        backend.scale(up, &scaled, 1.702)?;
+        let sg = backend.zeros(up.shape().to_vec())?;
+        backend.sigmoid(&scaled, &sg)?;
+        backend.mul(up, &sg, &g)?;
+    }
+    Ok(g)
+}
+
 struct VisionLayer {
     ln1_w: Tensor,
     ln1_b: Tensor,
@@ -120,7 +141,7 @@ impl VisionModel {
                 .ok_or_else(|| BackendError::Shape(format!("missing tensor {name}")))?;
             let data = crate::weights_map::dequant_f32(tensor);
             let shape: Vec<usize> = tensor.shape.iter().map(|&d| d as usize).collect();
-            Ok(backend.from_cpu_f32(&data, shape)?)
+            backend.from_cpu_f32(&data, shape)
         };
         let d = cfg.embedding_length;
         let patch_embd = t("v.patch_embd.weight")?;
@@ -225,8 +246,8 @@ impl VisionModel {
             let x2 = ln.view(vec![b * tq, cfg.embedding_length]);
             let qkv = backend.zeros(vec![b * tq, 3 * cfg.embedding_length])?;
             backend.gemm_nt(&x2, &layer.qkv, &qkv)?;
-            let mut qkv_b = backend.zeros(qkv.shape().to_vec())?;
-            backend.add_bias(&qkv, &layer.qkv_b, &mut qkv_b)?;
+            let qkv_b = backend.zeros(qkv.shape().to_vec())?;
+            backend.add_bias(&qkv, &layer.qkv_b, &qkv_b)?;
             let qkv = qkv_b;
             let qkv = qkv.view(vec![b, tq, 3 * cfg.embedding_length]);
             let q = crate::nn::slice_last(backend, &qkv, cfg.embedding_length, 0)?;
@@ -255,8 +276,8 @@ impl VisionModel {
             let ao_b = backend.zeros(vec![b * tq, cfg.embedding_length])?;
             backend.add_bias(&ao0, &layer.attn_out_b, &ao_b)?;
             let ao = ao_b.view(vec![b, tq, cfg.embedding_length]);
-            let mut xr = backend.zeros(x.shape().to_vec())?;
-            backend.add(&x, &ao, &mut xr)?;
+            let xr = backend.zeros(x.shape().to_vec())?;
+            backend.add(&x, &ao, &xr)?;
             // ln2 → ffn (gelu)
             let xrv = xr.view(vec![b * tq, cfg.embedding_length]);
             let ln2_2d = backend.zeros(vec![b * tq, cfg.embedding_length])?;
@@ -266,21 +287,14 @@ impl VisionModel {
             let up = backend.zeros(vec![b * tq, cfg.ffn_length])?;
             backend.gemm_nt(&x3, &layer.ffn_up, &up)?;
             backend.add_bias(&up, &layer.ffn_up_b, &up)?;
-            if cfg.use_gelu {
-                let g = backend.zeros(vec![b * tq, cfg.ffn_length])?;
-                backend.gelu_tanh(&up, &g)?;
-                let down = backend.zeros(vec![b * tq, cfg.embedding_length])?;
-                backend.gemm_nt(&g, &layer.ffn_down, &down)?;
-                backend.add_bias(&down, &layer.ffn_down_b, &down)?;
-                let down = down.view(vec![b, tq, cfg.embedding_length]);
-                let mut xf = backend.zeros(x.shape().to_vec())?;
-                backend.add(&xr, &down, &mut xf)?;
-                x = xf;
-            } else {
-                return Err(BackendError::Shape(
-                    "non-gelu vision FFN not implemented yet".into(),
-                ));
-            }
+            let g = clip_ffn_activation(backend, &up, cfg.use_gelu)?;
+            let down = backend.zeros(vec![b * tq, cfg.embedding_length])?;
+            backend.gemm_nt(&g, &layer.ffn_down, &down)?;
+            backend.add_bias(&down, &layer.ffn_down_b, &down)?;
+            let down = down.view(vec![b, tq, cfg.embedding_length]);
+            let xf = backend.zeros(x.shape().to_vec())?;
+            backend.add(&xr, &down, &xf)?;
+            x = xf;
         }
         // final norm → projector (norm_b required at load)
         let (b, tq, _) = (x.shape()[0], x.shape()[1], x.shape()[2]);
@@ -451,5 +465,34 @@ mod tests {
         let (n, data, cpp) = preprocess(&img, 32, 32, &cfg).unwrap();
         assert_eq!((n, cpp), (4, 3 * 16 * 16));
         assert_eq!(data.len(), n * cpp);
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    /// quick-GELU == x·σ(1.702x) на хосте (обе ветки активации живы).
+    #[test]
+    fn quick_gelu_matches_host() {
+        let Ok(backend) = crate::backend::default_backend() else {
+            eprintln!("no backend — skipping");
+            return;
+        };
+        let x: Vec<f32> = (0..37).map(|i| (i as f32 * 0.37).sin() * 4.0).collect();
+        let t = backend.from_cpu_f32(&x, vec![1, 37]).unwrap();
+        let q = clip_ffn_activation(backend.as_ref(), &t, false).unwrap();
+        let got = backend.to_cpu_f32(&q).unwrap();
+        for (i, (&v, &g)) in x.iter().zip(&got).enumerate() {
+            let want = v * (1.0 / (1.0 + (-1.702 * v).exp()));
+            assert!(
+                (g - want).abs() <= 1e-6,
+                "i={i}: quick_gelu {g} vs {want} (x={v})"
+            );
+        }
+        // GELU-ветка отвечает и не совпадает с quick на тех же данных.
+        let gelu = clip_ffn_activation(backend.as_ref(), &t, true).unwrap();
+        let gv = backend.to_cpu_f32(&gelu).unwrap();
+        assert!(gv.iter().zip(&got).any(|(a, b)| (a - b).abs() > 1e-3));
     }
 }
